@@ -47,6 +47,10 @@ func NewRegistry() *Registry {
 	r.Register(NewAct(mgr))
 	r.Register(NewSessionClose(mgr))
 	r.Register(NewSessionList(mgr))
+	r.Register(NewBrowserCreate(mgr))
+	r.Register(NewBrowserList(mgr))
+	r.Register(NewBrowserClose(mgr))
+	r.Register(NewPageList(mgr))
 	return r
 }
 

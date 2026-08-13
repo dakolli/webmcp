@@ -70,25 +70,34 @@ func NewManager(opts ...Option) *Manager {
 // headful by default (unless WithHeadless(true) was set) with stealth applied
 // to every new page (unless WithStealth(false) was set).
 func (m *Manager) Open(ctx context.Context) (*Browser, error) {
-	// TODO(web-mcp): implement — see go-rod-primer.md
-	//
-	// Intended flow (Phase 1):
-	//   m.mu.Lock()
-	//   if m.shutdown { m.mu.Unlock(); return nil, errors.New("browsers: manager has been shut down") }
-	//   if m.browser != nil { b := m.browser; m.mu.Unlock(); return b, nil }
-	//   m.mu.Unlock()
-	//
-	//   b := NewBrowser(m.headless, m.stealth)
-	//   if err := b.Launch(ctx); err != nil {
-	//       return nil, fmt.Errorf("browsers: launch browser: %w", err)
-	//   }
-	//
-	//   m.mu.Lock()
-	//   if m.shutdown { m.mu.Unlock(); _ = b.Close(ctx); return nil, errors.New("browsers: manager has been shut down") }
-	//   m.browser = b
-	//   m.mu.Unlock()
-	//   return b, nil
-	return nil, fmt.Errorf("browsers.manager.Open: not implemented")
+	m.mu.Lock()
+	if m.shutdown {
+		m.mu.Unlock()
+		return nil, errors.New("browsers: manager has been shut down")
+	}
+	if m.browser != nil {
+		b := m.browser
+		m.mu.Unlock()
+		return b, nil
+	}
+	m.mu.Unlock()
+
+	b := NewBrowser(m.headless, m.stealth)
+	if err := b.Launch(ctx); err != nil {
+		return nil, fmt.Errorf("browsers: launch browser: %w", err)
+	}
+
+	m.mu.Lock()
+	if m.shutdown {
+		// Shutdown raced in while we were launching: do not register the fresh
+		// browser — close it so nothing leaks, and surface the shutdown error.
+		m.mu.Unlock()
+		_ = b.Close(ctx)
+		return nil, errors.New("browsers: manager has been shut down")
+	}
+	m.browser = b
+	m.mu.Unlock()
+	return b, nil
 }
 
 // Browser returns the manager's live Browser, or an error when no Browser has

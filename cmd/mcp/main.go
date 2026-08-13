@@ -1,5 +1,6 @@
 // Package main implements a Model Context Protocol (MCP) server over SSE.
-// The server exposes browser tools (fetch_page, page_fetch, page_act,
+// The server exposes browser tools (browser_create, browser_list,
+// browser_close, page_list, fetch_page, page_fetch, page_act,
 // session_close, session_list) that give LLM agents a live, stateful browser
 // session via go-rod.
 package main
@@ -35,11 +36,15 @@ var (
 		//   )
 		mgr := browsers.NewManager()
 		r := tools.NewEmptyRegistry()
-		r.Register(tools.NewFetch(mgr))        // fetch_page
-		r.Register(tools.NewPage(mgr))         // page_fetch
-		r.Register(tools.NewAct(mgr))          // page_act
-		r.Register(tools.NewSessionClose(mgr)) // session_close
-		r.Register(tools.NewSessionList(mgr))  // session_list
+		r.Register(tools.NewFetch(mgr))         // fetch_page
+		r.Register(tools.NewPage(mgr))          // page_fetch
+		r.Register(tools.NewAct(mgr))           // page_act
+		r.Register(tools.NewSessionClose(mgr))  // session_close
+		r.Register(tools.NewSessionList(mgr))   // session_list
+		r.Register(tools.NewBrowserCreate(mgr)) // browser_create
+		r.Register(tools.NewBrowserList(mgr))   // browser_list
+		r.Register(tools.NewBrowserClose(mgr))  // browser_close
+		r.Register(tools.NewPageList(mgr))      // page_list
 		return r
 	}()
 )

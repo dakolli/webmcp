@@ -2,7 +2,6 @@ package browsers
 
 import (
 	"context"
-	"fmt"
 	"sync"
 
 	"github.com/go-rod/rod"
@@ -42,16 +41,18 @@ func (p *Page) Unlock() {
 }
 
 // Close closes the underlying rod tab, releasing the browser tab. The page
-// must not be used afterwards.
+// must not be used afterwards. It is safe to call on an already-closed page
+// (nil Rod handle) and is best-effort by design: teardown is attempted even if
+// ctx has expired so resources are not leaked.
 func (p *Page) Close(ctx context.Context) error {
-	// TODO(web-mcp): implement — see go-rod-primer.md
-	//
-	// Intended flow (Phase 1):
-	//   p.Lock()
-	//   defer p.Unlock()
-	//   if p.Rod == nil { return nil }
-	//   return p.Rod.Close()                       // error form; no Must*
-	return fmt.Errorf("browsers.page.Close: not implemented")
+	p.Lock()
+	defer p.Unlock()
+	if p.Rod == nil {
+		return nil
+	}
+	// rod has no ctx-aware Close; the error-returning form is used and the
+	// context is honored at the caller boundary (Browser.Close, ClosePage).
+	return p.Rod.Close() // error form; no Must*
 }
 
 // PageInfo is a read-only snapshot of a page's metadata, safe to copy and

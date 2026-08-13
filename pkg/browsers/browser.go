@@ -7,6 +7,9 @@ import (
 	"sync"
 
 	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/launcher"
+	"github.com/go-rod/rod/lib/proto"
+	"github.com/go-rod/stealth"
 )
 
 // Browser owns a single live Chromium instance (a *rod.Browser) and the map of
@@ -45,25 +48,38 @@ func NewBrowser(headless, stealth bool) *Browser {
 // constructed with headless=true; NoSandbox is always set, as required in
 // containers. Launch is idempotent: it is a no-op once the browser is up.
 func (b *Browser) Launch(ctx context.Context) error {
-	// TODO(web-mcp): implement — see go-rod-primer.md
-	//
-	// Intended flow (Phase 1):
-	//   b.mu.Lock()
-	//   if b.rod != nil { b.mu.Unlock(); return nil }
-	//   b.mu.Unlock()
-	//
-	//   l := launcher.New().NoSandbox(true).Headless(b.headless) // headful by default
-	//   u, err := l.Launch()                                     // error form; no Must*
-	//   if err != nil { return fmt.Errorf("browsers: launch chromium: %w", err) }
-	//
-	//   rb := rod.New().ControlURL(u)
-	//   if err := rb.Connect(); err != nil { return fmt.Errorf("browsers: connect: %w", err) }
-	//
-	//   b.mu.Lock()
-	//   b.rod = rb
-	//   b.mu.Unlock()
-	//   return nil
-	return fmt.Errorf("browsers.browser.Launch: not implemented")
+	b.mu.Lock()
+	if b.rod != nil {
+		b.mu.Unlock()
+		return nil // idempotent: already launched
+	}
+	b.mu.Unlock()
+
+	// Bail out early when the caller's context is already done; the launcher
+	// and connect steps below are local but can still block (e.g. first run
+	// downloading Chromium), so honor ctx between steps.
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("browsers: launch browser: %w", err)
+	}
+
+	l := launcher.New().NoSandbox(true).Headless(b.headless) // headful by default
+	u, err := l.Launch()                                     // error form; no Must*
+	if err != nil {
+		return fmt.Errorf("browsers: launch chromium: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("browsers: launch browser: %w", err)
+	}
+
+	rb := rod.New().ControlURL(u)
+	if err := rb.Connect(); err != nil {
+		return fmt.Errorf("browsers: connect: %w", err)
+	}
+
+	b.mu.Lock()
+	b.rod = rb
+	b.mu.Unlock()
+	return nil
 }
 
 // NewPage opens a new tab in the Browser, navigates it to url (when non-empty)
@@ -71,33 +87,43 @@ func (b *Browser) Launch(ctx context.Context) error {
 // to every new page by default and skipped only when the Browser was
 // constructed with stealth=false.
 func (b *Browser) NewPage(ctx context.Context, url string) (*Page, error) {
-	// TODO(web-mcp): implement — see go-rod-primer.md
-	//
-	// Intended flow (Phase 1):
-	//   b.mu.Lock()
-	//   if b.rod == nil { b.mu.Unlock(); return nil, fmt.Errorf("browsers: browser not launched") }
-	//   b.mu.Unlock()
-	//
-	//   var p *rod.Page
-	//   var err error
-	//   if b.stealth {
-	//       p, err = stealth.Page(b.rod)         // stealth on by default (error form)
-	//   } else {
-	//       p, err = b.rod.Page(proto.TargetCreateTarget{})
-	//   }
-	//   if err != nil { return nil, fmt.Errorf("browsers: new page: %w", err) }
-	//   if url != "" {
-	//       if err := p.Navigate(url); err != nil { return nil, fmt.Errorf("browsers: navigate: %w", err) }
-	//       if err := p.WaitLoad(); err != nil { return nil, fmt.Errorf("browsers: wait load: %w", err) }
-	//   }
-	//
-	//   b.mu.Lock()
-	//   defer b.mu.Unlock()
-	//   b.nextID++
-	//   page := &Page{ID: PageID(fmt.Sprintf("page-%d", b.nextID)), URL: url, Rod: p}
-	//   b.pages[page.ID] = page
-	//   return page, nil
-	return nil, fmt.Errorf("browsers.browser.NewPage: not implemented")
+	b.mu.Lock()
+	if b.rod == nil {
+		b.mu.Unlock()
+		return nil, fmt.Errorf("browsers: browser not launched")
+	}
+	b.mu.Unlock()
+
+	var p *rod.Page
+	var err error
+	if b.stealth {
+		p, err = stealth.Page(b.rod) // stealth on by default (error form)
+	} else {
+		p, err = b.rod.Page(proto.TargetCreateTarget{})
+	}
+	if err != nil {
+		return nil, fmt.Errorf("browsers: new page: %w", err)
+	}
+
+	if url != "" {
+		// Bound to ctx so a hung navigation cannot outlive the tool call.
+		pc := p.Context(ctx)
+		if err := pc.Navigate(url); err != nil {
+			_ = p.Close() // do not leak the orphaned tab
+			return nil, fmt.Errorf("browsers: navigate: %w", err)
+		}
+		if err := pc.WaitLoad(); err != nil {
+			_ = p.Close() // do not leak the orphaned tab
+			return nil, fmt.Errorf("browsers: wait load: %w", err)
+		}
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.nextID++
+	page := &Page{ID: PageID(fmt.Sprintf("page-%d", b.nextID)), URL: url, Rod: p}
+	b.pages[page.ID] = page
+	return page, nil
 }
 
 // Page returns the live page with the given ID, or an error when no page with
@@ -148,17 +174,17 @@ func (b *Browser) ClosePage(ctx context.Context, id PageID) error {
 // Close closes the Browser and all of its live pages, releasing the underlying
 // Chromium process. After Close the Browser must not be reused.
 func (b *Browser) Close(ctx context.Context) error {
-	// TODO(web-mcp): implement — see go-rod-primer.md
-	//
-	// Intended flow (Phase 1):
-	//   b.mu.Lock()
-	//   for _, p := range b.pages { _ = p.Close(ctx) }   // best-effort per-page close
-	//   b.pages = make(map[PageID]*Page)
-	//   rb := b.rod
-	//   b.rod = nil
-	//   b.mu.Unlock()
-	//
-	//   if rb == nil { return nil }
-	//   return rb.Close()                                // error form; no Must*
-	return fmt.Errorf("browsers.browser.Close: not implemented")
+	b.mu.Lock()
+	for _, p := range b.pages {
+		_ = p.Close(ctx) // best-effort per-page close
+	}
+	b.pages = make(map[PageID]*Page)
+	rb := b.rod
+	b.rod = nil
+	b.mu.Unlock()
+
+	if rb == nil {
+		return nil
+	}
+	return rb.Close() // error form; no Must*
 }

@@ -147,41 +147,93 @@ func (t *Page) Execute(ctx context.Context, args json.RawMessage) (string, error
 // extractHTML returns the page's outerHTML, or of the element matched by
 // selector when one is given. Backed by p.Rod.HTML() / element HTML().
 func (t *Page) extractHTML(ctx context.Context, p *browsers.Page, selector string) (string, error) {
-	// TODO(web-mcp): implement — see go-rod-primer.md
-	//
-	// Intended flow (Phase 1):
-	//   p.Lock(); defer p.Unlock()
-	//   if selector == "" { return p.Rod.HTML() }
-	//   el, err := p.Rod.Element(selector)
-	//   return el.HTML()
-	return "", fmt.Errorf("page_fetch.extractHTML: not implemented")
+	p.Lock()
+	defer p.Unlock()
+
+	if selector == "" {
+		html, err := p.Rod.Context(ctx).HTML()
+		if err != nil {
+			return "", fmt.Errorf("read page html: %w", err)
+		}
+		return html, nil
+	}
+
+	el, err := p.Rod.Context(ctx).Element(selector) // CSS; retries until found
+	if err != nil {
+		return "", fmt.Errorf("no element matched selector %q: %w", selector, err)
+	}
+	html, err := el.HTML()
+	if err != nil {
+		return "", fmt.Errorf("read html of element %q: %w", selector, err)
+	}
+	return html, nil
 }
 
 // extractText returns the visible text of the page (or of the element matched
 // by selector). Backed by Eval over document.body.innerText / element.innerText.
 func (t *Page) extractText(ctx context.Context, p *browsers.Page, selector string) (string, error) {
-	// TODO(web-mcp): implement — see go-rod-primer.md
-	//
-	// Intended flow (Phase 1):
-	//   p.Lock(); defer p.Unlock()
-	//   js := `() => document.body.innerText`
-	//   if selector != "" { js = `() => document.querySelector(` + JSON-quoted selector + `).innerText` }
-	//   res, err := p.Rod.Eval(js)
-	//   return res.Str(), nil   // gson .Str()
-	return "", fmt.Errorf("page_fetch.extractText: not implemented")
+	p.Lock()
+	defer p.Unlock()
+
+	js := `() => document.body ? document.body.innerText : ''`
+	if selector != "" {
+		// JSON-quote the selector so it is safe to embed in the JS source
+		// (quotes, backslashes and control characters are escaped).
+		q, err := json.Marshal(selector)
+		if err != nil {
+			return "", fmt.Errorf("encode selector %q: %w", selector, err)
+		}
+		js = `() => { const el = document.querySelector(` + string(q) + `); return el ? el.innerText : null }`
+	}
+
+	res, err := p.Rod.Context(ctx).Eval(js)
+	if err != nil {
+		return "", fmt.Errorf("evaluate innerText: %w", err)
+	}
+	// The selector-scoped Eval resolves to null when nothing matches; the
+	// whole-document Eval always yields a string. Nil() must be checked before
+	// Str(), because gson Str() renders a null as "<nil>".
+	if res.Value.Nil() {
+		return "", fmt.Errorf("no element matched selector %q", selector)
+	}
+	return res.Value.Str(), nil
 }
 
-// extractLinks returns the page's anchor links as a JSON array of {text, href}.
-// Backed by Eval collecting document.querySelectorAll('a[href]').
+// extractLinks returns the page's anchor links as a JSON array of {text, href},
+// deduplicated by href (first occurrence wins). Backed by Eval collecting
+// document.querySelectorAll('a[href]').
 func (t *Page) extractLinks(ctx context.Context, p *browsers.Page) (string, error) {
-	// TODO(web-mcp): implement — see go-rod-primer.md
-	//
-	// Intended flow (Phase 1):
-	//   p.Lock(); defer p.Unlock()
-	//   res, err := p.Rod.Eval(
-	//     `() => [...document.querySelectorAll('a[href]')].map(a => ({text: a.innerText.trim(), href: a.href}))`)
-	//   return res.JSON string
-	return "", fmt.Errorf("page_fetch.extractLinks: not implemented")
+	p.Lock()
+	defer p.Unlock()
+
+	res, err := p.Rod.Context(ctx).Eval(
+		`() => [...document.querySelectorAll('a[href]')].map(a => ({text: a.innerText.trim(), href: a.href}))`)
+	if err != nil {
+		return "", fmt.Errorf("evaluate links: %w", err)
+	}
+
+	var links []linkEntry
+	if err := res.Value.Unmarshal(&links); err != nil {
+		return "", fmt.Errorf("decode links: %w", err)
+	}
+
+	// Dedupe by href, first occurrence wins (the JS Map alternative would do
+	// the same; doing it Go-side keeps the JS simple).
+	seen := make(map[string]bool, len(links))
+	dedup := make([]linkEntry, 0, len(links))
+	for _, l := range links {
+		if seen[l.Href] {
+			continue
+		}
+		seen[l.Href] = true
+		dedup = append(dedup, l)
+	}
+
+	b, err := json.Marshal(dedup)
+	if err != nil {
+		return "", fmt.Errorf("encode links: %w", err)
+	}
+	return string(b), nil
 }
 
 // extractDOMSnapshot returns the page's full DOM as a flattened Documents array
@@ -234,17 +286,73 @@ func (t *Page) extractScreenshot(ctx context.Context, p *browsers.Page) (string,
 	return "", fmt.Errorf("page_fetch.extractScreenshot: not implemented")
 }
 
-// extractMeta returns the page's meta info (title, url, description) as JSON.
-// Backed by p.Rod.Info() plus Eval for meta description/tags.
+// extractMeta returns the page's meta info (title, url, meta tags) as a JSON
+// object. Backed by p.Rod.Info() plus Eval collecting every <meta> tag.
 func (t *Page) extractMeta(ctx context.Context, p *browsers.Page) (string, error) {
-	// TODO(web-mcp): implement — see go-rod-primer.md
-	//
-	// Intended flow (Phase 1):
-	//   p.Lock(); defer p.Unlock()
-	//   info, err := p.Rod.Info()
-	//   res, err := p.Rod.Eval(`() => document.querySelector('meta[name="description"]')?.content || ''`)
-	//   return JSON {title: info.Title, url: info.URL, description: res.Str()}
-	return "", fmt.Errorf("page_fetch.extractMeta: not implemented")
+	p.Lock()
+	defer p.Unlock()
+
+	info, err := p.Rod.Context(ctx).Info()
+	if err != nil {
+		return "", fmt.Errorf("read page info: %w", err)
+	}
+
+	// Each meta tag is flattened to its meaningful attributes; absent ones
+	// (getAttribute returned null) are dropped Go-side via omitempty.
+	res, err := p.Rod.Context(ctx).Eval(
+		`() => [...document.querySelectorAll('meta')].map(m => ({name: m.getAttribute('name'), ` +
+			`property: m.getAttribute('property'), 'http-equiv': m.getAttribute('http-equiv'), ` +
+			`content: m.getAttribute('content'), charset: m.getAttribute('charset')}))`)
+	if err != nil {
+		return "", fmt.Errorf("evaluate meta tags: %w", err)
+	}
+
+	var tags []metaTag
+	if err := res.Value.Unmarshal(&tags); err != nil {
+		return "", fmt.Errorf("decode meta tags: %w", err)
+	}
+
+	out := pageMeta{Title: info.Title, URL: info.URL, Meta: tags}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return "", fmt.Errorf("encode page meta: %w", err)
+	}
+	return string(b), nil
+}
+
+// linkEntry is one anchor link collected by extractLinks: its visible text and
+// its absolute href.
+type linkEntry struct {
+	// Text is the anchor's visible text, trimmed of surrounding whitespace.
+	Text string `json:"text"`
+	// Href is the anchor's absolute URL (resolved against the document base).
+	Href string `json:"href"`
+}
+
+// pageMeta is the JSON shape returned by extractMeta: the page title and URL
+// plus the collected <meta> tags.
+type pageMeta struct {
+	// Title is the page's document title.
+	Title string `json:"title"`
+	// URL is the page's current URL.
+	URL string `json:"url"`
+	// Meta is the ordered list of <meta> tags.
+	Meta []metaTag `json:"meta"`
+}
+
+// metaTag is one <meta> tag flattened to its meaningful attributes. Attributes
+// absent on the tag are dropped via omitempty.
+type metaTag struct {
+	// Name is the tag's name attribute (e.g. "viewport", "description").
+	Name string `json:"name,omitempty"`
+	// Property is the tag's property attribute (e.g. OpenGraph "og:title").
+	Property string `json:"property,omitempty"`
+	// HTTPEquiv is the tag's http-equiv attribute (e.g. "refresh").
+	HTTPEquiv string `json:"http-equiv,omitempty"`
+	// Content is the tag's content attribute.
+	Content string `json:"content,omitempty"`
+	// Charset is the tag's charset attribute.
+	Charset string `json:"charset,omitempty"`
 }
 
 // truncate caps s at maxBytes bytes, cutting on a UTF-8 rune boundary so the

@@ -4,10 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"webmcp/pkg/browsers"
 	"webmcp/pkg/mcp/models"
 )
+
+// defaultFetchTimeout bounds the whole fetch_page tool call when the caller
+// does not provide timeout_ms: a hung page must not block the server forever.
+const defaultFetchTimeout = 30 * time.Second
 
 // Fetch implements the "fetch_page" tool: it opens a URL in a new browser
 // session and returns a compact page summary (title, url, session_id, size
@@ -126,52 +131,104 @@ func (t *Fetch) Execute(ctx context.Context, args json.RawMessage) (string, erro
 		return "", fmt.Errorf("fetch_page: %w", err)
 	}
 
-	// TODO(web-mcp): implement — see go-rod-primer.md
-	//
-	// Intended flow (Phase 1):
-	//   b, err := t.mgr.Open(ctx)                 // lazily launches the single Browser
-	//   if err != nil { return "", fmt.Errorf("fetch_page: %w", err) }
-	//   p, err := b.NewPage(ctx, a.URL)          // new tab; stealth applied by default
-	//   if err != nil { return "", fmt.Errorf("fetch_page: %w", err) }
-	//   if err := t.waitForPage(ctx, p, a.WaitFor); err != nil {
-	//       return "", fmt.Errorf("fetch_page: %w", err)
-	//   }
-	//   return t.pageSummary(ctx, p)
-	return "", fmt.Errorf("fetch_page: not implemented yet")
+	// Enforce an explicit per-call timeout so a hung page (or a first-run
+	// Chromium download) cannot block the server: default 30s, honoring
+	// timeout_ms from the caller. The derived ctx flows through Open, NewPage
+	// and every wait below.
+	timeout := defaultFetchTimeout
+	if a.TimeoutMS > 0 {
+		timeout = time.Duration(a.TimeoutMS) * time.Millisecond
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	start := time.Now() // load timing for the summary
+
+	b, err := t.mgr.Open(ctx) // lazily launches the single Browser
+	if err != nil {
+		return "", fmt.Errorf("fetch_page: %w", err)
+	}
+	p, err := b.NewPage(ctx, a.URL) // new tab; stealth applied by default
+	if err != nil {
+		return "", fmt.Errorf("fetch_page: %w", err)
+	}
+	if err := t.waitForPage(ctx, p, a.WaitFor); err != nil {
+		return "", fmt.Errorf("fetch_page: %w", err)
+	}
+	return t.pageSummary(ctx, p, start)
+}
+
+// pageSummaryResult is the JSON shape returned by fetch_page. It carries the
+// session_id the caller must pass to page_fetch/page_act, page metadata, and
+// compact size/timing hints — never the full HTML (first-50KB rule).
+type pageSummaryResult struct {
+	SessionID   string `json:"session_id"`
+	Title       string `json:"title"`
+	URL         string `json:"url"`
+	TextSnippet string `json:"text_snippet"`
+	HTMLBytes   int    `json:"html_bytes"`
+	LoadMs      int64  `json:"load_ms"`
 }
 
 // pageSummary renders a compact, LLM-friendly JSON summary of a live page: the
 // page ID, its title and URL (via p.Rod.Info()), plus a short text snippet
-// with byte-size hints so the caller can decide what to fetch next.
-func (t *Fetch) pageSummary(ctx context.Context, p *browsers.Page) (string, error) {
-	// TODO(web-mcp): implement — see go-rod-primer.md
-	//
-	// Intended flow (Phase 1):
-	//   p.Lock(); defer p.Unlock()
-	//   info, err := p.Rod.Info()              // title + url
-	//   html, err := p.Rod.HTML()              // for byte-size hint only
-	//   text, err := p.Rod.Eval(`() => document.body.innerText.slice(0, 500)`)
-	//   return json.Marshal({session_id, title, url, text_snippet, html_bytes, ...})
-	return "", fmt.Errorf("fetch_page.pageSummary: not implemented")
+// with byte-size hints so the caller can decide what to fetch next. loadStarted
+// anchors the load_ms timing (captured around launch → navigate → wait).
+func (t *Fetch) pageSummary(ctx context.Context, p *browsers.Page, loadStarted time.Time) (string, error) {
+	p.Lock()
+	defer p.Unlock()
+
+	// Bound each rod call by ctx so a stuck page cannot outlive the tool call.
+	info, err := p.Rod.Context(ctx).Info() // title + url
+	if err != nil {
+		return "", fmt.Errorf("fetch_page: page info: %w", err)
+	}
+
+	html, err := p.Rod.Context(ctx).HTML() // byte-size hint only; not shipped
+	if err != nil {
+		return "", fmt.Errorf("fetch_page: read html: %w", err)
+	}
+
+	text, err := p.Rod.Context(ctx).Eval(`() => document.body.innerText.slice(0, 500)`)
+	if err != nil {
+		return "", fmt.Errorf("fetch_page: read text: %w", err)
+	}
+
+	summary := pageSummaryResult{
+		SessionID:   string(p.ID),
+		Title:       info.Title,
+		URL:         info.URL,
+		TextSnippet: text.Value.Str(),
+		HTMLBytes:   len(html),
+		LoadMs:      time.Since(loadStarted).Milliseconds(),
+	}
+	out, err := json.Marshal(summary)
+	if err != nil {
+		return "", fmt.Errorf("fetch_page: marshal summary: %w", err)
+	}
+	return string(out), nil
 }
 
 // waitForPage blocks until the page satisfies the requested readiness level.
 // It maps "load" to WaitLoad, "idle" to WaitRequestIdle, and "stable" to
-// WaitDOMStable; an empty waitFor is treated as "idle".
+// WaitDOMStable; an empty waitFor is treated as "idle". The wait is bound to
+// ctx (via a page clone) so cancellation aborts a stuck wait.
 func (t *Fetch) waitForPage(ctx context.Context, p *browsers.Page, waitFor string) error {
-	// TODO(web-mcp): implement — see go-rod-primer.md
-	//
-	// Intended flow (Phase 1):
-	//   p.Lock(); defer p.Unlock()
-	//   switch waitFor {
-	//   case "", "idle":
-	//       wait := p.Rod.WaitRequestIdle(500*time.Millisecond, nil, nil, nil); wait()
-	//   case "load":
-	//       return p.Rod.WaitLoad()
-	//   case "stable":
-	//       return p.Rod.WaitDOMStable(500*time.Millisecond, 0.05)
-	//   }
-	return fmt.Errorf("fetch_page.waitForPage: not implemented")
+	p.Lock()
+	defer p.Unlock()
+
+	pc := p.Rod.Context(ctx)
+	switch waitFor {
+	case "", "idle":
+		// WaitRequestIdle RETURNS a blocking func() — call it, do not return it.
+		wait := pc.WaitRequestIdle(500*time.Millisecond, nil, nil, nil)
+		wait()
+	case "load":
+		return pc.WaitLoad()
+	case "stable":
+		return pc.WaitDOMStable(500*time.Millisecond, 0.05)
+	}
+	return nil
 }
 
 // Ensure Fetch satisfies the Tool interface at compile time.
