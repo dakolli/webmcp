@@ -46,7 +46,7 @@ designed so `headless: true` is a clean option. **Stealth** (`github.com/go-rod/
 to every page by default, with a per-browser/per-page toggle to turn it off.
 
 **Side-by-side CLI and MCP (maintained together).** We deliberately maintain a lightweight CLI
-(`pkg/cli`, entrypoint `cmd/cli/main.go`) *alongside* the MCP server, mirroring the same browser
+(`pkg/cli`, entrypoint `cmd/web-cli/main.go`) *alongside* the MCP server, mirroring the same browser
 capabilities, so that we (the developers) can experiment interactively with the exact functionality
 the agent gets over MCP — the CLI is the human's knob, MCP is the agent's. The CLI talks directly
 to `pkg/browsers`, never through the MCP layer (same core-vs-MCP boundary as the tools package).
@@ -67,7 +67,7 @@ not now.
 - `pkg/browsers/` — **core browser engine** (rod only, zero MCP imports): `manager.go`
   (`BrowserManager`), `browser.go` (`Browser` type owning rod pages), `session.go` (page sessions).
 - `pkg/cli/` — **side-by-side CLI mirror** of the MCP toolset (cobra commands in `pkg/cli/cmd/`:
-  `root.go`, `launch.go`, `fetch.go`, `page.go`; entrypoint `cmd/cli/main.go`). Imports
+  `root.go`, `launch.go`, `fetch.go`, `page.go`; entrypoint `cmd/web-cli/main.go`). Imports
   `pkg/browsers` directly; never imports `pkg/mcp` or touches rod itself.
 - `go-rod-primer.md` — rod quick reference (read before writing rod code).
 

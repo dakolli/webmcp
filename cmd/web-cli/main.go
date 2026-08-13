@@ -1,4 +1,4 @@
-// Command webmcp-cli is the lightweight CLI mirror of the web-mcp MCP tools:
+// Command web-cli is the lightweight CLI mirror of the web-mcp MCP tools:
 // it drives the same pkg/browsers core engine from the command line, so we
 // (the developers) can experiment interactively with the exact functionality
 // the agent gets over MCP. It talks directly to pkg/browsers — never through

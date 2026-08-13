@@ -4,12 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"webmcp/pkg/browsers"
+	"webmcp/pkg/cli/ipc"
+	"webmcp/pkg/cli/pageops"
 )
 
 // defaultFetchTimeout bounds the whole fetch command when --timeout-ms is not
@@ -37,10 +38,10 @@ func NewFetchCmd(mgr *browsers.Manager) *cobra.Command {
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			urlStr := args[0]
-			if err := validateURL(urlStr); err != nil {
+			if err := pageops.ValidateURL(urlStr); err != nil {
 				return fmt.Errorf("fetch: %w", err)
 			}
-			if err := validateWait(waitFor); err != nil {
+			if err := pageops.ValidateWait(waitFor); err != nil {
 				return fmt.Errorf("fetch: %w", err)
 			}
 
@@ -56,6 +57,15 @@ func NewFetchCmd(mgr *browsers.Manager) *cobra.Command {
 			ctx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 
+			// Forward to a live serve process when one is running (the browser
+			// and its pages then persist across invocations); else fall back to
+			// the in-process path below, which works exactly as before.
+			if cl := dialServe(cmd); cl != nil {
+				defer cl.Close()
+				return fetchViaIPC(cmd, ctx, cl, urlStr, waitFor, asJSON)
+			}
+			printServeHint(cmd)
+
 			start := time.Now() // load timing for the summary
 
 			b, err := mgr.Open(ctx) // lazily launches the single Browser
@@ -66,10 +76,10 @@ func NewFetchCmd(mgr *browsers.Manager) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("fetch: %w", err)
 			}
-			if err := waitForPage(ctx, p, waitFor); err != nil {
+			if err := pageops.WaitForPage(ctx, p, waitFor); err != nil {
 				return fmt.Errorf("fetch: %w", err)
 			}
-			summary, err := pageSummary(ctx, p, start)
+			summary, err := pageops.PageSummary(ctx, p, start)
 			if err != nil {
 				return fmt.Errorf("fetch: %w", err)
 			}
@@ -99,99 +109,31 @@ func NewFetchCmd(mgr *browsers.Manager) *cobra.Command {
 	return cmd
 }
 
-// validateURL checks that s is an absolute http(s) URL the browser can
-// navigate to: it must parse, be absolute and carry a host.
-func validateURL(s string) error {
-	u, err := url.Parse(s)
-	if err != nil {
-		return fmt.Errorf("invalid url %q: %w", s, err)
+// fetchViaIPC implements the fetch command against a live serve process: it
+// opens the browser (idempotent — mirrors Manager.Open's laziness) and the
+// page over IPC, then prints the summary byte-identically to the in-process
+// path (the IPC page.open result IS the pageops.FetchSummary shape).
+func fetchViaIPC(cmd *cobra.Command, ctx context.Context, cl *ipc.Client, urlStr, waitFor string, asJSON bool) error {
+	var open ipc.BrowserOpenResult
+	if err := cl.Call(ctx, ipc.MethodBrowserOpen, &ipc.BrowserOpenParams{}, &open); err != nil {
+		return fmt.Errorf("fetch: %w", err)
 	}
-	if !u.IsAbs() || u.Host == "" {
-		return fmt.Errorf("invalid url %q: must be an absolute http(s) URL", s)
+	var summary ipc.PageOpenResult
+	if err := cl.Call(ctx, ipc.MethodPageOpen, &ipc.PageOpenParams{URL: urlStr, Wait: waitFor}, &summary); err != nil {
+		return fmt.Errorf("fetch: %w", err)
 	}
-	switch u.Scheme {
-	case "http", "https":
+
+	if asJSON {
+		out, err := json.Marshal(summary)
+		if err != nil {
+			return fmt.Errorf("fetch: marshal summary: %w", err)
+		}
+		fmt.Fprintln(cmd.OutOrStdout(), string(out))
 		return nil
-	default:
-		return fmt.Errorf("invalid url %q: scheme %q not supported (must be http or https)", s, u.Scheme)
 	}
-}
-
-// validateWait checks that the --wait value is one of idle, load, stable.
-func validateWait(waitFor string) error {
-	switch waitFor {
-	case "idle", "load", "stable":
-		return nil
-	default:
-		return fmt.Errorf("invalid --wait %q (must be one of idle, load, stable)", waitFor)
-	}
-}
-
-// waitForPage blocks until the page satisfies the requested readiness level.
-// It maps "load" to WaitLoad, "idle" to WaitRequestIdle, and "stable" to
-// WaitDOMStable. All rod page calls are serialized with the per-page lock.
-func waitForPage(ctx context.Context, p *browsers.Page, waitFor string) error {
-	p.Lock()
-	defer p.Unlock()
-
-	pc := p.Rod.Context(ctx) // bound to ctx so cancellation aborts a stuck wait
-	switch waitFor {
-	case "idle":
-		// WaitRequestIdle RETURNS a blocking func() — call it, do not return it.
-		wait := pc.WaitRequestIdle(500*time.Millisecond, nil, nil, nil)
-		wait()
-		return nil
-	case "load":
-		return pc.WaitLoad()
-	case "stable":
-		return pc.WaitDOMStable(500*time.Millisecond, 0.05)
-	default:
-		return fmt.Errorf("invalid wait option %q", waitFor)
-	}
-}
-
-// fetchSummary is the output shape of the fetch command, identical between the
-// human-readable and --json forms. It carries the session_id (usable with the
-// page command), page metadata and compact size/timing hints — never the full
-// HTML (first-50KB rule).
-type fetchSummary struct {
-	SessionID   string `json:"session_id"`
-	Title       string `json:"title"`
-	URL         string `json:"url"`
-	TextSnippet string `json:"text_snippet"`
-	HTMLBytes   int    `json:"html_bytes"`
-	LoadMs      int64  `json:"load_ms"`
-}
-
-// pageSummary renders a compact summary of a live page: the page ID, its title
-// and URL (via p.Rod.Info()), plus a short text snippet and byte-size hints.
-// loadStarted anchors the load_ms timing (captured around open → navigate →
-// wait).
-func pageSummary(ctx context.Context, p *browsers.Page, loadStarted time.Time) (fetchSummary, error) {
-	p.Lock()
-	defer p.Unlock()
-
-	info, err := p.Rod.Context(ctx).Info() // title + url
-	if err != nil {
-		return fetchSummary{}, fmt.Errorf("page info: %w", err)
-	}
-
-	html, err := p.Rod.Context(ctx).HTML() // byte-size hint only; not printed in full
-	if err != nil {
-		return fetchSummary{}, fmt.Errorf("read html: %w", err)
-	}
-
-	text, err := p.Rod.Context(ctx).Eval(`() => document.body.innerText.slice(0, 500)`)
-	if err != nil {
-		return fetchSummary{}, fmt.Errorf("read text: %w", err)
-	}
-
-	return fetchSummary{
-		SessionID:   string(p.ID),
-		Title:       info.Title,
-		URL:         info.URL,
-		TextSnippet: text.Value.Str(),
-		HTMLBytes:   len(html),
-		LoadMs:      time.Since(loadStarted).Milliseconds(),
-	}, nil
+	fmt.Fprintf(cmd.OutOrStdout(),
+		"session_id: %s\ntitle: %s\nurl: %s\ntext_snippet: %s\nhtml_bytes: %d\nload_ms: %d\n",
+		summary.SessionID, summary.Title, summary.URL,
+		summary.TextSnippet, summary.HTMLBytes, summary.LoadMs)
+	return nil
 }
