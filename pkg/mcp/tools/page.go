@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"unicode/utf8"
 
+	"webmcp/pkg/browsers"
 	"webmcp/pkg/mcp/models"
 )
 
@@ -25,13 +26,14 @@ const defaultMaxBytes = 50_000
 // (iframes, shadow DOM and all). "css"/"js" enumerate the page's resource tree
 // and fetch the matching resources. "screenshot" returns a base64 PNG.
 type Page struct {
-	// sessions is the shared SessionManager owning the live browser sessions.
-	sessions *SessionManager
+	// mgr is the shared browsers.Manager owning the single Browser and its
+	// live pages (sessions).
+	mgr *browsers.Manager
 }
 
-// NewPage constructs the page_fetch tool wired to the given SessionManager.
-func NewPage(sessions *SessionManager) *Page {
-	return &Page{sessions: sessions}
+// NewPage constructs the page_fetch tool wired to the given browsers.Manager.
+func NewPage(mgr *browsers.Manager) *Page {
+	return &Page{mgr: mgr}
 }
 
 // Name returns the MCP tool name "page_fetch".
@@ -79,8 +81,8 @@ func (t *Page) InputSchema() models.InputSchema {
 
 // pageFetchArgs is the strict decoding target for page_fetch arguments.
 type pageFetchArgs struct {
-	// SessionID identifies the live session to read (required).
-	SessionID SessionID `json:"session_id"`
+	// SessionID identifies the live page/session to read (required).
+	SessionID browsers.PageID `json:"session_id"`
 	// What is the aspect to extract (required).
 	What string `json:"what"`
 	// Selector optionally scopes the extraction to a matching element.
@@ -106,7 +108,11 @@ func (t *Page) Execute(ctx context.Context, args json.RawMessage) (string, error
 		a.MaxBytes = defaultMaxBytes
 	}
 
-	s, err := t.sessions.Get(ctx, a.SessionID)
+	b, err := t.mgr.Open(ctx) // lazily launches (or returns) the single Browser
+	if err != nil {
+		return "", fmt.Errorf("page_fetch: %w", err)
+	}
+	p, err := b.Page(a.SessionID)
 	if err != nil {
 		return "", fmt.Errorf("page_fetch: %w", err)
 	}
@@ -114,21 +120,21 @@ func (t *Page) Execute(ctx context.Context, args json.RawMessage) (string, error
 	var out string
 	switch a.What {
 	case "html":
-		out, err = t.extractHTML(ctx, s, a.Selector)
+		out, err = t.extractHTML(ctx, p, a.Selector)
 	case "dom":
-		out, err = t.extractDOMSnapshot(ctx, s)
+		out, err = t.extractDOMSnapshot(ctx, p)
 	case "text":
-		out, err = t.extractText(ctx, s, a.Selector)
+		out, err = t.extractText(ctx, p, a.Selector)
 	case "css":
-		out, err = t.extractCSS(ctx, s)
+		out, err = t.extractCSS(ctx, p)
 	case "js":
-		out, err = t.extractJS(ctx, s)
+		out, err = t.extractJS(ctx, p)
 	case "links":
-		out, err = t.extractLinks(ctx, s)
+		out, err = t.extractLinks(ctx, p)
 	case "screenshot":
-		out, err = t.extractScreenshot(ctx, s)
+		out, err = t.extractScreenshot(ctx, p)
 	case "meta":
-		out, err = t.extractMeta(ctx, s)
+		out, err = t.extractMeta(ctx, p)
 	default:
 		return "", fmt.Errorf("page_fetch: unknown what=%q (must be one of html, dom, text, css, js, links, screenshot, meta)", a.What)
 	}
@@ -139,104 +145,104 @@ func (t *Page) Execute(ctx context.Context, args json.RawMessage) (string, error
 }
 
 // extractHTML returns the page's outerHTML, or of the element matched by
-// selector when one is given. Backed by s.Page.HTML() / element HTML().
-func (t *Page) extractHTML(ctx context.Context, s *Session, selector string) (string, error) {
+// selector when one is given. Backed by p.Rod.HTML() / element HTML().
+func (t *Page) extractHTML(ctx context.Context, p *browsers.Page, selector string) (string, error) {
 	// TODO(web-mcp): implement — see go-rod-primer.md
 	//
 	// Intended flow (Phase 1):
-	//   s.Lock(); defer s.Unlock()
-	//   if selector == "" { return s.Page.HTML() }
-	//   el, err := s.Page.Element(selector)
+	//   p.Lock(); defer p.Unlock()
+	//   if selector == "" { return p.Rod.HTML() }
+	//   el, err := p.Rod.Element(selector)
 	//   return el.HTML()
 	return "", fmt.Errorf("page_fetch.extractHTML: not implemented")
 }
 
 // extractText returns the visible text of the page (or of the element matched
 // by selector). Backed by Eval over document.body.innerText / element.innerText.
-func (t *Page) extractText(ctx context.Context, s *Session, selector string) (string, error) {
+func (t *Page) extractText(ctx context.Context, p *browsers.Page, selector string) (string, error) {
 	// TODO(web-mcp): implement — see go-rod-primer.md
 	//
 	// Intended flow (Phase 1):
-	//   s.Lock(); defer s.Unlock()
+	//   p.Lock(); defer p.Unlock()
 	//   js := `() => document.body.innerText`
 	//   if selector != "" { js = `() => document.querySelector(` + JSON-quoted selector + `).innerText` }
-	//   res, err := s.Page.Eval(js)
+	//   res, err := p.Rod.Eval(js)
 	//   return res.Str(), nil   // gson .Str()
 	return "", fmt.Errorf("page_fetch.extractText: not implemented")
 }
 
 // extractLinks returns the page's anchor links as a JSON array of {text, href}.
 // Backed by Eval collecting document.querySelectorAll('a[href]').
-func (t *Page) extractLinks(ctx context.Context, s *Session) (string, error) {
+func (t *Page) extractLinks(ctx context.Context, p *browsers.Page) (string, error) {
 	// TODO(web-mcp): implement — see go-rod-primer.md
 	//
 	// Intended flow (Phase 1):
-	//   s.Lock(); defer s.Unlock()
-	//   res, err := s.Page.Eval(
+	//   p.Lock(); defer p.Unlock()
+	//   res, err := p.Rod.Eval(
 	//     `() => [...document.querySelectorAll('a[href]')].map(a => ({text: a.innerText.trim(), href: a.href}))`)
 	//   return res.JSON string
 	return "", fmt.Errorf("page_fetch.extractLinks: not implemented")
 }
 
 // extractDOMSnapshot returns the page's full DOM as a flattened Documents array
-// plus the shared Strings table (via s.Page.CaptureDOMSnapshot()). This is the
+// plus the shared Strings table (via p.Rod.CaptureDOMSnapshot()). This is the
 // LLM-friendly total view of the page — it pierces iframes and shadow DOM.
-func (t *Page) extractDOMSnapshot(ctx context.Context, s *Session) (string, error) {
+func (t *Page) extractDOMSnapshot(ctx context.Context, p *browsers.Page) (string, error) {
 	// TODO(web-mcp): implement — see go-rod-primer.md
 	//
 	// Intended flow (Phase 2):
-	//   s.Lock(); defer s.Unlock()
-	//   snap, err := s.Page.CaptureDOMSnapshot()
+	//   p.Lock(); defer p.Unlock()
+	//   snap, err := p.Rod.CaptureDOMSnapshot()
 	//   // snap.Documents[0] is the root; strings live in the shared Strings table.
 	//   // Flatten both into a single JSON document for the LLM.
 	return "", fmt.Errorf("page_fetch.extractDOMSnapshot: not implemented")
 }
 
 // extractCSS returns the URLs and contents of the page's stylesheet resources.
-// Backed by proto.PageGetResourceTree enumeration + s.Page.GetResource(url).
-func (t *Page) extractCSS(ctx context.Context, s *Session) (string, error) {
+// Backed by proto.PageGetResourceTree enumeration + p.Rod.GetResource(url).
+func (t *Page) extractCSS(ctx context.Context, p *browsers.Page) (string, error) {
 	// TODO(web-mcp): implement — see go-rod-primer.md
 	//
 	// Intended flow (Phase 2):
-	//   s.Lock(); defer s.Unlock()
-	//   tree, err := s.Page.Call(proto.PageGetResourceTree{})
+	//   p.Lock(); defer p.Unlock()
+	//   tree, err := p.Rod.Call(proto.PageGetResourceTree{})
 	//   walk resources filtering type == Stylesheet, then GetResource each URL.
 	return "", fmt.Errorf("page_fetch.extractCSS: not implemented")
 }
 
 // extractJS returns the URLs and contents of the page's script resources.
-// Backed by proto.PageGetResourceTree enumeration + s.Page.GetResource(url).
-func (t *Page) extractJS(ctx context.Context, s *Session) (string, error) {
+// Backed by proto.PageGetResourceTree enumeration + p.Rod.GetResource(url).
+func (t *Page) extractJS(ctx context.Context, p *browsers.Page) (string, error) {
 	// TODO(web-mcp): implement — see go-rod-primer.md
 	//
 	// Intended flow (Phase 2):
-	//   s.Lock(); defer s.Unlock()
-	//   tree, err := s.Page.Call(proto.PageGetResourceTree{})
+	//   p.Lock(); defer p.Unlock()
+	//   tree, err := p.Rod.Call(proto.PageGetResourceTree{})
 	//   walk resources filtering type == Script, then GetResource each URL.
 	return "", fmt.Errorf("page_fetch.extractJS: not implemented")
 }
 
 // extractScreenshot returns a base64-encoded PNG screenshot of the visible
-// viewport. Backed by s.Page.Screenshot(false, nil).
-func (t *Page) extractScreenshot(ctx context.Context, s *Session) (string, error) {
+// viewport. Backed by p.Rod.Screenshot(false, nil).
+func (t *Page) extractScreenshot(ctx context.Context, p *browsers.Page) (string, error) {
 	// TODO(web-mcp): implement — see go-rod-primer.md
 	//
 	// Intended flow (Phase 2):
-	//   s.Lock(); defer s.Unlock()
-	//   b, err := s.Page.Screenshot(false, nil)
+	//   p.Lock(); defer p.Unlock()
+	//   b, err := p.Rod.Screenshot(false, nil)
 	//   return base64.StdEncoding.EncodeToString(b)  // data URL for the LLM
 	return "", fmt.Errorf("page_fetch.extractScreenshot: not implemented")
 }
 
 // extractMeta returns the page's meta info (title, url, description) as JSON.
-// Backed by s.Page.Info() plus Eval for meta description/tags.
-func (t *Page) extractMeta(ctx context.Context, s *Session) (string, error) {
+// Backed by p.Rod.Info() plus Eval for meta description/tags.
+func (t *Page) extractMeta(ctx context.Context, p *browsers.Page) (string, error) {
 	// TODO(web-mcp): implement — see go-rod-primer.md
 	//
 	// Intended flow (Phase 1):
-	//   s.Lock(); defer s.Unlock()
-	//   info, err := s.Page.Info()
-	//   res, err := s.Page.Eval(`() => document.querySelector('meta[name="description"]')?.content || ''`)
+	//   p.Lock(); defer p.Unlock()
+	//   info, err := p.Rod.Info()
+	//   res, err := p.Rod.Eval(`() => document.querySelector('meta[name="description"]')?.content || ''`)
 	//   return JSON {title: info.Title, url: info.URL, description: res.Str()}
 	return "", fmt.Errorf("page_fetch.extractMeta: not implemented")
 }

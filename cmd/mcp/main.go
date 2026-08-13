@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"webmcp/pkg/browsers"
 	"webmcp/pkg/mcp/models"
 	"webmcp/pkg/mcp/tools"
 )
@@ -24,22 +25,21 @@ var (
 	sessionsMu sync.Mutex
 	sessions   = make(map[string]chan []byte)
 	registry   = func() *tools.Registry {
-		// Every tool must share the SAME SessionManager so that a session
-		// opened by fetch_page can be read by page_fetch and driven by
-		// page_act, and so a single *rod.Browser backs all sessions.
+		// Every tool must share the SAME browsers.Manager so that a page opened
+		// by fetch_page can be read by page_fetch and driven by page_act, and
+		// so a single Browser (one Chromium instance) backs all sessions.
 		//
-		//   sm := tools.NewSessionManager(             // optionally:
-		//       tools.WithTTL(5*time.Minute),          //   idle-TTL sweep
-		//       tools.WithHeadless(true),              //   headless Chromium
-		//       tools.WithBrowserURL("ws://..."),      //   connect to a running browser
+		//   mgr := browsers.NewManager(            // optionally:
+		//       browsers.WithHeadless(true),       //   headless Chromium (default headful)
+		//       browsers.WithStealth(false),       //   disable go-rod/stealth (default on)
 		//   )
-		sm := tools.NewSessionManager()
+		mgr := browsers.NewManager()
 		r := tools.NewEmptyRegistry()
-		r.Register(tools.NewFetch(sm))        // fetch_page
-		r.Register(tools.NewPage(sm))         // page_fetch
-		r.Register(tools.NewAct(sm))          // page_act
-		r.Register(tools.NewSessionClose(sm)) // session_close
-		r.Register(tools.NewSessionList(sm))  // session_list
+		r.Register(tools.NewFetch(mgr))        // fetch_page
+		r.Register(tools.NewPage(mgr))         // page_fetch
+		r.Register(tools.NewAct(mgr))          // page_act
+		r.Register(tools.NewSessionClose(mgr)) // session_close
+		r.Register(tools.NewSessionList(mgr))  // session_list
 		return r
 	}()
 )

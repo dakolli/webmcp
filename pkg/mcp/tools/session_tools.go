@@ -5,21 +5,23 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"webmcp/pkg/browsers"
 	"webmcp/pkg/mcp/models"
 )
 
 // SessionClose implements the "session_close" tool: it closes a live browser
-// session opened by fetch_page, releasing its browser tab and freeing memory.
+// page opened by fetch_page, releasing its browser tab and freeing memory.
 // The session can no longer be used by page_fetch/page_act afterwards.
 type SessionClose struct {
-	// sessions is the shared SessionManager owning the live browser sessions.
-	sessions *SessionManager
+	// mgr is the shared browsers.Manager owning the single Browser and its
+	// live pages (sessions).
+	mgr *browsers.Manager
 }
 
 // NewSessionClose constructs the session_close tool wired to the given
-// SessionManager.
-func NewSessionClose(sessions *SessionManager) *SessionClose {
-	return &SessionClose{sessions: sessions}
+// browsers.Manager.
+func NewSessionClose(mgr *browsers.Manager) *SessionClose {
+	return &SessionClose{mgr: mgr}
 }
 
 // Name returns the MCP tool name "session_close".
@@ -52,13 +54,13 @@ func (t *SessionClose) InputSchema() models.InputSchema {
 
 // sessionCloseArgs is the strict decoding target for session_close arguments.
 type sessionCloseArgs struct {
-	// SessionID identifies the session to close (required).
-	SessionID SessionID `json:"session_id"`
+	// SessionID identifies the page/session to close (required).
+	SessionID browsers.PageID `json:"session_id"`
 }
 
-// Execute parses the session_id and closes the session via the SessionManager.
-// This is thin glue around SessionManager.Close and is implemented fully (no
-// browser work lives here).
+// Execute parses the session_id and closes the page via the browsers.Manager.
+// This is thin glue around Manager.Open -> Browser.ClosePage and is implemented
+// fully (no browser work lives here).
 func (t *SessionClose) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var a sessionCloseArgs
 	if err := json.Unmarshal(args, &a); err != nil {
@@ -67,24 +69,29 @@ func (t *SessionClose) Execute(ctx context.Context, args json.RawMessage) (strin
 	if a.SessionID == "" {
 		return "", fmt.Errorf("session_close: missing required argument %q", "session_id")
 	}
-	if err := t.sessions.Close(ctx, a.SessionID); err != nil {
+	b, err := t.mgr.Open(ctx) // lazily launches (or returns) the single Browser
+	if err != nil {
+		return "", fmt.Errorf("session_close: %w", err)
+	}
+	if err := b.ClosePage(ctx, a.SessionID); err != nil {
 		return "", fmt.Errorf("session_close: %w", err)
 	}
 	return fmt.Sprintf("session %s closed", a.SessionID), nil
 }
 
 // SessionList implements the "session_list" tool: it lists every live browser
-// session (id, url, title, created/last-used timestamps) as a JSON array so the
-// agent can see what tabs are still open across its session lifecycle.
+// page (id, url) as a JSON array so the agent can see what tabs are still open
+// across its session lifecycle.
 type SessionList struct {
-	// sessions is the shared SessionManager owning the live browser sessions.
-	sessions *SessionManager
+	// mgr is the shared browsers.Manager owning the single Browser and its
+	// live pages (sessions).
+	mgr *browsers.Manager
 }
 
 // NewSessionList constructs the session_list tool wired to the given
-// SessionManager.
-func NewSessionList(sessions *SessionManager) *SessionList {
-	return &SessionList{sessions: sessions}
+// browsers.Manager.
+func NewSessionList(mgr *browsers.Manager) *SessionList {
+	return &SessionList{mgr: mgr}
 }
 
 // Name returns the MCP tool name "session_list".
@@ -107,16 +114,19 @@ func (t *SessionList) InputSchema() models.InputSchema {
 	}
 }
 
-// Execute returns the current sessions as a JSON array. This is thin glue
-// around SessionManager.List and is implemented fully (no browser work lives
-// here).
+// Execute returns the current pages as a JSON array. This is thin glue around
+// Manager.Open -> Browser.Pages and is implemented fully (no browser work
+// lives here).
 func (t *SessionList) Execute(ctx context.Context, args json.RawMessage) (string, error) {
-	infos := t.sessions.List(ctx)
-	b, err := json.MarshalIndent(infos, "", "  ")
+	b, err := t.mgr.Open(ctx) // lazily launches (or returns) the single Browser
 	if err != nil {
 		return "", fmt.Errorf("session_list: %w", err)
 	}
-	return string(b), nil
+	data, err := json.MarshalIndent(b.Pages(), "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("session_list: %w", err)
+	}
+	return string(data), nil
 }
 
 // Ensure both session tools satisfy the Tool interface at compile time.

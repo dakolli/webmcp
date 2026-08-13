@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
 
+	"webmcp/pkg/browsers"
 	"webmcp/pkg/mcp/models"
 )
 
@@ -13,14 +13,15 @@ import (
 // session and returns a compact page summary (title, url, session_id, size
 // hints) so the agent can decide what to read next via page_fetch.
 type Fetch struct {
-	// sessions is the shared SessionManager that owns the browser and the
-	// session map. Every open session becomes usable by the other tools.
-	sessions *SessionManager
+	// mgr is the shared browsers.Manager that owns the single Browser and its
+	// live pages (sessions). Every page opened here becomes usable by the
+	// other tools.
+	mgr *browsers.Manager
 }
 
-// NewFetch constructs the fetch_page tool wired to the given SessionManager.
-func NewFetch(sessions *SessionManager) *Fetch {
-	return &Fetch{sessions: sessions}
+// NewFetch constructs the fetch_page tool wired to the given browsers.Manager.
+func NewFetch(mgr *browsers.Manager) *Fetch {
+	return &Fetch{mgr: mgr}
 }
 
 // Name returns the MCP tool name "fetch_page".
@@ -128,28 +129,28 @@ func (t *Fetch) Execute(ctx context.Context, args json.RawMessage) (string, erro
 	// TODO(web-mcp): implement — see go-rod-primer.md
 	//
 	// Intended flow (Phase 1):
-	//   opts := []OpenOption{WithOpenTimeout(time.Duration(a.TimeoutMS) * time.Millisecond)}
-	//   if a.Viewport != nil { opts = append(opts, WithViewport(a.Viewport.Width, a.Viewport.Height)) }
-	//   if a.UserAgent != "" { opts = append(opts, WithUserAgent(a.UserAgent)) }
-	//   s, err := t.sessions.Open(ctx, a.URL, opts...)
+	//   b, err := t.mgr.Open(ctx)                 // lazily launches the single Browser
 	//   if err != nil { return "", fmt.Errorf("fetch_page: %w", err) }
-	//   if err := t.waitForPage(ctx, s, a.WaitFor); err != nil { return "", fmt.Errorf("fetch_page: %w", err) }
-	//   return t.pageSummary(ctx, s)
-	_ = time.Duration(a.TimeoutMS)
+	//   p, err := b.NewPage(ctx, a.URL)          // new tab; stealth applied by default
+	//   if err != nil { return "", fmt.Errorf("fetch_page: %w", err) }
+	//   if err := t.waitForPage(ctx, p, a.WaitFor); err != nil {
+	//       return "", fmt.Errorf("fetch_page: %w", err)
+	//   }
+	//   return t.pageSummary(ctx, p)
 	return "", fmt.Errorf("fetch_page: not implemented yet")
 }
 
-// pageSummary renders a compact, LLM-friendly JSON summary of a live session:
-// the session ID, page title and URL (via s.Page.Info()), plus a short text
-// snippet with byte-size hints so the caller can decide what to fetch next.
-func (t *Fetch) pageSummary(ctx context.Context, s *Session) (string, error) {
+// pageSummary renders a compact, LLM-friendly JSON summary of a live page: the
+// page ID, its title and URL (via p.Rod.Info()), plus a short text snippet
+// with byte-size hints so the caller can decide what to fetch next.
+func (t *Fetch) pageSummary(ctx context.Context, p *browsers.Page) (string, error) {
 	// TODO(web-mcp): implement — see go-rod-primer.md
 	//
 	// Intended flow (Phase 1):
-	//   s.Lock(); defer s.Unlock()
-	//   info, err := s.Page.Info()              // title + url
-	//   html, err := s.Page.HTML()              // for byte-size hint only
-	//   text, err := s.Page.Eval(`() => document.body.innerText.slice(0, 500)`)
+	//   p.Lock(); defer p.Unlock()
+	//   info, err := p.Rod.Info()              // title + url
+	//   html, err := p.Rod.HTML()              // for byte-size hint only
+	//   text, err := p.Rod.Eval(`() => document.body.innerText.slice(0, 500)`)
 	//   return json.Marshal({session_id, title, url, text_snippet, html_bytes, ...})
 	return "", fmt.Errorf("fetch_page.pageSummary: not implemented")
 }
@@ -157,18 +158,18 @@ func (t *Fetch) pageSummary(ctx context.Context, s *Session) (string, error) {
 // waitForPage blocks until the page satisfies the requested readiness level.
 // It maps "load" to WaitLoad, "idle" to WaitRequestIdle, and "stable" to
 // WaitDOMStable; an empty waitFor is treated as "idle".
-func (t *Fetch) waitForPage(ctx context.Context, s *Session, waitFor string) error {
+func (t *Fetch) waitForPage(ctx context.Context, p *browsers.Page, waitFor string) error {
 	// TODO(web-mcp): implement — see go-rod-primer.md
 	//
 	// Intended flow (Phase 1):
-	//   s.Lock(); defer s.Unlock()
+	//   p.Lock(); defer p.Unlock()
 	//   switch waitFor {
 	//   case "", "idle":
-	//       wait := s.Page.WaitRequestIdle(500*time.Millisecond, nil, nil, nil); wait()
+	//       wait := p.Rod.WaitRequestIdle(500*time.Millisecond, nil, nil, nil); wait()
 	//   case "load":
-	//       return s.Page.WaitLoad()
+	//       return p.Rod.WaitLoad()
 	//   case "stable":
-	//       return s.Page.WaitDOMStable(500*time.Millisecond, 0.05)
+	//       return p.Rod.WaitDOMStable(500*time.Millisecond, 0.05)
 	//   }
 	return fmt.Errorf("fetch_page.waitForPage: not implemented")
 }

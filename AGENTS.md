@@ -7,10 +7,11 @@ tool calls. Read `go-rod-primer.md` before writing any rod code.
 
 ## Current state (2026-08-13)
 
-- Scaffold only. `cmd/mcp/main.go` is a copied mem-mcp SSE server and **does not compile**
-  (imports `mem-mcp/internal/...`, module is `webmcp`). `pkg/mcp/tools/registry.go` references
-  undefined types/tools. `pkg/mcp/tools/fetch.go` is a stub. Fixing these is Phase 0.
-- Module `webmcp`, Go 1.26. No rod dependency yet.
+- Scaffold compiles (`go build ./...` green): `pkg/mcp/tools` has an interface-compliant `Tool`
+  skeleton (fetch/page/act/session tools, `models.InputSchema`); `cmd/mcp/main.go` serves SSE with
+  imports fixed to `webmcp/pkg/...`. No real browser work yet — `SessionManager` is a stub.
+- Module `webmcp`, Go 1.26.4. rod + launcher deps present; stealth not yet added.
+- Next: sketch the `pkg/browsers` core engine (see Architecture) and wire tools to import it.
 
 ## Architecture (decided — do not redesign without asking)
 
@@ -34,6 +35,16 @@ creates, closes, and interacts with pages *inside* a browser. This is the operat
    `session_id → Session` map, a per-session mutex (rod Pages are not thread-safe), and idle-TTL
    cleanup.
 
+**Core engine lives outside MCP.** All rod/Chromium logic lives in `pkg/browsers` (package
+`browsers`): `manager.go` (`BrowserManager`), `browser.go` (the `Browser` type — holds pointers to
+rod pages), and `session.go` (page sessions). `pkg/mcp/tools` only **imports** `pkg/browsers` and
+translates MCP calls; the MCP package never touches rod directly.
+
+**Defaults (decided):** the service starts with a **single `Browser`** (its own type) whose pages
+are the MCP-accessible sessions; MCP creates pages in that browser. **Headful by default**,
+designed so `headless: true` is a clean option. **Stealth** (`github.com/go-rod/stealth`) is applied
+to every page by default, with a per-browser/per-page toggle to turn it off.
+
 **Lighter-weight fetcher (go colly) is on the roadmap**, for headless-less HTML/static extraction —
 not now.
 
@@ -41,8 +52,10 @@ not now.
 
 - `cmd/mcp/main.go` — MCP server entrypoint (SSE). Keep server logic; fix imports to `webmcp/pkg/...`.
 - `pkg/mcp/models/` — JSON-RPC / MCP types (`InputSchema`, `CallToolRequest`, …).
-- `pkg/mcp/tools/` — the `Tool` interface, `Registry`, the `BrowserManager`/`Browser` types
-  (`browser.go`/`session.go`), and one file per tool: `fetch.go`, `page.go`, `act.go`, `session.go`.
+- `pkg/mcp/tools/` — the `Tool` interface, `Registry`, and one file per tool: `fetch.go`, `page.go`,
+  `act.go`, `session.go`, `browser.go`. Imports `pkg/browsers`; no direct rod usage.
+- `pkg/browsers/` — **core browser engine** (rod only, zero MCP imports): `manager.go`
+  (`BrowserManager`), `browser.go` (`Browser` type owning rod pages), `session.go` (page sessions).
 - `go-rod-primer.md` — rod quick reference (read before writing rod code).
 
 ## Tool interface (mandatory contract)
@@ -62,15 +75,16 @@ type Tool interface {
 - `InputSchema` returns `models.InputSchema` (package `models`, **not** `types`).
 - Tool names: `browser_create`, `browser_list`, `browser_close`, `fetch_page`, `page_list`,
   `page_fetch`, `page_act`, `session_close`.
-- `Execute` parses args → calls `BrowserManager` (resolve browser → resolve page session) → returns
-  a string (text/JSON) for the LLM. Truncate/dehydrate huge outputs (e.g. "first 50KB; use
+- `Execute` parses args → calls `browsers.Manager` (resolve browser → resolve page session) →
+  returns a string (text/JSON) for the LLM. Truncate/dehydrate huge outputs (e.g. "first 50KB; use
   `what=css&target=URL` to fetch more").
 
 ## Roadmap
 
 1. **Phase 0 — Foundation (now)**: fix `registry.go` (Tool interface + empty registry, drop stale
-   todo tools), rewrite `fetch.go` as the interface-compliant skeleton, add `BrowserManager` +
-   `Browser` (owning pages/sessions), fix `main.go` imports, add rod + launcher deps,
+   todo tools), rewrite `fetch.go` as the interface-compliant skeleton, sketch the `pkg/browsers`
+   core (`manager.go` + `Browser` type + page sessions; single browser, headful default, stealth on
+   by default), wire tools to import it, fix `main.go` imports, add rod + launcher + stealth deps,
    `go build ./...` green. *No real browser work.*
 2. **Phase 1 — Fetch core**: real `browser_create`/`browser_list`/`browser_close` +
    `fetch_page` (launch, navigate, wait, summary) + `page_fetch` for `html`, `text`, `meta`,

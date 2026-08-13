@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
 
+	"webmcp/pkg/browsers"
 	"webmcp/pkg/mcp/models"
 )
 
@@ -13,16 +13,17 @@ import (
 // previously opened with fetch_page. The action enum covers the common fast
 // paths (click, input, type, navigate, back, forward, reload, hover, scroll,
 // select, wait) and "eval" — the primary escape hatch for arbitrary page
-// manipulation via JavaScript (s.Page.Eval). Rod built-ins are the fast path;
+// manipulation via JavaScript (p.Rod.Eval). Rod built-ins are the fast path;
 // eval is the general path for anything not covered by a built-in.
 type Act struct {
-	// sessions is the shared SessionManager owning the live browser sessions.
-	sessions *SessionManager
+	// mgr is the shared browsers.Manager owning the single Browser and its
+	// live pages (sessions).
+	mgr *browsers.Manager
 }
 
-// NewAct constructs the page_act tool wired to the given SessionManager.
-func NewAct(sessions *SessionManager) *Act {
-	return &Act{sessions: sessions}
+// NewAct constructs the page_act tool wired to the given browsers.Manager.
+func NewAct(mgr *browsers.Manager) *Act {
+	return &Act{mgr: mgr}
 }
 
 // Name returns the MCP tool name "page_act".
@@ -85,8 +86,8 @@ func (t *Act) InputSchema() models.InputSchema {
 
 // actArgs is the strict decoding target for page_act arguments.
 type actArgs struct {
-	// SessionID identifies the live session to act on (required).
-	SessionID SessionID `json:"session_id"`
+	// SessionID identifies the live page/session to act on (required).
+	SessionID browsers.PageID `json:"session_id"`
 	// Action is the interaction to perform (required).
 	Action string `json:"action"`
 	// Selector is the CSS/XPath target for element actions.
@@ -116,7 +117,11 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 		return "", fmt.Errorf("page_act: missing required argument %q", "action")
 	}
 
-	s, err := t.sessions.Get(ctx, a.SessionID)
+	b, err := t.mgr.Open(ctx) // lazily launches (or returns) the single Browser
+	if err != nil {
+		return "", fmt.Errorf("page_act: %w", err)
+	}
+	p, err := b.Page(a.SessionID)
 	if err != nil {
 		return "", fmt.Errorf("page_act: %w", err)
 	}
@@ -124,29 +129,29 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 	var out string
 	switch a.Action {
 	case "click":
-		out, err = t.actClick(ctx, s, a.Selector)
+		out, err = t.actClick(ctx, p, a.Selector)
 	case "input":
-		out, err = t.actInput(ctx, s, a.Selector, a.Value)
+		out, err = t.actInput(ctx, p, a.Selector, a.Value)
 	case "type":
-		out, err = t.actType(ctx, s, a.Selector, a.Value)
+		out, err = t.actType(ctx, p, a.Selector, a.Value)
 	case "eval":
-		out, err = t.actEval(ctx, s, a.Value)
+		out, err = t.actEval(ctx, p, a.Value)
 	case "navigate":
-		out, err = t.actNavigate(ctx, s, a.Value)
+		out, err = t.actNavigate(ctx, p, a.Value)
 	case "back":
-		out, err = t.actBack(ctx, s)
+		out, err = t.actBack(ctx, p)
 	case "forward":
-		out, err = t.actForward(ctx, s)
+		out, err = t.actForward(ctx, p)
 	case "reload":
-		out, err = t.actReload(ctx, s)
+		out, err = t.actReload(ctx, p)
 	case "hover":
-		out, err = t.actHover(ctx, s, a.Selector)
+		out, err = t.actHover(ctx, p, a.Selector)
 	case "scroll":
-		out, err = t.actScroll(ctx, s, a.X, a.Y)
+		out, err = t.actScroll(ctx, p, a.X, a.Y)
 	case "select":
-		out, err = t.actSelect(ctx, s, a.Selector, a.Value)
+		out, err = t.actSelect(ctx, p, a.Selector, a.Value)
 	case "wait":
-		out, err = t.actWait(ctx, s, a.TimeoutMS)
+		out, err = t.actWait(ctx, p, a.TimeoutMS)
 	default:
 		return "", fmt.Errorf("page_act: unknown action=%q (must be one of click, input, type, eval, navigate, back, forward, reload, hover, scroll, select, wait)", a.Action)
 	}
@@ -157,134 +162,134 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 }
 
 // actClick clicks the element matched by selector (CSS or XPath). Backed by
-// s.Page.Element(selector) -> WaitInteractable() -> Click(left, 1).
-func (t *Act) actClick(ctx context.Context, s *Session, selector string) (string, error) {
+// p.Rod.Element(selector) -> WaitInteractable() -> Click(left, 1).
+func (t *Act) actClick(ctx context.Context, p *browsers.Page, selector string) (string, error) {
 	// TODO(web-mcp): implement — see go-rod-primer.md
 	//
 	// Intended flow (Phase 1):
-	//   s.Lock(); defer s.Unlock()
-	//   el, err := s.Page.Element(selector)
+	//   p.Lock(); defer p.Unlock()
+	//   el, err := p.Rod.Element(selector)
 	//   if _, err := el.WaitInteractable(); err != nil { return "", err }
 	//   return el.Click(proto.InputMouseButtonLeft, 1)
 	return "", fmt.Errorf("page_act.actClick: not implemented")
 }
 
 // actInput sets the value of the element matched by selector. Backed by
-// s.Page.Element(selector).Input(value).
-func (t *Act) actInput(ctx context.Context, s *Session, selector, value string) (string, error) {
+// p.Rod.Element(selector).Input(value).
+func (t *Act) actInput(ctx context.Context, p *browsers.Page, selector, value string) (string, error) {
 	// TODO(web-mcp): implement — see go-rod-primer.md
 	//
 	// Intended flow (Phase 1):
-	//   s.Lock(); defer s.Unlock()
-	//   el, err := s.Page.Element(selector)
+	//   p.Lock(); defer p.Unlock()
+	//   el, err := p.Rod.Element(selector)
 	//   return el.Input(value)
 	return "", fmt.Errorf("page_act.actInput: not implemented")
 }
 
 // actType types keystrokes into the element matched by selector. Backed by
 // Element.Focus() + Page.KeyActions().Type(...).Do() or el.Type(...).
-func (t *Act) actType(ctx context.Context, s *Session, selector, value string) (string, error) {
+func (t *Act) actType(ctx context.Context, p *browsers.Page, selector, value string) (string, error) {
 	// TODO(web-mcp): implement — see go-rod-primer.md
 	//
 	// Intended flow (Phase 1):
-	//   s.Lock(); defer s.Unlock()
-	//   el, err := s.Page.Element(selector)
+	//   p.Lock(); defer p.Unlock()
+	//   el, err := p.Rod.Element(selector)
 	//   if err := el.Focus(); err != nil { return "", err }
-	//   return s.Page.InsertText(value)
+	//   return p.Rod.InsertText(value)
 	return "", fmt.Errorf("page_act.actType: not implemented")
 }
 
 // actEval runs arbitrary JavaScript in the page — the primary escape hatch for
 // any page manipulation not covered by a rod built-in. Backed by
-// s.Page.Eval(js) and returns the JSON result. js must be a JS function
+// p.Rod.Eval(js) and returns the JSON result. js must be a JS function
 // definition, e.g. "() => document.title".
-func (t *Act) actEval(ctx context.Context, s *Session, js string) (string, error) {
+func (t *Act) actEval(ctx context.Context, p *browsers.Page, js string) (string, error) {
 	// TODO(web-mcp): implement — see go-rod-primer.md
 	//
 	// Intended flow (Phase 1):
-	//   s.Lock(); defer s.Unlock()
-	//   res, err := s.Page.Eval(js)   // Eval only accepts a JS function definition
-	//   return res.JSON, nil          // gson marshals to JSON text
+	//   p.Lock(); defer p.Unlock()
+	//   res, err := p.Rod.Eval(js)   // Eval only accepts a JS function definition
+	//   return res.JSON, nil         // gson marshals to JSON text
 	return "", fmt.Errorf("page_act.actEval: not implemented")
 }
 
 // actNavigate navigates the session's page to url and waits for load. Backed by
-// s.Page.Navigate(url) -> WaitLoad() (callers may follow with waitForPage).
-func (t *Act) actNavigate(ctx context.Context, s *Session, url string) (string, error) {
+// p.Rod.Navigate(url) -> WaitLoad() (callers may follow with waitForPage).
+func (t *Act) actNavigate(ctx context.Context, p *browsers.Page, url string) (string, error) {
 	// TODO(web-mcp): implement — see go-rod-primer.md
 	//
 	// Intended flow (Phase 1):
-	//   s.Lock(); defer s.Unlock()
-	//   if err := s.Page.Navigate(url); err != nil { return "", err }
-	//   return s.Page.WaitLoad()
+	//   p.Lock(); defer p.Unlock()
+	//   if err := p.Rod.Navigate(url); err != nil { return "", err }
+	//   return p.Rod.WaitLoad()
 	return "", fmt.Errorf("page_act.actNavigate: not implemented")
 }
 
 // actBack navigates one step back in the page's history. Backed by
-// s.Page.NavigateBack().
-func (t *Act) actBack(ctx context.Context, s *Session) (string, error) {
+// p.Rod.NavigateBack().
+func (t *Act) actBack(ctx context.Context, p *browsers.Page) (string, error) {
 	// TODO(web-mcp): implement — see go-rod-primer.md
 	//
 	// Intended flow (Phase 1):
-	//   s.Lock(); defer s.Unlock()
-	//   return s.Page.NavigateBack()
+	//   p.Lock(); defer p.Unlock()
+	//   return p.Rod.NavigateBack()
 	return "", fmt.Errorf("page_act.actBack: not implemented")
 }
 
 // actForward navigates one step forward in the page's history. Backed by
-// s.Page.NavigateForward().
-func (t *Act) actForward(ctx context.Context, s *Session) (string, error) {
+// p.Rod.NavigateForward().
+func (t *Act) actForward(ctx context.Context, p *browsers.Page) (string, error) {
 	// TODO(web-mcp): implement — see go-rod-primer.md
 	//
 	// Intended flow (Phase 1):
-	//   s.Lock(); defer s.Unlock()
-	//   return s.Page.NavigateForward()
+	//   p.Lock(); defer p.Unlock()
+	//   return p.Rod.NavigateForward()
 	return "", fmt.Errorf("page_act.actForward: not implemented")
 }
 
-// actReload reloads the page and waits for load. Backed by s.Page.Reload()
+// actReload reloads the page and waits for load. Backed by p.Rod.Reload()
 // -> WaitLoad().
-func (t *Act) actReload(ctx context.Context, s *Session) (string, error) {
+func (t *Act) actReload(ctx context.Context, p *browsers.Page) (string, error) {
 	// TODO(web-mcp): implement — see go-rod-primer.md
 	//
 	// Intended flow (Phase 1):
-	//   s.Lock(); defer s.Unlock()
-	//   if err := s.Page.Reload(); err != nil { return "", err }
-	//   return s.Page.WaitLoad()
+	//   p.Lock(); defer p.Unlock()
+	//   if err := p.Rod.Reload(); err != nil { return "", err }
+	//   return p.Rod.WaitLoad()
 	return "", fmt.Errorf("page_act.actReload: not implemented")
 }
 
 // actHover moves the mouse over the element matched by selector. Backed by
-// s.Page.Element(selector).Hover().
-func (t *Act) actHover(ctx context.Context, s *Session, selector string) (string, error) {
+// p.Rod.Element(selector).Hover().
+func (t *Act) actHover(ctx context.Context, p *browsers.Page, selector string) (string, error) {
 	// TODO(web-mcp): implement — see go-rod-primer.md
 	//
 	// Intended flow (Phase 1):
-	//   s.Lock(); defer s.Unlock()
-	//   el, err := s.Page.Element(selector)
+	//   p.Lock(); defer p.Unlock()
+	//   el, err := p.Rod.Element(selector)
 	//   return el.Hover()
 	return "", fmt.Errorf("page_act.actHover: not implemented")
 }
 
 // actScroll scrolls the page by x/y pixels. Backed by
-// s.Page.Mouse.Scroll(x, y, steps).
-func (t *Act) actScroll(ctx context.Context, s *Session, x, y float64) (string, error) {
+// p.Rod.Mouse.Scroll(x, y, steps).
+func (t *Act) actScroll(ctx context.Context, p *browsers.Page, x, y float64) (string, error) {
 	// TODO(web-mcp): implement — see go-rod-primer.md
 	//
 	// Intended flow (Phase 1):
-	//   s.Lock(); defer s.Unlock()
-	//   return s.Page.Mouse.Scroll(x, y, 1)
+	//   p.Lock(); defer p.Unlock()
+	//   return p.Rod.Mouse.Scroll(x, y, 1)
 	return "", fmt.Errorf("page_act.actScroll: not implemented")
 }
 
 // actSelect selects an option with the given value in the element matched by
-// selector. Backed by s.Page.Element(selector).Select([value], true, ...).
-func (t *Act) actSelect(ctx context.Context, s *Session, selector, value string) (string, error) {
+// selector. Backed by p.Rod.Element(selector).Select([value], true, ...).
+func (t *Act) actSelect(ctx context.Context, p *browsers.Page, selector, value string) (string, error) {
 	// TODO(web-mcp): implement — see go-rod-primer.md
 	//
 	// Intended flow (Phase 1):
-	//   s.Lock(); defer s.Unlock()
-	//   el, err := s.Page.Element(selector)
+	//   p.Lock(); defer p.Unlock()
+	//   el, err := p.Rod.Element(selector)
 	//   return el.Select([]string{value}, true, SelectorTypeValue)
 	return "", fmt.Errorf("page_act.actSelect: not implemented")
 }
@@ -292,15 +297,13 @@ func (t *Act) actSelect(ctx context.Context, s *Session, selector, value string)
 // actWait idles the page for timeoutMS milliseconds (default 30000), letting
 // in-flight requests and animations settle before the next action. Backed by
 // time.Sleep / WaitRequestIdle.
-func (t *Act) actWait(ctx context.Context, s *Session, timeoutMS int) (string, error) {
+func (t *Act) actWait(ctx context.Context, p *browsers.Page, timeoutMS int) (string, error) {
 	// TODO(web-mcp): implement — see go-rod-primer.md
 	//
 	// Intended flow (Phase 1):
 	//   d := time.Duration(timeoutMS) * time.Millisecond
 	//   if d <= 0 { d = 30 * time.Second }
 	//   select { case <-time.After(d): case <-ctx.Done(): return ctx.Err() }
-	_ = timeoutMS
-	_ = time.Second
 	return "", fmt.Errorf("page_act.actWait: not implemented")
 }
 

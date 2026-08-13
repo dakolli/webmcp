@@ -1,7 +1,9 @@
 // Package tools implements the Model Context Protocol (MCP) tools that expose a
-// stateful, session-based browser to LLM agents via go-rod. Each tool is a
-// struct satisfying the Tool interface; a shared SessionManager owns the
-// *rod.Browser and the session map that all tools operate on.
+// stateful, session-based browser to LLM agents. Each tool is a struct
+// satisfying the Tool interface and translates MCP calls into the core engine
+// in pkg/browsers; a shared browsers.Manager owns the single Browser whose
+// pages are the MCP sessions that all tools operate on. This package never
+// touches go-rod directly.
 package tools
 
 import (
@@ -9,13 +11,14 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"webmcp/pkg/browsers"
 	"webmcp/pkg/mcp/models"
 )
 
 // Tool represents a Model Context Protocol tool implementation.
 //
 // A tool is a stateless struct (typically holding only a pointer to the shared
-// SessionManager); every invocation arrives through Execute with the raw JSON
+// browsers.Manager); every invocation arrives through Execute with the raw JSON
 // arguments of the call and returns a string (plain text or JSON) for the LLM.
 type Tool interface {
 	// Name returns the tool's MCP name, e.g. "fetch_page".
@@ -35,15 +38,15 @@ type Registry struct {
 }
 
 // NewRegistry constructs a Registry and registers all available tools,
-// wiring them to a single shared SessionManager.
+// wiring them to a single shared browsers.Manager.
 func NewRegistry() *Registry {
 	r := NewEmptyRegistry()
-	sm := NewSessionManager()
-	r.Register(NewFetch(sm))
-	r.Register(NewPage(sm))
-	r.Register(NewAct(sm))
-	r.Register(NewSessionClose(sm))
-	r.Register(NewSessionList(sm))
+	mgr := browsers.NewManager()
+	r.Register(NewFetch(mgr))
+	r.Register(NewPage(mgr))
+	r.Register(NewAct(mgr))
+	r.Register(NewSessionClose(mgr))
+	r.Register(NewSessionList(mgr))
 	return r
 }
 
