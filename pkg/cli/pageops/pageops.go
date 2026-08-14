@@ -10,7 +10,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"net/url"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -179,14 +181,27 @@ func PageText(ctx context.Context, p *browsers.Page, selector string) (string, e
 }
 
 // PageLinks returns the page's anchor links as a JSON array of {text, href},
-// deduplicated by href (first occurrence wins) — mirrors the MCP extractLinks
-// shape.
+// deduplicated by href (first occurrence wins). Non-navigable hrefs
+// (javascript:/mailto:/data:/tel:, empty, exactly "#") and text-less anchors
+// are dropped; remaining hrefs are entity-decoded — mirrors the MCP
+// extractLinks shape and behavior.
 func PageLinks(ctx context.Context, p *browsers.Page) (string, error) {
 	p.Lock()
 	defer p.Unlock()
 
+	// Text comes from textContent (rendering-independent: captures anchors in
+	// CSS-hidden dropdown panels that innerText reports as ""), normalized to
+	// single spaces, with an accessible-name fallback chain (aria-label →
+	// title → img[alt]) for anchors with no text node. Anchors with no text
+	// and no fallback are dropped right here (no "text":"" on the wire, ever).
 	res, err := p.Rod.Context(ctx).Eval(
-		`() => [...document.querySelectorAll('a[href]')].map(a => ({text: a.innerText.trim(), href: a.href}))`)
+		`() => [...document.querySelectorAll('a[href]')].map(a => {
+  const text = (a.textContent || '').replace(/\s+/g, ' ').trim()
+    || (a.getAttribute('aria-label') || '').trim()
+    || (a.title || '').trim()
+    || ((a.querySelector('img') || {}).alt || '').trim();
+  return { text, href: a.href };
+}).filter(l => l.text !== '')`)
 	if err != nil {
 		return "", fmt.Errorf("evaluate links: %w", err)
 	}
@@ -196,23 +211,51 @@ func PageLinks(ctx context.Context, p *browsers.Page) (string, error) {
 		return "", fmt.Errorf("decode links: %w", err)
 	}
 
-	// Dedupe by href, first occurrence wins (the JS Map alternative would do
-	// the same; doing it Go-side keeps the JS simple).
+	// Filter, decode and dedupe in one pass — dedupe AFTER filtering so junk
+	// schemes never occupy the seen map. Drop non-navigable hrefs and any
+	// text-less leftover (the Eval already skips those; this guard keeps the
+	// no-empty-text invariant at the output boundary), unescape entity
+	// references a page may have set literally from JS ("&amp;" — harmless on
+	// already-decoded hrefs), then keep the first occurrence per href.
 	seen := make(map[string]bool, len(links))
 	dedup := make([]PageLink, 0, len(links))
 	for _, l := range links {
-		if seen[l.Href] {
+		l.Href = html.UnescapeString(l.Href)
+		if l.Text == "" || !navigableHref(l.Href) || seen[l.Href] {
 			continue
 		}
 		seen[l.Href] = true
 		dedup = append(dedup, l)
 	}
 
-	b, err := json.Marshal(dedup)
-	if err != nil {
+	// Encode without HTML-safe escaping so "&" renders literally on the links
+	// surface (json.Marshal would emit \u0026); every other extractor keeps
+	// the default escaping.
+	var buf strings.Builder
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(dedup); err != nil {
 		return "", fmt.Errorf("encode links: %w", err)
 	}
-	return string(b), nil
+	// json.Encoder appends a trailing newline that json.Marshal did not —
+	// trim it so the output shape is unchanged.
+	return strings.TrimSuffix(buf.String(), "\n"), nil
+}
+
+// navigableHref reports whether an href is one the browser can navigate to:
+// non-empty, not exactly "#", and not a non-navigable pseudo-scheme
+// (javascript:, mailto:, data:, tel: — compared case-insensitively). Relative
+// URLs (already resolved absolute by a.href) and same-page fragment links like
+// "#skip" pass through.
+func navigableHref(href string) bool {
+	if href == "" || href == "#" {
+		return false
+	}
+	switch strings.ToLower(strings.SplitN(href, ":", 2)[0]) {
+	case "javascript", "mailto", "data", "tel":
+		return false
+	}
+	return true
 }
 
 // PageMeta returns the page's meta info (title, url, meta tags) as a JSON
@@ -265,12 +308,15 @@ func PageEval(ctx context.Context, p *browsers.Page, js string) (string, error) 
 	return res.Value.JSON("", ""), nil // gson marshals to compact JSON text
 }
 
-// PageLink is one anchor link collected by PageLinks: its visible text and its
-// absolute href.
+// PageLink is one anchor link collected by PageLinks: its text (the anchor's
+// own text or its accessible name) and its absolute href.
 type PageLink struct {
-	// Text is the anchor's visible text, trimmed of surrounding whitespace.
+	// Text is the anchor's whitespace-normalized text, or its accessible name
+	// when it has no text (fallback chain: aria-label → title → img[alt]).
+	// Never empty — text-less anchors are filtered out.
 	Text string `json:"text"`
-	// Href is the anchor's absolute URL (resolved against the document base).
+	// Href is the anchor's absolute, entity-decoded URL (resolved against the
+	// document base).
 	Href string `json:"href"`
 }
 
