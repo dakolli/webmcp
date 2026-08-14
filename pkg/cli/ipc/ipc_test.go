@@ -48,6 +48,11 @@ func (s *stubbedManager) Browser() (*browsers.Browser, error) {
 	return s.browser, nil
 }
 
+// Page implements manager.
+func (s *stubbedManager) Page(ctx context.Context, id browsers.PageID) (*browsers.Page, error) {
+	return s.browser.Page(ctx, id)
+}
+
 // newStubServer returns a Server wired to a stub manager whose Browser is
 // unlaunched and empty (no pages) — safe for any wire-contract test.
 func newStubServer() *Server {

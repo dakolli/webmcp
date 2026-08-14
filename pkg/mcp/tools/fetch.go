@@ -177,6 +177,9 @@ type pageSummaryResult struct {
 func (t *Fetch) pageSummary(ctx context.Context, p *browsers.Page, loadStarted time.Time) (string, error) {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
 
 	// Bound each rod call by ctx so a stuck page cannot outlive the tool call.
 	info, err := p.Rod.Context(ctx).Info() // title + url
@@ -216,6 +219,9 @@ func (t *Fetch) pageSummary(ctx context.Context, p *browsers.Page, loadStarted t
 func (t *Fetch) waitForPage(ctx context.Context, p *browsers.Page, waitFor string) error {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return fmt.Errorf("page session is closed")
+	}
 
 	pc := p.Rod.Context(ctx)
 	switch waitFor {

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/proto"
 )
 
 // defaultTTL is the per-page idle timeout applied by NewManager when no
@@ -25,6 +26,12 @@ const defaultTTL = 15 * time.Minute
 // closePageTimeout bounds each individual page close performed by the
 // background sweeper, so a single hung tab cannot stall the sweep loop.
 const closePageTimeout = 30 * time.Second
+
+// probeTimeout bounds every liveness probe (browser-level and per-page): rod
+// has no auto-reconnect, so on a dead CDP websocket a Call blocks until its
+// ctx deadline. Probes therefore always derive a short timeout off the caller's
+// ctx, failing the probe instead of hanging the caller.
+const probeTimeout = 2 * time.Second
 
 // Option configures a Manager at construction time. Apply via
 // NewManager(WithHeadless(...), WithStealth(...), ...).
@@ -83,6 +90,14 @@ type Manager struct {
 	mu sync.Mutex
 	// browser is the single Browser owned by this manager; nil until first Open.
 	browser *Browser
+	// relaunched is set when the manager observed its Browser's Chromium
+	// process die and (re)started it. While set, a session id that does not
+	// resolve on the current Browser is reported with an explicit "browser was
+	// restarted" error instead of a bare "not found", so the LLM knows the old
+	// sessions are gone. It is deliberately sticky: it is set under mu on every
+	// observed death and never cleared, because the restart it describes makes
+	// every pre-restart session id permanently unresolvable. Guarded by mu.
+	relaunched bool
 	// headless controls launcher headless mode (default: headful).
 	headless bool
 	// stealth controls per-page stealth (default: on).
@@ -145,19 +160,66 @@ func sweepIntervalForTTL(ttl time.Duration) time.Duration {
 // exactly one Browser survives — the loser closes its own just-launched
 // Browser (best-effort, error form) and every caller receives the winner, so
 // no Chromium instance is orphaned.
+//
+// Open also verifies the cached Browser is still alive before returning it: a
+// dead Chromium process makes the cached *rod.Browser handle useless (rod has
+// no auto-reconnect), so on a failed liveness probe the stale Browser is torn
+// down — wiping its page map — and exactly one fresh Browser is relaunched.
+// Callers that reference pre-restart session ids then resolve to "not found"
+// (see Page for the explicit restart-aware error), while callers that just
+// want a browser (browser_create, fetch_page) silently heal.
 func (m *Manager) Open(ctx context.Context) (*Browser, error) {
 	m.mu.Lock()
 	if m.shutdown {
 		m.mu.Unlock()
 		return nil, errors.New("browsers: manager has been shut down")
 	}
-	if m.browser != nil {
-		b := m.browser
+	if m.browser == nil {
 		m.mu.Unlock()
-		return b, nil
+		return m.launch(ctx)
 	}
+	b := m.browser
 	m.mu.Unlock()
 
+	// Fast path: probe the cached Browser OUTSIDE m.mu (the probe is a network
+	// call that blocks until its ctx deadline on a dead websocket). On failure
+	// the stale Browser is torn down — identity-checked under m.mu so a
+	// concurrent observer that already observed the same death and relaunched
+	// hands us its winner instead of being double-closed — and the launch
+	// block below relaunches exactly one fresh Browser.
+	if err := probeBrowser(b); err != nil {
+		m.mu.Lock()
+		if m.browser != b {
+			// Another goroutine already observed the death and tore the stale
+			// Browser down (and possibly relaunched): hand out its winner, or
+			// join the launch race when it has not registered one yet.
+			winner := m.browser
+			m.mu.Unlock()
+			if winner != nil {
+				return winner, nil
+			}
+			return m.launch(ctx)
+		}
+		// We are the observer that still owns the stale handle: tear it down
+		// (best-effort; the process is already dead), record the restart, and
+		// relaunch below.
+		m.browser = nil
+		m.relaunched = true
+		m.stopSweeperLocked()
+		m.mu.Unlock()
+		_ = b.Close(ctx)
+		return m.launch(ctx)
+	}
+	return b, nil
+}
+
+// launch constructs a fresh Browser, launches it, and registers it under the
+// manager's mutex with the WEB-40 winner/loser double-check intact: when two
+// goroutines race a launch, exactly one Browser is registered — the loser
+// closes its own just-launched Browser (best-effort, error form) and every
+// caller receives the winner, so no Chromium instance is orphaned and the
+// sweeper is started exactly once (by the winner's insert).
+func (m *Manager) launch(ctx context.Context) (*Browser, error) {
 	b := NewBrowser(m.headless, m.stealth)
 	if err := b.Launch(ctx); err != nil {
 		return nil, fmt.Errorf("browsers: launch browser: %w", err)
@@ -189,15 +251,87 @@ func (m *Manager) Open(ctx context.Context) (*Browser, error) {
 	return b, nil
 }
 
+// Page resolves the live page with the given ID, opening the Browser first if
+// needed (via Open). When the lookup misses and the Browser was restarted
+// after a process death (see relaunched), the error explains the situation in
+// LLM-actionable terms instead of a bare "not found", so an agent referencing
+// a pre-restart session id knows the old sessions are gone and must call
+// fetch_page again.
+func (m *Manager) Page(ctx context.Context, id PageID) (*Page, error) {
+	b, err := m.Open(ctx)
+	if err != nil {
+		return nil, err
+	}
+	p, err := b.Page(ctx, id)
+	if err != nil {
+		m.mu.Lock()
+		relaunched := m.relaunched
+		m.mu.Unlock()
+		if relaunched {
+			return nil, fmt.Errorf("session %q no longer exists: the browser process died and was restarted; all previous sessions are gone — call fetch_page to re-open URLs", id)
+		}
+		return nil, err
+	}
+	return p, nil
+}
+
 // Browser returns the manager's live Browser, or an error when no Browser has
-// been opened yet (call Open first).
+// been opened yet (call Open first). It probes the cached Browser so a dead
+// one is never reported as healthy: on a failed probe the stale Browser is
+// torn down (identity-checked under the lock, mirroring Open) and the error is
+// returned, so a list tool reports "no browser open" instead of stale pages.
+// Listing must not launch a browser — probing an existing one is fine.
 func (m *Manager) Browser() (*Browser, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.browser == nil {
+		m.mu.Unlock()
 		return nil, errors.New("browsers: no browser open; call Manager.Open first")
 	}
-	return m.browser, nil
+	b := m.browser
+	m.mu.Unlock()
+
+	if err := probeBrowser(b); err != nil {
+		m.mu.Lock()
+		if m.browser == b {
+			m.browser = nil
+			m.relaunched = true
+			m.stopSweeperLocked()
+			m.mu.Unlock()
+			closeCtx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+			defer cancel()
+			_ = b.Close(closeCtx) // best-effort; the process is already dead
+		} else {
+			m.mu.Unlock()
+		}
+		return nil, errors.New("browsers: no browser open; call Manager.Open first")
+	}
+	return b, nil
+}
+
+// probeBrowser verifies the given Browser's Chromium process is still alive
+// with a Browser.getVersion round trip. It must NEVER be called while holding
+// m.mu or b.mu — it is a network call, and on a dead websocket it blocks until
+// its (short) timeout, which is exactly how it detects the death. b.rod is
+// captured under b.mu briefly (a field read); the network call itself runs
+// lock-free.
+//
+// The probe is deliberately NOT derived from the caller's ctx: rod cannot
+// distinguish a caller-cancelled ctx from a dead websocket (both surface
+// context.Canceled), so a caller whose ctx expired would wrongly condemn a
+// healthy Browser to teardown+relaunch. Instead the probe always runs on a
+// fixed 2s timeout off context.Background; the caller's own ctx still bounds
+// the rod work that follows (extractions, navigation).
+func probeBrowser(b *Browser) error {
+	b.mu.Lock()
+	rb := b.rod
+	b.mu.Unlock()
+	if rb == nil {
+		return errors.New("browsers: browser not launched")
+	}
+	probeCtx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancel()
+	_, err := proto.BrowserGetVersion{}.Call(rb.Context(probeCtx))
+	return err
 }
 
 // Close closes the manager's Browser and all of its pages, so a fresh Browser

@@ -145,11 +145,7 @@ func (t *Page) Execute(ctx context.Context, args json.RawMessage) (string, error
 	ctx, cancel := context.WithTimeout(ctx, defaultPageTimeout)
 	defer cancel()
 
-	b, err := t.mgr.Open(ctx) // lazily launches (or returns) the single Browser
-	if err != nil {
-		return "", fmt.Errorf("page_fetch: %w", err)
-	}
-	p, err := b.Page(a.SessionID)
+	p, err := t.mgr.Page(ctx, a.SessionID) // opens the Browser if needed; probes for liveness
 	if err != nil {
 		return "", fmt.Errorf("page_fetch: %w", err)
 	}
@@ -193,6 +189,9 @@ func (t *Page) Execute(ctx context.Context, args json.RawMessage) (string, error
 func (t *Page) extractHTML(ctx context.Context, p *browsers.Page, selector string) (string, error) {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
 
 	if selector == "" {
 		html, err := p.Rod.Context(ctx).HTML()
@@ -218,6 +217,9 @@ func (t *Page) extractHTML(ctx context.Context, p *browsers.Page, selector strin
 func (t *Page) extractText(ctx context.Context, p *browsers.Page, selector string) (string, error) {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
 
 	js := `() => document.body ? document.body.innerText : ''`
 	if selector != "" {
@@ -251,6 +253,9 @@ func (t *Page) extractText(ctx context.Context, p *browsers.Page, selector strin
 func (t *Page) extractLinks(ctx context.Context, p *browsers.Page) (string, error) {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
 
 	// Text comes from textContent (rendering-independent: captures anchors in
 	// CSS-hidden dropdown panels that innerText reports as ""), normalized to
@@ -715,6 +720,9 @@ type resourceEntry struct {
 func (t *Page) extractScreenshot(ctx context.Context, p *browsers.Page, fullPage bool) (string, error) {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
 
 	b, err := p.Rod.Context(ctx).Screenshot(fullPage, nil)
 	if err != nil {
@@ -728,6 +736,9 @@ func (t *Page) extractScreenshot(ctx context.Context, p *browsers.Page, fullPage
 func (t *Page) extractMeta(ctx context.Context, p *browsers.Page) (string, error) {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
 
 	info, err := p.Rod.Context(ctx).Info()
 	if err != nil {

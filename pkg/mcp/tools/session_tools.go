@@ -73,6 +73,12 @@ func (t *SessionClose) Execute(ctx context.Context, args json.RawMessage) (strin
 	if err != nil {
 		return "", fmt.Errorf("session_close: %w", err)
 	}
+	// Resolve the session through the manager so a pre-restart session id
+	// surfaces the explicit "browser was restarted" error instead of a bare
+	// "not found" (or a raw CDP error).
+	if _, err := t.mgr.Page(ctx, a.SessionID); err != nil {
+		return "", fmt.Errorf("session_close: %w", err)
+	}
 	if err := b.ClosePage(ctx, a.SessionID); err != nil {
 		return "", fmt.Errorf("session_close: %w", err)
 	}

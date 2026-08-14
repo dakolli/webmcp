@@ -149,11 +149,7 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	b, err := t.mgr.Open(ctx) // lazily launches (or returns) the single Browser
-	if err != nil {
-		return "", fmt.Errorf("page_act: %w", err)
-	}
-	p, err := b.Page(a.SessionID)
+	p, err := t.mgr.Page(ctx, a.SessionID) // opens the Browser if needed; probes for liveness
 	if err != nil {
 		return "", fmt.Errorf("page_act: %w", err)
 	}
@@ -197,11 +193,11 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 // the element, waits until it is interactable, then clicks it with the left
 // button. Returns a short confirmation for the LLM.
 func (t *Act) actClick(ctx context.Context, p *browsers.Page, selector string) (string, error) {
+	p.Lock()
+	defer p.Unlock()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page_act.actClick: page is closed (nil rod handle)")
 	}
-	p.Lock()
-	defer p.Unlock()
 
 	// Bind ctx once so every rod call honors the Execute ctx and a missing
 	// element (sleeper retries) cannot hang the server.
@@ -224,11 +220,11 @@ func (t *Act) actClick(ctx context.Context, p *browsers.Page, selector string) (
 // focuses the element, clears its existing content and types the new value.
 // Returns a short confirmation for the LLM.
 func (t *Act) actInput(ctx context.Context, p *browsers.Page, selector, value string) (string, error) {
+	p.Lock()
+	defer p.Unlock()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page_act.actInput: page is closed (nil rod handle)")
 	}
-	p.Lock()
-	defer p.Unlock()
 
 	page := p.Rod.Context(ctx).Timeout(defaultActTimeout)
 
@@ -262,11 +258,11 @@ func (t *Act) actType(ctx context.Context, p *browsers.Page, selector, value str
 // arrays are pretty-printed JSON. JS exceptions surface as *rod.EvalError and
 // are returned verbatim so the LLM can fix its script.
 func (t *Act) actEval(ctx context.Context, p *browsers.Page, js string) (string, error) {
+	p.Lock()
+	defer p.Unlock()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page_act.actEval: page is closed (nil rod handle)")
 	}
-	p.Lock()
-	defer p.Unlock()
 
 	page := p.Rod.Context(ctx).Timeout(defaultActTimeout)
 
@@ -295,11 +291,11 @@ func (t *Act) actEval(ctx context.Context, p *browsers.Page, js string) (string,
 // to load (rod's Navigate returns after the response header, so WaitLoad is
 // mandatory). Returns the final URL and title for the LLM.
 func (t *Act) actNavigate(ctx context.Context, p *browsers.Page, url string) (string, error) {
+	p.Lock()
+	defer p.Unlock()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page_act.actNavigate: page is closed (nil rod handle)")
 	}
-	p.Lock()
-	defer p.Unlock()
 
 	page := p.Rod.Context(ctx).Timeout(defaultActTimeout)
 	if err := page.Navigate(url); err != nil {
@@ -321,11 +317,11 @@ func (t *Act) actNavigate(ctx context.Context, p *browsers.Page, url string) (st
 // previous page to load (history.back() triggers a fresh navigation). Returns
 // the resulting URL.
 func (t *Act) actBack(ctx context.Context, p *browsers.Page) (string, error) {
+	p.Lock()
+	defer p.Unlock()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page_act.actBack: page is closed (nil rod handle)")
 	}
-	p.Lock()
-	defer p.Unlock()
 
 	page := p.Rod.Context(ctx).Timeout(defaultActTimeout)
 	if err := page.NavigateBack(); err != nil {
@@ -346,11 +342,11 @@ func (t *Act) actBack(ctx context.Context, p *browsers.Page) (string, error) {
 // actForward navigates one step forward in the page's history and waits for
 // the page to load. Returns the resulting URL.
 func (t *Act) actForward(ctx context.Context, p *browsers.Page) (string, error) {
+	p.Lock()
+	defer p.Unlock()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page_act.actForward: page is closed (nil rod handle)")
 	}
-	p.Lock()
-	defer p.Unlock()
 
 	page := p.Rod.Context(ctx).Timeout(defaultActTimeout)
 	if err := page.NavigateForward(); err != nil {
@@ -369,11 +365,11 @@ func (t *Act) actForward(ctx context.Context, p *browsers.Page) (string, error) 
 // actReload reloads the page and waits for it to load again. Returns a short
 // confirmation for the LLM.
 func (t *Act) actReload(ctx context.Context, p *browsers.Page) (string, error) {
+	p.Lock()
+	defer p.Unlock()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page_act.actReload: page is closed (nil rod handle)")
 	}
-	p.Lock()
-	defer p.Unlock()
 
 	page := p.Rod.Context(ctx).Timeout(defaultActTimeout)
 	if err := page.Reload(); err != nil {
@@ -388,11 +384,11 @@ func (t *Act) actReload(ctx context.Context, p *browsers.Page) (string, error) {
 // actHover moves the mouse over the element matched by selector (CSS or
 // XPath), triggering hover-dependent UI. Returns a short confirmation.
 func (t *Act) actHover(ctx context.Context, p *browsers.Page, selector string) (string, error) {
+	p.Lock()
+	defer p.Unlock()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page_act.actHover: page is closed (nil rod handle)")
 	}
-	p.Lock()
-	defer p.Unlock()
 
 	page := p.Rod.Context(ctx).Timeout(defaultActTimeout)
 
@@ -410,11 +406,11 @@ func (t *Act) actHover(ctx context.Context, p *browsers.Page, selector string) (
 // primary path) and returns the resulting scroll position [scrollX, scrollY].
 // Missing x/y are treated as 0.
 func (t *Act) actScroll(ctx context.Context, p *browsers.Page, x, y float64) (string, error) {
+	p.Lock()
+	defer p.Unlock()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page_act.actScroll: page is closed (nil rod handle)")
 	}
-	p.Lock()
-	defer p.Unlock()
 
 	page := p.Rod.Context(ctx).Timeout(defaultActTimeout)
 
@@ -432,11 +428,11 @@ func (t *Act) actScroll(ctx context.Context, p *browsers.Page, x, y float64) (st
 // selector. rod v0.116.2 has no SelectorTypeValue, so the option is matched
 // with a CSS attribute selector [value="..."]. Returns a short confirmation.
 func (t *Act) actSelect(ctx context.Context, p *browsers.Page, selector, value string) (string, error) {
+	p.Lock()
+	defer p.Unlock()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page_act.actSelect: page is closed (nil rod handle)")
 	}
-	p.Lock()
-	defer p.Unlock()
 
 	page := p.Rod.Context(ctx).Timeout(defaultActTimeout)
 
@@ -459,9 +455,16 @@ func (t *Act) actSelect(ctx context.Context, p *browsers.Page, selector, value s
 // settle before the next action. The "ms" sleep touches no rod state, so it
 // does not take the page lock; every rod-backed mode is fully locked.
 func (t *Act) actWait(ctx context.Context, p *browsers.Page, mode, selector string, timeoutMS int) (string, error) {
+	// Synchronized read (under p.mu, like every other nil guard): the eviction
+	// path can nil p.Rod concurrently, so the check must not run lock-free. The
+	// lock is released before the mode switch — rod-backed modes re-lock (and
+	// re-check) themselves below.
+	p.Lock()
 	if p.Rod == nil {
+		p.Unlock()
 		return "", fmt.Errorf("page_act.actWait: page is closed (nil rod handle)")
 	}
+	p.Unlock()
 
 	switch mode {
 	case "", "ms":
@@ -490,6 +493,11 @@ func (t *Act) actWait(ctx context.Context, p *browsers.Page, mode, selector stri
 		}
 		p.Lock()
 		defer p.Unlock()
+		// Re-check under the lock: a concurrent eviction may have nilled p.Rod
+		// since the entry check above released the lock.
+		if p.Rod == nil {
+			return "", fmt.Errorf("page_act.actWait: page is closed (nil rod handle)")
+		}
 		page := p.Rod.Context(ctx).Timeout(defaultActTimeout)
 		el, err := page.Element(selector)
 		if err != nil {
@@ -513,11 +521,11 @@ func (t *Act) actWait(ctx context.Context, p *browsers.Page, mode, selector stri
 // (via a page clone) so cancellation aborts a stuck wait. The page_act-only
 // "interactable" and "ms" modes are handled in actWait, not here.
 func waitForPage(ctx context.Context, p *browsers.Page, mode string) error {
+	p.Lock()
+	defer p.Unlock()
 	if p.Rod == nil {
 		return fmt.Errorf("waitForPage: page is closed (nil rod handle)")
 	}
-	p.Lock()
-	defer p.Unlock()
 
 	pc := p.Rod.Context(ctx)
 	switch mode {

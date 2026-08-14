@@ -134,18 +134,78 @@ func (b *Browser) NewPage(ctx context.Context, url string) (*Page, error) {
 
 // Page returns the live page with the given ID, or an error when no page with
 // that ID is open (e.g. it was closed or swept). Every successful lookup
-// refreshes the page's last-access time (under the same browser mutex the
-// sweeper iterates under), so the manager's TTL sweeper never closes a page
-// that is in use.
-func (b *Browser) Page(id PageID) (*Page, error) {
+// verifies the tab is still alive (a single crashed tab keeps its map entry —
+// the rod handle object survives — while its CDP target is gone) and refreshes
+// the page's last-access time (under the same browser mutex the sweeper
+// iterates under), so the manager's TTL sweeper never closes a page that is in
+// use.
+//
+// The liveness probe is a network call (Target.getTargetInfo via p.Rod.Info),
+// so it runs outside b.mu and only under the per-page mutex, bound to a short
+// timeout: a dead websocket fails the probe instead of blocking. On probe
+// failure the dead entry is evicted race-safely (WEB-39 pattern): the handle
+// is captured and nilled under the locks and closed strictly afterwards, so a
+// concurrent sweepOnce or Page lookup never double-closes or panics.
+func (b *Browser) Page(ctx context.Context, id PageID) (*Page, error) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	p, ok := b.pages[id]
+	if ok {
+		p.touch()
+	}
+	b.mu.Unlock()
 	if !ok {
+		return nil, fmt.Errorf("browsers: page %q not found", id)
+	}
+
+	if err := probePage(p); err != nil {
+		// The tab is dead: evict it (WEB-39 TOCTOU-safe capture pattern).
+		var handle *rod.Page
+		b.mu.Lock()
+		if cur, ok := b.pages[id]; ok && cur == p {
+			p.mu.Lock()
+			handle = p.Rod
+			p.Rod = nil
+			delete(b.pages, id)
+			p.mu.Unlock()
+		}
+		b.mu.Unlock()
+		if handle != nil {
+			// Close the captured handle outside the locks, via closeRodPage
+			// (the sweeper's path): it honors a bound close ctx and converts a
+			// concurrent-close panic into an error — an in-flight tool call on
+			// the same tab (goroutine-per-request MCP callers) can race this
+			// close. Best-effort: the target is already gone.
+			closeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+			defer cancel()
+			_ = closeRodPage(closeCtx, handle)
+		}
 		return nil, fmt.Errorf("browsers: page %q not found", id)
 	}
 	p.touch()
 	return p, nil
+}
+
+// probePage verifies the page's CDP target is still alive with an Info() round
+// trip, the call that surfaces -32602 "No target with given id found" when the
+// tab crashed while its rod handle survived. It is a network call, so it must
+// never run under b.mu (or m.mu) — only under the page's own mutex, consistent
+// with the tools holding p.Lock() during their rod calls — and it is bound to
+// a short timeout so a dead websocket fails the probe instead of blocking.
+//
+// The probe is deliberately NOT derived from the caller's ctx (mirroring
+// probeBrowser): rod cannot distinguish a caller-cancelled ctx from a dead
+// websocket, so a caller whose ctx expired would wrongly evict a healthy tab.
+// The probe always runs on a fixed 2s timeout off context.Background.
+func probePage(p *Page) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.Rod == nil {
+		return fmt.Errorf("browsers: page rod handle is nil")
+	}
+	probeCtx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancel()
+	_, err := p.Rod.Context(probeCtx).Info()
+	return err
 }
 
 // Pages returns a read-only snapshot of the Browser's live pages (id + url),

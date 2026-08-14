@@ -77,6 +77,9 @@ func ValidateWait(waitFor string) error {
 func WaitForPage(ctx context.Context, p *browsers.Page, waitFor string) error {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return fmt.Errorf("page session is closed")
+	}
 
 	pc := p.Rod.Context(ctx) // bound to ctx so cancellation aborts a stuck wait
 	switch waitFor {
@@ -115,6 +118,9 @@ type FetchSummary struct {
 func PageSummary(ctx context.Context, p *browsers.Page, loadStarted time.Time) (FetchSummary, error) {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return FetchSummary{}, fmt.Errorf("page session is closed")
+	}
 
 	info, err := p.Rod.Context(ctx).Info() // title + url
 	if err != nil {
@@ -147,6 +153,9 @@ func PageSummary(ctx context.Context, p *browsers.Page, loadStarted time.Time) (
 func PageHTML(ctx context.Context, p *browsers.Page, selector string) (string, error) {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
 
 	if selector == "" {
 		html, err := p.Rod.Context(ctx).HTML()
@@ -173,6 +182,9 @@ func PageHTML(ctx context.Context, p *browsers.Page, selector string) (string, e
 func PageText(ctx context.Context, p *browsers.Page, selector string) (string, error) {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
 
 	js := `() => document.body ? document.body.innerText : ''`
 	if selector != "" {
@@ -206,6 +218,9 @@ func PageText(ctx context.Context, p *browsers.Page, selector string) (string, e
 func PageLinks(ctx context.Context, p *browsers.Page) (string, error) {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
 
 	// Text comes from textContent (rendering-independent: captures anchors in
 	// CSS-hidden dropdown panels that innerText reports as ""), normalized to
@@ -282,6 +297,9 @@ func navigableHref(href string) bool {
 func PageMeta(ctx context.Context, p *browsers.Page) (string, error) {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
 
 	info, err := p.Rod.Context(ctx).Info()
 	if err != nil {
@@ -321,6 +339,9 @@ func PageMeta(ctx context.Context, p *browsers.Page) (string, error) {
 func PageScreenshot(ctx context.Context, p *browsers.Page, fullPage bool) (string, error) {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
 
 	b, err := p.Rod.Context(ctx).Screenshot(fullPage, nil)
 	if err != nil {
@@ -359,6 +380,9 @@ func PageJS(ctx context.Context, p *browsers.Page, target string) (string, error
 func PageResources(ctx context.Context, p *browsers.Page, target string, kind proto.NetworkResourceType) (string, error) {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
 
 	// Bind the ctx-bounded clone once and reuse it for the tree call and the
 	// GetResource fetch, so the whole extraction honors the caller's context.
@@ -466,6 +490,9 @@ type resourceEntry struct {
 func PageDOM(ctx context.Context, p *browsers.Page) (string, error) {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
 
 	snap, err := p.Rod.Context(ctx).CaptureDOMSnapshot()
 	if err != nil {
@@ -715,6 +742,9 @@ func rareString(strs []string, rd *proto.DOMSnapshotRareStringData, i int) strin
 func PageEval(ctx context.Context, p *browsers.Page, js string) (string, error) {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
 
 	res, err := p.Rod.Context(ctx).Eval(js) // Eval only accepts a JS function definition
 	if err != nil {
@@ -729,6 +759,9 @@ func PageEval(ctx context.Context, p *browsers.Page, js string) (string, error) 
 func PageClick(ctx context.Context, p *browsers.Page, selector string) (string, error) {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
 
 	page := p.Rod.Context(ctx) // bound to ctx so a missing element aborts
 
@@ -751,6 +784,9 @@ func PageClick(ctx context.Context, p *browsers.Page, selector string) (string, 
 func PageInput(ctx context.Context, p *browsers.Page, selector, value string) (string, error) {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
 
 	page := p.Rod.Context(ctx)
 
@@ -770,6 +806,9 @@ func PageInput(ctx context.Context, p *browsers.Page, selector, value string) (s
 func PageHover(ctx context.Context, p *browsers.Page, selector string) (string, error) {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
 
 	page := p.Rod.Context(ctx)
 
@@ -789,6 +828,9 @@ func PageHover(ctx context.Context, p *browsers.Page, selector string) (string, 
 func PageScroll(ctx context.Context, p *browsers.Page, x, y float64) (string, error) {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
 
 	res, err := p.Rod.Context(ctx).Eval(
 		"(x, y) => { window.scrollBy(x, y); return [window.scrollX, window.scrollY]; }",
@@ -807,6 +849,9 @@ func PageScroll(ctx context.Context, p *browsers.Page, x, y float64) (string, er
 func PageSelect(ctx context.Context, p *browsers.Page, selector, value string) (string, error) {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
 
 	page := p.Rod.Context(ctx)
 
@@ -828,6 +873,9 @@ func PageSelect(ctx context.Context, p *browsers.Page, selector, value string) (
 func PageNavigate(ctx context.Context, p *browsers.Page, url string) (string, error) {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
 
 	page := p.Rod.Context(ctx)
 	if err := page.Navigate(url); err != nil {
@@ -851,6 +899,9 @@ func PageNavigate(ctx context.Context, p *browsers.Page, url string) (string, er
 func PageBack(ctx context.Context, p *browsers.Page) (string, error) {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
 
 	page := p.Rod.Context(ctx)
 	if err := page.NavigateBack(); err != nil {
@@ -874,6 +925,9 @@ func PageBack(ctx context.Context, p *browsers.Page) (string, error) {
 func PageForward(ctx context.Context, p *browsers.Page) (string, error) {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
 
 	page := p.Rod.Context(ctx)
 	if err := page.NavigateForward(); err != nil {
@@ -894,6 +948,9 @@ func PageForward(ctx context.Context, p *browsers.Page) (string, error) {
 func PageReload(ctx context.Context, p *browsers.Page) (string, error) {
 	p.Lock()
 	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
 
 	page := p.Rod.Context(ctx)
 	if err := page.Reload(); err != nil {
@@ -914,6 +971,17 @@ func PageReload(ctx context.Context, p *browsers.Page) (string, error) {
 // lock; every rod-backed mode is fully locked (load/idle/stable delegate to
 // WaitForPage, which owns the lock). Mirrors the MCP page_act wait helper.
 func PageWait(ctx context.Context, p *browsers.Page, mode, selector string, timeout time.Duration) (string, error) {
+	// Synchronized read (under p.mu, like every other nil guard): the
+	// eviction path can nil p.Rod concurrently, so the check must not run
+	// lock-free. The lock is released before the mode switch — rod-backed
+	// modes re-lock (and re-check) themselves below.
+	p.Lock()
+	if p.Rod == nil {
+		p.Unlock()
+		return "", fmt.Errorf("page session is closed")
+	}
+	p.Unlock()
+
 	switch mode {
 	case "", "ms":
 		// Backward-compatible default: sleep (ctx-aware) for timeout, so a
@@ -942,6 +1010,11 @@ func PageWait(ctx context.Context, p *browsers.Page, mode, selector string, time
 		}
 		p.Lock()
 		defer p.Unlock()
+		// Re-check under the lock: a concurrent eviction may have nilled p.Rod
+		// since the entry check above released the lock.
+		if p.Rod == nil {
+			return "", fmt.Errorf("page session is closed")
+		}
 		page := p.Rod.Context(ctx)
 		el, err := page.Element(selector)
 		if err != nil {

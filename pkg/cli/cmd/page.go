@@ -144,11 +144,7 @@ shapes. Screenshots print a data:image/png;base64,... data-URI.`,
 			}
 			printServeHint(cmd)
 
-			b, err := mgr.Open(ctx) // lazily launches (or returns) the single Browser
-			if err != nil {
-				return fmt.Errorf("page fetch: %w", err)
-			}
-			p, err := b.Page(browsers.PageID(id))
+			p, err := mgr.Page(ctx, browsers.PageID(id)) // opens the Browser if needed; probes for liveness
 			if err != nil {
 				return fmt.Errorf("page fetch: %w", err)
 			}
@@ -275,11 +271,7 @@ the JSON result.`,
 			}
 			printServeHint(cmd)
 
-			b, err := mgr.Open(ctx) // lazily launches (or returns) the single Browser
-			if err != nil {
-				return fmt.Errorf("page act: %w", err)
-			}
-			p, err := b.Page(browsers.PageID(id))
+			p, err := mgr.Page(ctx, browsers.PageID(id)) // opens the Browser if needed; probes for liveness
 			if err != nil {
 				return fmt.Errorf("page act: %w", err)
 			}
@@ -329,8 +321,9 @@ the JSON result.`,
 	return cmd
 }
 
-// newPageCloseCmd builds `page close`: it closes the page with the given id via
-// Manager.Open -> Browser.ClosePage (mirroring SessionClose).
+// newPageCloseCmd builds `page close`: it resolves the page with the given id
+// via Manager.Page (surfacing restart-aware errors for pre-restart sessions),
+// then closes it via Manager.Open -> Browser.ClosePage (mirroring SessionClose).
 func newPageCloseCmd(mgr *browsers.Manager) *cobra.Command {
 	var id string
 	cmd := &cobra.Command{
@@ -350,6 +343,12 @@ session id becomes invalid afterwards.`,
 
 			b, err := mgr.Open(ctx) // lazily launches (or returns) the single Browser
 			if err != nil {
+				return fmt.Errorf("page close: %w", err)
+			}
+			// Resolve through the manager first so a pre-restart session id
+			// surfaces the explicit "browser was restarted" error (mirrors the
+			// MCP session_close tool).
+			if _, err := mgr.Page(ctx, browsers.PageID(id)); err != nil {
 				return fmt.Errorf("page close: %w", err)
 			}
 			if err := b.ClosePage(ctx, browsers.PageID(id)); err != nil {

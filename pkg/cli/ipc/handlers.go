@@ -24,6 +24,9 @@ type manager interface {
 	Close(ctx context.Context) error
 	// Browser returns the live Browser, or an error when none is open yet.
 	Browser() (*browsers.Browser, error)
+	// Page resolves the live page with the given ID, opening the Browser if
+	// needed; it surfaces restart-aware errors for pre-restart session ids.
+	Page(ctx context.Context, id browsers.PageID) (*browsers.Page, error)
 }
 
 // compile-time proof that the concrete Manager satisfies the handler seam.
@@ -194,11 +197,7 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 		}
 	}
 
-	b, err := s.mgr.Open(ctx)
-	if err != nil {
-		return nil, serverError(err)
-	}
-	page, err := b.Page(browsers.PageID(p.SessionID))
+	page, err := s.mgr.Page(ctx, browsers.PageID(p.SessionID)) // opens the Browser if needed; probes for liveness
 	if err != nil {
 		return nil, serverError(err)
 	}
@@ -287,11 +286,7 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		}
 	}
 
-	b, err := s.mgr.Open(ctx)
-	if err != nil {
-		return nil, serverError(err)
-	}
-	page, err := b.Page(browsers.PageID(p.SessionID))
+	page, err := s.mgr.Page(ctx, browsers.PageID(p.SessionID)) // opens the Browser if needed; probes for liveness
 	if err != nil {
 		return nil, serverError(err)
 	}
@@ -327,9 +322,10 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 	return PageActResult{Data: out}, nil
 }
 
-// handlePageClose implements page.close: it closes the page with the given id
-// via Manager.Open -> Browser.ClosePage. The session id becomes invalid
-// afterwards.
+// handlePageClose implements page.close: it resolves the page with the given id
+// via Manager.Page (surfacing restart-aware errors for pre-restart sessions),
+// then closes it via Manager.Open -> Browser.ClosePage. The session id becomes
+// invalid afterwards.
 func (s *Server) handlePageClose(ctx context.Context, params json.RawMessage) (any, *Error) {
 	p, rpcErr := decodeParams[PageCloseParams](params)
 	if rpcErr != nil {
@@ -341,6 +337,12 @@ func (s *Server) handlePageClose(ctx context.Context, params json.RawMessage) (a
 
 	b, err := s.mgr.Open(ctx)
 	if err != nil {
+		return nil, serverError(err)
+	}
+	// Resolve through the manager first so a pre-restart session id surfaces
+	// the explicit "browser was restarted" error (mirrors the MCP
+	// session_close tool).
+	if _, err := s.mgr.Page(ctx, browsers.PageID(p.SessionID)); err != nil {
 		return nil, serverError(err)
 	}
 	if err := b.ClosePage(ctx, browsers.PageID(p.SessionID)); err != nil {
