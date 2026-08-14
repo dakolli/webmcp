@@ -2,11 +2,16 @@ package tools
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"html"
 	"strings"
+	"time"
 	"unicode/utf8"
+
+	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/proto"
 
 	"webmcp/pkg/browsers"
 	"webmcp/pkg/mcp/models"
@@ -17,16 +22,22 @@ import (
 // with a narrower selector or a higher max_bytes.
 const defaultMaxBytes = 50_000
 
+// defaultPageTimeout bounds the whole page_fetch call when the caller does not
+// provide one: a hung page (or a wedged CDP connection) must not block the
+// server. Every extraction inherits this bound via p.Rod.Context(ctx).
+const defaultPageTimeout = 30 * time.Second
+
 // Page implements the "page_fetch" tool: it reads any aspect of a LIVE page
 // that was previously opened with fetch_page. The session_id from fetch_page
 // identifies which browser tab to read; what selects the aspect:
 //
 //	html | dom | text | css | js | links | screenshot | meta
 //
-// The "dom" output is the flattened Documents array + Strings table produced by
-// CaptureDOMSnapshot and is meant to be an LLM-friendly total view of the page
-// (iframes, shadow DOM and all). "css"/"js" enumerate the page's resource tree
-// and fetch the matching resources. "screenshot" returns a base64 PNG.
+// The "dom" output is the page's DOM re-nested from the flattened Documents
+// array + Strings table produced by CaptureDOMSnapshot into a compact,
+// LLM-friendly tree (iframes, shadow DOM and all). "css"/"js" enumerate the
+// page's resource tree and fetch the matching resources. "screenshot" returns
+// a base64 PNG data-URI.
 type Page struct {
 	// mgr is the shared browsers.Manager owning the single Browser and its
 	// live pages (sessions).
@@ -47,13 +58,16 @@ func (t *Page) Name() string {
 func (t *Page) Description() string {
 	return "Reads an aspect of a live page that was opened with fetch_page: " +
 		"html, dom (full flattened DOM snapshot, LLM-friendly), text, css, js, " +
-		"links, screenshot (base64 PNG), or meta. Pass the session_id returned " +
-		"by fetch_page plus what=<aspect>; use selector to scope extraction and " +
+		"links, screenshot (base64 PNG data-URI), or meta. Pass the session_id " +
+		"returned by fetch_page plus what=<aspect>; use selector to scope " +
+		"extraction, target to fetch exactly one css/js resource's full content " +
+		"(instead of the resource list), full_page to capture the whole " +
+		"scrollable page in a screenshot (default: visible viewport), and " +
 		"max_bytes to cap the response size."
 }
 
 // InputSchema returns the JSON Schema for page_fetch's arguments: a required
-// session_id and what, plus optional selector and max_bytes.
+// session_id and what, plus optional selector, target, max_bytes and full_page.
 func (t *Page) InputSchema() models.InputSchema {
 	return models.InputSchema{
 		Type: "object",
@@ -65,7 +79,7 @@ func (t *Page) InputSchema() models.InputSchema {
 			"what": map[string]any{
 				"type":        "string",
 				"enum":        []string{"html", "dom", "text", "css", "js", "links", "screenshot", "meta"},
-				"description": "The aspect of the page to extract: html (outerHTML), dom (flattened DOM snapshot), text (visible text), css (style resources), js (script resources), links (anchor hrefs), screenshot (base64 PNG), meta (title/url/description).",
+				"description": "The aspect of the page to extract: html (outerHTML), dom (flattened DOM snapshot), text (visible text), css (style resources), js (script resources), links (anchor hrefs), screenshot (base64 PNG data-URI; full_page captures the whole scrollable page), meta (title/url/description).",
 			},
 			"selector": map[string]any{
 				"type":        "string",
@@ -75,6 +89,15 @@ func (t *Page) InputSchema() models.InputSchema {
 				"type":        "integer",
 				"default":     defaultMaxBytes,
 				"description": "Maximum response size in bytes (default 50000).",
+			},
+			"full_page": map[string]any{
+				"type":        "boolean",
+				"default":     false,
+				"description": "Capture the entire scrollable page instead of the visible viewport.",
+			},
+			"target": map[string]any{
+				"type":        "string",
+				"description": "Resource URL to fetch exactly one css/js resource (instead of listing). Use with what=css|js.",
 			},
 		},
 		Required: []string{"session_id", "what"},
@@ -91,6 +114,12 @@ type pageFetchArgs struct {
 	Selector string `json:"selector"`
 	// MaxBytes caps the response size (default defaultMaxBytes).
 	MaxBytes int `json:"max_bytes"`
+	// FullPage captures the entire scrollable page instead of the visible
+	// viewport (screenshot only; zero value = viewport-only capture).
+	FullPage bool `json:"full_page"`
+	// Target is a resource URL that, when set, makes what=css|js fetch exactly
+	// that one resource's content instead of listing the page's resources.
+	Target string `json:"target"`
 }
 
 // Execute parses the page_fetch arguments, resolves the session and dispatches
@@ -110,6 +139,12 @@ func (t *Page) Execute(ctx context.Context, args json.RawMessage) (string, error
 		a.MaxBytes = defaultMaxBytes
 	}
 
+	// Enforce an explicit per-call timeout so a hung page (or a wedged CDP
+	// connection) cannot block the server. The bounded ctx flows into every
+	// p.Rod.Context(ctx) call below, so cancellation aborts the extraction.
+	ctx, cancel := context.WithTimeout(ctx, defaultPageTimeout)
+	defer cancel()
+
 	b, err := t.mgr.Open(ctx) // lazily launches (or returns) the single Browser
 	if err != nil {
 		return "", fmt.Errorf("page_fetch: %w", err)
@@ -128,13 +163,13 @@ func (t *Page) Execute(ctx context.Context, args json.RawMessage) (string, error
 	case "text":
 		out, err = t.extractText(ctx, p, a.Selector)
 	case "css":
-		out, err = t.extractCSS(ctx, p)
+		out, err = t.extractCSS(ctx, p, a.Target)
 	case "js":
-		out, err = t.extractJS(ctx, p)
+		out, err = t.extractJS(ctx, p, a.Target)
 	case "links":
 		out, err = t.extractLinks(ctx, p)
 	case "screenshot":
-		out, err = t.extractScreenshot(ctx, p)
+		out, err = t.extractScreenshot(ctx, p, a.FullPage)
 	case "meta":
 		out, err = t.extractMeta(ctx, p)
 	default:
@@ -142,6 +177,13 @@ func (t *Page) Execute(ctx context.Context, args json.RawMessage) (string, error
 	}
 	if err != nil {
 		return "", fmt.Errorf("page_fetch: %w", err)
+	}
+	// Screenshots bypass truncate: the data-URI is binary-as-text and cutting
+	// it mid-stream would produce an undecodable image. Image size scales with
+	// the viewport (or full-page height), not max_bytes — the 50KB truncation
+	// convention applies to text extractions only.
+	if a.What == "screenshot" {
+		return out, nil
 	}
 	return t.truncate(out, a.MaxBytes), nil
 }
@@ -279,54 +321,406 @@ func navigableHref(href string) bool {
 	return true
 }
 
-// extractDOMSnapshot returns the page's full DOM as a flattened Documents array
-// plus the shared Strings table (via p.Rod.CaptureDOMSnapshot()). This is the
-// LLM-friendly total view of the page — it pierces iframes and shadow DOM.
+// extractDOMSnapshot returns the page's DOM as a compact, LLM-friendly JSON
+// tree. CaptureDOMSnapshot yields a flattened Documents array (index 0 = root
+// document, later indexes = iframe/imported documents) plus a shared Strings
+// table; this helper re-nests each document's parallel-array node tables by
+// ParentIndex and resolves every string index through the table, so the agent
+// reads a real tree (iframes, template contents and flattened shadow DOM
+// included) instead of raw CDP arrays. Backed by p.Rod.CaptureDOMSnapshot().
 func (t *Page) extractDOMSnapshot(ctx context.Context, p *browsers.Page) (string, error) {
-	// TODO(web-mcp): implement — see go-rod-primer.md
-	//
-	// Intended flow (Phase 2):
-	//   p.Lock(); defer p.Unlock()
-	//   snap, err := p.Rod.CaptureDOMSnapshot()
-	//   // snap.Documents[0] is the root; strings live in the shared Strings table.
-	//   // Flatten both into a single JSON document for the LLM.
-	return "", fmt.Errorf("page_fetch.extractDOMSnapshot: not implemented")
+	p.Lock()
+	defer p.Unlock()
+
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
+	snap, err := p.Rod.Context(ctx).CaptureDOMSnapshot()
+	if err != nil {
+		return "", fmt.Errorf("capture DOM snapshot: %w", err)
+	}
+
+	docs := buildDOMDocuments(snap)
+	b, err := json.Marshal(docs)
+	if err != nil {
+		return "", fmt.Errorf("encode DOM snapshot: %w", err)
+	}
+	return string(b), nil
 }
 
-// extractCSS returns the URLs and contents of the page's stylesheet resources.
-// Backed by proto.PageGetResourceTree enumeration + p.Rod.GetResource(url).
-func (t *Page) extractCSS(ctx context.Context, p *browsers.Page) (string, error) {
-	// TODO(web-mcp): implement — see go-rod-primer.md
-	//
-	// Intended flow (Phase 2):
-	//   p.Lock(); defer p.Unlock()
-	//   tree, err := p.Rod.Call(proto.PageGetResourceTree{})
-	//   walk resources filtering type == Stylesheet, then GetResource each URL.
-	return "", fmt.Errorf("page_fetch.extractCSS: not implemented")
+// domDocument is the JSON shape of one document in the DOM snapshot output:
+// its context (title, url, frame id) plus the re-nested element tree.
+type domDocument struct {
+	// Title is the document's title.
+	Title string `json:"title"`
+	// URL is the document's URL.
+	URL string `json:"url"`
+	// FrameID is the CDP frame id this document belongs to.
+	FrameID string `json:"frame_id,omitempty"`
+	// Root is the nested tree root (#document).
+	Root *domNode `json:"root"`
 }
 
-// extractJS returns the URLs and contents of the page's script resources.
-// Backed by proto.PageGetResourceTree enumeration + p.Rod.GetResource(url).
-func (t *Page) extractJS(ctx context.Context, p *browsers.Page) (string, error) {
-	// TODO(web-mcp): implement — see go-rod-primer.md
-	//
-	// Intended flow (Phase 2):
-	//   p.Lock(); defer p.Unlock()
-	//   tree, err := p.Rod.Call(proto.PageGetResourceTree{})
-	//   walk resources filtering type == Script, then GetResource each URL.
-	return "", fmt.Errorf("page_fetch.extractJS: not implemented")
+// domNode is one node in the re-nested DOM tree.
+type domNode struct {
+	// Tag is the lowercased element name ("div"), or a pseudo-name for
+	// non-elements ("#document", "#text", "#comment").
+	Tag string `json:"tag"`
+	// ID is the element's id attribute, hoisted out of Attrs.
+	ID string `json:"id,omitempty"`
+	// Class is the element's class attribute, whitespace-normalized, hoisted
+	// out of Attrs.
+	Class string `json:"class,omitempty"`
+	// Attrs holds the element's remaining attributes.
+	Attrs map[string]string `json:"attrs,omitempty"`
+	// Text is the node's text: the nodeValue for text nodes, the textarea/
+	// input value or the layout text for elements.
+	Text string `json:"text,omitempty"`
+	// Visible is true when the node has a layout box (absolute bounds), i.e.
+	// it is rendered rather than display:none or detached. Absent when false.
+	Visible bool `json:"visible,omitempty"`
+	// Bounds is the node's absolute position bounding box as reported by CDP
+	// (an array of floats), when the node has one.
+	Bounds []float64 `json:"bounds,omitempty"`
+	// FrameURL is set on frame-owner elements (iframe/frame/object) that CDP
+	// reports as containing another document; the child document itself is
+	// also emitted as its own entry in the Documents array.
+	FrameURL string `json:"frame_url,omitempty"`
+	// Children are the node's element/text/comment children in document order.
+	Children []*domNode `json:"children,omitempty"`
 }
 
-// extractScreenshot returns a base64-encoded PNG screenshot of the visible
-// viewport. Backed by p.Rod.Screenshot(false, nil).
-func (t *Page) extractScreenshot(ctx context.Context, p *browsers.Page) (string, error) {
-	// TODO(web-mcp): implement — see go-rod-primer.md
-	//
-	// Intended flow (Phase 2):
-	//   p.Lock(); defer p.Unlock()
-	//   b, err := p.Rod.Screenshot(false, nil)
-	//   return base64.StdEncoding.EncodeToString(b)  // data URL for the LLM
-	return "", fmt.Errorf("page_fetch.extractScreenshot: not implemented")
+// buildDOMDocuments converts every document in the snapshot into a nested tree
+// and attaches iframe child documents to their frame-owner nodes. Each
+// document is emitted with its title/url/frame id context so no document is
+// lost, and frame owners carry the child document's URL inline.
+func buildDOMDocuments(snap *proto.DOMSnapshotCaptureSnapshotResult) []domDocument {
+	docs := make([]domDocument, len(snap.Documents))
+	nodesByDoc := make([]map[int]*domNode, len(snap.Documents))
+	for i, d := range snap.Documents {
+		root, byIndex := buildDOMTree(snap.Strings, d)
+		nodesByDoc[i] = byIndex
+		docs[i] = domDocument{
+			Title:   str(snap.Strings, d.Title),
+			URL:     str(snap.Strings, d.DocumentURL),
+			FrameID: str(snap.Strings, d.FrameID),
+			Root:    root,
+		}
+	}
+
+	// Second pass: a node whose ContentDocumentIndex rare data points at
+	// another document is a frame owner — annotate it with the child
+	// document's URL so the reader can jump from the iframe to its content.
+	for i, d := range snap.Documents {
+		byIndex := nodesByDoc[i]
+		if byIndex == nil || d.Nodes == nil || d.Nodes.ContentDocumentIndex == nil {
+			continue
+		}
+		for k, nodeIdx := range d.Nodes.ContentDocumentIndex.Index {
+			childIdx := d.Nodes.ContentDocumentIndex.Value[k]
+			if childIdx < 0 || childIdx >= len(docs) || childIdx == i {
+				continue
+			}
+			if node := byIndex[nodeIdx]; node != nil {
+				node.FrameURL = docs[childIdx].URL
+			}
+		}
+	}
+	return docs
+}
+
+// buildDOMTree re-nests one document's flat parallel-array node table into a
+// tree rooted at the node with parent -1, and returns the root plus a flat
+// node-index → *domNode map (used to attach iframe documents afterwards).
+// Whitespace-only text nodes and the inline bodies of <script>/<style>
+// elements are elided to keep the output compact (script/style sources are
+// available via what=js/css instead).
+func buildDOMTree(strs []string, doc *proto.DOMSnapshotDocumentSnapshot) (*domNode, map[int]*domNode) {
+	n := doc.Nodes
+	if n == nil || len(n.ParentIndex) == 0 {
+		return nil, nil
+	}
+
+	layout := layoutIndex(doc.Layout)
+	byIndex := make(map[int]*domNode, len(n.ParentIndex))
+
+	// Pass 1: populate every node from its parallel-array rows.
+	for i := range n.ParentIndex {
+		nd := &domNode{Tag: nodeTag(strs, n, i)}
+		if i < len(n.NodeType) {
+			switch n.NodeType[i] {
+			case 1: // element: hoist id/class, keep other attributes
+				nd.ID, nd.Class, nd.Attrs = nodeAttrs(strs, n.Attributes, i)
+				nd.Text = rareString(strs, n.TextValue, i)
+				if nd.Text == "" {
+					nd.Text = rareString(strs, n.InputValue, i)
+				}
+			case 3: // text: the nodeValue is the text itself
+				nd.Text = str(strs, n.NodeValue[i])
+			}
+		}
+		if li, ok := layout[i]; ok {
+			if li < len(doc.Layout.Bounds) && len(doc.Layout.Bounds[li]) > 0 {
+				nd.Visible = true
+				nd.Bounds = doc.Layout.Bounds[li]
+			}
+			if nd.Text == "" && li < len(doc.Layout.Text) {
+				nd.Text = str(strs, doc.Layout.Text[li])
+			}
+		}
+		byIndex[i] = nd
+	}
+
+	// Pass 2: attach children by ParentIndex, in document order.
+	var root *domNode
+	for i := range n.ParentIndex {
+		nd := byIndex[i]
+		parent := n.ParentIndex[i]
+		if parent < 0 || parent >= len(n.ParentIndex) || parent == i {
+			root = nd
+			continue
+		}
+		// Elide whitespace-only text nodes (pretty-printed markup noise) and
+		// the bodies of script/style elements (sources via what=js/css).
+		if i < len(n.NodeType) && n.NodeType[i] == 3 && strings.TrimSpace(nd.Text) == "" {
+			continue
+		}
+		pn := byIndex[parent]
+		if pn == nil {
+			root = nd
+			continue
+		}
+		if pn.Tag == "script" || pn.Tag == "style" {
+			continue
+		}
+		pn.Children = append(pn.Children, nd)
+	}
+	return root, byIndex
+}
+
+// layoutIndex maps node-tree index → layout-tree entry for O(1) lookups.
+func layoutIndex(layout *proto.DOMSnapshotLayoutTreeSnapshot) map[int]int {
+	if layout == nil {
+		return nil
+	}
+	m := make(map[int]int, len(layout.NodeIndex))
+	for i, node := range layout.NodeIndex {
+		m[node] = i
+	}
+	return m
+}
+
+// nodeTag resolves a node's tag name: the nodeName lowercased for elements
+// ("DIV" → "div"), or the raw pseudo-name for non-elements ("#document",
+// "#text", "#comment").
+func nodeTag(strs []string, n *proto.DOMSnapshotNodeTreeSnapshot, i int) string {
+	if i >= len(n.NodeName) {
+		return ""
+	}
+	name := str(strs, n.NodeName[i])
+	if name == "" || strings.HasPrefix(name, "#") {
+		return name
+	}
+	return strings.ToLower(name)
+}
+
+// nodeAttrs parses the flattened name,value attribute pairs of element node i,
+// hoisting id and class out and returning the remaining attributes. Unnamed or
+// unvalued trailing pairs are ignored.
+func nodeAttrs(strs []string, attrs []proto.DOMSnapshotArrayOfStrings, i int) (id, class string, rest map[string]string) {
+	if i >= len(attrs) {
+		return "", "", nil
+	}
+	pairs := attrs[i]
+	for k := 0; k+1 < len(pairs); k += 2 {
+		name := str(strs, pairs[k])
+		value := str(strs, pairs[k+1])
+		switch name {
+		case "id":
+			id = value
+		case "class":
+			class = strings.Join(strings.Fields(value), " ")
+		case "":
+			// unnamed attribute pair — skip
+		default:
+			if rest == nil {
+				rest = make(map[string]string, 4)
+			}
+			rest[name] = value
+		}
+	}
+	return id, class, rest
+}
+
+// str resolves a string-table index, returning "" for negative or
+// out-of-range indexes (a node may simply have no value).
+func str(strs []string, idx proto.DOMSnapshotStringIndex) string {
+	if idx < 0 || int(idx) >= len(strs) {
+		return ""
+	}
+	return strs[idx]
+}
+
+// rareString returns the string-table value of the rare-data entry for node
+// index i, or "" when the table has no entry for it. Rare data is small, so a
+// linear scan is fine.
+func rareString(strs []string, rd *proto.DOMSnapshotRareStringData, i int) string {
+	if rd == nil {
+		return ""
+	}
+	for k, node := range rd.Index {
+		if node == i {
+			return str(strs, rd.Value[k])
+		}
+	}
+	return ""
+}
+
+// extractCSS returns the page's stylesheet resources: a JSON list of
+// {url, type, size} entries, or — when target is non-empty — the full content
+// of exactly that one stylesheet. Backed by proto.PageGetResourceTree
+// enumeration + p.Rod.GetResource(url).
+func (t *Page) extractCSS(ctx context.Context, p *browsers.Page, target string) (string, error) {
+	return t.extractResources(ctx, p, target, proto.NetworkResourceTypeStylesheet)
+}
+
+// extractJS returns the page's script resources: a JSON list of
+// {url, type, size} entries, or — when target is non-empty — the full content
+// of exactly that one script. Backed by proto.PageGetResourceTree enumeration
+// + p.Rod.GetResource(url).
+func (t *Page) extractJS(ctx context.Context, p *browsers.Page, target string) (string, error) {
+	return t.extractResources(ctx, p, target, proto.NetworkResourceTypeScript)
+}
+
+// extractResources is the shared backend of extractCSS and extractJS. It
+// enumerates the page's resources of the given kind by walking the CDP
+// resource tree recursively (iframes/subframes included) and returns either:
+//
+//   - with target set: the content of exactly that resource, fetched via
+//     p.Rod.GetResource(url) and prefixed with a small // url= / // bytes=
+//     header, or an LLM-actionable error when the resource is unknown; or
+//   - without target: the JSON list of matching resources, capped downstream
+//     by truncate (re-request with what=css&target=URL for full content).
+//
+// The per-page mutex is held for the whole extraction because rod pages are
+// not thread-safe.
+func (t *Page) extractResources(ctx context.Context, p *browsers.Page, target string, kind proto.NetworkResourceType) (string, error) {
+	p.Lock()
+	defer p.Unlock()
+
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
+	// Bind the ctx-bounded clone once and reuse it for the tree call and the
+	// GetResource fetch, so the whole extraction honors the Execute context.
+	page := p.Rod.Context(ctx)
+
+	res, err := proto.PageGetResourceTree{}.Call(page)
+	if err != nil {
+		return "", fmt.Errorf("enumerate resource tree: %w", err)
+	}
+
+	var resources []*proto.PageFrameResource
+	collectResources(res.FrameTree, kind, &resources)
+
+	if target != "" {
+		return t.fetchResource(page, resources, target)
+	}
+
+	list := make([]resourceEntry, 0, len(resources))
+	for _, r := range resources {
+		list = append(list, resourceEntry{URL: r.URL, Type: string(r.Type), Size: r.ContentSize})
+	}
+	b, err := json.Marshal(list)
+	if err != nil {
+		return "", fmt.Errorf("encode resource list: %w", err)
+	}
+	// The list is capped by truncate in Execute; the hint tells the agent how
+	// to fetch a single resource's full content (AGENTS.md dehydration
+	// convention: "first 50KB; use what=css&target=URL to fetch more").
+	return string(b) + "\n// hint: to fetch one resource's full content, re-request with what=" +
+		strings.ToLower(string(kind)) + "&target=<url>", nil
+}
+
+// collectResources walks the resource tree depth-first, appending every
+// resource of the given kind that actually loaded (Failed and Canceled both
+// false) to out. ChildFrames are visited recursively so iframe/subframe
+// resources are included.
+func collectResources(tree *proto.PageFrameResourceTree, kind proto.NetworkResourceType, out *[]*proto.PageFrameResource) {
+	if tree == nil {
+		return
+	}
+	for _, r := range tree.Resources {
+		if r.Type == kind && !r.Failed && !r.Canceled {
+			*out = append(*out, r)
+		}
+	}
+	for _, child := range tree.ChildFrames {
+		collectResources(child, kind, out)
+	}
+}
+
+// fetchResource returns the content of the resource whose URL equals target,
+// preferring a match from the enumerated (already-loaded) resources but
+// falling back to a direct GetResource attempt so an unknown-but-fetchable URL
+// still resolves. The content is prefixed with a small // url= / // bytes=
+// header and capped downstream by truncate.
+func (t *Page) fetchResource(page *rod.Page, resources []*proto.PageFrameResource, target string) (string, error) {
+	for _, r := range resources {
+		if r.URL == target {
+			b, err := page.GetResource(r.URL)
+			if err != nil {
+				return "", fmt.Errorf("fetch resource %q: %w", target, err)
+			}
+			return formatResource(target, len(b), b), nil
+		}
+	}
+	b, err := page.GetResource(target)
+	if err != nil {
+		return "", fmt.Errorf("resource %q not found in the page's resource tree: %w", target, err)
+	}
+	return formatResource(target, len(b), b), nil
+}
+
+// formatResource prefixes fetched resource bytes with a header identifying the
+// URL and byte size, so the LLM knows which resource the content belongs to.
+func formatResource(url string, size int, b []byte) string {
+	var buf strings.Builder
+	fmt.Fprintf(&buf, "// url=%s\n// bytes=%d\n", url, size)
+	buf.Write(b)
+	return buf.String()
+}
+
+// resourceEntry is one css/js resource in the enumeration list returned by
+// extractResources.
+type resourceEntry struct {
+	// URL is the absolute resource URL.
+	URL string `json:"url"`
+	// Type is the resource type as reported by the browser ("Stylesheet" or
+	// "Script").
+	Type string `json:"type"`
+	// Size is the content size in bytes reported by the browser, or null when
+	// the browser did not report one. Resources are never fetched just to size
+	// them.
+	Size *float64 `json:"size"`
+}
+
+// extractScreenshot returns a PNG screenshot of the page as a base64 data-URI
+// ("data:image/png;base64,…") that MCP clients can render directly. When
+// fullPage is true the entire scrollable page is captured; otherwise only the
+// visible viewport. Backed by p.Rod.Screenshot(fullPage, nil) — a nil request
+// yields CDP defaults (PNG). The output deliberately bypasses truncate in
+// Execute: image size scales with the viewport, not max_bytes, and cutting a
+// data-URI mid-stream would corrupt it.
+func (t *Page) extractScreenshot(ctx context.Context, p *browsers.Page, fullPage bool) (string, error) {
+	p.Lock()
+	defer p.Unlock()
+
+	b, err := p.Rod.Context(ctx).Screenshot(fullPage, nil)
+	if err != nil {
+		return "", fmt.Errorf("capture screenshot (full_page=%t): %w", fullPage, err)
+	}
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(b), nil
 }
 
 // extractMeta returns the page's meta info (title, url, meta tags) as a JSON
