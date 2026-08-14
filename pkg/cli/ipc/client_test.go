@@ -242,6 +242,94 @@ func TestStubHappyPaths(t *testing.T) {
 	}
 }
 
+// TestStubBrowserFocusWirePins pins the browser.focus wire contract through
+// the stub manager (no Chromium reachable): the engine's exact not-launched
+// error on the default unlaunched stub, the no-lazy-launch -32000 when the
+// manager's Browser() fails, a -32602 for a bogus state, and the empty-state →
+// normal default (the params decode path reaches the engine instead of being
+// rejected as an unknown state).
+func TestStubBrowserFocusWirePins(t *testing.T) {
+	t.Run("not-launched engine error on default stub", func(t *testing.T) {
+		path := startServer(t, newStubServer())
+		c, err := Dial(path)
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		err = c.Call(context.Background(), MethodBrowserFocus, BrowserFocusParams{State: "normal"}, nil)
+		var se *ServerError
+		if !errors.As(err, &se) {
+			t.Fatalf("Call error = %v (%T), want a wrapped *ServerError", err, err)
+		}
+		if se.Code != CodeServerError {
+			t.Errorf("code = %d, want %d (-32000)", se.Code, CodeServerError)
+		}
+		if want := "browsers: focus: browser not launched"; se.Message != want {
+			t.Errorf("message = %q, want %q", se.Message, want)
+		}
+	})
+
+	t.Run("no-lazy-launch path with browserErr set", func(t *testing.T) {
+		s := newServer(&stubbedManager{browserErr: errors.New("no browser open")})
+		path := startServer(t, s)
+		c, err := Dial(path)
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		err = c.Call(context.Background(), MethodBrowserFocus, nil, nil)
+		var se *ServerError
+		if !errors.As(err, &se) {
+			t.Fatalf("Call error = %v (%T), want a wrapped *ServerError", err, err)
+		}
+		if se.Code != CodeServerError {
+			t.Errorf("code = %d, want %d (-32000)", se.Code, CodeServerError)
+		}
+		if want := "browser.focus: no browser open; call browser.open first"; se.Message != want {
+			t.Errorf("message = %q, want %q", se.Message, want)
+		}
+	})
+
+	t.Run("bogus state is invalid params", func(t *testing.T) {
+		path := startServer(t, newStubServer())
+		c, err := Dial(path)
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		err = c.Call(context.Background(), MethodBrowserFocus, BrowserFocusParams{State: "bogus"}, nil)
+		var se *ServerError
+		if !errors.As(err, &se) {
+			t.Fatalf("Call error = %v (%T), want a wrapped *ServerError", err, err)
+		}
+		if se.Code != CodeInvalidParams {
+			t.Errorf("code = %d, want %d (-32602)", se.Code, CodeInvalidParams)
+		}
+		if want := `browser.focus: unknown state="bogus" (must be one of normal, maximized, fullscreen)`; se.Message != want {
+			t.Errorf("message = %q, want %q", se.Message, want)
+		}
+	})
+
+	t.Run("state omitted defaults to normal", func(t *testing.T) {
+		path := startServer(t, newStubServer())
+		c, err := Dial(path)
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		// No state param: the handler maps empty → normal and reaches the
+		// engine (which fails on the unlaunched stub) instead of rejecting the
+		// params as an unknown state.
+		err = c.Call(context.Background(), MethodBrowserFocus, nil, nil)
+		var se *ServerError
+		if !errors.As(err, &se) {
+			t.Fatalf("Call error = %v (%T), want a wrapped *ServerError", err, err)
+		}
+		if se.Code != CodeServerError {
+			t.Errorf("code = %d, want %d (-32000)", se.Code, CodeServerError)
+		}
+		if want := "browsers: focus: browser not launched"; se.Message != want {
+			t.Errorf("message = %q, want %q", se.Message, want)
+		}
+	})
+}
+
 // TestStubEngineErrorSurfacing pins that engine errors from the stub (which
 // has no live pages) surface as -32000 with the engine's own message — the
 // same path a real engine error takes, without launching Chromium.

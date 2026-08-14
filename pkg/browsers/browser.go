@@ -208,6 +208,121 @@ func probePage(p *Page) error {
 	return err
 }
 
+// WindowState is the desired OS window state for Browser.Focus. The engine
+// owns the vocabulary and maps it to proto.BrowserWindowState internally, so
+// the IPC/CLI layers never import rod.
+type WindowState string
+
+const (
+	// WindowStateNormal restores a minimized window and re-asserts its bounds
+	// as the standard best-effort raise. This is the default.
+	WindowStateNormal WindowState = "normal"
+	// WindowStateMaximized maximizes the browser window (a stronger raise on
+	// window managers that re-layout the window on top).
+	WindowStateMaximized WindowState = "maximized"
+	// WindowStateFullscreen makes the browser window fullscreen.
+	WindowStateFullscreen WindowState = "fullscreen"
+)
+
+// Focus raises the Browser's OS window to the foreground via pure CDP (no
+// wmctrl/xdotool): it resolves the OS window id of the window containing any
+// live page's devtools target (all pages live in the same window) with
+// proto.BrowserGetWindowForTarget, then applies the requested window state
+// with proto.BrowserSetWindowBounds. The default state (normal) restores a
+// minimized window and re-asserts its current bounds — the standard
+// best-effort raise; maximize/fullscreen are state-only, because the proto doc
+// forbids combining those states with left/top/width/height.
+//
+// Focus is NOT a launch trigger and never closes the browser: with no browser
+// launched it fails (mirroring the NewPage guard), and with no live page it
+// fails — the --no-startup-window case, where Chromium may have no window
+// until a page opens.
+func (b *Browser) Focus(ctx context.Context, state WindowState) error {
+	// Fail fast on a bogus state before any network round trip (the IPC/CLI
+	// layers validate too; this guards direct engine callers).
+	switch state {
+	case WindowStateNormal, WindowStateMaximized, WindowStateFullscreen:
+	default:
+		return fmt.Errorf("browsers: focus: unknown window state %q (must be one of normal, maximized, fullscreen)", state)
+	}
+
+	b.mu.Lock()
+	rb := b.rod
+	if rb == nil {
+		b.mu.Unlock()
+		return fmt.Errorf("browsers: focus: browser not launched")
+	}
+	// Collect EVERY live page's target id under the locks: map iteration is
+	// unordered, and a crashed tab whose rod handle survived (the WEB-47 case)
+	// would fail BrowserGetWindowForTarget with "No target with given id
+	// found". The candidates are tried in order below until one resolves the
+	// OS window, so a single dead tab cannot block the focus.
+	var pageIDs []proto.TargetTargetID
+	for _, p := range b.pages {
+		p.mu.Lock()
+		if p.Rod != nil {
+			pageIDs = append(pageIDs, p.Rod.TargetID) // immutable after page creation
+		}
+		p.mu.Unlock()
+	}
+	b.mu.Unlock()
+	if len(pageIDs) == 0 {
+		return fmt.Errorf("browsers: focus: no pages open; open a page first")
+	}
+
+	// Bound to the caller's ctx (rod's ctx-aware form; no Must*). The first
+	// candidate that resolves the OS window wins; a dead target's failure is
+	// skipped so a healthy tab still resolves the window (all pages share the
+	// same browser window).
+	var res *proto.BrowserGetWindowForTargetResult
+	var lastErr error
+	for _, pageID := range pageIDs {
+		r, err := proto.BrowserGetWindowForTarget{TargetID: pageID}.Call(rb.Context(ctx))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		res = r
+		break
+	}
+	if res == nil {
+		return fmt.Errorf("browsers: focus: no live page window: %w", lastErr)
+	}
+
+	switch state {
+	case WindowStateNormal:
+		// Re-asserting the returned bounds (position/size echoed from the get
+		// result) is the standard best-effort raise. Bounds fields may be nil
+		// (e.g. minimized); nil fields are left unchanged per the proto doc.
+		bounds := &proto.BrowserBounds{WindowState: proto.BrowserWindowStateNormal}
+		if res.Bounds != nil {
+			bounds.Left = res.Bounds.Left
+			bounds.Top = res.Bounds.Top
+			bounds.Width = res.Bounds.Width
+			bounds.Height = res.Bounds.Height
+		}
+		if err := (proto.BrowserSetWindowBounds{WindowID: res.WindowID, Bounds: bounds}).Call(rb.Context(ctx)); err != nil {
+			return fmt.Errorf("browsers: focus: set window bounds: %w", err)
+		}
+		return nil
+	case WindowStateMaximized:
+		// State-only: the proto doc forbids combining maximized with
+		// left/top/width/height.
+		if err := (proto.BrowserSetWindowBounds{WindowID: res.WindowID, Bounds: &proto.BrowserBounds{WindowState: proto.BrowserWindowStateMaximized}}).Call(rb.Context(ctx)); err != nil {
+			return fmt.Errorf("browsers: focus: set window state: %w", err)
+		}
+		return nil
+	case WindowStateFullscreen:
+		// State-only, same proto constraint as maximized.
+		if err := (proto.BrowserSetWindowBounds{WindowID: res.WindowID, Bounds: &proto.BrowserBounds{WindowState: proto.BrowserWindowStateFullscreen}}).Call(rb.Context(ctx)); err != nil {
+			return fmt.Errorf("browsers: focus: set window state: %w", err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("browsers: focus: unknown window state %q (must be one of normal, maximized, fullscreen)", state)
+	}
+}
+
 // Pages returns a read-only snapshot of the Browser's live pages (id + url),
 // safe to marshal and iterate; it never exposes the live *rod.Page handles.
 func (b *Browser) Pages() []PageInfo {

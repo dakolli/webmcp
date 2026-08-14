@@ -29,6 +29,9 @@ const (
 	MethodBrowserClose = "browser.close"
 	// MethodBrowserList lists the live Browser and its open pages.
 	MethodBrowserList = "browser.list"
+	// MethodBrowserFocus raises the live Browser's OS window to the foreground
+	// (pure CDP via the rod handle; no external tools).
+	MethodBrowserFocus = "browser.focus"
 	// MethodPageOpen opens a URL as a new page (minting a persistent page-N id).
 	MethodPageOpen = "page.open"
 	// MethodPageList lists the Browser's open pages.
@@ -135,6 +138,20 @@ type BrowserListResult struct {
 	BrowserID string `json:"browser_id"`
 	// Pages is the snapshot of the Browser's open pages.
 	Pages []browsers.PageInfo `json:"pages"`
+}
+
+// BrowserFocusParams carries the browser.focus parameters. State is the target
+// OS window state; an empty value defaults to normal.
+type BrowserFocusParams struct {
+	// State is the target window state: normal (default), maximized or
+	// fullscreen.
+	State string `json:"state,omitempty"`
+}
+
+// BrowserFocusResult is the result of browser.focus.
+type BrowserFocusResult struct {
+	// OK is true once the window state was applied.
+	OK bool `json:"ok"`
 }
 
 // PageOpenParams carries the page.open parameters. wait ∈ idle|load|stable,

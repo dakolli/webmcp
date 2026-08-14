@@ -45,6 +45,8 @@ func (s *Server) handle(ctx context.Context, req Request) (any, *Error) {
 		return s.handleBrowserClose(ctx, req.Params)
 	case MethodBrowserList:
 		return s.handleBrowserList(ctx, req.Params)
+	case MethodBrowserFocus:
+		return s.handleBrowserFocus(ctx, req.Params)
 	case MethodPageOpen:
 		return s.handlePageOpen(ctx, req.Params)
 	case MethodPageList:
@@ -114,6 +116,45 @@ func (s *Server) handleBrowserList(ctx context.Context, params json.RawMessage) 
 		}
 	}
 	return BrowserListResult{BrowserID: browserID, Pages: b.Pages()}, nil
+}
+
+// handleBrowserFocus implements browser.focus: it raises the serve process's
+// Browser OS window to the foreground via pure CDP on the manager's live rod
+// handle (Browser.getWindowForTarget + Browser.setWindowBounds — no external
+// tools). It never lazily launches the browser (mirroring handleBrowserList):
+// with no browser open it fails with an actionable -32000 error telling the
+// caller to run browser.open first. state ∈ normal|maximized|fullscreen, empty
+// → normal; an unknown state is a -32602 invalid-params error naming the
+// offender.
+func (s *Server) handleBrowserFocus(ctx context.Context, params json.RawMessage) (any, *Error) {
+	p, rpcErr := decodeParams[BrowserFocusParams](params)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	state := p.State
+	if state == "" {
+		state = string(browsers.WindowStateNormal) // default
+	}
+	switch browsers.WindowState(state) {
+	case browsers.WindowStateNormal, browsers.WindowStateMaximized, browsers.WindowStateFullscreen:
+	default:
+		return nil, &Error{
+			Code:    CodeInvalidParams,
+			Message: fmt.Sprintf("browser.focus: unknown state=%q (must be one of normal, maximized, fullscreen)", p.State),
+		}
+	}
+
+	b, err := s.mgr.Browser() // no lazy launch
+	if err != nil {
+		return nil, &Error{
+			Code:    CodeServerError,
+			Message: "browser.focus: no browser open; call browser.open first",
+		}
+	}
+	if err := b.Focus(ctx, browsers.WindowState(state)); err != nil {
+		return nil, serverError(err)
+	}
+	return BrowserFocusResult{OK: true}, nil
 }
 
 // handlePageOpen implements page.open: it validates the URL and wait strategy
