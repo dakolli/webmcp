@@ -52,6 +52,8 @@ func (s *Server) handle(ctx context.Context, req Request) (any, *Error) {
 		return s.handlePageAct(ctx, req.Params)
 	case MethodPageClose:
 		return s.handlePageClose(ctx, req.Params)
+	case MethodServerShutdown:
+		return s.handleServerShutdown(ctx, req.Params)
 	default:
 		return nil, &Error{
 			Code:    CodeMethodNotFound,
@@ -303,6 +305,16 @@ func (s *Server) handlePageClose(ctx context.Context, params json.RawMessage) (a
 		return nil, serverError(err)
 	}
 	return PageCloseResult{OK: true}, nil
+}
+
+// handleServerShutdown implements server.shutdown: it returns {ok: true} and
+// asks the serve loop to stop gracefully. The manager is deliberately NOT
+// closed here — the serve process's own teardown path (mgr.Shutdown in
+// runServeForeground) shuts the browser down after Serve returns. The loop
+// stop is triggered by dispatch only after the response line is flushed, so
+// the client reliably sees the result before the connection closes.
+func (s *Server) handleServerShutdown(_ context.Context, _ json.RawMessage) (any, *Error) {
+	return ShutdownResult{OK: true}, nil
 }
 
 // decodeParams unmarshals a method's params into T. An absent params object is

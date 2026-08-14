@@ -39,6 +39,11 @@ const (
 	MethodPageAct = "page.act"
 	// MethodPageClose closes an open page.
 	MethodPageClose = "page.close"
+	// MethodServerShutdown requests a graceful stop of the serve process: the
+	// server answers {ok: true}, then stops accepting connections and removes
+	// the socket file. The browser itself is torn down by the serve process's
+	// own teardown path (mgr.Shutdown), not by this method.
+	MethodServerShutdown = "server.shutdown"
 )
 
 // JSON-RPC error codes (https://www.jsonrpc.org/specification#error_object).
@@ -205,5 +210,13 @@ type PageCloseParams struct {
 // PageCloseResult is the result of page.close.
 type PageCloseResult struct {
 	// OK is true once the page is closed and its id invalidated.
+	OK bool `json:"ok"`
+}
+
+// ShutdownResult is the result of server.shutdown: {ok: true} once the graceful
+// stop has been requested (the serve loop exits shortly after the response is
+// flushed).
+type ShutdownResult struct {
+	// OK is always true for a successful shutdown request.
 	OK bool `json:"ok"`
 }

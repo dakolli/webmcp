@@ -24,8 +24,8 @@ import (
 const singleBrowserID = "browser-1"
 
 // NewRootCmd constructs the web-cli root command, wiring it to the shared
-// browsers.Manager and registering the browser / launch / fetch / page
-// commands.
+// browsers.Manager and registering the browser / fetch / page commands and the
+// serve tree (serve, serve stop, serve mcp).
 func NewRootCmd(mgr *browsers.Manager) *cobra.Command {
 	root := &cobra.Command{
 		Use:   "web-cli",
@@ -48,7 +48,7 @@ func NewRootCmd(mgr *browsers.Manager) *cobra.Command {
 	}
 	browserCmd.AddCommand(NewBrowserListCmd(mgr), NewBrowserCloseCmd(mgr))
 
-	root.AddCommand(browserCmd, NewLaunchCmd(), NewFetchCmd(mgr), NewPageCmd(mgr), NewServeCmd())
+	root.AddCommand(browserCmd, NewFetchCmd(mgr), NewPageCmd(mgr), NewServeCmd())
 	return root
 }
 
@@ -78,7 +78,7 @@ func NewBrowserListCmd(mgr *browsers.Manager) *cobra.Command {
 			b, err := mgr.Browser()
 			if err != nil {
 				// No browser open yet — nothing to list.
-				fmt.Printf("no browser running (%s not open); start one with 'web-cli launch'\n",
+				fmt.Printf("no browser running (%s not open); start one with 'web-cli serve'\n",
 					singleBrowserID)
 				return nil
 			}
@@ -154,7 +154,7 @@ func browserListViaIPC(cmd *cobra.Command, cl *ipc.Client) error {
 		if errors.As(err, &serverErr) &&
 			serverErr.Code == ipc.CodeServerError &&
 			strings.Contains(serverErr.Message, "no browser open") {
-			fmt.Printf("no browser running (%s not open); start one with 'web-cli launch'\n",
+			fmt.Printf("no browser running (%s not open); start one with 'web-cli serve'\n",
 				singleBrowserID)
 			return nil
 		}

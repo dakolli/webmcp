@@ -54,6 +54,13 @@ type Server struct {
 	conns map[net.Conn]struct{}
 	// closed marks the server as stopped; Close is idempotent after this.
 	closed bool
+
+	// shutdownCtx is cancelled by requestShutdown (a server.shutdown request)
+	// so the Serve loop stops gracefully, in addition to the caller's ctx. The
+	// manager is not touched here — the serve process tears it down itself.
+	shutdownCtx context.Context
+	// cancelShutdown cancels shutdownCtx; see requestShutdown.
+	cancelShutdown context.CancelFunc
 }
 
 // NewServer constructs a Server that dispatches JSON-RPC methods against mgr.
@@ -67,7 +74,13 @@ func NewServer(mgr *browsers.Manager) *Server {
 // tests, which inject a manager stub through the seam so no test path can
 // launch Chromium.
 func newServer(mgr manager) *Server {
-	return &Server{mgr: mgr, conns: make(map[net.Conn]struct{})}
+	shutdownCtx, cancel := context.WithCancel(context.Background())
+	return &Server{
+		mgr:            mgr,
+		conns:          make(map[net.Conn]struct{}),
+		shutdownCtx:    shutdownCtx,
+		cancelShutdown: cancel,
+	}
 }
 
 // Bind prepares the unix socket at path and starts listening. Stale-socket
@@ -137,9 +150,15 @@ func (s *Server) Serve(ctx context.Context) error {
 	s.mu.Unlock()
 
 	// Stop the accept loop and close every connection when ctx is done
-	// (SIGINT/SIGTERM cancels the signal-bound ctx in cmd/web-cli/main.go).
+	// (SIGINT/SIGTERM cancels the signal-bound ctx in cmd/web-cli/main.go) or
+	// when a server.shutdown request arrives (requestShutdown). Close is
+	// idempotent, so both goroutines may race harmlessly.
 	go func() {
 		<-ctx.Done()
+		_ = s.Close()
+	}()
+	go func() {
+		<-s.shutdownCtx.Done()
 		_ = s.Close()
 	}()
 
@@ -154,6 +173,14 @@ func (s *Server) Serve(ctx context.Context) error {
 		s.track(conn)
 		go s.serveConn(ctx, conn)
 	}
+}
+
+// requestShutdown asks the serve loop to stop gracefully. It is invoked by a
+// successful server.shutdown request, but only AFTER dispatch has flushed the
+// response line, so the requesting client reliably reads its {ok: true} result
+// before the connections are closed.
+func (s *Server) requestShutdown() {
+	s.cancelShutdown()
 }
 
 // Close stops the server: it closes the listener, every live connection and
@@ -226,6 +253,13 @@ func (s *Server) dispatch(connCtx context.Context, conn net.Conn, req Request) {
 	defer cancel()
 
 	result, rpcErr := s.handle(rctx, req)
+	// A successful server.shutdown stops the serve loop only after the
+	// response is flushed: the defer runs when this function returns, which is
+	// after the writeLine below. Notifications (nil ID) still stop the loop —
+	// the defer is registered before the early return.
+	if req.Method == MethodServerShutdown && rpcErr == nil {
+		defer s.requestShutdown()
+	}
 	if req.ID == nil {
 		return // JSON-RPC notification — no response
 	}

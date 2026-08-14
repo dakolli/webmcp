@@ -26,9 +26,9 @@ This installs the `web-cli` binary into `$(go env GOPATH)/bin`.
 ## Quick start
 
 ```sh
-# 1. Launch the shared browser (headful Chromium, stealth on). fetch/page
-#    commands also launch it lazily, so this step is optional.
-web-cli launch
+# 1. Start the shared browser as a background daemon (headful Chromium, stealth
+#    on). fetch/page commands also launch it lazily, so this step is optional.
+web-cli serve
 
 # 2. Open a URL in a new page — prints session_id, title, url, text snippet,
 #    html bytes and load time.
@@ -39,9 +39,10 @@ web-cli page list
 web-cli page fetch --id <session_id> --what text
 web-cli page act --id <session_id> --action eval --value '() => document.title'
 
-# 4. Close a page, or the whole browser.
+# 4. Close a page, the browser, or the whole serve daemon.
 web-cli page close --id <session_id>
 web-cli browser close
+web-cli serve stop
 ```
 
 ## Commands
@@ -52,9 +53,11 @@ The CLI mirrors the MCP tools one-to-one, talking directly to the
 
 | Command | Mirrors | Description |
 | --- | --- | --- |
-| `web-cli launch` | `browser_create` | Lazily start the shared browser and print its `browser_id`. Flags `--headless` / `--stealth` are accepted for parity but reserved. |
+| `web-cli serve` | `browser_create` | Start the shared browser as a background **daemon**: it binds the IPC socket, launches Chromium, answers the readiness ping and returns to the prompt (status in `$XDG_STATE_HOME/web-cli/serve.log`, else `~/.web-cli/serve.log`). A second `serve` fails fast on the bound socket. Flags `--headless` / `--stealth`; `--foreground` runs in the terminal instead (Ctrl-C stops it, as before). Stop the daemon with `web-cli serve stop`. |
+| `web-cli serve stop` | — | Stop the serve daemon via the `server.shutdown` IPC message; prints a friendly error when no daemon is running. |
+| `web-cli serve mcp --port <n>` | — | Daemonize exactly like `serve` and additionally host the MCP HTTP/SSE server on port `<n>` (default 4099) in the same process, so MCP tools and the CLI drive the same live browser. |
 | `web-cli browser list` | `browser_list` | List the live browser and its open pages (`id\turl` rows). Never launches the browser. |
-| `web-cli browser close` | `browser_close` | Close the browser and all of its pages. Idempotent when nothing is open. |
+| `web-cli browser close` | `browser_close` | Close the browser and all of its pages. Idempotent when nothing is open. Note: this closes the *browser*, not the serve daemon — stop the daemon with `web-cli serve stop`. |
 | `web-cli fetch <url>` | `fetch_page` | Open `<url>` in a new page and print a summary (`session_id`, title, url, text snippet, html bytes, load ms). Flags: `--json`, `--wait idle\|load\|stable` (default `idle`), `--timeout-ms` (default `30000`). |
 | `web-cli page list` | `page_list` | List the browser's open pages (`id\turl`). |
 | `web-cli page fetch --id <session> --what <what>` | `page_fetch` | Extract an aspect of a live page. `--what` is one of `html`, `text`, `links`, `meta` (implemented) — `dom`, `css`, `js`, `screenshot` are not yet implemented. Optional `--selector` (CSS) scopes html/text; `--max-bytes` caps output (default `50000`, truncation is flagged). `links` and `meta` print JSON. |
@@ -64,8 +67,10 @@ The CLI mirrors the MCP tools one-to-one, talking directly to the
 ### Example session
 
 ```sh
-$ web-cli launch
+$ web-cli serve
 browser_id: browser-1
+socket: /home/dakolli/.web-mcp.sock
+daemonized (log: /home/dakolli/.web-cli/serve.log); stop with 'web-cli serve stop'
 
 $ web-cli fetch https://go-rod.github.io/
 session_id: 30c1c3f17d20cbceb4f9dbb3d0a1ce0c
@@ -86,11 +91,45 @@ session 30c1c3f17d20cbceb4f9dbb3d0a1ce0c closed
 
 $ web-cli browser close
 browser browser-1 closed
+
+$ web-cli serve stop
+stopped
 ```
 
 Every engine call is bound to a per-call timeout (default 30s) so a hung page
 cannot block the CLI; `SIGINT`/`SIGTERM` also triggers a graceful browser
 shutdown.
+
+## Testing
+
+Run the full test suite:
+
+```sh
+go test ./...
+```
+
+Useful variants:
+
+- `go test -count=1 ./...` — bypass the test cache and always run fresh.
+- `go test -race ./...` — enable the race detector (good for the IPC
+  server's Serve/Close/connection-set concurrency paths).
+- `go test -v ./pkg/cli/ipc/...` — verbose output for one package.
+- `go test ./pkg/cli/ipc/ ./pkg/cli/pageops/` — just the packages that
+  currently have tests (the IPC wire contract + pageops truncation pins);
+  other packages report `[no test files]`.
+
+Before finishing any change, the repo conventions require all of these to pass:
+
+```sh
+gofmt -l .     # prints nothing (files are formatted; use -s for simplification)
+go vet ./...   # static analysis
+go build ./... # everything compiles
+go test ./...  # all tests pass
+```
+
+> Tests never launch a real browser: the IPC suite injects a stub browser
+> manager, so `go test ./...` needs no Chromium download and runs in under a
+> second.
 
 ## MCP
 
