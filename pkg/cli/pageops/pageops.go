@@ -309,7 +309,10 @@ func PageTruncate(s string, maxBytes int) string {
 		return s
 	}
 	b := []byte(s)
-	for len(b) > maxBytes && !utf8.RuneStart(b[maxBytes]) {
+	// Guard maxBytes > 0 so the walk-back is total even for malformed UTF-8
+	// input (a run of orphan continuation bytes could otherwise decrement
+	// past zero and index b[-1], panicking).
+	for maxBytes > 0 && len(b) > maxBytes && !utf8.RuneStart(b[maxBytes]) {
 		maxBytes--
 	}
 	return string(b[:maxBytes]) + "\n… (output truncated — raise --max-bytes or narrow the selector)"

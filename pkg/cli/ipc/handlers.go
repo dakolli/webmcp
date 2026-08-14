@@ -10,6 +10,25 @@ import (
 	"webmcp/pkg/cli/pageops"
 )
 
+// manager is the minimal engine surface the JSON-RPC handlers dispatch
+// against. *browsers.Manager satisfies it (proven by the compile-time
+// assertion below); the package tests inject a stub implementation instead,
+// so no handler path in a test can reach a real Chromium. Keeping the seam
+// internal — and limited to the three methods the handlers actually use —
+// means a future Manager refactor is caught at compile time without widening
+// the public API (NewServer still accepts *browsers.Manager).
+type manager interface {
+	// Open lazily launches the single Browser on first use and returns it.
+	Open(ctx context.Context) (*browsers.Browser, error)
+	// Close closes the Browser and all of its pages (a no-op when none open).
+	Close(ctx context.Context) error
+	// Browser returns the live Browser, or an error when none is open yet.
+	Browser() (*browsers.Browser, error)
+}
+
+// compile-time proof that the concrete Manager satisfies the handler seam.
+var _ manager = (*browsers.Manager)(nil)
+
 // handle dispatches a decoded request to its method handler. Unknown methods
 // get a -32601 error naming the method; handlers return (result, nil) on
 // success and (nil, *Error) on JSON-RPC failure.

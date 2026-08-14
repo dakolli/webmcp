@@ -40,8 +40,9 @@ func DefaultSocketPath() string {
 // over a unix socket. Construct with NewServer, bind the socket with Bind, then
 // serve connections until the context is cancelled or Close is called.
 type Server struct {
-	// mgr is the engine the JSON-RPC methods dispatch against.
-	mgr *browsers.Manager
+	// mgr is the engine the JSON-RPC methods dispatch against (the internal
+	// manager seam — *browsers.Manager in production, a stub in tests).
+	mgr manager
 
 	// mu guards listener, path, conns and closed.
 	mu sync.Mutex
@@ -59,6 +60,13 @@ type Server struct {
 // The manager's lifecycle stays with the caller (`web-cli serve` constructs
 // it, binds the socket and calls Shutdown on exit).
 func NewServer(mgr *browsers.Manager) *Server {
+	return newServer(mgr)
+}
+
+// newServer is the internal constructor shared by NewServer and the package
+// tests, which inject a manager stub through the seam so no test path can
+// launch Chromium.
+func newServer(mgr manager) *Server {
 	return &Server{mgr: mgr, conns: make(map[net.Conn]struct{})}
 }
 
