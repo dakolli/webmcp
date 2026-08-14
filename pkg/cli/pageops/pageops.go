@@ -1,13 +1,17 @@
 // Package pageops holds the cobra-free page helpers shared by the web-cli
 // commands (pkg/cli/cmd) and the IPC server (pkg/cli/ipc): fetching page
-// summaries, extracting page aspects (html, text, links, meta), running JS
-// (eval) and truncating output. The helpers own the per-page Lock/Unlock
-// discipline required because rod Pages are not thread-safe (pkg/browsers
-// session.go) — callers must not lock themselves.
+// summaries, extracting page aspects (html, dom, text, css, js, links,
+// screenshot, meta), performing page actions (click, input, hover, scroll,
+// select, eval, navigate, back, forward, reload, wait) and truncating output.
+// The helpers own the per-page Lock/Unlock discipline required because rod
+// Pages are not thread-safe (pkg/browsers session.go) — callers must not lock
+// themselves. Only this package drives rod on the CLI side; cmd/ipc never
+// import rod-family packages (AGENTS.md CLI boundary).
 package pageops
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -16,14 +20,24 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/proto"
+
 	"webmcp/pkg/browsers"
 )
 
 // DefaultPageMaxBytes caps how much of any page fetch extraction is returned
 // in one call (the CLI --max-bytes default and the IPC page.fetch default).
 // Huge pages are dehydrated to a first slice; the caller can re-run with a
-// narrower selector or a higher max_bytes.
+// narrower selector or a higher max_bytes. Screenshots are the documented
+// exception: the data-URI bypasses PageTruncate entirely.
 const DefaultPageMaxBytes = 50_000
+
+// defaultActTimeout bounds the page_act-style helpers' "ms" wait-mode sleep
+// when the caller passes no explicit timeout (mirroring defaultActTimeout in
+// pkg/mcp/tools/act.go). Callers bound the ctx themselves (defaultCmdTimeout /
+// the IPC per-call timeout); this fallback only sizes the sleep.
+const defaultActTimeout = 30 * time.Second
 
 // ValidateURL checks that s is an absolute http(s) URL the browser can
 // navigate to: it must parse, be absolute and carry a host.
@@ -43,19 +57,23 @@ func ValidateURL(s string) error {
 	}
 }
 
-// ValidateWait checks that the wait strategy is one of idle, load, stable.
+// ValidateWait checks that the wait strategy is one of the shared readiness
+// vocabulary: idle, load, stable (used by fetch and page.open) plus the
+// page_act-only interactable and ms modes (used by the wait action's --wait).
 func ValidateWait(waitFor string) error {
 	switch waitFor {
-	case "idle", "load", "stable":
+	case "idle", "load", "stable", "interactable", "ms":
 		return nil
 	default:
-		return fmt.Errorf("invalid --wait %q (must be one of idle, load, stable)", waitFor)
+		return fmt.Errorf("invalid --wait %q (must be one of idle, load, stable, interactable, ms)", waitFor)
 	}
 }
 
 // WaitForPage blocks until the page satisfies the requested readiness level.
 // It maps "load" to WaitLoad, "idle" to WaitRequestIdle, and "stable" to
-// WaitDOMStable. All rod page calls are serialized with the per-page lock.
+// WaitDOMStable. All rod page calls are serialized with the per-page lock. The
+// page_act-only "interactable" and "ms" modes are handled by PageWait, not
+// here (they need a selector and a timeout respectively).
 func WaitForPage(ctx context.Context, p *browsers.Page, waitFor string) error {
 	p.Lock()
 	defer p.Unlock()
@@ -293,6 +311,403 @@ func PageMeta(ctx context.Context, p *browsers.Page) (string, error) {
 	return string(b), nil
 }
 
+// PageScreenshot returns a PNG screenshot of the page as a base64 data-URI
+// ("data:image/png;base64,…") that consumers can render directly. When fullPage
+// is true the entire scrollable page is captured; otherwise only the visible
+// viewport. Backed by p.Rod.Screenshot(fullPage, nil) — a nil request yields
+// CDP defaults (PNG). The output deliberately bypasses PageTruncate at the call
+// sites: image size scales with the viewport, not max_bytes, and cutting a
+// data-URI mid-stream would corrupt it. Mirrors the MCP extractScreenshot.
+func PageScreenshot(ctx context.Context, p *browsers.Page, fullPage bool) (string, error) {
+	p.Lock()
+	defer p.Unlock()
+
+	b, err := p.Rod.Context(ctx).Screenshot(fullPage, nil)
+	if err != nil {
+		return "", fmt.Errorf("capture screenshot (full_page=%t): %w", fullPage, err)
+	}
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(b), nil
+}
+
+// PageCSS returns the page's stylesheet resources: a JSON list of
+// {url, type, size} entries, or — when target is non-empty — the full content
+// of exactly that one stylesheet. Mirrors the MCP extractCSS.
+func PageCSS(ctx context.Context, p *browsers.Page, target string) (string, error) {
+	return PageResources(ctx, p, target, proto.NetworkResourceTypeStylesheet)
+}
+
+// PageJS returns the page's script resources: a JSON list of {url, type, size}
+// entries, or — when target is non-empty — the full content of exactly that one
+// script. Mirrors the MCP extractJS.
+func PageJS(ctx context.Context, p *browsers.Page, target string) (string, error) {
+	return PageResources(ctx, p, target, proto.NetworkResourceTypeScript)
+}
+
+// PageResources is the shared backend of PageCSS and PageJS. It enumerates the
+// page's resources of the given kind by walking the CDP resource tree
+// recursively (iframes/subframes included) and returns either:
+//
+//   - with target set: the content of exactly that resource, fetched via
+//     p.Rod.GetResource(url) and prefixed with a small // url= / // bytes=
+//     header, or an LLM-actionable error when the resource is unknown; or
+//   - without target: the JSON list of matching resources, capped downstream
+//     by PageTruncate (re-request with --what css|js --target <url> for full
+//     content).
+//
+// The per-page mutex is held for the whole extraction because rod pages are
+// not thread-safe. Mirrors the MCP extractResources.
+func PageResources(ctx context.Context, p *browsers.Page, target string, kind proto.NetworkResourceType) (string, error) {
+	p.Lock()
+	defer p.Unlock()
+
+	// Bind the ctx-bounded clone once and reuse it for the tree call and the
+	// GetResource fetch, so the whole extraction honors the caller's context.
+	page := p.Rod.Context(ctx)
+
+	res, err := proto.PageGetResourceTree{}.Call(page)
+	if err != nil {
+		return "", fmt.Errorf("enumerate resource tree: %w", err)
+	}
+
+	var resources []*proto.PageFrameResource
+	collectResources(res.FrameTree, kind, &resources)
+
+	if target != "" {
+		return fetchResource(page, resources, target)
+	}
+
+	list := make([]resourceEntry, 0, len(resources))
+	for _, r := range resources {
+		list = append(list, resourceEntry{URL: r.URL, Type: string(r.Type), Size: r.ContentSize})
+	}
+	b, err := json.Marshal(list)
+	if err != nil {
+		return "", fmt.Errorf("encode resource list: %w", err)
+	}
+	// The list is capped by PageTruncate at the call sites; the hint tells the
+	// caller how to fetch a single resource's full content (AGENTS.md
+	// dehydration convention: "first 50KB; use what=css&target=URL to fetch
+	// more").
+	return string(b) + "\n// hint: to fetch one resource's full content, re-request with what=" +
+		strings.ToLower(string(kind)) + "&target=<url>", nil
+}
+
+// collectResources walks the resource tree depth-first, appending every
+// resource of the given kind that actually loaded (Failed and Canceled both
+// false) to out. ChildFrames are visited recursively so iframe/subframe
+// resources are included.
+func collectResources(tree *proto.PageFrameResourceTree, kind proto.NetworkResourceType, out *[]*proto.PageFrameResource) {
+	if tree == nil {
+		return
+	}
+	for _, r := range tree.Resources {
+		if r.Type == kind && !r.Failed && !r.Canceled {
+			*out = append(*out, r)
+		}
+	}
+	for _, child := range tree.ChildFrames {
+		collectResources(child, kind, out)
+	}
+}
+
+// fetchResource returns the content of the resource whose URL equals target,
+// preferring a match from the enumerated (already-loaded) resources but
+// falling back to a direct GetResource attempt so an unknown-but-fetchable URL
+// still resolves. The content is prefixed with a small // url= / // bytes=
+// header and capped downstream by PageTruncate.
+func fetchResource(page *rod.Page, resources []*proto.PageFrameResource, target string) (string, error) {
+	for _, r := range resources {
+		if r.URL == target {
+			b, err := page.GetResource(r.URL)
+			if err != nil {
+				return "", fmt.Errorf("fetch resource %q: %w", target, err)
+			}
+			return formatResource(target, len(b), b), nil
+		}
+	}
+	b, err := page.GetResource(target)
+	if err != nil {
+		return "", fmt.Errorf("resource %q not found in the page's resource tree: %w", target, err)
+	}
+	return formatResource(target, len(b), b), nil
+}
+
+// formatResource prefixes fetched resource bytes with a header identifying the
+// URL and byte size, so the caller knows which resource the content belongs to.
+func formatResource(url string, size int, b []byte) string {
+	var buf strings.Builder
+	fmt.Fprintf(&buf, "// url=%s\n// bytes=%d\n", url, size)
+	buf.Write(b)
+	return buf.String()
+}
+
+// resourceEntry is one css/js resource in the enumeration list returned by
+// PageResources.
+type resourceEntry struct {
+	// URL is the absolute resource URL.
+	URL string `json:"url"`
+	// Type is the resource type as reported by the browser ("Stylesheet" or
+	// "Script").
+	Type string `json:"type"`
+	// Size is the content size in bytes reported by the browser, or null when
+	// the browser did not report one. Resources are never fetched just to size
+	// them.
+	Size *float64 `json:"size"`
+}
+
+// PageDOM returns the page's DOM as a compact, LLM-friendly JSON tree.
+// CaptureDOMSnapshot yields a flattened Documents array (index 0 = root
+// document, later indexes = iframe/imported documents) plus a shared Strings
+// table; this helper re-nests each document's parallel-array node tables by
+// ParentIndex and resolves every string index through the table, so the reader
+// sees a real tree (iframes, template contents and flattened shadow DOM
+// included) instead of raw CDP arrays. Backed by p.Rod.CaptureDOMSnapshot();
+// mirrors the MCP extractDOMSnapshot shape exactly.
+func PageDOM(ctx context.Context, p *browsers.Page) (string, error) {
+	p.Lock()
+	defer p.Unlock()
+
+	snap, err := p.Rod.Context(ctx).CaptureDOMSnapshot()
+	if err != nil {
+		return "", fmt.Errorf("capture DOM snapshot: %w", err)
+	}
+
+	docs := buildDOMDocuments(snap)
+	b, err := json.Marshal(docs)
+	if err != nil {
+		return "", fmt.Errorf("encode DOM snapshot: %w", err)
+	}
+	return string(b), nil
+}
+
+// domDocument is the JSON shape of one document in the DOM snapshot output:
+// its context (title, url, frame id) plus the re-nested element tree.
+type domDocument struct {
+	// Title is the document's title.
+	Title string `json:"title"`
+	// URL is the document's URL.
+	URL string `json:"url"`
+	// FrameID is the CDP frame id this document belongs to.
+	FrameID string `json:"frame_id,omitempty"`
+	// Root is the nested tree root (#document).
+	Root *domNode `json:"root"`
+}
+
+// domNode is one node in the re-nested DOM tree.
+type domNode struct {
+	// Tag is the lowercased element name ("div"), or a pseudo-name for
+	// non-elements ("#document", "#text", "#comment").
+	Tag string `json:"tag"`
+	// ID is the element's id attribute, hoisted out of Attrs.
+	ID string `json:"id,omitempty"`
+	// Class is the element's class attribute, whitespace-normalized, hoisted
+	// out of Attrs.
+	Class string `json:"class,omitempty"`
+	// Attrs holds the element's remaining attributes.
+	Attrs map[string]string `json:"attrs,omitempty"`
+	// Text is the node's text: the nodeValue for text nodes, the textarea/
+	// input value or the layout text for elements.
+	Text string `json:"text,omitempty"`
+	// Visible is true when the node has a layout box (absolute bounds), i.e.
+	// it is rendered rather than display:none or detached. Absent when false.
+	Visible bool `json:"visible,omitempty"`
+	// Bounds is the node's absolute position bounding box as reported by CDP
+	// (an array of floats), when the node has one.
+	Bounds []float64 `json:"bounds,omitempty"`
+	// FrameURL is set on frame-owner elements (iframe/frame/object) that CDP
+	// reports as containing another document; the child document itself is
+	// also emitted as its own entry in the Documents array.
+	FrameURL string `json:"frame_url,omitempty"`
+	// Children are the node's element/text/comment children in document order.
+	Children []*domNode `json:"children,omitempty"`
+}
+
+// buildDOMDocuments converts every document in the snapshot into a nested tree
+// and attaches iframe child documents to their frame-owner nodes. Each
+// document is emitted with its title/url/frame id context so no document is
+// lost, and frame owners carry the child document's URL inline.
+func buildDOMDocuments(snap *proto.DOMSnapshotCaptureSnapshotResult) []domDocument {
+	docs := make([]domDocument, len(snap.Documents))
+	nodesByDoc := make([]map[int]*domNode, len(snap.Documents))
+	for i, d := range snap.Documents {
+		root, byIndex := buildDOMTree(snap.Strings, d)
+		nodesByDoc[i] = byIndex
+		docs[i] = domDocument{
+			Title:   str(snap.Strings, d.Title),
+			URL:     str(snap.Strings, d.DocumentURL),
+			FrameID: str(snap.Strings, d.FrameID),
+			Root:    root,
+		}
+	}
+
+	// Second pass: a node whose ContentDocumentIndex rare data points at
+	// another document is a frame owner — annotate it with the child
+	// document's URL so the reader can jump from the iframe to its content.
+	for i, d := range snap.Documents {
+		byIndex := nodesByDoc[i]
+		if byIndex == nil || d.Nodes == nil || d.Nodes.ContentDocumentIndex == nil {
+			continue
+		}
+		for k, nodeIdx := range d.Nodes.ContentDocumentIndex.Index {
+			childIdx := d.Nodes.ContentDocumentIndex.Value[k]
+			if childIdx < 0 || childIdx >= len(docs) || childIdx == i {
+				continue
+			}
+			if node := byIndex[nodeIdx]; node != nil {
+				node.FrameURL = docs[childIdx].URL
+			}
+		}
+	}
+	return docs
+}
+
+// buildDOMTree re-nests one document's flat parallel-array node table into a
+// tree rooted at the node with parent -1, and returns the root plus a flat
+// node-index → *domNode map (used to attach iframe documents afterwards).
+// Whitespace-only text nodes and the inline bodies of <script>/<style>
+// elements are elided to keep the output compact (script/style sources are
+// available via --what js/css instead).
+func buildDOMTree(strs []string, doc *proto.DOMSnapshotDocumentSnapshot) (*domNode, map[int]*domNode) {
+	n := doc.Nodes
+	if n == nil || len(n.ParentIndex) == 0 {
+		return nil, nil
+	}
+
+	layout := layoutIndex(doc.Layout)
+	byIndex := make(map[int]*domNode, len(n.ParentIndex))
+
+	// Pass 1: populate every node from its parallel-array rows.
+	for i := range n.ParentIndex {
+		nd := &domNode{Tag: nodeTag(strs, n, i)}
+		if i < len(n.NodeType) {
+			switch n.NodeType[i] {
+			case 1: // element: hoist id/class, keep other attributes
+				nd.ID, nd.Class, nd.Attrs = nodeAttrs(strs, n.Attributes, i)
+				nd.Text = rareString(strs, n.TextValue, i)
+				if nd.Text == "" {
+					nd.Text = rareString(strs, n.InputValue, i)
+				}
+			case 3: // text: the nodeValue is the text itself
+				nd.Text = str(strs, n.NodeValue[i])
+			}
+		}
+		if li, ok := layout[i]; ok {
+			if li < len(doc.Layout.Bounds) && len(doc.Layout.Bounds[li]) > 0 {
+				nd.Visible = true
+				nd.Bounds = doc.Layout.Bounds[li]
+			}
+			if nd.Text == "" && li < len(doc.Layout.Text) {
+				nd.Text = str(strs, doc.Layout.Text[li])
+			}
+		}
+		byIndex[i] = nd
+	}
+
+	// Pass 2: attach children by ParentIndex, in document order.
+	var root *domNode
+	for i := range n.ParentIndex {
+		nd := byIndex[i]
+		parent := n.ParentIndex[i]
+		if parent < 0 || parent >= len(n.ParentIndex) || parent == i {
+			root = nd
+			continue
+		}
+		// Elide whitespace-only text nodes (pretty-printed markup noise) and
+		// the bodies of script/style elements (sources via --what js/css).
+		if i < len(n.NodeType) && n.NodeType[i] == 3 && strings.TrimSpace(nd.Text) == "" {
+			continue
+		}
+		pn := byIndex[parent]
+		if pn == nil {
+			root = nd
+			continue
+		}
+		if pn.Tag == "script" || pn.Tag == "style" {
+			continue
+		}
+		pn.Children = append(pn.Children, nd)
+	}
+	return root, byIndex
+}
+
+// layoutIndex maps node-tree index → layout-tree entry for O(1) lookups.
+func layoutIndex(layout *proto.DOMSnapshotLayoutTreeSnapshot) map[int]int {
+	if layout == nil {
+		return nil
+	}
+	m := make(map[int]int, len(layout.NodeIndex))
+	for i, node := range layout.NodeIndex {
+		m[node] = i
+	}
+	return m
+}
+
+// nodeTag resolves a node's tag name: the nodeName lowercased for elements
+// ("DIV" → "div"), or the raw pseudo-name for non-elements ("#document",
+// "#text", "#comment").
+func nodeTag(strs []string, n *proto.DOMSnapshotNodeTreeSnapshot, i int) string {
+	if i >= len(n.NodeName) {
+		return ""
+	}
+	name := str(strs, n.NodeName[i])
+	if name == "" || strings.HasPrefix(name, "#") {
+		return name
+	}
+	return strings.ToLower(name)
+}
+
+// nodeAttrs parses the flattened name,value attribute pairs of element node i,
+// hoisting id and class out and returning the remaining attributes. Unnamed or
+// unvalued trailing pairs are ignored.
+func nodeAttrs(strs []string, attrs []proto.DOMSnapshotArrayOfStrings, i int) (id, class string, rest map[string]string) {
+	if i >= len(attrs) {
+		return "", "", nil
+	}
+	pairs := attrs[i]
+	for k := 0; k+1 < len(pairs); k += 2 {
+		name := str(strs, pairs[k])
+		value := str(strs, pairs[k+1])
+		switch name {
+		case "id":
+			id = value
+		case "class":
+			class = strings.Join(strings.Fields(value), " ")
+		case "":
+			// unnamed attribute pair — skip
+		default:
+			if rest == nil {
+				rest = make(map[string]string, 4)
+			}
+			rest[name] = value
+		}
+	}
+	return id, class, rest
+}
+
+// str resolves a string-table index, returning "" for negative or
+// out-of-range indexes (a node may simply have no value).
+func str(strs []string, idx proto.DOMSnapshotStringIndex) string {
+	if idx < 0 || int(idx) >= len(strs) {
+		return ""
+	}
+	return strs[idx]
+}
+
+// rareString returns the string-table value of the rare-data entry for node
+// index i, or "" when the table has no entry for it. Rare data is small, so a
+// linear scan is fine.
+func rareString(strs []string, rd *proto.DOMSnapshotRareStringData, i int) string {
+	if rd == nil {
+		return ""
+	}
+	for k, node := range rd.Index {
+		if node == i {
+			return str(strs, rd.Value[k])
+		}
+	}
+	return ""
+}
+
 // PageEval runs a JavaScript function in the page — the primary escape hatch
 // for any page manipulation — and returns the JSON result. Backed by
 // p.Rod.Context(ctx).Eval(js); js must be a JS function definition, e.g.
@@ -306,6 +721,240 @@ func PageEval(ctx context.Context, p *browsers.Page, js string) (string, error) 
 		return "", fmt.Errorf("evaluate js: %w", err)
 	}
 	return res.Value.JSON("", ""), nil // gson marshals to compact JSON text
+}
+
+// PageClick clicks the element matched by selector (CSS or XPath). It resolves
+// the element, waits until it is interactable, then clicks it with the left
+// button. Returns the same confirmation string as the MCP page_act click.
+func PageClick(ctx context.Context, p *browsers.Page, selector string) (string, error) {
+	p.Lock()
+	defer p.Unlock()
+
+	page := p.Rod.Context(ctx) // bound to ctx so a missing element aborts
+
+	el, err := page.Element(selector)
+	if err != nil {
+		return "", fmt.Errorf("click: element %q: %w", selector, err)
+	}
+	if _, err := el.WaitInteractable(); err != nil {
+		return "", fmt.Errorf("click: element %q: %w", selector, err)
+	}
+	if err := el.Click(proto.InputMouseButtonLeft, 1); err != nil {
+		return "", fmt.Errorf("click: element %q: %w", selector, err)
+	}
+	return fmt.Sprintf("clicked selector=%q", selector), nil
+}
+
+// PageInput sets the value of the element matched by selector. rod's Input
+// focuses the element, clears its existing content and types the new value.
+// Returns the same confirmation string as the MCP page_act input.
+func PageInput(ctx context.Context, p *browsers.Page, selector, value string) (string, error) {
+	p.Lock()
+	defer p.Unlock()
+
+	page := p.Rod.Context(ctx)
+
+	el, err := page.Element(selector)
+	if err != nil {
+		return "", fmt.Errorf("input: element %q: %w", selector, err)
+	}
+	if err := el.Input(value); err != nil {
+		return "", fmt.Errorf("input: element %q: %w", selector, err)
+	}
+	return fmt.Sprintf("set input selector=%q value=%q", selector, value), nil
+}
+
+// PageHover moves the mouse over the element matched by selector (CSS or
+// XPath), triggering hover-dependent UI. Returns the same confirmation string
+// as the MCP page_act hover.
+func PageHover(ctx context.Context, p *browsers.Page, selector string) (string, error) {
+	p.Lock()
+	defer p.Unlock()
+
+	page := p.Rod.Context(ctx)
+
+	el, err := page.Element(selector)
+	if err != nil {
+		return "", fmt.Errorf("hover: element %q: %w", selector, err)
+	}
+	if err := el.Hover(); err != nil {
+		return "", fmt.Errorf("hover: element %q: %w", selector, err)
+	}
+	return fmt.Sprintf("hovered selector=%q", selector), nil
+}
+
+// PageScroll scrolls the window by x/y pixels (window.scrollBy via Eval — the
+// primary path) and returns the resulting scroll position [scrollX, scrollY].
+// Missing x/y are treated as 0. Mirrors the MCP page_act scroll confirmation.
+func PageScroll(ctx context.Context, p *browsers.Page, x, y float64) (string, error) {
+	p.Lock()
+	defer p.Unlock()
+
+	res, err := p.Rod.Context(ctx).Eval(
+		"(x, y) => { window.scrollBy(x, y); return [window.scrollX, window.scrollY]; }",
+		x, y,
+	)
+	if err != nil {
+		return "", fmt.Errorf("scroll: %w", err)
+	}
+	return fmt.Sprintf("scrolled to %s", res.Value.JSON("", "  ")), nil
+}
+
+// PageSelect selects an <option> with the given value in the element matched by
+// selector. rod v0.116.2 has no SelectorTypeValue, so the option is matched
+// with a CSS attribute selector [value="..."]. Returns the same confirmation
+// string as the MCP page_act select.
+func PageSelect(ctx context.Context, p *browsers.Page, selector, value string) (string, error) {
+	p.Lock()
+	defer p.Unlock()
+
+	page := p.Rod.Context(ctx)
+
+	el, err := page.Element(selector)
+	if err != nil {
+		return "", fmt.Errorf("select: element %q: %w", selector, err)
+	}
+	opt := `[value="` + value + `"]`
+	if err := el.Select([]string{opt}, true, rod.SelectorTypeCSSSector); err != nil {
+		return "", fmt.Errorf("select: element %q: %w", selector, err)
+	}
+	return fmt.Sprintf("selected option value=%q in selector=%q", value, selector), nil
+}
+
+// PageNavigate navigates the page to url and waits for the new page to load
+// (rod's Navigate returns after the response header, so WaitLoad is
+// mandatory). Returns the final URL and title — the same confirmation shape as
+// the MCP page_act navigate.
+func PageNavigate(ctx context.Context, p *browsers.Page, url string) (string, error) {
+	p.Lock()
+	defer p.Unlock()
+
+	page := p.Rod.Context(ctx)
+	if err := page.Navigate(url); err != nil {
+		return "", fmt.Errorf("navigate: %w", err)
+	}
+	if err := page.WaitLoad(); err != nil {
+		return "", fmt.Errorf("wait for load: %w", err)
+	}
+	// Info() reports the final URL (post-redirect) and title; fall back to the
+	// requested URL if the metadata read fails — the navigation already landed.
+	msg := fmt.Sprintf("navigated to %q", url)
+	if info, err := page.Info(); err == nil {
+		msg = fmt.Sprintf("navigated to %q (title %q)", info.URL, info.Title)
+	}
+	return msg, nil
+}
+
+// PageBack navigates one step back in the page's history and waits for the
+// previous page to load (history.back() triggers a fresh navigation). Returns
+// the resulting URL — the same confirmation shape as the MCP page_act back.
+func PageBack(ctx context.Context, p *browsers.Page) (string, error) {
+	p.Lock()
+	defer p.Unlock()
+
+	page := p.Rod.Context(ctx)
+	if err := page.NavigateBack(); err != nil {
+		return "", fmt.Errorf("navigate back: %w", err)
+	}
+	// WaitLoad returns immediately if no navigation happened (no history); when
+	// it does, the URL below reflects the previous page.
+	if err := page.WaitLoad(); err != nil {
+		return "", fmt.Errorf("wait for load: %w", err)
+	}
+	info, err := page.Info()
+	if err != nil {
+		return "", fmt.Errorf("read page info: %w", err)
+	}
+	return fmt.Sprintf("navigated back to %q", info.URL), nil
+}
+
+// PageForward navigates one step forward in the page's history and waits for
+// the page to load. Returns the resulting URL — the same confirmation shape as
+// the MCP page_act forward.
+func PageForward(ctx context.Context, p *browsers.Page) (string, error) {
+	p.Lock()
+	defer p.Unlock()
+
+	page := p.Rod.Context(ctx)
+	if err := page.NavigateForward(); err != nil {
+		return "", fmt.Errorf("navigate forward: %w", err)
+	}
+	if err := page.WaitLoad(); err != nil {
+		return "", fmt.Errorf("wait for load: %w", err)
+	}
+	info, err := page.Info()
+	if err != nil {
+		return "", fmt.Errorf("read page info: %w", err)
+	}
+	return fmt.Sprintf("navigated forward to %q", info.URL), nil
+}
+
+// PageReload reloads the page and waits for it to load again. Returns the same
+// confirmation string as the MCP page_act reload.
+func PageReload(ctx context.Context, p *browsers.Page) (string, error) {
+	p.Lock()
+	defer p.Unlock()
+
+	page := p.Rod.Context(ctx)
+	if err := page.Reload(); err != nil {
+		return "", fmt.Errorf("reload: %w", err)
+	}
+	if err := page.WaitLoad(); err != nil {
+		return "", fmt.Errorf("wait for load: %w", err)
+	}
+	return "reloaded page", nil
+}
+
+// PageWait blocks until the page satisfies the requested readiness level, or
+// sleeps for a fixed duration. It supports the readiness modes shared with
+// fetch ("load", "idle", "stable"), an element-level "interactable" mode
+// (requires selector), and the default "ms" mode — a ctx-aware sleep honoring
+// timeout that lets in-flight requests and animations settle before the next
+// action. The "ms" sleep touches no rod state, so it does not take the page
+// lock; every rod-backed mode is fully locked (load/idle/stable delegate to
+// WaitForPage, which owns the lock). Mirrors the MCP page_act wait helper.
+func PageWait(ctx context.Context, p *browsers.Page, mode, selector string, timeout time.Duration) (string, error) {
+	switch mode {
+	case "", "ms":
+		// Backward-compatible default: sleep (ctx-aware) for timeout, so a
+		// cancelled context aborts the sleep instead of blocking the caller.
+		d := timeout
+		if d <= 0 {
+			d = defaultActTimeout
+		}
+		select {
+		case <-time.After(d):
+			return fmt.Sprintf("waited %s", d), nil
+		case <-ctx.Done():
+			return "", fmt.Errorf("wait: %w", ctx.Err())
+		}
+
+	case "load", "idle", "stable":
+		// WaitForPage takes the page lock itself (shared with fetch).
+		if err := WaitForPage(ctx, p, mode); err != nil {
+			return "", fmt.Errorf("wait: %w", err)
+		}
+		return fmt.Sprintf("waited for %q", mode), nil
+
+	case "interactable":
+		if selector == "" {
+			return "", fmt.Errorf("wait: interactable mode requires a selector")
+		}
+		p.Lock()
+		defer p.Unlock()
+		page := p.Rod.Context(ctx)
+		el, err := page.Element(selector)
+		if err != nil {
+			return "", fmt.Errorf("wait: element %q: %w", selector, err)
+		}
+		if _, err := el.WaitInteractable(); err != nil {
+			return "", fmt.Errorf("wait: element %q: %w", selector, err)
+		}
+		return fmt.Sprintf("element %q is interactable", selector), nil
+
+	default:
+		return "", fmt.Errorf("wait: unknown wait_mode %q (must be one of load, idle, stable, interactable, ms)", mode)
+	}
 }
 
 // PageLink is one anchor link collected by PageLinks: its text (the anchor's

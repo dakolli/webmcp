@@ -33,9 +33,9 @@ const (
 	MethodPageOpen = "page.open"
 	// MethodPageList lists the Browser's open pages.
 	MethodPageList = "page.list"
-	// MethodPageFetch extracts an aspect of a live page (html/text/links/meta).
+	// MethodPageFetch extracts an aspect of a live page (html/dom/text/css/js/links/screenshot/meta).
 	MethodPageFetch = "page.fetch"
-	// MethodPageAct performs an action on a live page (eval implemented).
+	// MethodPageAct performs an action on a live page (click/input/hover/scroll/select/eval/navigate/back/forward/reload/wait).
 	MethodPageAct = "page.act"
 	// MethodPageClose closes an open page.
 	MethodPageClose = "page.close"
@@ -158,16 +158,26 @@ type PageListResult struct {
 	Pages []browsers.PageInfo `json:"pages"`
 }
 
-// PageFetchParams carries the page.fetch parameters. what ∈ html|text|links|
-// meta (dom/css/js/screenshot are not implemented); selector scopes html/text;
-// max_bytes caps the returned data (default pageops.DefaultPageMaxBytes).
+// PageFetchParams carries the page.fetch parameters. what ∈ html|dom|text|css|
+// js|links|screenshot|meta; selector scopes html/text; target fetches exactly
+// one css/js resource's content instead of the {url,type,size} list; full_page
+// captures the whole scrollable page in a screenshot; max_bytes caps the
+// returned data (default pageops.DefaultPageMaxBytes; screenshots are never
+// truncated).
 type PageFetchParams struct {
 	// SessionID identifies the live page to fetch from.
 	SessionID string `json:"session_id"`
-	// What is the aspect to extract: html, text, links, meta.
+	// What is the aspect to extract: html, dom, text, css, js, links,
+	// screenshot, meta.
 	What string `json:"what"`
 	// Selector optionally scopes html/text extraction to a CSS match.
 	Selector string `json:"selector,omitempty"`
+	// Target is a resource URL that, when set, makes what=css|js fetch exactly
+	// that one resource's content instead of listing the page's resources.
+	Target string `json:"target,omitempty"`
+	// FullPage captures the entire scrollable page instead of the visible
+	// viewport (screenshot only).
+	FullPage bool `json:"full_page,omitempty"`
 	// MaxBytes caps the returned data size (0 → DefaultPageMaxBytes).
 	MaxBytes int `json:"max_bytes,omitempty"`
 }
@@ -178,14 +188,19 @@ type PageFetchResult struct {
 	Data string `json:"data"`
 }
 
-// PageActParams carries the page.act parameters. Only action=eval is
-// implemented; the other actions return the existing "not implemented" error.
+// PageActParams carries the page.act parameters. action ∈ click|input|type|
+// eval|navigate|back|forward|reload|hover|scroll|select|wait (type is accepted
+// for parity but returns "not implemented"); selector/value/x/y are the
+// per-action payloads; timeout_ms bounds the action (default 30000) and sizes
+// the wait action's "ms" sleep; wait_mode selects what the wait action waits
+// for: load|idle|stable|interactable|ms (default ms).
 type PageActParams struct {
 	// SessionID identifies the live page to act on.
 	SessionID string `json:"session_id"`
-	// Action is the action to perform (eval implemented; rest pending).
+	// Action is the action to perform.
 	Action string `json:"action"`
-	// Value is the payload: a JS function for eval, text for input/type, URL for navigate.
+	// Value is the payload: a JS function for eval, text for input, URL for
+	// navigate, an option value for select.
 	Value string `json:"value,omitempty"`
 	// Selector targets an element for element actions.
 	Selector string `json:"selector,omitempty"`
@@ -193,6 +208,12 @@ type PageActParams struct {
 	X float64 `json:"x,omitempty"`
 	// Y is the vertical offset for scroll.
 	Y float64 `json:"y,omitempty"`
+	// TimeoutMS bounds the action in milliseconds (0 → server default 30000);
+	// the wait action's "ms" mode sleeps for this long.
+	TimeoutMS int `json:"timeout_ms,omitempty"`
+	// WaitMode selects the readiness level the wait action waits for:
+	// "load" | "idle" | "stable" | "interactable" | "ms" (default "ms").
+	WaitMode string `json:"wait_mode,omitempty"`
 }
 
 // PageActResult is the result of page.act.

@@ -168,9 +168,13 @@ func (s *Server) handlePageList(ctx context.Context, params json.RawMessage) (an
 }
 
 // handlePageFetch implements page.fetch: it extracts an aspect of a live page —
-// html, text, links, meta (selector scoping html/text; results truncated to
-// max_bytes, default pageops.DefaultPageMaxBytes). dom/css/js/screenshot return
-// the verbatim "not implemented" -32000 error the CLI produces.
+// html, text, links, meta (selector scoping html/text), dom (nested DOM JSON),
+// css/js (resource list or one target resource), screenshot (base64 PNG
+// data-URI; full_page captures the whole page) — mirroring the CLI page fetch
+// command. Results are truncated to max_bytes (default
+// pageops.DefaultPageMaxBytes) except screenshots, which bypass truncation
+// (mirrors the CLI/MCP truncation exception). An unknown extractor is a -32602
+// invalid-params error.
 func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (any, *Error) {
 	p, rpcErr := decodeParams[PageFetchParams](params)
 	if rpcErr != nil {
@@ -179,16 +183,8 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 	if p.SessionID == "" {
 		return nil, &Error{Code: CodeInvalidParams, Message: `page.fetch: missing required param "session_id"`}
 	}
-	// Fail fast on the deferred extractors (and unknown values) so the caller
-	// is told the extractor itself is unimplemented, not that the page lookup
-	// failed (verbatim parity with pkg/cli/cmd/page.go).
 	switch p.What {
-	case "html", "text", "links", "meta":
-	case "dom", "css", "js", "screenshot":
-		return nil, &Error{
-			Code:    CodeServerError,
-			Message: fmt.Sprintf("page fetch %s: not implemented (engine lacks it; see WEB-18/19/20)", p.What),
-		}
+	case "html", "text", "links", "meta", "dom", "css", "js", "screenshot":
 	case "":
 		return nil, &Error{Code: CodeInvalidParams, Message: `page.fetch: missing required param "what"`}
 	default:
@@ -217,9 +213,25 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 		out, err = pageops.PageLinks(ctx, page)
 	case "meta":
 		out, err = pageops.PageMeta(ctx, page)
+	case "dom":
+		out, err = pageops.PageDOM(ctx, page)
+	case "css":
+		out, err = pageops.PageCSS(ctx, page, p.Target)
+	case "js":
+		out, err = pageops.PageJS(ctx, page, p.Target)
+	case "screenshot":
+		out, err = pageops.PageScreenshot(ctx, page, p.FullPage)
 	}
 	if err != nil {
 		return nil, serverError(err)
+	}
+
+	// Screenshots bypass truncate: the data-URI is binary-as-text and cutting
+	// it mid-stream would produce an undecodable image. Image size scales with
+	// the viewport (or full-page height), not max_bytes (mirrors the CLI and
+	// MCP truncation exception).
+	if p.What == "screenshot" {
+		return PageFetchResult{Data: out}, nil
 	}
 
 	maxBytes := p.MaxBytes
@@ -229,11 +241,12 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 	return PageFetchResult{Data: pageops.PageTruncate(out, maxBytes)}, nil
 }
 
-// handlePageAct implements page.act: only eval is implemented (JS via
-// PageEval); every other known action returns the verbatim "not implemented"
-// -32000 error the CLI produces, deferred to a follow-up CLI ticket (engine
-// interaction methods pending WEB-22/WEB-23). An unknown action is a -32602
-// invalid-params error.
+// handlePageAct implements page.act: it performs the requested action on a
+// live page — click, input, hover, scroll, select, eval, navigate, back,
+// forward, reload or wait — mirroring the CLI page act command. type is
+// accepted for parity but stays deferred (the MCP page_act type action is
+// still stubbed), returning a -32000 "not implemented" error. An unknown
+// action is a -32602 invalid-params error.
 func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any, *Error) {
 	p, rpcErr := decodeParams[PageActParams](params)
 	if rpcErr != nil {
@@ -253,19 +266,24 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 			Message: fmt.Sprintf("page.act: unknown action=%q (must be one of click, input, type, eval, navigate, back, forward, reload, hover, scroll, select, wait)", p.Action),
 		}
 	}
-	// Fail fast on the deferred actions so the caller is told the action itself
-	// is unimplemented, not that the page lookup failed (verbatim parity with
-	// pkg/cli/cmd/page.go).
-	if p.Action != "eval" {
+	// type stays deferred (MCP parity — the MCP page_act type action is still
+	// stubbed): reject it before touching the page with the same "not
+	// implemented" surface as the CLI.
+	if p.Action == "type" {
 		return nil, &Error{
 			Code:    CodeServerError,
-			Message: fmt.Sprintf("page act %s: not implemented — deferred to a follow-up CLI ticket (engine interaction methods pending WEB-22/WEB-23)", p.Action),
+			Message: "page.act type: not implemented",
 		}
 	}
-	if p.Value == "" {
+	if p.Action == "eval" && p.Value == "" {
 		return nil, &Error{
 			Code:    CodeInvalidParams,
-			Message: "page.act: eval requires a non-empty value (a JS function, e.g. '() => document.title')",
+			Message: "page.act: eval requires a non-empty --value (a JS function, e.g. '() => document.title')",
+		}
+	}
+	if p.Action == "wait" {
+		if err := pageops.ValidateWait(p.WaitMode); err != nil {
+			return nil, &Error{Code: CodeInvalidParams, Message: fmt.Sprintf("page.act: %v", err)}
 		}
 	}
 
@@ -278,7 +296,31 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		return nil, serverError(err)
 	}
 
-	out, err := pageops.PageEval(ctx, page, p.Value)
+	var out string
+	switch p.Action {
+	case "click":
+		out, err = pageops.PageClick(ctx, page, p.Selector)
+	case "input":
+		out, err = pageops.PageInput(ctx, page, p.Selector, p.Value)
+	case "eval":
+		out, err = pageops.PageEval(ctx, page, p.Value)
+	case "navigate":
+		out, err = pageops.PageNavigate(ctx, page, p.Value)
+	case "back":
+		out, err = pageops.PageBack(ctx, page)
+	case "forward":
+		out, err = pageops.PageForward(ctx, page)
+	case "reload":
+		out, err = pageops.PageReload(ctx, page)
+	case "hover":
+		out, err = pageops.PageHover(ctx, page, p.Selector)
+	case "scroll":
+		out, err = pageops.PageScroll(ctx, page, p.X, p.Y)
+	case "select":
+		out, err = pageops.PageSelect(ctx, page, p.Selector, p.Value)
+	case "wait":
+		out, err = pageops.PageWait(ctx, page, p.WaitMode, p.Selector, time.Duration(p.TimeoutMS)*time.Millisecond)
+	}
 	if err != nil {
 		return nil, serverError(err)
 	}
