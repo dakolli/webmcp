@@ -9,8 +9,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
+	"time"
 )
+
+// defaultTTL is the per-page idle timeout applied by NewManager when no
+// WithTTL option is given. Pages that go unused for longer than the TTL are
+// closed by the manager's background sweeper.
+const defaultTTL = 15 * time.Minute
+
+// closePageTimeout bounds each individual page close performed by the
+// background sweeper, so a single hung tab cannot stall the sweep loop.
+const closePageTimeout = 30 * time.Second
 
 // Option configures a Manager at construction time. Apply via
 // NewManager(WithHeadless(...), WithStealth(...), ...).
@@ -29,6 +40,16 @@ func WithStealth(stealth bool) Option {
 	return func(m *Manager) { m.stealth = stealth }
 }
 
+// WithTTL sets the per-page idle timeout enforced by the manager's background
+// sweeper: pages that go unused for longer than ttl are closed and removed,
+// reclaiming leaked tabs. The default is 15 minutes; the sweep interval is
+// derived from the TTL (see sweepIntervalForTTL). A non-positive ttl disables
+// sweeping entirely — pages are never reclaimed and no sweeper goroutine is
+// started at all.
+func WithTTL(ttl time.Duration) Option {
+	return func(m *Manager) { m.ttl = ttl }
+}
+
 // Manager owns the single Browser that all MCP sessions live in.
 //
 // Lifecycle:
@@ -42,7 +63,7 @@ func WithStealth(stealth bool) Option {
 //     a browser_id → Browser map is the planned growth path when multi-browser
 //     support lands (AGENTS.md "Browser-first paradigm").
 type Manager struct {
-	// mu guards browser and shutdown.
+	// mu guards browser, shutdown, and the sweeper stop channel.
 	mu sync.Mutex
 	// browser is the single Browser owned by this manager; nil until first Open.
 	browser *Browser
@@ -52,17 +73,45 @@ type Manager struct {
 	stealth bool
 	// shutdown marks the manager as terminated; Open rejects further calls.
 	shutdown bool
+	// ttl is the per-page idle timeout enforced by the background sweeper
+	// (default: 15m; a non-positive value disables sweeping).
+	ttl time.Duration
+	// sweepInterval is how often the background sweeper runs; derived from ttl
+	// at construction (see sweepIntervalForTTL).
+	sweepInterval time.Duration
+	// sweepStop, when non-nil, is the stop channel of a running sweeper
+	// goroutine; nil means no sweeper is running. Guarded by mu.
+	sweepStop chan struct{}
 }
 
 // NewManager constructs a Manager with the given options applied over sensible
-// defaults: headful Chromium and stealth on for every page. The Browser itself
-// is NOT launched here — that happens lazily on the first Open call.
+// defaults: headful Chromium, stealth on for every page, and a 15-minute
+// per-page idle TTL enforced by a background sweeper. The Browser itself is NOT
+// launched here — that happens lazily on the first Open call.
 func NewManager(opts ...Option) *Manager {
-	m := &Manager{stealth: true}
+	m := &Manager{
+		stealth:       true,
+		ttl:           defaultTTL,
+		sweepInterval: sweepIntervalForTTL(defaultTTL),
+	}
 	for _, o := range opts {
 		o(m)
 	}
+	// Re-derive the sweep interval after options so a custom WithTTL also gets
+	// a proportional polling cadence.
+	m.sweepInterval = sweepIntervalForTTL(m.ttl)
 	return m
+}
+
+// sweepIntervalForTTL derives the background sweep interval from a TTL: half
+// the TTL, floored at 1s so even a very short TTL yields a sane polling
+// cadence.
+func sweepIntervalForTTL(ttl time.Duration) time.Duration {
+	interval := ttl / 2
+	if interval < time.Second {
+		interval = time.Second
+	}
+	return interval
 }
 
 // Open lazily launches the manager's single Browser on first use and returns
@@ -96,6 +145,9 @@ func (m *Manager) Open(ctx context.Context) (*Browser, error) {
 		return nil, errors.New("browsers: manager has been shut down")
 	}
 	m.browser = b
+	if m.ttl > 0 {
+		m.startSweeperLocked()
+	}
 	m.mu.Unlock()
 	return b, nil
 }
@@ -112,9 +164,12 @@ func (m *Manager) Browser() (*Browser, error) {
 }
 
 // Close closes the manager's Browser and all of its pages, so a fresh Browser
-// can be opened with a later Open call. It is a no-op when no Browser is open.
+// can be opened with a later Open call. It stops the background sweeper first
+// (idempotently — a second Close is a no-op when nothing is open); a later
+// Open restarts a fresh sweeper. It is a no-op when no Browser is open.
 func (m *Manager) Close(ctx context.Context) error {
 	m.mu.Lock()
+	m.stopSweeperLocked()
 	b := m.browser
 	m.browser = nil
 	m.mu.Unlock()
@@ -126,12 +181,13 @@ func (m *Manager) Close(ctx context.Context) error {
 }
 
 // Shutdown is the graceful-teardown entry point, intended to be called from
-// main() when the server shuts down: it closes the Browser and all of its
-// pages and marks the manager as terminated. After Shutdown the manager must
-// not be reused — further Open calls fail.
+// main() when the server shuts down: it stops the background sweeper, closes
+// the Browser and all of its pages, and marks the manager as terminated. After
+// Shutdown the manager must not be reused — further Open calls fail.
 func (m *Manager) Shutdown(ctx context.Context) error {
 	m.mu.Lock()
 	m.shutdown = true
+	m.stopSweeperLocked()
 	b := m.browser
 	m.browser = nil
 	m.mu.Unlock()
@@ -140,4 +196,104 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 		return nil
 	}
 	return b.Close(ctx)
+}
+
+// startSweeperLocked launches the background TTL sweep goroutine unless one is
+// already running. It must be called with m.mu held. With a non-positive TTL
+// sweeping is disabled and no goroutine is started at all.
+func (m *Manager) startSweeperLocked() {
+	if m.ttl <= 0 {
+		return // sweeping disabled: no ticker goroutine at all
+	}
+	if m.sweepStop != nil {
+		return // a sweeper is already running
+	}
+	stop := make(chan struct{})
+	m.sweepStop = stop
+	go m.sweep(stop)
+}
+
+// stopSweeperLocked stops a running TTL sweep goroutine. It is idempotent — a
+// second call is a no-op — and must be called with m.mu held. The sweeper
+// observes the closed stop channel on its next iteration and exits, so no
+// goroutine is leaked.
+func (m *Manager) stopSweeperLocked() {
+	if m.sweepStop == nil {
+		return
+	}
+	close(m.sweepStop)
+	m.sweepStop = nil
+}
+
+// sweep runs the background TTL sweep loop until stop is closed: on every
+// tick it closes pages that have been idle for longer than the manager's TTL.
+func (m *Manager) sweep(stop <-chan struct{}) {
+	ticker := time.NewTicker(m.sweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			m.sweepOnce(context.Background())
+		}
+	}
+}
+
+// sweepOnce closes every live page that has been idle longer than the
+// manager's TTL, via Browser.ClosePage (rod close + map removal). Each close
+// is best-effort and bounded by closePageTimeout so a hung tab cannot stall or
+// crash the sweep loop. ctx is the sweep's base context (typically
+// context.Background); per-close timeouts are derived from it.
+func (m *Manager) sweepOnce(ctx context.Context) {
+	m.mu.Lock()
+	b := m.browser
+	ttl := m.ttl
+	m.mu.Unlock()
+	if b == nil || ttl <= 0 {
+		return
+	}
+
+	// Snapshot the idle candidates under the browser mutex. Every successful
+	// Browser.Page lookup touches the page under this same mutex, so a page
+	// looked up before this sweep tick reads as fresh and is spared.
+	b.mu.Lock()
+	var idle []PageID
+	now := time.Now()
+	for id, p := range b.pages {
+		p.mu.Lock()
+		idleSince := p.lastAccess
+		p.mu.Unlock()
+		if now.Sub(idleSince) > ttl {
+			idle = append(idle, id)
+		}
+	}
+	b.mu.Unlock()
+
+	for _, id := range idle {
+		// Re-check under the browser mutex that the page is still idle: a
+		// lookup may have touched it after the snapshot. ClosePage then does
+		// the real work (rod close + map removal).
+		b.mu.Lock()
+		p, ok := b.pages[id]
+		stale := false
+		if ok {
+			p.mu.Lock()
+			stale = time.Since(p.lastAccess) > ttl
+			p.mu.Unlock()
+		}
+		b.mu.Unlock()
+		if !ok || !stale {
+			continue
+		}
+
+		closeCtx, cancel := context.WithTimeout(ctx, closePageTimeout)
+		err := b.ClosePage(closeCtx, id)
+		cancel()
+		if err != nil {
+			// Best-effort by design: log and keep sweeping; a failed close
+			// will be retried on the next tick.
+			log.Printf("browsers: sweep: close page %q: %v", id, err)
+		}
+	}
 }

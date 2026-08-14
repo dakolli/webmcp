@@ -8,11 +8,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"webmcp/pkg/browsers"
@@ -22,19 +26,30 @@ import (
 
 const port = ":4099"
 
+// shutdownTimeout bounds the HTTP and browser-manager teardown performed on
+// SIGINT/SIGTERM, so a hung Chromium cannot block process exit indefinitely.
+const shutdownTimeout = 5 * time.Second
+
+// mgr is the single browsers.Manager backing every registered tool. It is
+// package-level so main can tear it down gracefully (closing Chromium and all
+// live pages) when the server shuts down.
+var mgr = browsers.NewManager()
+
 var (
 	sessionsMu sync.Mutex
 	sessions   = make(map[string]chan []byte)
 	registry   = func() *tools.Registry {
-		// Every tool must share the SAME browsers.Manager so that a page opened
-		// by fetch_page can be read by page_fetch and driven by page_act, and
-		// so a single Browser (one Chromium instance) backs all sessions.
+		// Every tool must share the SAME browsers.Manager (mgr) so that a page
+		// opened by fetch_page can be read by page_fetch and driven by page_act,
+		// and so a single Browser (one Chromium instance) backs all sessions.
+		//
+		// Configure the manager at construction, e.g.:
 		//
 		//   mgr := browsers.NewManager(            // optionally:
 		//       browsers.WithHeadless(true),       //   headless Chromium (default headful)
 		//       browsers.WithStealth(false),       //   disable go-rod/stealth (default on)
+		//       browsers.WithTTL(15*time.Minute),  //   page idle TTL (default 15m)
 		//   )
-		mgr := browsers.NewManager()
 		r := tools.NewEmptyRegistry()
 		r.Register(tools.NewFetch(mgr))         // fetch_page
 		r.Register(tools.NewPage(mgr))          // page_fetch
@@ -54,10 +69,42 @@ func main() {
 	http.HandleFunc("/message", handleMessage)
 	http.HandleFunc("/", handleHome)
 
+	// Stop the HTTP server when SIGINT or SIGTERM arrives: the background
+	// goroutine drains it (srv.Shutdown), which makes ListenAndServe return
+	// http.ErrServerClosed and main fall through to the browser teardown below.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	srv := &http.Server{Addr: port}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			// The graceful drain hit its deadline — typically attached SSE
+			// clients that never idle out. Force-drop the remaining active
+			// connections so the process can exit promptly; the browser
+			// teardown below still runs.
+			log.Printf("web-mcp: http shutdown timed out: %v; forcing connections closed", err)
+			if closeErr := srv.Close(); closeErr != nil && !errors.Is(closeErr, http.ErrServerClosed) {
+				log.Printf("web-mcp: http force-close: %v", closeErr)
+			}
+		}
+	}()
+
 	log.Printf("web-mcp Server listening on http://0.0.0.0%s", port)
-	if err := http.ListenAndServe(port, nil); err != nil {
-		log.Fatalf("Server aborted: %v", err)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Printf("web-mcp: server aborted: %v", err)
 	}
+
+	// Graceful browser teardown: close Chromium and all live pages so nothing
+	// leaks when the process exits. Bounded so a hung page cannot block exit.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := mgr.Shutdown(shutdownCtx); err != nil {
+		log.Printf("web-mcp: browser shutdown: %v", err)
+	}
+	log.Print("web-mcp: shut down cleanly")
 }
 
 // handleHome serves a simple diagnostics text page.

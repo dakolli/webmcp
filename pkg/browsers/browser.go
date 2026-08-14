@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
@@ -121,13 +122,21 @@ func (b *Browser) NewPage(ctx context.Context, url string) (*Page, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.nextID++
-	page := &Page{ID: PageID(fmt.Sprintf("page-%d", b.nextID)), URL: url, Rod: p}
+	page := &Page{
+		ID:         PageID(fmt.Sprintf("page-%d", b.nextID)),
+		URL:        url,
+		Rod:        p,
+		lastAccess: time.Now(),
+	}
 	b.pages[page.ID] = page
 	return page, nil
 }
 
 // Page returns the live page with the given ID, or an error when no page with
-// that ID is open (e.g. it was closed or swept).
+// that ID is open (e.g. it was closed or swept). Every successful lookup
+// refreshes the page's last-access time (under the same browser mutex the
+// sweeper iterates under), so the manager's TTL sweeper never closes a page
+// that is in use.
 func (b *Browser) Page(id PageID) (*Page, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -135,6 +144,7 @@ func (b *Browser) Page(id PageID) (*Page, error) {
 	if !ok {
 		return nil, fmt.Errorf("browsers: page %q not found", id)
 	}
+	p.touch()
 	return p, nil
 }
 
