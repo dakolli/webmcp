@@ -9,9 +9,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"io"
+	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/go-rod/rod"
 )
 
 // defaultTTL is the per-page idle timeout applied by NewManager when no
@@ -50,6 +53,19 @@ func WithTTL(ttl time.Duration) Option {
 	return func(m *Manager) { m.ttl = ttl }
 }
 
+// WithLogger sets the logger used for the manager's best-effort background
+// logging (currently the sweeper's page-close failures). The default is a
+// no-op logger that discards everything, keeping pkg/browsers a quiet library
+// unless the caller opts in; pass WithLogger(slog.Default()) to route to the
+// process logger. A nil logger is ignored (the default no-op is kept).
+func WithLogger(logger *slog.Logger) Option {
+	return func(m *Manager) {
+		if logger != nil {
+			m.logger = logger
+		}
+	}
+}
+
 // Manager owns the single Browser that all MCP sessions live in.
 //
 // Lifecycle:
@@ -82,6 +98,11 @@ type Manager struct {
 	// sweepStop, when non-nil, is the stop channel of a running sweeper
 	// goroutine; nil means no sweeper is running. Guarded by mu.
 	sweepStop chan struct{}
+	// logger is the sink for the manager's best-effort background logging
+	// (e.g. sweeper close failures). Defaults to a no-op discard logger;
+	// inject one with WithLogger. Read-only after construction, so it is safe
+	// to use without holding mu.
+	logger *slog.Logger
 }
 
 // NewManager constructs a Manager with the given options applied over sensible
@@ -93,6 +114,7 @@ func NewManager(opts ...Option) *Manager {
 		stealth:       true,
 		ttl:           defaultTTL,
 		sweepInterval: sweepIntervalForTTL(defaultTTL),
+		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	for _, o := range opts {
 		o(m)
@@ -118,6 +140,11 @@ func sweepIntervalForTTL(ttl time.Duration) time.Duration {
 // it; subsequent calls return the already-open Browser. The Browser runs
 // headful by default (unless WithHeadless(true) was set) with stealth applied
 // to every new page (unless WithStealth(false) was set).
+//
+// Open is safe for concurrent use: when two goroutines race the first launch,
+// exactly one Browser survives — the loser closes its own just-launched
+// Browser (best-effort, error form) and every caller receives the winner, so
+// no Chromium instance is orphaned.
 func (m *Manager) Open(ctx context.Context) (*Browser, error) {
 	m.mu.Lock()
 	if m.shutdown {
@@ -143,6 +170,16 @@ func (m *Manager) Open(ctx context.Context) (*Browser, error) {
 		m.mu.Unlock()
 		_ = b.Close(ctx)
 		return nil, errors.New("browsers: manager has been shut down")
+	}
+	if winner := m.browser; winner != nil {
+		// Another goroutine won the race and registered its Browser while we
+		// were launching. Close our just-launched Browser (best-effort, error
+		// form) so no Chromium is orphaned, and hand out the winner. The
+		// sweeper is left untouched: the winner's insert started it exactly
+		// once, and the loser must not stop it.
+		m.mu.Unlock()
+		_ = b.Close(ctx)
+		return winner, nil
 	}
 	m.browser = b
 	if m.ttl > 0 {
@@ -241,10 +278,15 @@ func (m *Manager) sweep(stop <-chan struct{}) {
 }
 
 // sweepOnce closes every live page that has been idle longer than the
-// manager's TTL, via Browser.ClosePage (rod close + map removal). Each close
-// is best-effort and bounded by closePageTimeout so a hung tab cannot stall or
-// crash the sweep loop. ctx is the sweep's base context (typically
-// context.Background); per-close timeouts are derived from it.
+// manager's TTL. Each candidate is removed from the pages map — and its rod
+// handle captured and nilled — while still holding the browser and page locks,
+// so the actual tab close happens strictly afterwards, outside any lock: a
+// Browser.Page lookup racing the sweep either sees the page (and touches it,
+// sparing it) or correctly reports "page not found" — never a page whose tab is
+// mid-close. Each close is best-effort, bounded by closePageTimeout, and never
+// retried, so a wedged tab cannot stall the sweep loop or resurface. ctx is the
+// sweep's base context (typically context.Background); per-close timeouts are
+// derived from it.
 func (m *Manager) sweepOnce(ctx context.Context) {
 	m.mu.Lock()
 	b := m.browser
@@ -271,29 +313,53 @@ func (m *Manager) sweepOnce(ctx context.Context) {
 	b.mu.Unlock()
 
 	for _, id := range idle {
-		// Re-check under the browser mutex that the page is still idle: a
-		// lookup may have touched it after the snapshot. ClosePage then does
-		// the real work (rod close + map removal).
+		// Re-check under the browser mutex that the page is still stale: a
+		// lookup may have touched it after the snapshot. If it is, capture its
+		// rod handle, remove it from the map, and nil p.Rod while still holding
+		// the locks — a later lookup then sees "page not found" instead of
+		// racing the close. The handle is closed below, outside the locks.
+		var handle *rod.Page
 		b.mu.Lock()
 		p, ok := b.pages[id]
-		stale := false
 		if ok {
 			p.mu.Lock()
-			stale = time.Since(p.lastAccess) > ttl
+			if time.Since(p.lastAccess) > ttl {
+				handle = p.Rod
+				p.Rod = nil
+				delete(b.pages, id)
+			}
 			p.mu.Unlock()
 		}
 		b.mu.Unlock()
-		if !ok || !stale {
-			continue
+		if handle == nil {
+			continue // re-touched after the snapshot, or already gone
 		}
 
 		closeCtx, cancel := context.WithTimeout(ctx, closePageTimeout)
-		err := b.ClosePage(closeCtx, id)
+		err := closeRodPage(closeCtx, handle)
 		cancel()
 		if err != nil {
-			// Best-effort by design: log and keep sweeping; a failed close
-			// will be retried on the next tick.
-			log.Printf("browsers: sweep: close page %q: %v", id, err)
+			// Best-effort by design: log once and move on. The page's map slot
+			// and rod handle are already reclaimed, so a tab that keeps failing
+			// to close is logged once (never once per sweep tick) through the
+			// injected logger (no-op by default).
+			m.logger.Warn("browsers: sweep: close page failed",
+				"page", id, "error", err)
 		}
 	}
+}
+
+// closeRodPage closes a *rod.Page handle captured by the sweeper. rod's Close
+// has no ctx-aware form, so a ctx-bound clone honors the caller's timeout
+// (closePageTimeout). The recover is a safety net for the sweeper path: the
+// handle's page may be raced by an in-flight tool call that still holds a
+// reference, and a concurrent close can surface as a panic; converting it to an
+// error keeps the sweep loop alive.
+func closeRodPage(ctx context.Context, handle *rod.Page) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("browsers: close page: panic: %v", r)
+		}
+	}()
+	return handle.Context(ctx).Close()
 }
