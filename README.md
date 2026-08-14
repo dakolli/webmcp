@@ -5,10 +5,9 @@ A Go MCP server that gives LLM agents a **live, stateful browser** built on
 decomposition (DOM tree, HTML, CSS, JS, text, screenshot), and drives it
 (click, input, navigate, run JS) across multiple tool calls.
 
-> **Status:** this README currently documents the **CLI** (`web-cli`) — the
-> human-facing mirror of the MCP toolset that drives the same `pkg/browsers`
-> core engine. MCP server usage and the tool reference will be documented here
-> soon.
+> **Status:** this README documents the **CLI** (`web-cli`) — the human-facing
+> mirror of the MCP toolset that drives the same `pkg/browsers` core engine —
+> and how to connect an LLM agent over **MCP** (see [MCP](#mcp)).
 
 ## Install
 
@@ -133,4 +132,33 @@ go test ./...  # all tests pass
 
 ## MCP
 
-> MCP server usage (SSE endpoint, tool reference) will be added here.
+`web-cli serve mcp` hosts the MCP HTTP/SSE server inside the serve daemon, so
+LLM agents drive the **same live browser** as the CLI over MCP. The MCP toolset
+mirrors the CLI commands one-to-one (`browser_create`, `browser_list`,
+`browser_close`, `fetch_page`, `page_list`, `page_fetch`, `page_act`,
+`session_close`).
+
+### Start the MCP server
+
+```sh
+web-cli serve mcp --port 4099
+```
+
+This daemonizes exactly like `web-cli serve` (same socket, same log) and
+additionally serves the SSE endpoint at `http://127.0.0.1:4099/sse`. It prints
+the client config snippet with your actual port on startup.
+
+### Add it to your MCP client config
+
+Add an entry to your MCP client's config file — e.g. Claude Desktop's
+`claude_desktop_config.json`, a `mem-mcp` client config, or any SSE-capable MCP
+client. The server key is the name you assign to the server (here:
+`web-mcp`):
+
+```json
+"web-mcp": {
+    "type": "remote",
+    "url": "http://127.0.0.1:4099/sse",
+    "enabled": true
+}
+```

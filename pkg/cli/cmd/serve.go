@@ -239,9 +239,37 @@ browser. Stop the daemon with 'web-cli serve stop'.
 			return nil
 		},
 	}
-	mcpCmd.Flags().IntVar(&port, "port", 4099,
-		"HTTP port for the MCP/SSE server (default 4099)")
+	mcpCmd.Flags().IntVar(&port, "port", defaultServeMcpPort,
+		fmt.Sprintf("HTTP port for the MCP/SSE server (default %d)", defaultServeMcpPort))
 	return mcpCmd
+}
+
+// defaultServeMcpPort is the default HTTP port for the in-process MCP/SSE
+// server hosted by `serve mcp`; the --port flag default and the plain-`serve`
+// one-line pointer both reference it so they can never drift.
+const defaultServeMcpPort = 4099
+
+// mcpServeHint returns the one-line pointer printed by plain `serve` (which
+// does not host the MCP endpoint), steering the user to `serve mcp` — the
+// full client-config snippet would be misleading there.
+func mcpServeHint() string {
+	return fmt.Sprintf("host the MCP SSE endpoint for LLM agents: web-cli serve mcp --port %d", defaultServeMcpPort)
+}
+
+// mcpClientConfig renders the MCP client config instructions for the SSE
+// endpoint on port: a one-line explanation followed by the JSON snippet to add
+// to an MCP client config (Claude Desktop, mem-mcp, ...). The snippet stays
+// byte-identical to the README "## MCP" section (key "web-mcp", type remote,
+// url http://127.0.0.1:<port>/sse, enabled true) so the CLI and the docs never
+// diverge.
+func mcpClientConfig(port int) string {
+	return fmt.Sprintf(`Add to your MCP client config, e.g. Claude Desktop / mem-mcp:
+
+"web-mcp": {
+    "type": "remote",
+    "url": "http://127.0.0.1:%d/sse",
+    "enabled": true
+}`, port)
 }
 
 // daemonizeServe spawns the serve loop (childArgs, e.g. ["serve",
@@ -265,10 +293,25 @@ func daemonizeServe(cmd *cobra.Command, opts serveRunOptions, childArgs []string
 	}
 	cmd.Printf("browser_id: %s\n", singleBrowserID)
 	cmd.Printf("socket: %s\n", opts.socket)
-	if opts.mcpPort != 0 {
-		cmd.Printf("mcp: http://localhost:%d\n", opts.mcpPort)
-	}
 	cmd.Printf("daemonized (log: %s); stop with 'web-cli serve stop'\n", logPath)
+	if opts.mcpPort != 0 {
+		// Probe the daemon's MCP port before advertising the endpoint and the
+		// client-config snippet: the daemon may have failed to bind it (e.g.
+		// port already occupied), in which case a URL or snippet would point
+		// the user at a dead endpoint. A short dial is enough — the bind
+		// already happened (or failed) synchronously before the daemon
+		// answered ping.
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("localhost:%d", opts.mcpPort), 300*time.Millisecond)
+		if err != nil {
+			cmd.Printf("mcp: http server did not start on :%d (see log)\n", opts.mcpPort)
+		} else {
+			_ = conn.Close()
+			cmd.Printf("mcp: http://localhost:%d\n", opts.mcpPort)
+			cmd.Printf("%s\n", mcpClientConfig(opts.mcpPort))
+		}
+	} else {
+		cmd.Printf("%s\n", mcpServeHint())
+	}
 	return nil
 }
 
@@ -312,15 +355,27 @@ func runServeForeground(ctx context.Context, opts serveRunOptions) error {
 	defer cancelServe()
 
 	// serve mcp: host the MCP HTTP/SSE server in-process on the SAME manager,
-	// so MCP tools drive the very browser the IPC layer serves.
+	// so MCP tools drive the very browser the IPC layer serves. The port is
+	// bound synchronously here — BEFORE the HTTP goroutine and before mgr.Open
+	// — so a bind failure (e.g. port already occupied) surfaces as a warning
+	// in the output block instead of an async log after the browser launched.
 	var httpSrv *mcpServer.Server
+	var mcpBindErr error
 	if opts.mcpPort != 0 {
-		httpSrv = mcpServer.New(mgr, fmt.Sprintf(":%d", opts.mcpPort))
-		go func() {
-			if err := httpSrv.Serve(serveCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				log.Printf("serve mcp: http server: %v", err)
-			}
-		}()
+		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", opts.mcpPort))
+		if err != nil {
+			// Keep httpSrv nil: no HTTP goroutine starts, and the output
+			// block prints a warning instead of the client-config snippet.
+			mcpBindErr = err
+		} else {
+			httpSrv = mcpServer.New(mgr, fmt.Sprintf(":%d", opts.mcpPort))
+			httpSrv.SetListener(ln)
+			go func() {
+				if err := httpSrv.Serve(serveCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+					log.Printf("serve mcp: http server: %v", err)
+				}
+			}()
+		}
 	}
 
 	// First run downloads Chromium (~100MB); serveCtx bounds the launch.
@@ -330,10 +385,17 @@ func runServeForeground(ctx context.Context, opts serveRunOptions) error {
 
 	fmt.Printf("browser_id: %s\n", singleBrowserID)
 	fmt.Printf("socket: %s\n", path)
-	if httpSrv != nil {
+	if mcpBindErr != nil {
+		fmt.Printf("mcp: failed to bind :%d: %v\n", opts.mcpPort, mcpBindErr)
+	} else if httpSrv != nil {
 		fmt.Printf("mcp: http://localhost:%d\n", opts.mcpPort)
 	}
 	fmt.Printf("press Ctrl-C to stop\n")
+	if httpSrv != nil {
+		fmt.Printf("%s\n", mcpClientConfig(opts.mcpPort))
+	} else if mcpBindErr == nil {
+		fmt.Printf("%s\n", mcpServeHint())
+	}
 
 	// Blocks until SIGINT/SIGTERM (ctx cancellation) or a server.shutdown
 	// request (the internal shutdown hook makes Serve return), or an

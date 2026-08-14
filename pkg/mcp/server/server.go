@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -40,6 +41,10 @@ type Server struct {
 	registry *tools.Registry
 	// httpSrv is the underlying HTTP server; constructed in New.
 	httpSrv *http.Server
+	// ln is an optional pre-bound listener. When set (via SetListener), Serve
+	// serves on it instead of binding addr itself, so a caller can surface a
+	// bind failure synchronously before any serving goroutine starts.
+	ln net.Listener
 
 	// sessionsMu guards sessions: the SSE session_id → outbound message
 	// channel map (an SSE stream buffers responses for its client).
@@ -60,6 +65,16 @@ func New(mgr *browsers.Manager, addr string) *Server {
 	return s
 }
 
+// SetListener injects a pre-bound net.Listener that Serve uses instead of
+// binding the configured address itself. This lets a caller detect a bind
+// failure synchronously (net.Listen returns the error) before starting any
+// serving goroutine — e.g. `web-cli serve mcp` binds the MCP port up front
+// and falls back to a warning instead of an async log. When no listener is
+// set, Serve binds the configured address itself.
+func (s *Server) SetListener(ln net.Listener) {
+	s.ln = ln
+}
+
 // Handler returns the HTTP handler exposing the MCP routes: /sse (the
 // Server-Sent Events stream), /message (JSON-RPC POST) and / (diagnostics).
 func (s *Server) Handler() http.Handler {
@@ -70,15 +85,18 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-// Serve runs the HTTP server on the configured address until ctx is cancelled
-// (SIGINT/SIGTERM, or the serve loop stopping in the serve-mcp daemon); it
-// returns nil on a graceful stop and a wrapped error on failure. Attached SSE
-// clients are drained with a bounded shutdown; if the drain times out the
-// remaining connections are force-closed so the process can exit.
+// Serve runs the HTTP server until ctx is cancelled (SIGINT/SIGTERM, or the
+// serve loop stopping in the serve-mcp daemon); it returns nil on a graceful
+// stop and a wrapped error on failure. When a listener was injected via
+// SetListener it serves on that listener (returning http.ErrServerClosed on a
+// graceful shutdown, same as ListenAndServe); otherwise it binds the
+// configured address itself. Attached SSE clients are drained with a bounded
+// shutdown; if the drain times out the remaining connections are force-closed
+// so the process can exit.
 func (s *Server) Serve(ctx context.Context) error {
 	// Stop the HTTP server when ctx is cancelled: the background goroutine
-	// drains it (http.Server.Shutdown), which makes ListenAndServe return
-	// http.ErrServerClosed.
+	// drains it (http.Server.Shutdown), which makes Serve/ListenAndServe
+	// return http.ErrServerClosed.
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
@@ -96,6 +114,15 @@ func (s *Server) Serve(ctx context.Context) error {
 	}()
 
 	log.Printf("web-mcp Server listening on http://0.0.0.0%s", s.addr)
+	if s.ln != nil {
+		// Serve on the pre-bound listener (web-cli serve mcp): the caller
+		// already owns the bind, so a port conflict surfaced synchronously
+		// instead of as an async log after launch.
+		if err := s.httpSrv.Serve(s.ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("web-mcp: server aborted: %w", err)
+		}
+		return nil
+	}
 	if err := s.httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("web-mcp: server aborted: %w", err)
 	}

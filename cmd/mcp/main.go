@@ -19,6 +19,9 @@ import (
 )
 
 func main() {
+	// Keep the default in sync with web-cli's --port default
+	// (pkg/cli/cmd.defaultServeMcpPort, WEB-43): the const cannot cross the
+	// package boundary, so the two defaults must stay in lockstep by hand.
 	port := flag.Int("port", 4099, "HTTP port for the MCP/SSE server")
 	flag.Parse()
 
