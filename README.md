@@ -5,9 +5,10 @@ A Go MCP server that gives LLM agents a **live, stateful browser** built on
 decomposition (DOM tree, HTML, CSS, JS, text, screenshot), and drives it
 (click, input, navigate, run JS) across multiple tool calls.
 
-> **Status:** this README documents the **CLI** (`web-cli`) — the human-facing
-> mirror of the MCP toolset that drives the same `pkg/browsers` core engine —
-> and how to connect an LLM agent over **MCP** (see [MCP](#mcp)).
+> **Status:** this README documents the full **MCP toolset** (see
+> [MCP](#mcp)) and its human-facing mirror, the **`web-cli`** CLI. Both drive
+> the same `pkg/browsers` core engine, and the full page-reading and
+> page-interaction surfaces described here are implemented and live.
 
 ## Install
 
@@ -35,11 +36,11 @@ web-cli fetch https://example.com
 
 # 3. Inspect and interact with the live page using its session_id.
 web-cli page list
-web-cli page fetch --id <session_id> --what text
-web-cli page act --id <session_id> --action eval --value '() => document.title'
+web-cli page fetch --id page-1 --what text
+web-cli page act --id page-1 --action eval --value '() => document.title'
 
 # 4. Close a page, the browser, or the whole serve daemon.
-web-cli page close --id <session_id>
+web-cli page close --id page-1
 web-cli browser close
 web-cli serve stop
 ```
@@ -48,19 +49,20 @@ web-cli serve stop
 
 The CLI mirrors the MCP tools one-to-one, talking directly to the
 `pkg/browsers` core engine (never through `pkg/mcp`). Every command accepts
-`--browser-id` (default `browser-1`), the id of the single managed browser.
+`--browser-id` (default `browser-1`), the id of the single managed browser,
+and `--socket` (the path of the serve daemon's IPC socket).
 
 | Command | Mirrors | Description |
 | --- | --- | --- |
-| `web-cli serve` | `browser_create` | Start the shared browser as a background **daemon**: it binds the IPC socket, launches Chromium, answers the readiness ping and returns to the prompt (status in `$XDG_STATE_HOME/web-cli/serve.log`, else `~/.web-cli/serve.log`). A second `serve` fails fast on the bound socket. Flags `--headless` / `--stealth`; `--foreground` runs in the terminal instead (Ctrl-C stops it, as before). Stop the daemon with `web-cli serve stop`. |
+| `web-cli serve` | `browser_create` | Start the shared browser as a background **daemon**: it binds the IPC socket, launches Chromium, answers the readiness ping and returns to the prompt (status in `$XDG_STATE_HOME/web-cli/serve.log`, else `~/.web-cli/serve.log`). A second `serve` fails fast on the bound socket. Flags `--headless` (default headful), `--stealth` (default on), `--socket`, and `--foreground` (run in the terminal instead; Ctrl-C stops it). Stop the daemon with `web-cli serve stop`. |
 | `web-cli serve stop` | — | Stop the serve daemon via the `server.shutdown` IPC message; prints a friendly error when no daemon is running. |
-| `web-cli serve mcp --port <n>` | — | Daemonize exactly like `serve` and additionally host the MCP HTTP/SSE server on port `<n>` (default 4099) in the same process, so MCP tools and the CLI drive the same live browser. |
+| `web-cli serve mcp --port <n>` | — | Daemonize exactly like `serve` and additionally host the MCP HTTP/SSE server on port `<n>` (default 4099) in the same process, so MCP tools and the CLI drive the same live browser. Prints the client-config snippet on startup. |
 | `web-cli browser list` | `browser_list` | List the live browser and its open pages (`id\turl` rows). Never launches the browser. |
 | `web-cli browser close` | `browser_close` | Close the browser and all of its pages. Idempotent when nothing is open. Note: this closes the *browser*, not the serve daemon — stop the daemon with `web-cli serve stop`. |
 | `web-cli fetch <url>` | `fetch_page` | Open `<url>` in a new page and print a summary (`session_id`, title, url, text snippet, html bytes, load ms). Flags: `--json`, `--wait idle\|load\|stable` (default `idle`), `--timeout-ms` (default `30000`). |
 | `web-cli page list` | `page_list` | List the browser's open pages (`id\turl`). |
-| `web-cli page fetch --id <session> --what <what>` | `page_fetch` | Extract an aspect of a live page. `--what` is one of `html`, `text`, `links`, `meta` (implemented) — `dom`, `css`, `js`, `screenshot` are not yet implemented. Optional `--selector` (CSS) scopes html/text; `--max-bytes` caps output (default `50000`, truncation is flagged). `links` and `meta` print JSON. |
-| `web-cli page act --id <session> --action eval --value <js>` | `page_act` | Perform an action on a live page. Only `eval` is implemented: run a JS function (e.g. `'() => document.title'`) and print the JSON result. `click`, `input`, `type`, `navigate`, `back`, `forward`, `reload`, `hover`, `scroll`, `select`, `wait` are accepted but not yet implemented. |
+| `web-cli page fetch --id <session> --what <what>` | `page_fetch` | Extract an aspect of a live page. `--what` is one of `html`, `text`, `links`, `meta`, `dom`, `css`, `js`, `screenshot`. Optional `--selector` (CSS) scopes html/text; `--target <url>` fetches exactly one css/js resource's full content instead of the `{url,type,size}` list; `--full-page` captures the entire scrollable page (screenshot only); `--max-bytes` caps output (default `50000`, truncation is flagged; screenshots are never truncated). `links`, `meta`, `dom` and the css/js lists print JSON; `screenshot` prints a `data:image/png;base64,…` data-URI. |
+| `web-cli page act --id <session> --action <action>` | `page_act` | Perform an action on a live page: `click`, `input`, `eval`, `navigate`, `back`, `forward`, `reload`, `hover`, `scroll`, `select`, `wait` — all implemented; `type` is accepted but still errors "not implemented". `--selector` targets elements (click/input/hover/select/wait-interactable); `--value` carries the payload (eval JS / input text / navigate URL / select option value); `--x`/`--y` scroll by pixels; `--wait` (load\|idle\|stable\|interactable\|ms, default `ms`) selects the wait mode; `--timeout-ms` (default `30000`) bounds the action. |
 | `web-cli page close --id <session>` | `session_close` | Close the page, releasing its tab. The session id becomes invalid. |
 
 ### Example session
@@ -68,25 +70,34 @@ The CLI mirrors the MCP tools one-to-one, talking directly to the
 ```sh
 $ web-cli serve
 browser_id: browser-1
-socket: /home/dakolli/.web-mcp.sock
+socket: /run/user/1000/web-mcp.sock
 daemonized (log: /home/dakolli/.web-cli/serve.log); stop with 'web-cli serve stop'
 
 $ web-cli fetch https://go-rod.github.io/
-session_id: 30c1c3f17d20cbceb4f9dbb3d0a1ce0c
+session_id: page-1
 title: go-rod
 url: https://go-rod.github.io/
 text_snippet: go-rod — A high-efficiency driver for Chromium...
 html_bytes: 42119
 load_ms: 1420
 
-$ web-cli page fetch --id 30c1c3f17d20cbceb4f9dbb3d0a1ce0c --what links --max-bytes 2000
+$ web-cli page fetch --id page-1 --what links --max-bytes 2000
 [{"text":"Github","href":"https://github.com/go-rod/rod"},...]
 
-$ web-cli page act --id 30c1c3f17d20cbceb4f9dbb3d0a1ce0c --action eval --value '() => document.title'
-"go-rod"
+$ web-cli page fetch --id page-1 --what dom --max-bytes 1500
+[{"title":"go-rod","url":"https://go-rod.github.io/","root":{"tag":"#document","children":[{"tag":"html",...}]}}]
 
-$ web-cli page close --id 30c1c3f17d20cbceb4f9dbb3d0a1ce0c
-session 30c1c3f17d20cbceb4f9dbb3d0a1ce0c closed
+$ web-cli page fetch --id page-1 --what screenshot --full-page | head -c 120
+data:image/png;base64,iVBORw0KGgoAAAANSUhEUgA...
+
+$ web-cli page act --id page-1 --action eval --value '() => document.title'
+eval result: "go-rod"
+
+$ web-cli page act --id page-1 --action click --selector 'nav a'
+clicked selector="nav a"
+
+$ web-cli page close --id page-1
+session page-1 closed
 
 $ web-cli browser close
 browser browser-1 closed
@@ -133,10 +144,95 @@ go test ./...  # all tests pass
 ## MCP
 
 `web-cli serve mcp` hosts the MCP HTTP/SSE server inside the serve daemon, so
-LLM agents drive the **same live browser** as the CLI over MCP. The MCP toolset
-mirrors the CLI commands one-to-one (`browser_create`, `browser_list`,
-`browser_close`, `fetch_page`, `page_list`, `page_fetch`, `page_act`,
-`session_close`).
+LLM agents drive the **same live browser** as the CLI over MCP. The toolset
+mirrors the CLI commands one-to-one:
+
+| Tool | Purpose | Key params |
+| --- | --- | --- |
+| `browser_create` | Lazily launch the shared live browser (one Chromium instance) and return its `browser_id`. | — (optional `headless`/`stealth`, reserved) |
+| `browser_list` | List the live browser with its open pages; `[]` when nothing is running (never launches). | — |
+| `browser_close` | Close the browser and all of its pages. | `browser_id` |
+| `fetch_page` | Open a URL in a new session; returns `session_id` + a page summary. Call FIRST. | `url`, `wait_for`, `viewport`, `user_agent`, `timeout_ms` |
+| `page_list` | List a browser's open pages. | `browser_id` |
+| `session_list` | List every live session (manager-wide equivalent of `page_list`). | — |
+| `page_fetch` | Read any aspect of a live page. | `session_id`, `what`, `selector`, `max_bytes`, `full_page`, `target` |
+| `page_act` | Interact with a live page. | `session_id`, `action`, `selector`, `value`, `x`, `y`, `timeout_ms`, `wait_mode` |
+| `session_close` | Close a session; its `session_id` becomes invalid. | `session_id` |
+
+Every call is bound to a per-call timeout (default 30s), so a hung page cannot
+block the server.
+
+### `page_fetch` — what you can read
+
+`what` selects the aspect:
+
+- `html` — the page's outerHTML (`selector` scopes it to one element).
+- `dom` — the full DOM re-nested from a CDP flattened snapshot (via
+  `CaptureDOMSnapshot`) into a compact, LLM-friendly tree — iframes, shadow
+  DOM and all, with `id`/`class` hoisted and layout info (visibility, bounds)
+  attached.
+- `text` — the page's visible text (`selector` scopes it).
+- `css` / `js` — a JSON list of the page's `{url, type, size}` style/script
+  resources; pass `target=<url>` to fetch exactly one resource's full content
+  (prefixed with a `// url=… // bytes=…` header).
+- `links` — a JSON array of `{text, href}` anchors, deduplicated by href with
+  non-navigable links (`javascript:`, `mailto:`, `data:`, `tel:`, `#`)
+  dropped.
+- `screenshot` — a base64 PNG data-URI (`data:image/png;base64,…`); pass
+  `full_page: true` to capture the entire scrollable page instead of the
+  visible viewport.
+- `meta` — the page title, URL and collected `<meta>` tags as JSON.
+
+`max_bytes` (default `50000`) caps every text extraction: output is cut on a
+UTF-8 rune boundary and a truncation note is appended, so the agent can
+re-request with a narrower `selector`, a `target` resource URL, or a higher
+cap. **Screenshots are the exception** — the data-URI bypasses truncation
+entirely, because image size scales with the viewport (or full-page height),
+not `max_bytes`, and cutting a data-URI mid-stream would corrupt it.
+
+### `page_act` — what you can do
+
+`action` selects the interaction:
+
+- `click` / `hover` — a CSS or XPath `selector`; click waits until the element
+  is interactable first.
+- `input` — set a field's value (`selector` + `value`).
+- `type` — deferred: still errors "not implemented".
+- `eval` — run arbitrary JavaScript, the primary escape hatch. Pass a JS
+  function (e.g. `() => document.title`); the JSON result is returned and JS
+  exceptions surface verbatim.
+- `navigate` — go to a URL and wait for it to load.
+- `back` / `forward` / `reload` — history navigation, each waiting for load.
+- `scroll` — scroll by `x`/`y` pixels; returns the resulting scroll position.
+- `select` — pick an `<option>` by `value` in the element matched by
+  `selector`.
+- `wait` — block until the page satisfies a readiness level.
+
+`wait` supports these `wait_mode`s: `load` (window.onload), `idle` (no network
+requests for ~500ms), `stable` (DOM unchanged for ~500ms), `interactable` (the
+element matched by `selector` is clickable), and `ms` (sleep for `timeout_ms`;
+the default).
+
+### Session lifecycle
+
+`fetch_page` creates a session (id `page-N`) inside the live browser; every
+subsequent `page_fetch` / `page_act` targets it via `session_id`. Sessions live
+until `session_close` (or `browser_close`), after which their `session_id`
+becomes invalid. The browser itself is launched lazily by
+`browser_create`/`fetch_page` and torn down by `browser_close`.
+
+### Browser liveness (self-healing)
+
+The engine probes Chromium's liveness on every call, so a dead process is never
+reported as healthy:
+
+- lists go honest — `browser_list` returns `[]` (or `page_list` an empty array)
+  instead of stale pages;
+- `browser_create` and `fetch_page` silently relaunch a fresh browser;
+- a `page_fetch` / `page_act` / `session_close` referencing a pre-restart
+  session id fails with an explicit error: the browser process died and was
+  restarted, all previous sessions are gone — call `fetch_page` to re-open
+  URLs.
 
 ### Start the MCP server
 
