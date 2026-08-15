@@ -46,9 +46,18 @@ func NewRootCmd(mgr *browsers.Manager) *cobra.Command {
 		Use:   "browser",
 		Short: "Manage the live browser",
 	}
-	browserCmd.AddCommand(NewBrowserListCmd(mgr), NewBrowserCloseCmd(mgr), NewBrowserFocusCmd(mgr))
+	browserCmd.AddCommand(
+		NewBrowserListCmd(mgr),
+		NewBrowserCloseCmd(mgr),
+		NewBrowserFocusCmd(mgr),
+	)
 
-	root.AddCommand(browserCmd, NewFetchCmd(mgr), NewPageCmd(mgr), NewServeCmd())
+	root.AddCommand(
+		browserCmd,
+		NewFetchCmd(mgr),
+		NewPageCmd(mgr),
+		NewServeCmd(),
+	)
 	return root
 }
 

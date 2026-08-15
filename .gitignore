@@ -2,6 +2,6 @@ AGENTS.md
 go-rod-primer.md
 ipc-guide.md
 .env
-.trash/
+/_trash
 lane-planning.md
 /_examples
