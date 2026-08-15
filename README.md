@@ -55,7 +55,7 @@ and `--socket` (the path of the serve daemon's IPC socket).
 | Command | Mirrors | Description |
 | --- | --- | --- |
 | `web-cli serve` | `browser_create` | Start the shared browser as a background **daemon**: it binds the IPC socket, launches Chromium, answers the readiness ping and returns to the prompt (status in `$XDG_STATE_HOME/web-cli/serve.log`, else `~/.web-cli/serve.log`). A second `serve` fails fast on the bound socket. Flags `--headless` (default headful), `--stealth` (default on), `--socket`, and `--foreground` (run in the terminal instead; Ctrl-C stops it). Stop the daemon with `web-cli serve stop`. |
-| `web-cli serve stop` | — | Stop the serve daemon via the `server.shutdown` IPC message; prints a friendly error when no daemon is running. |
+| `web-cli serve stop` | — | Stop the serve daemon via the `server.shutdown` IPC message; prints a friendly notice (and exits 0) when no daemon is running. |
 | `web-cli serve mcp --port <n>` | — | Daemonize exactly like `serve` and additionally host the MCP HTTP/SSE server on port `<n>` (default 4099) in the same process, so MCP tools and the CLI drive the same live browser. Prints the client-config snippet on startup. |
 | `web-cli browser list` | `browser_list` | List the live browser and its open pages (`id\turl` rows). Never launches the browser. |
 | `web-cli browser close` | `browser_close` | Close the browser and all of its pages. Idempotent when nothing is open. Note: this closes the *browser*, not the serve daemon — stop the daemon with `web-cli serve stop`. |

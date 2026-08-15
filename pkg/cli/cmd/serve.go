@@ -148,17 +148,18 @@ func serveFlagsFromCmd(cmd *cobra.Command) (serveFlags, error) {
 
 // NewServeStopCmd builds `serve stop`: it probes the IPC socket, sends the
 // server.shutdown request and waits briefly for the socket to disappear, then
-// prints "stopped" — or a friendly "no serve daemon running" error when the
-// probe fails. The socket-disappearance poll, not the response, is the source
-// of truth (the daemon may tear down while answering).
+// prints "stopped" — or a friendly "no serve daemon running" notice (exit 0)
+// when the probe fails (idempotent stop, mirroring `browser close`). The
+// socket-disappearance poll, not the response, is the source of truth (the
+// daemon may tear down while answering).
 func NewServeStopCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "stop",
 		Short: "Stop the serve daemon",
 		Long: `Stops the background serve daemon (started with 'web-cli serve' or
 'web-cli serve mcp') by sending it a server.shutdown request over the IPC
-socket and waiting for the socket to disappear. Prints a friendly error when
-no serve daemon is running.`,
+socket and waiting for the socket to disappear. Prints a friendly notice (and
+exits 0) when no serve daemon is running.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			path, err := socketPath(cmd)
 			if err != nil {
@@ -166,7 +167,13 @@ no serve daemon is running.`,
 			}
 			cl, err := ipc.Dial(path)
 			if err != nil {
-				return fmt.Errorf("serve stop: no serve daemon running at %s", path)
+				// Idempotent stop: no daemon running is not an error. Mirrors
+				// `browser close` (idempotent no-op, exit 0) and keeps `make
+				// install` / `make launch` / scripts clean. Dial probes the
+				// listener, so a stale socket from a crashed daemon lands here
+				// too (same benign path, no error dump).
+				fmt.Println("no serve daemon running; nothing to stop")
+				return nil
 			}
 			defer cl.Close()
 
