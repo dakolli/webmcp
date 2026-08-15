@@ -37,6 +37,10 @@ func NewFetchCmd(mgr *browsers.Manager) *cobra.Command {
 			"to load, and prints a compact summary (session_id, title, url, text snippet, " +
 			"html byte size, load time). It mirrors the MCP fetch_page tool; the printed " +
 			"session_id can be used with the page command to read or interact with the page.",
+		Example: `  web-cli fetch https://news.ycombinator.com          # open a page; prints session id + summary
+  web-cli fetch https://example.com --wait stable     # wait for the DOM to settle first
+  web-cli fetch https://example.com --device IPhoneX  # emulate an iPhone X (opt-in)
+  web-cli fetch https://example.com --json            # machine-readable summary`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			urlStr := args[0]

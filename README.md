@@ -34,13 +34,16 @@ web-cli serve
 #    html bytes and load time.
 web-cli fetch https://example.com
 
-# 3. Inspect and interact with the live page using its session_id.
+# 3. Inspect and interact with the live page. With one page open the id is
+#    optional; `last` means the most recently opened page; a bare number
+#    resolves to page-N. The --id/--what/--action flag forms still work.
 web-cli page list
-web-cli page fetch --id page-1 --what text
-web-cli page act --id page-1 --action eval --value '() => document.title'
+web-cli page fetch links
+web-cli page act eval '() => document.title'
+web-cli page fetch --id page-1 --what meta
 
 # 4. Close a page, the browser, or the whole serve daemon.
-web-cli page close --id page-1
+web-cli page close
 web-cli browser close
 web-cli serve stop
 ```
@@ -61,9 +64,9 @@ and `--socket` (the path of the serve daemon's IPC socket).
 | `web-cli browser close` | `browser_close` | Close the browser and all of its pages. Idempotent when nothing is open. Note: this closes the *browser*, not the serve daemon — stop the daemon with `web-cli serve stop`. |
 | `web-cli fetch <url>` | `fetch_page` | Open `<url>` in a new page and print a summary (`session_id`, title, url, text snippet, html bytes, load ms). Flags: `--json`, `--wait idle\|load\|stable` (default `idle`), `--timeout-ms` (default `30000`). |
 | `web-cli page list` | `page_list` | List the browser's open pages (`id\turl`). |
-| `web-cli page fetch --id <session> --what <what>` | `page_fetch` | Extract an aspect of a live page. `--what` is one of `html`, `text`, `links`, `meta`, `dom`, `css`, `js`, `screenshot`. Optional `--selector` (CSS) scopes html/text; `--target <url>` fetches exactly one css/js resource's full content instead of the `{url,type,size}` list; `--full-page` captures the entire scrollable page (screenshot only); `--max-bytes` caps output (default `50000`, truncation is flagged; screenshots are never truncated). `links`, `meta`, `dom` and the css/js lists print JSON; `screenshot` prints a `data:image/png;base64,…` data-URI. |
-| `web-cli page act --id <session> --action <action>` | `page_act` | Perform an action on a live page: `click`, `input`, `eval`, `navigate`, `back`, `forward`, `reload`, `hover`, `scroll`, `select`, `wait` — all implemented; `type` is accepted but still errors "not implemented". `--selector` targets elements (click/input/hover/select/wait-interactable); `--value` carries the payload (eval JS / input text / navigate URL / select option value); `--x`/`--y` scroll by pixels; `--wait` (load\|idle\|stable\|interactable\|ms, default `ms`) selects the wait mode; `--timeout-ms` (default `30000`) bounds the action. |
-| `web-cli page close --id <session>` | `session_close` | Close the page, releasing its tab. The session id becomes invalid. |
+| `web-cli page fetch [id] [what]` | `page_fetch` | Extract an aspect of a live page. `[what]` is one of `html`, `text`, `links`, `meta`, `dom`, `css`, `js`, `screenshot` (default `text`); `[id]` is optional with one page open, `last` = most recently opened, and a bare number (`12`) resolves to `page-12`. The `--id`/`--what` flag forms remain supported. Optional `--selector` (CSS) scopes html/text; `--target <url>` fetches exactly one css/js resource's full content instead of the `{url,type,size}` list; `--full-page` captures the entire scrollable page (screenshot only); `--max-bytes` caps output (default `50000`, truncation is flagged; screenshots are never truncated). `links`, `meta`, `dom` and the css/js lists print JSON; `screenshot` prints a `data:image/png;base64,…` data-URI. |
+| `web-cli page act [id] [action] [payload...]` | `page_act` | Perform an action on a live page: `click`, `input`, `eval`, `navigate`, `back`, `forward`, `reload`, `hover`, `scroll`, `select`, `wait` — all implemented; `type` is accepted but still errors "not implemented". `[id]` follows the same conveniences as `page fetch`. Positional payloads fill each action's fields (`click "#x"`, `input "#q" "text"`, `navigate <url>`, `scroll 0 500`, `eval '() => document.title'`, …); the `--action`/`--selector`/`--value`/`--x`/`--y` flag forms remain supported. |
+| `web-cli page close [id]` | `session_close` | Close the page, releasing its tab (`[id]` optional with one page open; `last`; `12` → `page-12`; `--id` still works). The session id becomes invalid. |
 
 ### Example session
 
@@ -81,22 +84,41 @@ text_snippet: go-rod — A high-efficiency driver for Chromium...
 html_bytes: 42119
 load_ms: 1420
 
-$ web-cli page fetch --id page-1 --what links --max-bytes 2000
+$ web-cli page fetch links --max-bytes 2000     # single open page: no id needed
 [{"text":"Github","href":"https://github.com/go-rod/rod"},...]
 
-$ web-cli page fetch --id page-1 --what dom --max-bytes 1500
+$ web-cli page fetch dom
 [{"title":"go-rod","url":"https://go-rod.github.io/","root":{"tag":"#document","children":[{"tag":"html",...}]}}]
 
-$ web-cli page fetch --id page-1 --what screenshot --full-page | head -c 120
+$ web-cli page fetch screenshot --full-page | head -c 120
 data:image/png;base64,iVBORw0KGgoAAAANSUhEUgA...
 
-$ web-cli page act --id page-1 --action eval --value '() => document.title'
+$ web-cli page act eval '() => document.title'
 eval result: "go-rod"
 
-$ web-cli page act --id page-1 --action click --selector 'nav a'
+$ web-cli page act click 'nav a'
 clicked selector="nav a"
 
-$ web-cli page close --id page-1
+# Open a second page — now the id is required (or use `last`).
+$ web-cli fetch https://example.org
+session_id: page-2
+...
+
+$ web-cli page fetch last links                  # 'last' = most recently opened → page-2
+[{"text":"Example Domain","href":"https://www.iana.org/domains/example"},...]
+
+$ web-cli page fetch                            # two pages → helpful ambiguity error
+page fetch: multiple pages open — pass an explicit page id or 'last':
+  page-1	https://go-rod.github.io/
+  page-2	https://example.org
+
+$ web-cli page fetch 1 text                     # bare number → page-1
+...
+
+$ web-cli page act 1 navigate https://news.ycombinator.com
+navigated to https://news.ycombinator.com
+
+$ web-cli page close 1                          # close page-1 (or `page close last`)
 session page-1 closed
 
 $ web-cli browser close
@@ -109,6 +131,20 @@ stopped
 Every engine call is bound to a per-call timeout (default 30s) so a hung page
 cannot block the CLI; `SIGINT`/`SIGTERM` also triggers a graceful browser
 shutdown.
+
+### Human tips
+
+- The page **id is optional when only one page is open** — `web-cli page fetch
+  links` reads the single open page, `web-cli page act click "#search"` drives
+  it, `web-cli page close` closes it.
+- **`last`** means the most recently opened page (`web-cli page fetch last
+  links`).
+- A **bare number resolves to `page-N`** (`web-cli page fetch 12 dom` →
+  `page-12`).
+- With several pages open, an omitted or unknown id prints the open pages
+  (`id<TAB>url` rows) so you can copy the one you recognize.
+- All the legacy `--id`/`--what`/`--action` flag forms still work unchanged for
+  scripts and LLMs.
 
 ## Testing
 

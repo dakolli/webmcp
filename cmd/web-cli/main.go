@@ -3,6 +3,28 @@
 // (the developers) can experiment interactively with the exact functionality
 // the agent gets over MCP. It talks directly to pkg/browsers — never through
 // pkg/mcp — mirroring the core-vs-MCP boundary kept by pkg/mcp/tools.
+//
+// Example usage (human-facing):
+//
+//	# 1. Start the shared browser as a background daemon (optional — commands
+//	#    launch the browser lazily). fetch/page commands then persist across
+//	#    invocations over the IPC socket.
+//	web-cli serve
+//
+//	# 2. Open a URL. The printed session id (page-1) is what you pass to the
+//	#    page commands — with one page open, you can omit it entirely.
+//	web-cli fetch https://news.ycombinator.com
+//
+//	# 3. Read and drive the live page. 'last' means the most recently opened
+//	#    page; bare numbers resolve to page-N.
+//	web-cli page list
+//	web-cli page fetch links
+//	web-cli page act click "#search"
+//	web-cli page fetch 12 text
+//
+//	# 4. Close the page, the browser, and the daemon.
+//	web-cli page close
+//	web-cli serve stop
 package main
 
 import (

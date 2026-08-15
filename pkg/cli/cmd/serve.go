@@ -86,6 +86,13 @@ browser, so pages persist across invocations. Stop the daemon with
 Subcommands:
   stop  Stop the serve daemon (server.shutdown over IPC)
   mcp   Daemonize with the MCP HTTP/SSE server on --port as well`,
+		Example: `  web-cli serve                    # daemonize the shared browser (headful, stealth on)
+  web-cli serve --headless         # headless Chromium daemon
+  web-cli serve --foreground       # run in this terminal (Ctrl-C stops it)
+  web-cli serve stop               # stop the daemon
+
+  web-cli serve mcp                # daemonize + host the MCP SSE server on :4099
+  web-cli serve mcp --port 4089    # pick a different port`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			flags, err := serveFlagsFromCmd(cmd)
 			if err != nil {
@@ -160,6 +167,7 @@ func NewServeStopCmd() *cobra.Command {
 'web-cli serve mcp') by sending it a server.shutdown request over the IPC
 socket and waiting for the socket to disappear. Prints a friendly notice (and
 exits 0) when no serve daemon is running.`,
+		Example: `  web-cli serve stop    # stop the daemon started with 'web-cli serve' (or 'serve mcp')`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			path, err := socketPath(cmd)
 			if err != nil {
@@ -214,6 +222,8 @@ log, same daemonization) and additionally hosts the MCP HTTP/SSE server on
 browser. Stop the daemon with 'web-cli serve stop'.
 
   --port <n>  HTTP port for the MCP/SSE server (default 4099)`,
+		Example: `  web-cli serve mcp                # daemonize + host the MCP SSE server on :4099
+  web-cli serve mcp --port 4089    # pick a different port`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			flags, err := serveFlagsFromCmd(cmd)
 			if err != nil {

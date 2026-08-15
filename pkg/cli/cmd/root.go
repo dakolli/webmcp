@@ -30,6 +30,30 @@ func NewRootCmd(mgr *browsers.Manager) *cobra.Command {
 	root := &cobra.Command{
 		Use:   "web-cli",
 		Short: "Drive the web-mcp live browser engine from the command line",
+		Long: `Drive the web-mcp live browser engine from the command line: open URLs in a
+real Chromium browser, read any aspect of the live page, and interact with it
+— the human-side knob over the same engine the MCP tools expose to LLM agents.
+
+Typical workflow: 'web-cli serve' starts the shared browser as a background
+daemon (optional — fetch launches it lazily); 'web-cli fetch <url>' opens a
+page and prints its session id (page-1); 'web-cli page fetch/act' read and
+drive the live page; 'web-cli page close' and 'web-cli serve stop' clean up.
+With one page open the page id is optional; 'last' means the most recently
+opened page; a bare number resolves to page-N.`,
+		Example: `  # Start the shared browser as a background daemon (optional: fetch launches it lazily)
+  web-cli serve
+
+  # Open a URL — prints the session id (page-1) you use with the page commands
+  web-cli fetch https://news.ycombinator.com
+
+  # Read and drive the live page. With one page open, the id is optional.
+  web-cli page list
+  web-cli page fetch links
+  web-cli page act click "#search"
+
+  # Clean up
+  web-cli page close
+  web-cli serve stop`,
 	}
 
 	// --browser-id is inherited by every subcommand (mirrors browser_create's
@@ -45,6 +69,13 @@ func NewRootCmd(mgr *browsers.Manager) *cobra.Command {
 	browserCmd := &cobra.Command{
 		Use:   "browser",
 		Short: "Manage the live browser",
+		Long: `Manage the live browser: list its open pages, close it (and every page in
+it), or raise its OS window to the foreground. The CLI manages a single
+browser (browser-1), mirroring the MCP browser_create/list/close tools.`,
+		Example: `  web-cli browser list              # show the live browser and its open pages (id, url)
+  web-cli browser close             # close the browser and every page in it
+  web-cli browser focus             # raise the browser window (best-effort)
+  web-cli browser focus --state maximize`,
 	}
 	browserCmd.AddCommand(
 		NewBrowserListCmd(mgr),
@@ -69,6 +100,13 @@ func NewBrowserListCmd(mgr *browsers.Manager) *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
 		Short: "List the live browser and its open pages",
+		Long: `Shows the live browser's id and its open pages as "id<TAB>url" rows.
+Never launches the browser: with nothing running it prints a friendly hint and
+exits 0, so listing is safe in scripts.`,
+		Example: `  web-cli browser list              # show the live browser and its open pages (id, url)
+  web-cli browser close             # close the browser and every page in it
+  web-cli browser focus             # raise the browser window (best-effort)
+  web-cli browser focus --state maximize`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			// Forward to a live serve process when one is running (browser.list
 			// never lazily launches over IPC either — the server only reports
@@ -108,6 +146,13 @@ func NewBrowserCloseCmd(mgr *browsers.Manager) *cobra.Command {
 	return &cobra.Command{
 		Use:   "close",
 		Short: "Close the live browser and all of its pages",
+		Long: `Closes the browser and every page in it. Closing when nothing is open
+succeeds silently (idempotent, exit 0). Note: this closes the browser, not the
+serve daemon — stop that with 'web-cli serve stop'.`,
+		Example: `  web-cli browser list              # show the live browser and its open pages (id, url)
+  web-cli browser close             # close the browser and every page in it
+  web-cli browser focus             # raise the browser window (best-effort)
+  web-cli browser focus --state maximize`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			id, err := cmd.Flags().GetString("browser-id")
 			if err != nil {
@@ -167,6 +212,10 @@ raise on every window manager — re-asserting normal bounds is the standard
 best-effort; --state maximize is the stronger fallback.
 
 Focus never launches a browser: it operates on an already-running one.`,
+		Example: `  web-cli browser list              # show the live browser and its open pages (id, url)
+  web-cli browser close             # close the browser and every page in it
+  web-cli browser focus             # raise the browser window (best-effort)
+  web-cli browser focus --state maximize`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			id, err := cmd.Flags().GetString("browser-id")
 			if err != nil {
