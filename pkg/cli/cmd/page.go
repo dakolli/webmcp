@@ -36,17 +36,20 @@ subcommand's --help).
 Typical workflow: 'web-cli fetch <url>' opens a page and prints its session id
 (page-1); 'web-cli page list' shows the open pages (id + url); 'web-cli page
 fetch [id] [what]' reads an aspect of a live page; 'web-cli page act [id]
-[action] [payload...]' drives it; 'web-cli page close [id]' closes it.
+[action] [payload...]' drives it; 'web-cli page close [id]' closes it. 'web-cli
+page fetch <url>' skips the separate fetch step: it opens the URL in a new page
+first and reads the aspect in one go.
 
 Subcommands:
   list   List the browser's open pages (id, url)
-  fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta)
+  fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta); a URL opens a new page first
   act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate)
   close  Close an open page
 
 Run a subcommand with --help for its flags and examples.`,
 		Example: `  web-cli page list                  # see your open pages (id + url)
   web-cli page fetch links           # extract links from the single open page
+  web-cli page fetch https://x.com text   # open + read in one step (no prior fetch)
   web-cli page act click "#search"   # click on the single open page
   web-cli page close                 # close the single open page`,
 	}
@@ -119,26 +122,31 @@ func newPageFetchCmd(mgr *browsers.Manager) *cobra.Command {
 	var (
 		id       string
 		what     string
+		url      string
 		selector string
 		target   string
 		fullPage bool
 		maxBytes int
 	)
 	cmd := &cobra.Command{
-		Use:   "fetch [id] [what]",
+		Use:   "fetch [id|url] [what]",
 		Short: "Extract an aspect of a live page",
 		Long: `Extracts an aspect of a live page (html, text, links, meta, dom, css,
 js, screenshot) and prints it. The page id is optional when only one page is
 open; 'last' means the most recently opened page; a bare number resolves to
-page-N.
+page-N. A URL in the [id] slot opens a NEW page for it first — creating the
+browser if needed, exactly like 'web-cli fetch <url>' — and then extracts the
+aspect from that fresh page (one step, no separate "open first" dance).
 
   [id]    the page/session id to read (optional with one page; 'last'; or a
           bare number, e.g. 12 → page-12)
+  [url]   an absolute URL (contains "://") to open in a new page first, then
+          extract the aspect — mirrors 'web-cli fetch <url>' (wait: idle)
   [what]  the aspect to extract: html, text, links, meta, dom, css, js,
           screenshot (default: text)
 
   --id <session>     the page/session id (the positional [id] wins when both
-                     are given)
+                     are given; never treated as a URL)
   --what <what>      the aspect to extract (the positional [what] wins when
                      both are given; default text)
   --selector <css>   optional CSS selector scoping html/text extraction
@@ -153,15 +161,29 @@ shapes. Screenshots print a data:image/png;base64,... data-URI.`,
 		Example: `  web-cli page fetch links                              # single open page → its links
   web-cli page fetch 12 dom                             # page-12's DOM tree
   web-cli page fetch 12 text --selector ".article"      # scoped text extraction
-  web-cli page fetch last screenshot --full-page        # full-page capture of the latest page`,
+  web-cli page fetch last screenshot --full-page        # full-page capture of the latest page
+  web-cli page fetch https://hackernews.com links       # open + extract in one step`,
 		Args: cobra.MaximumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, cancel := context.WithTimeout(cmdCtx(cmd), defaultCmdTimeout)
 			defer cancel()
 
-			// Positional args win over --id/--what; what defaults to text when
-			// neither supplies it ("show me the text of my page").
-			id, what = parseFetchArgs(args, id, what)
+			// Positional args win over --id/--what; a URL-like positional
+			// fills the url slot (the "open a new page first" path); what
+			// defaults to text when neither supplies it ("show me the text of
+			// my page").
+			id, what, url = parseFetchArgs(args, id, what)
+
+			// The URL slot mirrors 'web-cli fetch <url>' (the "open a new page
+			// first" path): validate before any browser work — same fail-fast
+			// doctrine as fetch, so a bad scheme never launches Chromium. The
+			// serve path validates server-side too, but only after the daemon
+			// round-trip; failing here keeps both paths' errors identical.
+			if url != "" {
+				if err := pageops.ValidateURL(url); err != nil {
+					return fmt.Errorf("page fetch: %w", err)
+				}
+			}
 
 			switch what {
 			case "html", "text", "links", "meta", "dom", "css", "js", "screenshot":
@@ -170,9 +192,22 @@ shapes. Screenshots print a data:image/png;base64,... data-URI.`,
 			}
 
 			// Fail-fast switch passed: forward to a live serve process when one
-			// is running; else fall back to the in-process path below.
+			// is running; else fall back to the in-process path below. The url
+			// path opens the page before extracting (browser.open + page.open
+			// are both idempotent/lazy server-side, mirroring fetchViaIPC).
 			if cl := dialServe(cmd); cl != nil {
 				defer cl.Close()
+				if url != "" {
+					var open ipc.BrowserOpenResult
+					if err := cl.Call(ctx, ipc.MethodBrowserOpen, &ipc.BrowserOpenParams{}, &open); err != nil {
+						return fmt.Errorf("page fetch: %w", err)
+					}
+					var summary ipc.PageOpenResult
+					if err := cl.Call(ctx, ipc.MethodPageOpen, &ipc.PageOpenParams{URL: url, Wait: "idle"}, &summary); err != nil {
+						return fmt.Errorf("page fetch: %w", err)
+					}
+					return pageFetchViaIPC(cmd, ctx, cl, summary.SessionID, what, selector, target, fullPage, maxBytes)
+				}
 				rid, err := resolvePageID(ctx, cmd, mgr, cl, id, "page fetch")
 				if err != nil {
 					return err
@@ -181,13 +216,36 @@ shapes. Screenshots print a data:image/png;base64,... data-URI.`,
 			}
 			printServeHint(cmd)
 
-			rid, err := resolvePageID(ctx, cmd, mgr, nil, id, "page fetch")
-			if err != nil {
-				return err
-			}
-			p, err := mgr.Page(ctx, browsers.PageID(rid)) // opens the Browser if needed; probes for liveness
-			if err != nil {
-				return fmt.Errorf("page fetch: %w", err)
+			// Obtain the page: either resolve the id through the manager (never
+			// a lazy launch — that is what the "no open pages" wall guards), or
+			// open the URL in a fresh page, creating the browser if needed
+			// (mirrors the in-process fetch path: mgr.Open → NewPage plain →
+			// WaitForPage idle).
+			var p *browsers.Page
+			var err error
+			if url != "" {
+				var b *browsers.Browser
+				b, err = mgr.Open(ctx) // lazily launches (or returns) the single Browser
+				if err != nil {
+					return fmt.Errorf("page fetch: %w", err)
+				}
+				p, err = b.NewPage(ctx, url, nil, "", "") // new tab; plain launch; stealth applied by default
+				if err != nil {
+					return fmt.Errorf("page fetch: %w", err)
+				}
+				if err := pageops.WaitForPage(ctx, p, "idle"); err != nil {
+					return fmt.Errorf("page fetch: %w", err)
+				}
+			} else {
+				var rid string
+				rid, err = resolvePageID(ctx, cmd, mgr, nil, id, "page fetch")
+				if err != nil {
+					return err
+				}
+				p, err = mgr.Page(ctx, browsers.PageID(rid)) // opens the Browser if needed; probes for liveness
+				if err != nil {
+					return fmt.Errorf("page fetch: %w", err)
+				}
 			}
 
 			var out string

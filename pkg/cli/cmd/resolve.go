@@ -148,9 +148,12 @@ func resolvePageIDFromPages(raw string, pages []browsers.PageInfo, label string)
 }
 
 // noOpenPagesErr is the zero-page resolution error, shared by every resolution
-// rule: it is the actionable hint to open a page first.
+// rule: it is the actionable hint to open a page first, pointing at both the
+// two-step form (fetch then read) and the one-step 'page fetch <url>' form.
+// 'page act' and 'page close' share it unchanged — they still cannot create
+// pages, but the hint stays accurate for them too.
 func noOpenPagesErr(label string) error {
-	return fmt.Errorf("%s: no open pages — open one with 'web-cli fetch <url>'", label)
+	return fmt.Errorf("%s: no open pages — open one with 'web-cli fetch <url>' (or 'web-cli page fetch <url>' to open and read in one step)", label)
 }
 
 // unresolvedPageErr is the "no such page" error: it lists the open pages as
@@ -203,25 +206,43 @@ func isAllDigits(s string) bool {
 	return true
 }
 
+// isURLLike reports whether s looks like an absolute URL, i.e. it contains the
+// "://" scheme separator. Page ids can never contain "://" (they are minted as
+// page-N), so the test is unambiguous for the positional grammar: a URL-like
+// token is a URL, never a page id. Flag values never go through this test — a
+// --id flag value stays a page id by definition.
+func isURLLike(s string) bool {
+	return strings.Contains(s, "://")
+}
+
 // parseFetchArgs merges `page fetch` positional args with the --id/--what flag
 // values: a positional wins over its flag counterpart when both supply the
-// field. Grammar: 0 args → both fields empty; 1 arg → a fetch-aspect word is
-// the what, anything else is the id; 2 args → id, what (cobra enforces the
-// MaximumNArgs(2) bound). The what defaults to "text" when neither the
-// positional nor the flag supplies it ("show me the text of my page").
-func parseFetchArgs(args []string, idFlag, whatFlag string) (id, what string) {
+// field. Grammar: 0 args → all three fields empty; 1 arg → a fetch-aspect word
+// is the what, else a URL-like token (contains "://") is the url, else the id;
+// 2 args → args[0] URL-like ? (url, what) : (id, what) (cobra enforces the
+// MaximumNArgs(2) bound). A positional URL wins over --id/--what exactly like
+// the other positionals; --id is never treated as a URL (flag semantics
+// unchanged). The what defaults to "text" when neither the positional nor the
+// flag supplies it ("show me the text of my page").
+func parseFetchArgs(args []string, idFlag, whatFlag string) (id, what, url string) {
 	switch len(args) {
 	case 1:
 		if whatVocab[args[0]] {
 			what = args[0]
+		} else if isURLLike(args[0]) {
+			url = args[0]
 		} else {
 			id = args[0]
 		}
 	case 2:
-		id, what = args[0], args[1]
+		if isURLLike(args[0]) {
+			url, what = args[0], args[1]
+		} else {
+			id, what = args[0], args[1]
+		}
 	}
-	if id == "" {
-		id = idFlag
+	if id == "" && url == "" {
+		id = idFlag // a positional URL wins over --id entirely
 	}
 	if what == "" {
 		what = whatFlag
@@ -229,7 +250,7 @@ func parseFetchArgs(args []string, idFlag, whatFlag string) (id, what string) {
 	if what == "" {
 		what = "text"
 	}
-	return id, what
+	return id, what, url
 }
 
 // actArgFlags carries the page act --flag values that positional args may

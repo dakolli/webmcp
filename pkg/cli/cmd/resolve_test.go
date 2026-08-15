@@ -17,30 +17,66 @@ func TestParseFetchArgs(t *testing.T) {
 		name             string
 		args             []string
 		idFlag, whatFlag string
-		wantID, wantWhat string
+		wantID           string
+		wantWhat         string
+		wantURL          string
 	}{
-		{"no args no flags defaults", nil, "", "", "", "text"},
-		{"no args, what flag", nil, "", "html", "", "html"},
-		{"no args, id flag", nil, "page-1", "", "page-1", "text"},
-		{"1 arg aspect is what", []string{"links"}, "", "", "", "links"},
-		{"1 arg aspect, what flag loses", []string{"dom"}, "", "html", "", "dom"},
-		{"1 arg digits is id", []string{"12"}, "", "", "12", "text"},
-		{"1 arg literal id", []string{"page-1"}, "", "", "page-1", "text"},
-		{"1 arg non-aspect is id", []string{"bogus"}, "", "", "bogus", "text"},
-		{"2 args id what", []string{"12", "dom"}, "", "", "12", "dom"},
-		{"2 args beat both flags", []string{"page-2", "meta"}, "page-1", "links", "page-2", "meta"},
-		{"2 args what flag fallback", []string{"12", "links"}, "", "text", "12", "links"},
+		{"no args no flags defaults", nil, "", "", "", "text", ""},
+		{"no args, what flag", nil, "", "html", "", "html", ""},
+		{"no args, id flag", nil, "page-1", "", "page-1", "text", ""},
+		{"1 arg aspect is what", []string{"links"}, "", "", "", "links", ""},
+		{"1 arg aspect, what flag loses", []string{"dom"}, "", "html", "", "dom", ""},
+		{"1 arg digits is id", []string{"12"}, "", "", "12", "text", ""},
+		{"1 arg literal id", []string{"page-1"}, "", "", "page-1", "text", ""},
+		{"1 arg non-aspect is id", []string{"bogus"}, "", "", "bogus", "text", ""},
+		{"1 arg url is url", []string{"https://x.com"}, "", "", "", "text", "https://x.com"},
+		{"1 arg url, what flag", []string{"https://x.com"}, "", "html", "", "html", "https://x.com"},
+		{"1 arg url beats id flag", []string{"https://x.com"}, "page-1", "", "", "text", "https://x.com"},
+		{"2 args id what", []string{"12", "dom"}, "", "", "12", "dom", ""},
+		{"2 args beat both flags", []string{"page-2", "meta"}, "page-1", "links", "page-2", "meta", ""},
+		{"2 args what flag fallback", []string{"12", "links"}, "", "text", "12", "links", ""},
+		{"2 args url what", []string{"https://x.com", "links"}, "", "", "", "links", "https://x.com"},
+		{"2 args url what beat flags", []string{"https://x.com", "links"}, "page-1", "html", "", "links", "https://x.com"},
+		{"2 args non-url id what", []string{"bogus", "links"}, "", "", "bogus", "links", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotID, gotWhat := parseFetchArgs(tt.args, tt.idFlag, tt.whatFlag)
+			gotID, gotWhat, gotURL := parseFetchArgs(tt.args, tt.idFlag, tt.whatFlag)
 			if gotID != tt.wantID {
 				t.Errorf("parseFetchArgs(%v, %q, %q) id = %q, want %q", tt.args, tt.idFlag, tt.whatFlag, gotID, tt.wantID)
 			}
 			if gotWhat != tt.wantWhat {
 				t.Errorf("parseFetchArgs(%v, %q, %q) what = %q, want %q", tt.args, tt.idFlag, tt.whatFlag, gotWhat, tt.wantWhat)
 			}
+			if gotURL != tt.wantURL {
+				t.Errorf("parseFetchArgs(%v, %q, %q) url = %q, want %q", tt.args, tt.idFlag, tt.whatFlag, gotURL, tt.wantURL)
+			}
 		})
+	}
+}
+
+// TestIsURLLike pins the URL-slot detector of the page fetch positional
+// grammar: any token containing "://" is a URL, everything else (page ids,
+// bare numbers, 'last', aspect words) is not. Page ids can never contain
+// "://", so the test is unambiguous.
+func TestIsURLLike(t *testing.T) {
+	tests := []struct {
+		s    string
+		want bool
+	}{
+		{"https://x.com", true},
+		{"http://a.b/c", true},
+		{"ftp://x", true},
+		{"page-1", false},
+		{"12", false},
+		{"last", false},
+		{"links", false},
+		{"bogus", false},
+	}
+	for _, tt := range tests {
+		if got := isURLLike(tt.s); got != tt.want {
+			t.Errorf("isURLLike(%q) = %v, want %v", tt.s, got, tt.want)
+		}
 	}
 }
 
@@ -248,9 +284,9 @@ func TestResolvePageIDFromPages(t *testing.T) {
 		wantErr string
 	}{
 		{"single page default", "", one, "page fetch", "page-1", ""},
-		{"zero pages default", "", nil, "page fetch", "", `page fetch: no open pages — open one with 'web-cli fetch <url>'`},
-		{"zero pages literal", "page-1", nil, "page fetch", "", `page fetch: no open pages — open one with 'web-cli fetch <url>'`},
-		{"zero pages last", "last", nil, "page act", "", `page act: no open pages — open one with 'web-cli fetch <url>'`},
+		{"zero pages default", "", nil, "page fetch", "", `page fetch: no open pages — open one with 'web-cli fetch <url>' (or 'web-cli page fetch <url>' to open and read in one step)`},
+		{"zero pages literal", "page-1", nil, "page fetch", "", `page fetch: no open pages — open one with 'web-cli fetch <url>' (or 'web-cli page fetch <url>' to open and read in one step)`},
+		{"zero pages last", "last", nil, "page act", "", `page act: no open pages — open one with 'web-cli fetch <url>' (or 'web-cli page fetch <url>' to open and read in one step)`},
 		{
 			"multi page default lists them",
 			"", two, "page fetch", "",

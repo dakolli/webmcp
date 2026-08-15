@@ -42,6 +42,10 @@ web-cli page fetch links
 web-cli page act eval '() => document.title'
 web-cli page fetch --id page-1 --what meta
 
+#    Zero-setup path: `page fetch <url>` opens the URL in a new page first
+#    (creating the browser if needed) and reads the aspect in one step.
+web-cli page fetch https://example.com links
+
 # 4. Close a page, the browser, or the whole serve daemon.
 web-cli page close
 web-cli browser close
@@ -64,7 +68,7 @@ and `--socket` (the path of the serve daemon's IPC socket).
 | `web-cli browser close` | `browser_close` | Close the browser and all of its pages. Idempotent when nothing is open. Note: this closes the *browser*, not the serve daemon — stop the daemon with `web-cli serve stop`. |
 | `web-cli fetch <url>` | `fetch_page` | Open `<url>` in a new page and print a summary (`session_id`, title, url, text snippet, html bytes, load ms). Flags: `--json`, `--wait idle\|load\|stable` (default `idle`), `--timeout-ms` (default `30000`). |
 | `web-cli page list` | `page_list` | List the browser's open pages (`id\turl`). |
-| `web-cli page fetch [id] [what]` | `page_fetch` | Extract an aspect of a live page. `[what]` is one of `html`, `text`, `links`, `meta`, `dom`, `css`, `js`, `screenshot` (default `text`); `[id]` is optional with one page open, `last` = most recently opened, and a bare number (`12`) resolves to `page-12`. The `--id`/`--what` flag forms remain supported. Optional `--selector` (CSS) scopes html/text; `--target <url>` fetches exactly one css/js resource's full content instead of the `{url,type,size}` list; `--full-page` captures the entire scrollable page (screenshot only); `--max-bytes` caps output (default `50000`, truncation is flagged; screenshots are never truncated). `links`, `meta`, `dom` and the css/js lists print JSON; `screenshot` prints a `data:image/png;base64,…` data-URI. |
+| `web-cli page fetch [id\|url] [what]` | `page_fetch` | Extract an aspect of a live page. `[what]` is one of `html`, `text`, `links`, `meta`, `dom`, `css`, `js`, `screenshot` (default `text`); `[id]` is optional with one page open, `last` = most recently opened, and a bare number (`12`) resolves to `page-12`. A URL in the `[id]` slot (contains `://`) opens a NEW page first — creating the browser if needed, like `fetch <url>` — and reads the aspect in one step. The `--id`/`--what` flag forms remain supported. Optional `--selector` (CSS) scopes html/text; `--target <url>` fetches exactly one css/js resource's full content instead of the `{url,type,size}` list; `--full-page` captures the entire scrollable page (screenshot only); `--max-bytes` caps output (default `50000`, truncation is flagged; screenshots are never truncated). `links`, `meta`, `dom` and the css/js lists print JSON; `screenshot` prints a `data:image/png;base64,…` data-URI. |
 | `web-cli page act [id] [action] [payload...]` | `page_act` | Perform an action on a live page: `click`, `input`, `eval`, `navigate`, `back`, `forward`, `reload`, `hover`, `scroll`, `select`, `wait` — all implemented; `type` is accepted but still errors "not implemented". `[id]` follows the same conveniences as `page fetch`. Positional payloads fill each action's fields (`click "#x"`, `input "#q" "text"`, `navigate <url>`, `scroll 0 500`, `eval '() => document.title'`, …); the `--action`/`--selector`/`--value`/`--x`/`--y` flag forms remain supported. |
 | `web-cli page close [id]` | `session_close` | Close the page, releasing its tab (`[id]` optional with one page open; `last`; `12` → `page-12`; `--id` still works). The session id becomes invalid. |
 
