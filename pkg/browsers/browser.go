@@ -132,8 +132,12 @@ func (b *Browser) Launch(ctx context.Context) error {
 }
 
 // NewPage opens a new tab in the Browser, navigates it to url (when non-empty)
-// and registers it in the pages map under a fresh PageID. Stealth is applied
-// to every new page by default and skipped only when the Browser was
+// and registers it in the pages map under a fresh PageID. The page's rod
+// default ctx and browser binding hang off the manager-owned baseCtx — never
+// the caller's ctx — so the tab persists (and stays probeable) long after the
+// request that created it returns (WEB-63); only the create/navigate/wait ops
+// are chained to the caller's ctx, so a hung call still times out. Stealth is
+// applied to every new page by default and skipped only when the Browser was
 // constructed with stealth=false. The page launches PLAIN — no screen-size
 // override of any kind unless the caller explicitly passes one — and every
 // optional override is applied BEFORE navigating, so it governs the load
@@ -170,11 +174,15 @@ func (b *Browser) NewPage(
 		return nil, fmt.Errorf("browsers: browser not launched")
 	}
 
-	// Chain the per-call ctx explicitly: the rod browser's default ctx is the
-	// manager-owned baseCtx (WEB-59), so a stale/poisoned default is never
-	// inherited here, and the create-target CDP round trip is bounded by the
-	// tool call.
-	p, err := b.createPage(rb.Context(ctx))
+	// The tab is attached through the baseCtx-bound rod browser so the page's
+	// default ctx and browser binding hang off the manager-owned baseCtx, never
+	// this per-call ctx (WEB-63): a page bound to a per-request ctx dies when
+	// the request returns — the next lookup's probe routes Info() through
+	// p.browser whose ctx is the cancelled request ctx, so it fails, evicts the
+	// tab and reports "page-N not found". The per-call ctx is passed along only
+	// to bound the create-target round trip itself, so a hung create still
+	// times out with the tool call.
+	p, err := b.createPage(rb, ctx)
 	if err != nil {
 		return nil, fmt.Errorf("browsers: new page: %w", err)
 	}
@@ -250,22 +258,38 @@ func (b *Browser) NewPage(
 }
 
 // createPage creates a new rod tab, applying go-rod/stealth by default (skipped
-// only when the Browser was constructed with stealth=false). rb is a
-// ctx-chained rod browser clone whose ctx bounds the create (the per-call tool
-// ctx — never the poisoned default). Creation is serialized by b.createMu so a
-// failed create's orphan cleanup (closeOrphanedTab) can identify the tabs it
-// owns without racing a concurrent NewPage.
-func (b *Browser) createPage(rb *rod.Browser) (*rod.Page, error) {
+// only when the Browser was constructed with stealth=false). rb is the LIVE rod
+// browser whose default ctx is the manager-owned baseCtx; callCtx is the
+// per-call tool ctx that bounds the create round trip.
+//
+// The page is attached through the baseCtx-bound browser — never a ctx-chained
+// clone — so the page's default ctx (sessionCtx) and its browser binding hang
+// off the manager-owned baseCtx (WEB-63): a page bound to a per-request ctx
+// dies the moment the request returns, because rod's probePage.Info() routes
+// through p.browser whose ctx is the cancelled request ctx, so every later
+// lookup fails the probe, evicts the tab and reports "page-N not found". The
+// create-target call itself stays bounded by callCtx so a hung create times
+// out with the tool call; the attach round trip (Target.attachToTarget) must
+// run on the baseCtx-bound browser because rod derives the page's lifetime ctx
+// from the attaching browser's ctx at PageFromTarget (rod/browser.go:269-283)
+// — it is a fast localhost CDP op, and binding it to a per-call ctx would
+// re-poison the page it is creating.
+//
+// Creation is serialized by b.createMu so a failed create's orphan cleanup
+// (closeOrphanedTab) can identify the tabs it owns without racing a concurrent
+// NewPage.
+func (b *Browser) createPage(rb *rod.Browser, callCtx context.Context) (*rod.Page, error) {
 	b.createMu.Lock()
 	defer b.createMu.Unlock()
 
-	var p *rod.Page
-	var err error
-	if b.stealth {
-		p, err = stealth.Page(rb) // stealth on by default (error form)
-	} else {
-		p, err = rb.Page(proto.TargetCreateTarget{})
-	}
+	// Phase 1 — create the tab, bounded by the per-call ctx (a hung create
+	// must time out with the tool call, never block the server). The
+	// ctx-chained clone is used ONLY for this round trip and never becomes the
+	// page's browser binding.
+	target, err := proto.TargetCreateTarget{
+		URL:              "about:blank",
+		BrowserContextID: rb.BrowserContextID,
+	}.Call(rb.Context(callCtx))
 	if err != nil {
 		// rod's Browser.Page registers its leak-prevention close-target defer
 		// only AFTER Target.createTarget succeeds (rod/browser.go:195-200): a
@@ -276,6 +300,38 @@ func (b *Browser) createPage(rb *rod.Browser) (*rod.Page, error) {
 		b.closeOrphanedTab(rb)
 		return nil, err
 	}
+	// Phase 2 — attach the page through the baseCtx-bound browser (rod's
+	// PageFromTarget derives the page's sessionCtx from — and binds
+	// page.browser to — the attaching browser). On attach or stealth failure
+	// the fresh target is closed best-effort, bounded off the manager-owned
+	// baseCtx (WEB-59 pattern: the per-call ctx may be precisely what is
+	// failing).
+	attached := false
+	defer func() {
+		if !attached {
+			closeCtx, cancel := context.WithTimeout(b.baseCtx, closePageTimeout)
+			defer cancel()
+			_, _ = proto.TargetCloseTarget{TargetID: target.TargetID}.Call(rb.Context(closeCtx))
+		}
+	}()
+	p, err := rb.PageFromTarget(target.TargetID)
+	if err != nil {
+		return nil, err
+	}
+
+	if b.stealth {
+		// Apply the stealth preload script (the same JS stealth.Page injects,
+		// error form; no Must*), chained to the per-call ctx so the round trip
+		// times out with the tool call. attached stays false until this
+		// succeeds so a stealth failure closes the fresh tab too (it is not a
+		// registered page yet — leaking it would orphan the about:blank
+		// target until browser_close, the same class of leak closeOrphanedTab
+		// covers on the create path).
+		if _, err := p.Context(callCtx).EvalOnNewDocument(stealth.JS); err != nil {
+			return nil, err
+		}
+	}
+	attached = true
 	return p, nil
 }
 
@@ -322,13 +378,11 @@ func (b *Browser) closeOrphanedTab(rb *rod.Browser) {
 // closeUnregisteredPage best-effort closes a freshly created page whose session
 // was never registered, bounding the close off the manager-owned baseCtx so a
 // canceled per-call ctx cannot skip the close (WEB-59). The page's default ctx
-// IS the per-call tool ctx it was created under (inherited via rb.Context(ctx)
-// → stealth.Page/PageFromTarget): rod's Page.Close issues proto.PageClose on
-// p.GetContext(), so with a canceled ctx the cdp client returns ctx.Err()
-// immediately and the close is a NO-OP — the tab and its ~100 MB renderer leak
-// until browser_close (WEB-58). A fresh closePageTimeout derived from the
-// baseCtx — which outlives any single request — guarantees the close is
-// actually delivered. Best-effort by design, like closeOrphanedTab.
+// now hangs off the manager-owned baseCtx too (WEB-63: createPage attaches
+// through the baseCtx-bound browser), so rod's Page.Close on the base handle
+// would already be delivered — the fresh closePageTimeout derived from the
+// baseCtx still guarantees the close is bounded and outlives any single
+// request. Best-effort by design, like closeOrphanedTab.
 func (b *Browser) closeUnregisteredPage(p *rod.Page) {
 	closeCtx, cancel := context.WithTimeout(b.baseCtx, closePageTimeout)
 	defer cancel()
