@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	"webmcp/pkg/browsers"
 	"webmcp/pkg/mcp/models"
@@ -66,7 +67,9 @@ func (r *Registry) Register(t Tool) {
 	r.tools[t.Name()] = t
 }
 
-// List returns all registered tools as models.MCPTool.
+// List returns all registered tools as models.MCPTool, sorted
+// deterministically by tool name so that tools/list output is reproducible
+// across calls (map iteration order is otherwise random).
 func (r *Registry) List() []models.MCPTool {
 	list := make([]models.MCPTool, 0, len(r.tools))
 	for _, t := range r.tools {
@@ -76,6 +79,9 @@ func (r *Registry) List() []models.MCPTool {
 			InputSchema: t.InputSchema(),
 		})
 	}
+	sort.SliceStable(list, func(i, j int) bool {
+		return list[i].Name < list[j].Name
+	})
 	return list
 }
 

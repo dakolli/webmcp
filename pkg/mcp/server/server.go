@@ -229,6 +229,13 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A JSON-RPC notification is a request without an id (JSON-RPC 2.0 §2.3):
+	// the server MUST NOT reply to it. Silently accept it instead of routing
+	// it into processRequest, which would emit a spurious -32601 response.
+	if req.ID == nil {
+		return
+	}
+
 	resp := s.processRequest(r.Context(), req)
 	respBytes, err := json.Marshal(resp)
 	if err != nil {
