@@ -218,12 +218,11 @@ type PageFetchResult struct {
 
 // PageActParams carries the page.act parameters. action ∈ click|input|type|
 // eval|navigate|back|forward|reload|hover|scroll|select|wait|set_viewport|
-// emulate (type is accepted for parity but returns "not implemented");
-// selector/value/x/y are the per-action payloads; viewport carries the target
-// size for set_viewport and device the preset for emulate; timeout_ms bounds
-// the action (default 30000) and sizes the wait action's "ms" sleep;
-// wait_mode selects what the wait action waits for: load|idle|stable|
-// interactable|ms (default ms).
+// emulate; selector/value/x/y are the per-action payloads; viewport carries
+// the target size for set_viewport and device the preset for emulate;
+// timeout_ms bounds the action (default 30000) and sizes the wait action's
+// "ms" sleep; wait_mode selects what the wait action waits for: load|idle|
+// stable|interactable|ms (default ms).
 type PageActParams struct {
 	// SessionID identifies the live page to act on.
 	SessionID string `json:"session_id"`

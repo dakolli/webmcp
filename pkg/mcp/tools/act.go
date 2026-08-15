@@ -282,17 +282,31 @@ func (t *Act) actInput(ctx context.Context, p *browsers.Page, selector, value st
 	return fmt.Sprintf("set input selector=%q value=%q", selector, value), nil
 }
 
-// actType types keystrokes into the element matched by selector. Backed by
-// Element.Focus() + Page.KeyActions().Type(...).Do() or el.Type(...).
+// actType types keystrokes into the element matched by selector without
+// clearing it — unlike actInput (rod's Input clears the field first), type is
+// Focus + InsertText: it focuses the element (scrolling it into view by user
+// gesture) and pastes value at the current caret position. Returns a short
+// confirmation for the LLM.
 func (t *Act) actType(ctx context.Context, p *browsers.Page, selector, value string) (string, error) {
-	// TODO(web-mcp): implement — see go-rod-primer.md
-	//
-	// Intended flow (Phase 1):
-	//   p.Lock(); defer p.Unlock()
-	//   el, err := p.Rod.Element(selector)
-	//   if err := el.Focus(); err != nil { return "", err }
-	//   return p.Rod.InsertText(value)
-	return "", fmt.Errorf("page_act.actType: not implemented")
+	p.Lock()
+	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page_act.actType: page is closed (nil rod handle)")
+	}
+
+	page := p.Rod.Context(ctx).Timeout(defaultActTimeout)
+
+	el, err := page.Element(selector)
+	if err != nil {
+		return "", fmt.Errorf("page_act.actType: element %q: %w", selector, err)
+	}
+	if err := el.Focus(); err != nil {
+		return "", fmt.Errorf("page_act.actType: element %q: %w", selector, err)
+	}
+	if err := page.InsertText(value); err != nil {
+		return "", fmt.Errorf("page_act.actType: %w", err)
+	}
+	return fmt.Sprintf("typed selector=%q value=%q", selector, value), nil
 }
 
 // actEval runs arbitrary JavaScript in the page — the primary escape hatch for

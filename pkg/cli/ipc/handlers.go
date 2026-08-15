@@ -297,11 +297,9 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 }
 
 // handlePageAct implements page.act: it performs the requested action on a
-// live page — click, input, hover, scroll, select, eval, navigate, back,
+// live page — click, input, type, hover, scroll, select, eval, navigate, back,
 // forward, reload, wait or set_viewport — mirroring the CLI page act command.
-// type is accepted for parity but stays deferred (the MCP page_act type action
-// is still stubbed), returning a -32000 "not implemented" error. An unknown
-// action is a -32602 invalid-params error.
+// An unknown action is a -32602 invalid-params error.
 func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any, *Error) {
 	p, rpcErr := decodeParams[PageActParams](params)
 	if rpcErr != nil {
@@ -319,15 +317,6 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		return nil, &Error{
 			Code:    CodeInvalidParams,
 			Message: fmt.Sprintf("page.act: unknown action=%q (must be one of click, input, type, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate)", p.Action),
-		}
-	}
-	// type stays deferred (MCP parity — the MCP page_act type action is still
-	// stubbed): reject it before touching the page with the same "not
-	// implemented" surface as the CLI.
-	if p.Action == "type" {
-		return nil, &Error{
-			Code:    CodeServerError,
-			Message: "page.act type: not implemented",
 		}
 	}
 	if p.Action == "eval" && p.Value == "" {
@@ -375,6 +364,8 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		out, err = pageops.PageClick(ctx, page, p.Selector)
 	case "input":
 		out, err = pageops.PageInput(ctx, page, p.Selector, p.Value)
+	case "type":
+		out, err = pageops.PageType(ctx, page, p.Selector, p.Value)
 	case "eval":
 		out, err = pageops.PageEval(ctx, page, p.Value)
 	case "navigate":

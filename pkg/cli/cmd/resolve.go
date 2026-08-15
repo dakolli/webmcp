@@ -56,7 +56,7 @@ var actPayloadSpecs = map[string][]string{
 	"back":         {},
 	"forward":      {},
 	"reload":       {},
-	"type":         {},
+	"type":         {"selector", "text"},
 }
 
 // resolvePageID resolves a user-supplied page id (possibly empty) to a live
@@ -316,7 +316,7 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 	// Fill the per-action fields from the validated payload.
 	xSet, ySet, wSet, hSet := false, false, false, false
 	switch a.action {
-	case "click", "hover", "select", "input":
+	case "click", "hover", "select", "input", "type":
 		if len(payload) >= 1 {
 			a.selector = payload[0]
 		}

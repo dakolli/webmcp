@@ -830,6 +830,33 @@ func PageInput(ctx context.Context, p *browsers.Page, selector, value string) (s
 	return fmt.Sprintf("set input selector=%q value=%q", selector, value), nil
 }
 
+// PageType types keystrokes into the element matched by selector without
+// clearing it — unlike PageInput (rod's Input clears the field first), type is
+// Focus + InsertText: it focuses the element (scrolling it into view by user
+// gesture) and pastes value at the current caret position. Returns the same
+// confirmation string as the MCP page_act type.
+func PageType(ctx context.Context, p *browsers.Page, selector, value string) (string, error) {
+	p.Lock()
+	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
+
+	page := p.Rod.Context(ctx)
+
+	el, err := page.Element(selector)
+	if err != nil {
+		return "", fmt.Errorf("type: element %q: %w", selector, err)
+	}
+	if err := el.Focus(); err != nil {
+		return "", fmt.Errorf("type: element %q: %w", selector, err)
+	}
+	if err := page.InsertText(value); err != nil {
+		return "", fmt.Errorf("type: %w", err)
+	}
+	return fmt.Sprintf("typed selector=%q value=%q", selector, value), nil
+}
+
 // PageHover moves the mouse over the element matched by selector (CSS or
 // XPath), triggering hover-dependent UI. Returns the same confirmation string
 // as the MCP page_act hover.

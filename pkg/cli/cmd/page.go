@@ -294,9 +294,8 @@ shapes. Screenshots print a data:image/png;base64,... data-URI.`,
 }
 
 // newPageActCmd builds `page act`: it performs an action on a live page —
-// click, input, hover, scroll, select, eval, navigate, back, forward, reload
-// and wait (mirroring the MCP page_act surface; type stays deferred, see
-// RunE).
+// click, input, type, hover, scroll, select, eval, navigate, back, forward,
+// reload, wait, set_viewport and emulate (mirroring the MCP page_act surface).
 func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 	var (
 		id            string
@@ -333,7 +332,7 @@ Positional payloads fill each action's fields — the --selector/--value/--x/
   set_viewport [w] [h]
   emulate      [device]
   back/forward/reload    (none)
-  type         (none; deferred — "not implemented", MCP parity)
+  type         [selector] [text]
 
   --action click|input|hover|scroll|select|eval|navigate|back|forward|reload|wait|set_viewport|emulate
                  the interaction to perform (the positional [action] wins when
@@ -388,12 +387,6 @@ the JSON result.`,
 				return fmt.Errorf("page act: unknown action=%q (must be one of click, input, type, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate)", action)
 			}
 
-			// type stays deferred (MCP parity — the MCP page_act type action is
-			// still stubbed): reject it before touching the page with the same
-			// "not implemented" surface as the MCP stub.
-			if action == "type" {
-				return fmt.Errorf("page act type: not implemented")
-			}
 			if action == "set_viewport" && (width <= 0 || height <= 0) {
 				return fmt.Errorf("page act: viewport width and height must be positive")
 			}
@@ -448,6 +441,8 @@ the JSON result.`,
 				out, err = pageops.PageClick(ctx, p, selector)
 			case "input":
 				out, err = pageops.PageInput(ctx, p, selector, value)
+			case "type":
+				out, err = pageops.PageType(ctx, p, selector, value)
 			case "eval":
 				out, err = pageops.PageEval(ctx, p, value)
 			case "navigate":
@@ -481,7 +476,7 @@ the JSON result.`,
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to act on (optional with one page open; 'last'; or a bare number)")
 	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate")
 	cmd.Flags().StringVar(&selector, "selector", "", "CSS selector targeting the element (element actions)")
-	cmd.Flags().StringVar(&value, "value", "", "value for eval (JS function), input (text), navigate (URL), select (option value)")
+	cmd.Flags().StringVar(&value, "value", "", "value for eval (JS function), input (text), type (text), navigate (URL), select (option value)")
 	cmd.Flags().Float64Var(&x, "x", 0, "horizontal scroll offset in pixels (scroll)")
 	cmd.Flags().Float64Var(&y, "y", 0, "vertical scroll offset in pixels (scroll)")
 	cmd.Flags().StringVar(&waitMode, "wait", "ms", "wait mode (wait action): load, idle, stable, interactable (needs --selector), ms (sleep --timeout-ms; default ms)")
