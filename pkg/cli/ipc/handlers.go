@@ -180,9 +180,18 @@ func (s *Server) handlePageOpen(ctx context.Context, params json.RawMessage) (an
 	if err := pageops.ValidateWait(wait); err != nil {
 		return nil, &Error{Code: CodeInvalidParams, Message: fmt.Sprintf("page.open: %v", err)}
 	}
-	// A viewport override must be positive when given (nil = browser default).
+	// A viewport override must be positive when given (nil = plain launch,
+	// rod's own defaults).
 	if p.Viewport != nil && (p.Viewport.Width <= 0 || p.Viewport.Height <= 0) {
 		return nil, &Error{Code: CodeInvalidParams, Message: "page.open: viewport width and height must be positive"}
+	}
+	// Pre-flight the device preset (same fail-fast doctrine as the MCP
+	// fetch_page validate): an unknown name fails with the exact pinned
+	// unknown-device error before any browser work.
+	if p.Device != "" {
+		if err := browsers.ValidateDeviceName(p.Device); err != nil {
+			return nil, &Error{Code: CodeInvalidParams, Message: fmt.Sprintf("page.open: %v", err)}
+		}
 	}
 
 	start := time.Now() // load timing for the summary
@@ -190,7 +199,9 @@ func (s *Server) handlePageOpen(ctx context.Context, params json.RawMessage) (an
 	if err != nil {
 		return nil, serverError(err)
 	}
-	page, err := b.NewPage(ctx, p.URL, p.Viewport)
+	// NewPage applies the device preset pre-navigation (governs the load
+	// itself); page.open has no user_agent param (MCP-only).
+	page, err := b.NewPage(ctx, p.URL, p.Viewport, p.Device, "")
 	if err != nil {
 		return nil, serverError(err)
 	}
@@ -303,11 +314,11 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		return nil, &Error{Code: CodeInvalidParams, Message: `page.act: missing required param "action"`}
 	}
 	switch p.Action {
-	case "click", "input", "type", "eval", "navigate", "back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport":
+	case "click", "input", "type", "eval", "navigate", "back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport", "emulate":
 	default:
 		return nil, &Error{
 			Code:    CodeInvalidParams,
-			Message: fmt.Sprintf("page.act: unknown action=%q (must be one of click, input, type, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport)", p.Action),
+			Message: fmt.Sprintf("page.act: unknown action=%q (must be one of click, input, type, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate)", p.Action),
 		}
 	}
 	// type stays deferred (MCP parity — the MCP page_act type action is still
@@ -339,6 +350,17 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		}
 		if p.Viewport.Width <= 0 || p.Viewport.Height <= 0 {
 			return nil, &Error{Code: CodeInvalidParams, Message: "page.act: viewport width and height must be positive"}
+		}
+	}
+	// emulate carries its target preset in the device param: reject a missing
+	// or unknown device before any browser work (mirrors the MCP page_act
+	// validation).
+	if p.Action == "emulate" {
+		if p.Device == "" {
+			return nil, &Error{Code: CodeInvalidParams, Message: "page.act: emulate requires a device"}
+		}
+		if err := browsers.ValidateDeviceName(p.Device); err != nil {
+			return nil, &Error{Code: CodeInvalidParams, Message: fmt.Sprintf("page.act: %v", err)}
 		}
 	}
 
@@ -373,6 +395,8 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		out, err = pageops.PageWait(ctx, page, p.WaitMode, p.Selector, time.Duration(p.TimeoutMS)*time.Millisecond)
 	case "set_viewport":
 		out, err = pageops.PageSetViewport(ctx, page, p.Viewport.Width, p.Viewport.Height)
+	case "emulate":
+		out, err = pageops.PageEmulate(ctx, page, p.Device)
 	}
 	if err != nil {
 		return nil, serverError(err)

@@ -68,9 +68,9 @@ func (t *Act) InputSchema() models.InputSchema {
 				"type": "string",
 				"enum": []string{
 					"click", "input", "type", "eval", "navigate",
-					"back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport",
+					"back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport", "emulate",
 				},
-				"description": "The interaction to perform: click (CSS/XPath selector), input (set field value), type (type keystrokes), eval (run JS — the primary escape hatch), navigate (go to a URL), back/forward/reload (history), hover (selector), scroll (by x/y pixels), select (option by value), wait (wait_mode: load/idle/stable/interactable/ms), set_viewport (change the live page's viewport size via the viewport param).",
+				"description": "The interaction to perform: click (CSS/XPath selector), input (set field value), type (type keystrokes), eval (run JS — the primary escape hatch), navigate (go to a URL), back/forward/reload (history), hover (selector), scroll (by x/y pixels), select (option by value), wait (wait_mode: load/idle/stable/interactable/ms), set_viewport (change the live page's viewport size via the viewport param), emulate (apply a go-rod device preset via the device param).",
 			},
 			"selector": map[string]any{
 				"type":        "string",
@@ -106,6 +106,10 @@ func (t *Act) InputSchema() models.InputSchema {
 				},
 				"description": "Target viewport size for the set_viewport action (required with action=set_viewport).",
 			},
+			"device": map[string]any{
+				"type":        "string",
+				"description": "Go-rod device preset name for the emulate action (required with action=emulate), e.g. IPhoneX, iphone x, IPadPro, LaptopWithHiDPIScreen; 'clear' resets emulation.",
+			},
 		},
 		Required: []string{"session_id", "action"},
 	}
@@ -134,6 +138,9 @@ type actArgs struct {
 	// Viewport is the target viewport size for the set_viewport action
 	// (required when action is "set_viewport").
 	Viewport *browsers.Viewport `json:"viewport"`
+	// Device is the go-rod device preset name for the emulate action
+	// (required when action is "emulate").
+	Device string `json:"device"`
 }
 
 // Execute parses the page_act arguments, resolves the session and dispatches to
@@ -161,6 +168,14 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 		if a.Viewport.Width <= 0 || a.Viewport.Height <= 0 {
 			return "", fmt.Errorf("page_act: viewport width and height must be positive")
 		}
+	}
+
+	// emulate carries its target preset in the device param: reject a missing
+	// device before any browser work (the name itself is validated inside
+	// actEmulate via browsers.ValidateDeviceName, mirroring the set_viewport
+	// pre-validation split).
+	if a.Action == "emulate" && a.Device == "" {
+		return "", fmt.Errorf("page_act: emulate requires a device")
 	}
 
 	// Enforce an explicit per-call timeout so a wedged page (or a stuck wait)
@@ -207,8 +222,10 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 		out, err = t.actWait(ctx, p, a.WaitMode, a.Selector, a.TimeoutMS)
 	case "set_viewport":
 		out, err = t.actSetViewport(ctx, p, a.Viewport)
+	case "emulate":
+		out, err = t.actEmulate(ctx, p, a.Device)
 	default:
-		return "", fmt.Errorf("page_act: unknown action=%q (must be one of click, input, type, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport)", a.Action)
+		return "", fmt.Errorf("page_act: unknown action=%q (must be one of click, input, type, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate)", a.Action)
 	}
 	if err != nil {
 		return "", fmt.Errorf("page_act: %w", err)
@@ -556,6 +573,29 @@ func (t *Act) actSetViewport(ctx context.Context, p *browsers.Page, vp *browsers
 		return "", fmt.Errorf("page_act.actSetViewport: %w", err)
 	}
 	return fmt.Sprintf("set viewport to %dx%d", vp.Width, vp.Height), nil
+}
+
+// actEmulate applies a go-rod device preset (lib/devices, v0.116.2) to the
+// live page via the engine seam Page.Emulate — the primary, opt-in emulation
+// mechanism — so an agent can switch a live page to a mobile/desktop preset
+// (device UA + metrics + touch) without re-opening it. The name resolves
+// case-insensitively ("clear" resets); the engine method owns the page lock,
+// the nil-Rod guard and the pinned unknown-device error. The name is
+// pre-flighted via browsers.ValidateDeviceName so an unknown preset fails
+// before any CDP round trip. Execute pre-validates that device is non-empty;
+// the empty check here is defensive for direct callers (mirrors
+// actSetViewport). Returns the preset name for the LLM.
+func (t *Act) actEmulate(ctx context.Context, p *browsers.Page, device string) (string, error) {
+	if device == "" {
+		return "", fmt.Errorf("page_act.actEmulate: emulate requires a device")
+	}
+	if err := browsers.ValidateDeviceName(device); err != nil {
+		return "", err
+	}
+	if err := p.Emulate(ctx, device); err != nil {
+		return "", fmt.Errorf("page_act.actEmulate: %w", err)
+	}
+	return fmt.Sprintf("emulated device: %s", device), nil
 }
 
 // waitForPage blocks until the page satisfies the requested readiness mode. It

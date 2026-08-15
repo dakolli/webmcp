@@ -69,7 +69,7 @@ func (t *Fetch) InputSchema() models.InputSchema {
 			},
 			"device": map[string]any{
 				"type":        "string",
-				"description": "Optional go-rod device preset to emulate on the new page (the primary, opt-in emulation mechanism): a preset name or Title, case-insensitive, e.g. IPhoneX, iphone x, IPadPro, LaptopWithHiDPIScreen; 'clear' resets emulation. Applied after the page opens (re-navigate to re-fetch with the emulated UA). When both device and viewport are given, device wins.",
+				"description": "Optional go-rod device preset to emulate on the new page (the primary, opt-in emulation mechanism): a preset name or Title, case-insensitive, e.g. IPhoneX, iphone x, IPadPro, LaptopWithHiDPIScreen; 'clear' resets emulation. Applied BEFORE navigation, so the device UA + metrics govern the load itself (no re-navigate needed). When both device and viewport are given, device wins.",
 			},
 			"user_agent": map[string]any{
 				"type":        "string",
@@ -95,12 +95,15 @@ type fetchArgs struct {
 	// size is forced). Ignored when Device is set (device wins).
 	Viewport *browsers.Viewport `json:"viewport"`
 	// Device optionally applies a go-rod device preset (lib/devices) to the
-	// new page via Page.Emulate — the primary, opt-in emulation mechanism.
+	// new page BEFORE navigation via Page.Emulate — the primary, opt-in
+	// emulation mechanism, so the device UA + metrics govern the load itself.
 	// The name is case-insensitive on the preset Go identifier or its Title
 	// (e.g. "IPhoneX" / "iphone x"); "clear" resets emulation. When both
 	// Device and Viewport are given, Device wins.
 	Device string `json:"device"`
-	// UserAgent optionally overrides the page's User-Agent header.
+	// UserAgent optionally overrides the page's User-Agent header, applied
+	// BEFORE navigation (governs the load itself; wins over a device preset's
+	// UA when both are given).
 	UserAgent string `json:"user_agent"`
 	// TimeoutMS bounds the whole call in milliseconds (default 30000).
 	TimeoutMS int `json:"timeout_ms"`
@@ -164,23 +167,20 @@ func (t *Fetch) Execute(ctx context.Context, args json.RawMessage) (string, erro
 	}
 	// Device wins over a manual viewport when both are given (user decision
 	// 2026-08-14): a device preset is the primary emulation mechanism, so the
-	// page opens PLAIN and the preset is applied right after (before the
-	// readiness wait) via Page.Emulate; the manual viewport is only applied
-	// when no device was requested.
+	// page opens with the preset applied pre-navigation by the engine (NewPage
+	// applies viewport → device → UA before Navigate) — the device UA + metrics
+	// govern the load itself, no re-navigate needed.
 	vp := a.Viewport
 	if a.Device != "" {
 		vp = nil
 	}
-	p, err := b.NewPage(ctx, a.URL, vp) // new tab; stealth applied by default
+	// NewPage applies the device preset and UA override BEFORE navigating; the
+	// manual viewport only when no device was requested.
+	p, err := b.NewPage(ctx, a.URL, vp, a.Device, a.UserAgent) // new tab; stealth applied by default
 	if err != nil {
 		return "", fmt.Errorf("fetch_page: %w", err)
 	}
-	if a.Device != "" {
-		if err := p.Emulate(ctx, a.Device); err != nil {
-			return "", fmt.Errorf("fetch_page: %w", err)
-		}
-	}
-	if err := t.waitForPage(ctx, p, a.WaitFor); err != nil {
+	if err := waitForPage(ctx, p, a.WaitFor); err != nil {
 		return "", fmt.Errorf("fetch_page: %w", err)
 	}
 	return t.pageSummary(ctx, p, start)
@@ -238,31 +238,6 @@ func (t *Fetch) pageSummary(ctx context.Context, p *browsers.Page, loadStarted t
 		return "", fmt.Errorf("fetch_page: marshal summary: %w", err)
 	}
 	return string(out), nil
-}
-
-// waitForPage blocks until the page satisfies the requested readiness level.
-// It maps "load" to WaitLoad, "idle" to WaitRequestIdle, and "stable" to
-// WaitDOMStable; an empty waitFor is treated as "idle". The wait is bound to
-// ctx (via a page clone) so cancellation aborts a stuck wait.
-func (t *Fetch) waitForPage(ctx context.Context, p *browsers.Page, waitFor string) error {
-	p.Lock()
-	defer p.Unlock()
-	if p.Rod == nil {
-		return fmt.Errorf("page session is closed")
-	}
-
-	pc := p.Rod.Context(ctx)
-	switch waitFor {
-	case "", "idle":
-		// WaitRequestIdle RETURNS a blocking func() — call it, do not return it.
-		wait := pc.WaitRequestIdle(500*time.Millisecond, nil, nil, nil)
-		wait()
-	case "load":
-		return pc.WaitLoad()
-	case "stable":
-		return pc.WaitDOMStable(500*time.Millisecond, 0.05)
-	}
-	return nil
 }
 
 // Ensure Fetch satisfies the Tool interface at compile time.

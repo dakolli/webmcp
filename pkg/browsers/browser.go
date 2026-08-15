@@ -98,13 +98,32 @@ func (b *Browser) Launch(ctx context.Context) error {
 // and registers it in the pages map under a fresh PageID. Stealth is applied
 // to every new page by default and skipped only when the Browser was
 // constructed with stealth=false. The page launches PLAIN — no screen-size
-// override of any kind unless the caller explicitly passes one: a non-nil
-// viewport applies a manual override via Page.SetViewport
-// (Emulation.setDeviceMetricsOverride, ctx-bound, with matching screen
-// metrics) BEFORE navigating; nil leaves rod's own defaults in place (device
-// presets are applied separately via Page.Emulate, which is the primary
-// mechanism — see session.go).
-func (b *Browser) NewPage(ctx context.Context, url string, vp *Viewport) (*Page, error) {
+// override of any kind unless the caller explicitly passes one — and every
+// optional override is applied BEFORE navigating, so it governs the load
+// itself (no re-navigate needed), in this order:
+//
+//  1. viewport (when vp is non-nil): a MANUAL width × height override via
+//     Page.SetViewport (Emulation.setDeviceMetricsOverride, ctx-bound, with
+//     matching screen metrics); nil leaves rod's own defaults in place.
+//  2. device (when device is non-empty): a go-rod device preset via
+//     Page.Emulate — the primary, opt-in emulation mechanism (device UA +
+//     metrics + touch). An unknown name fails with the pinned
+//     "unknown device %q" error; a non-empty preset also makes the manual
+//     viewport (1) moot for metrics, but both steps run in order.
+//  3. userAgent (when userAgent is non-empty): an explicit User-Agent
+//     override via rod's SetUserAgent, applied after any device preset so an
+//     explicit UA wins over the preset's UA.
+//
+// Empty strings skip their step, so a plain call (nil viewport, empty device,
+// empty userAgent) makes ZERO emulation calls on the default path. Any failure
+// closes the orphaned tab (no leak) and wraps the error with %w.
+func (b *Browser) NewPage(
+	ctx context.Context,
+	url string,
+	vp *Viewport,
+	device,
+	userAgent string,
+) (*Page, error) {
 	b.mu.Lock()
 	if b.rod == nil {
 		b.mu.Unlock()
@@ -143,6 +162,30 @@ func (b *Browser) NewPage(ctx context.Context, url string, vp *Viewport) (*Page,
 		if err := page.SetViewport(ctx, vp); err != nil {
 			_ = p.Close() // do not leak the orphaned tab (mirror the navigate failure path)
 			return nil, err
+		}
+	}
+
+	// Apply a device preset pre-navigation via the engine seam (Page.Emulate
+	// owns the page lock and the nil-Rod guard and resolves the name
+	// case-insensitively, failing with the pinned "unknown device %q" error).
+	// Same pre-registration window as the viewport branch above: the page is
+	// not yet in the pages map, so no other goroutine can see it.
+	if device != "" {
+		if err := page.Emulate(ctx, device); err != nil {
+			_ = p.Close() // do not leak the orphaned tab
+			return nil, err
+		}
+	}
+
+	// Apply an explicit UA override pre-navigation via rod's own SetUserAgent
+	// (the same helper Page.Emulate uses internally for the preset UA; an
+	// explicit userAgent thus wins over a device preset's UA). ctx-bound so a
+	// hung CDP call cannot outlive the tool call. In the pre-registration
+	// window no lock is needed — no other goroutine can see the page yet.
+	if userAgent != "" {
+		if err := p.Context(ctx).SetUserAgent(&proto.NetworkSetUserAgentOverride{UserAgent: userAgent}); err != nil {
+			_ = p.Close() // do not leak the orphaned tab
+			return nil, fmt.Errorf("browsers: set user agent: %w", err)
 		}
 	}
 

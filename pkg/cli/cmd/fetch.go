@@ -27,6 +27,7 @@ func NewFetchCmd(mgr *browsers.Manager) *cobra.Command {
 		waitFor   string
 		timeoutMS int
 		viewport  string
+		device    string
 	)
 
 	cmd := &cobra.Command{
@@ -45,10 +46,18 @@ func NewFetchCmd(mgr *browsers.Manager) *cobra.Command {
 			if err := pageops.ValidateWait(waitFor); err != nil {
 				return fmt.Errorf("fetch: %w", err)
 			}
-			// Parse --viewport "WxH" (empty/absent = browser default).
+			// Parse --viewport "WxH" (empty/absent = plain launch, rod defaults).
 			vp, err := pageops.ParseViewport(viewport)
 			if err != nil {
 				return fmt.Errorf("fetch: %w", err)
+			}
+			// Pre-flight the --device preset (same fail-fast doctrine as the
+			// MCP fetch_page validate): an unknown name fails before any
+			// browser work, with the exact pinned unknown-device error.
+			if device != "" {
+				if err := browsers.ValidateDeviceName(device); err != nil {
+					return fmt.Errorf("fetch: %w", err)
+				}
 			}
 
 			// Enforce an explicit per-call timeout so a hung page (or a
@@ -68,7 +77,7 @@ func NewFetchCmd(mgr *browsers.Manager) *cobra.Command {
 			// the in-process path below, which works exactly as before.
 			if cl := dialServe(cmd); cl != nil {
 				defer cl.Close()
-				return fetchViaIPC(cmd, ctx, cl, urlStr, waitFor, asJSON, vp)
+				return fetchViaIPC(cmd, ctx, cl, urlStr, waitFor, asJSON, vp, device)
 			}
 			printServeHint(cmd)
 
@@ -78,7 +87,9 @@ func NewFetchCmd(mgr *browsers.Manager) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("fetch: %w", err)
 			}
-			p, err := b.NewPage(ctx, urlStr, vp) // new tab; stealth applied by default
+			// NewPage applies the device preset pre-navigation (governs the
+			// load itself); the CLI has no --user-agent flag (MCP-only).
+			p, err := b.NewPage(ctx, urlStr, vp, device, "") // new tab; stealth applied by default
 			if err != nil {
 				return fmt.Errorf("fetch: %w", err)
 			}
@@ -113,21 +124,25 @@ func NewFetchCmd(mgr *browsers.Manager) *cobra.Command {
 	cmd.Flags().IntVar(&timeoutMS, "timeout-ms", 30000,
 		"per-call timeout in milliseconds (default 30000)")
 	cmd.Flags().StringVar(&viewport, "viewport", "",
-		"viewport size as WxH, e.g. 1440x900 (default: 1920x1080 per-page via emulation)")
+		"viewport size as WxH, e.g. 1440x900 (explicit override only; pages launch plain by default)")
+	cmd.Flags().StringVar(&device, "device", "",
+		"go-rod device preset to emulate BEFORE navigation (primary, opt-in mechanism; e.g. IPhoneX, IPadPro; empty = plain launch)")
 	return cmd
 }
 
 // fetchViaIPC implements the fetch command against a live serve process: it
 // opens the browser (idempotent — mirrors Manager.Open's laziness) and the
 // page over IPC, then prints the summary byte-identically to the in-process
-// path (the IPC page.open result IS the pageops.FetchSummary shape).
-func fetchViaIPC(cmd *cobra.Command, ctx context.Context, cl *ipc.Client, urlStr, waitFor string, asJSON bool, vp *browsers.Viewport) error {
+// path (the IPC page.open result IS the pageops.FetchSummary shape). device is
+// threaded through PageOpenParams so the serve process applies the preset
+// pre-navigation (governs the load itself).
+func fetchViaIPC(cmd *cobra.Command, ctx context.Context, cl *ipc.Client, urlStr, waitFor string, asJSON bool, vp *browsers.Viewport, device string) error {
 	var open ipc.BrowserOpenResult
 	if err := cl.Call(ctx, ipc.MethodBrowserOpen, &ipc.BrowserOpenParams{}, &open); err != nil {
 		return fmt.Errorf("fetch: %w", err)
 	}
 	var summary ipc.PageOpenResult
-	if err := cl.Call(ctx, ipc.MethodPageOpen, &ipc.PageOpenParams{URL: urlStr, Wait: waitFor, Viewport: vp}, &summary); err != nil {
+	if err := cl.Call(ctx, ipc.MethodPageOpen, &ipc.PageOpenParams{URL: urlStr, Wait: waitFor, Viewport: vp, Device: device}, &summary); err != nil {
 		return fmt.Errorf("fetch: %w", err)
 	}
 

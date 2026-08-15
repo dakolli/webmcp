@@ -38,7 +38,7 @@ const (
 	MethodPageList = "page.list"
 	// MethodPageFetch extracts an aspect of a live page (html/dom/text/css/js/links/screenshot/meta).
 	MethodPageFetch = "page.fetch"
-	// MethodPageAct performs an action on a live page (click/input/hover/scroll/select/eval/navigate/back/forward/reload/wait/set_viewport).
+	// MethodPageAct performs an action on a live page (click/input/hover/scroll/select/eval/navigate/back/forward/reload/wait/set_viewport/emulate).
 	MethodPageAct = "page.act"
 	// MethodPageClose closes an open page.
 	MethodPageClose = "page.close"
@@ -155,15 +155,23 @@ type BrowserFocusResult struct {
 }
 
 // PageOpenParams carries the page.open parameters. wait ∈ idle|load|stable,
-// default idle. viewport optionally overrides the new page's viewport size
-// (nil = the page-level default: 1920×1080 incl. matching screen metrics).
+// default idle. viewport optionally overrides the new page's viewport size —
+// an explicit override only, applied pre-navigation; nil = plain launch with
+// rod's own defaults (no default size is forced). device optionally applies a
+// go-rod device preset BEFORE navigation (the primary, opt-in emulation
+// mechanism — device UA + metrics govern the load itself).
 type PageOpenParams struct {
 	// URL is the absolute http(s) URL to open in a new page.
 	URL string `json:"url"`
 	// Wait is the readiness level before returning: idle (default), load, stable.
 	Wait string `json:"wait,omitempty"`
-	// Viewport optionally overrides the new page's viewport size; nil = default.
+	// Viewport optionally overrides the new page's viewport size; nil = plain
+	// launch, rod's own defaults (explicit override only, never a default).
 	Viewport *browsers.Viewport `json:"viewport,omitempty"`
+	// Device optionally applies a go-rod device preset (lib/devices, e.g.
+	// IPhoneX, IPadPro) to the new page BEFORE navigation; empty = plain
+	// launch. When both Device and Viewport are given, Device wins.
+	Device string `json:"device,omitempty"`
 }
 
 // PageOpenResult is the result of page.open, mirroring the CLI fetch command's
@@ -209,12 +217,13 @@ type PageFetchResult struct {
 }
 
 // PageActParams carries the page.act parameters. action ∈ click|input|type|
-// eval|navigate|back|forward|reload|hover|scroll|select|wait|set_viewport
-// (type is accepted for parity but returns "not implemented");
+// eval|navigate|back|forward|reload|hover|scroll|select|wait|set_viewport|
+// emulate (type is accepted for parity but returns "not implemented");
 // selector/value/x/y are the per-action payloads; viewport carries the target
-// size for set_viewport; timeout_ms bounds the action (default 30000) and
-// sizes the wait action's "ms" sleep; wait_mode selects what the wait action
-// waits for: load|idle|stable|interactable|ms (default ms).
+// size for set_viewport and device the preset for emulate; timeout_ms bounds
+// the action (default 30000) and sizes the wait action's "ms" sleep;
+// wait_mode selects what the wait action waits for: load|idle|stable|
+// interactable|ms (default ms).
 type PageActParams struct {
 	// SessionID identifies the live page to act on.
 	SessionID string `json:"session_id"`
@@ -238,6 +247,9 @@ type PageActParams struct {
 	// Viewport is the target viewport size for the set_viewport action
 	// (required when action is "set_viewport").
 	Viewport *browsers.Viewport `json:"viewport,omitempty"`
+	// Device is the go-rod device preset for the emulate action (required when
+	// action is "emulate").
+	Device string `json:"device,omitempty"`
 }
 
 // PageActResult is the result of page.act.

@@ -71,11 +71,12 @@ func ValidateWait(waitFor string) error {
 }
 
 // ParseViewport parses a "WxH" viewport string (e.g. "1440x900") into a
-// browsers.Viewport. An empty or absent flag yields nil — the browser default
-// (the launch-time 1920×1080 window size) applies. Any malformed or
-// non-positive value fails with the exact pinned error so the CLI and IPC
-// layers share one parse surface (mirrors the ValidateURL/ValidateWait
-// pattern).
+// browsers.Viewport. An empty or absent flag yields nil — a plain launch with
+// rod's own defaults, NO override (the explicit-override-only doctrine: pages
+// launch plain by default; device presets via Page.Emulate are the primary
+// opt-in mechanism). Any malformed or non-positive value fails with the exact
+// pinned error so the CLI and IPC layers share one parse surface (mirrors the
+// ValidateURL/ValidateWait pattern).
 func ParseViewport(s string) (*browsers.Viewport, error) {
 	if s == "" {
 		return nil, nil
@@ -1004,6 +1005,22 @@ func PageSetViewport(ctx context.Context, p *browsers.Page, w, h int) (string, e
 		return "", err
 	}
 	return fmt.Sprintf("set viewport to %dx%d", w, h), nil
+}
+
+// PageEmulate applies a go-rod device preset (lib/devices, v0.116.2) to the
+// live page via the engine seam Page.Emulate — the primary, opt-in emulation
+// mechanism (device UA + metrics + touch), so the CLI can switch a live page
+// to a mobile/desktop preset without re-opening it. The engine method owns
+// the page lock and the nil-Rod guard and resolves the name
+// case-insensitively, failing with the pinned unknown-device error. Callers
+// pre-validate the name via browsers.ValidateDeviceName (the CLI --device
+// flag and the IPC page.act handler do, mirroring the MCP page_act). Returns
+// the same confirmation string as the MCP page_act emulate.
+func PageEmulate(ctx context.Context, p *browsers.Page, device string) (string, error) {
+	if err := p.Emulate(ctx, device); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("emulated device: %s", device), nil
 }
 
 // PageWait blocks until the page satisfies the requested readiness level, or

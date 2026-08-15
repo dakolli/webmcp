@@ -31,7 +31,7 @@ func NewPageCmd(mgr *browsers.Manager) *cobra.Command {
 Subcommands:
   list   List the browser's open pages (id, url)
   fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta)
-  act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport)
+  act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate)
   close  Close an open page
 
 Run a subcommand with --help for its flags.`,
@@ -210,13 +210,14 @@ func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 		waitMode      string
 		timeoutMS     int
 		width, height int
+		device        string
 	)
 	cmd := &cobra.Command{
 		Use:   "act",
 		Short: "Perform an action on a live page",
 		Long: `Performs an action on the live page identified by --id.
 
-  --action click|input|hover|scroll|select|eval|navigate|back|forward|reload|wait|set_viewport
+  --action click|input|hover|scroll|select|eval|navigate|back|forward|reload|wait|set_viewport|emulate
                  the interaction to perform (required); type is accepted but
                  not implemented yet (mirrors the MCP page_act stub)
 
@@ -228,6 +229,8 @@ func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
                     interactable (needs --selector), ms (sleep --timeout-ms;
                     default ms)
   --width, --height <n>  target viewport size in CSS pixels (set_viewport)
+  --device <preset>  go-rod device preset to apply (emulate action), e.g.
+                    IPhoneX, IPadPro
   --timeout-ms <n>  per-action timeout in milliseconds (default 30000)
 
 Interaction confirmation strings match the MCP page_act surface; eval prints
@@ -245,9 +248,9 @@ the JSON result.`,
 			defer cancel()
 
 			switch action {
-			case "click", "input", "type", "eval", "navigate", "back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport":
+			case "click", "input", "type", "eval", "navigate", "back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport", "emulate":
 			default:
-				return fmt.Errorf("page act: unknown action=%q (must be one of click, input, type, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport)", action)
+				return fmt.Errorf("page act: unknown action=%q (must be one of click, input, type, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate)", action)
 			}
 
 			// type stays deferred (MCP parity — the MCP page_act type action is
@@ -258,6 +261,17 @@ the JSON result.`,
 			}
 			if action == "set_viewport" && (width <= 0 || height <= 0) {
 				return fmt.Errorf("page act: viewport width and height must be positive")
+			}
+			// emulate carries its target preset in --device: reject a missing
+			// or unknown device before any browser work (mirrors the MCP
+			// page_act validation; the engine also guards inside Page.Emulate).
+			if action == "emulate" {
+				if device == "" {
+					return fmt.Errorf("page act: emulate requires a device")
+				}
+				if err := browsers.ValidateDeviceName(device); err != nil {
+					return fmt.Errorf("page act: %w", err)
+				}
 			}
 			if action == "eval" && value == "" {
 				return fmt.Errorf("page act: eval requires a non-empty --value (a JS function, e.g. '() => document.title')")
@@ -276,7 +290,7 @@ the JSON result.`,
 			}
 			if cl := dialServe(cmd); cl != nil {
 				defer cl.Close()
-				return pageActViaIPC(cmd, ctx, cl, id, action, selector, value, waitMode, x, y, timeoutMS, vp)
+				return pageActViaIPC(cmd, ctx, cl, id, action, selector, value, waitMode, x, y, timeoutMS, vp, device)
 			}
 			printServeHint(cmd)
 
@@ -311,6 +325,8 @@ the JSON result.`,
 				out, err = pageops.PageWait(ctx, p, waitMode, selector, timeout)
 			case "set_viewport":
 				out, err = pageops.PageSetViewport(ctx, p, width, height)
+			case "emulate":
+				out, err = pageops.PageEmulate(ctx, p, device)
 			}
 			if err != nil {
 				return fmt.Errorf("page act: %w", err)
@@ -320,7 +336,7 @@ the JSON result.`,
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to act on (required)")
-	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport (required)")
+	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate (required)")
 	cmd.Flags().StringVar(&selector, "selector", "", "CSS selector targeting the element (element actions)")
 	cmd.Flags().StringVar(&value, "value", "", "value for eval (JS function), input (text), navigate (URL), select (option value)")
 	cmd.Flags().Float64Var(&x, "x", 0, "horizontal scroll offset in pixels (scroll)")
@@ -329,6 +345,7 @@ the JSON result.`,
 	cmd.Flags().IntVar(&timeoutMS, "timeout-ms", 30000, "per-action timeout in milliseconds (default 30000)")
 	cmd.Flags().IntVar(&width, "width", 0, "target viewport width in CSS pixels (set_viewport action)")
 	cmd.Flags().IntVar(&height, "height", 0, "target viewport height in CSS pixels (set_viewport action)")
+	cmd.Flags().StringVar(&device, "device", "", "go-rod device preset to apply (emulate action), e.g. IPhoneX, IPadPro")
 	_ = cmd.MarkFlagRequired("id")
 	_ = cmd.MarkFlagRequired("action")
 	return cmd
@@ -425,10 +442,10 @@ func pageFetchViaIPC(cmd *cobra.Command, ctx context.Context, cl *ipc.Client, id
 }
 
 // pageActViaIPC implements `page act` against a live serve process: it
-// forwards the action (with its selector/value/x/y/timeout/wait/viewport
-// params) to page.act and prints the confirmation byte-identically to the
-// in-process path.
-func pageActViaIPC(cmd *cobra.Command, ctx context.Context, cl *ipc.Client, id, action, selector, value, waitMode string, x, y float64, timeoutMS int, vp *browsers.Viewport) error {
+// forwards the action (with its selector/value/x/y/timeout/wait/viewport/
+// device params) to page.act and prints the confirmation byte-identically to
+// the in-process path.
+func pageActViaIPC(cmd *cobra.Command, ctx context.Context, cl *ipc.Client, id, action, selector, value, waitMode string, x, y float64, timeoutMS int, vp *browsers.Viewport, device string) error {
 	var res ipc.PageActResult
 	if err := cl.Call(ctx, ipc.MethodPageAct, &ipc.PageActParams{
 		SessionID: id,
@@ -440,6 +457,7 @@ func pageActViaIPC(cmd *cobra.Command, ctx context.Context, cl *ipc.Client, id, 
 		TimeoutMS: timeoutMS,
 		WaitMode:  waitMode,
 		Viewport:  vp,
+		Device:    device,
 	}, &res); err != nil {
 		return fmt.Errorf("page act: %w", err)
 	}
