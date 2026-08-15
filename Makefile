@@ -22,3 +22,16 @@ install: stop
 launch: stop
 	web-cli serve mcp --port 4089
 	@echo "MCP SSE endpoint is at http://127.0.0.1:4089/sse"
+
+# fetch-example — download a file from go-rod into ./examples/
+# Usage: make fetch-example URL=https://github.com/go-rod/rod/blob/main/hijack_test.go
+fetch-example:
+	@if [ -z "$(URL)" ]; then \
+		echo "Error: Please provide a URL. Usage: make fetch-example URL=https://github.com/go-rod/rod/blob/main/filename.go"; \
+		exit 1; \
+	fi
+	@mkdir -p examples
+	@RAW_URL=$$(echo "$(URL)" | sed 's|github.com/go-rod/rod/blob/main/|raw.githubusercontent.com/go-rod/rod/main/|'); \
+	FILENAME=$$(basename "$$RAW_URL"); \
+	echo "Downloading $$FILENAME into ./examples/..."; \
+	curl -sSL "$$RAW_URL" -o "examples/$$FILENAME" && echo "Successfully saved examples/$$FILENAME"
