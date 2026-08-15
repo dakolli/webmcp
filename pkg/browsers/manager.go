@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/go-rod/rod"
-	"github.com/go-rod/rod/lib/proto"
 )
 
 // defaultTTL is the per-page idle timeout applied by NewManager when no
@@ -330,7 +329,7 @@ func probeBrowser(b *Browser) error {
 	}
 	probeCtx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
-	_, err := proto.BrowserGetVersion{}.Call(rb.Context(probeCtx))
+	_, err := rb.Context(probeCtx).Version()
 	return err
 }
 

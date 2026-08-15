@@ -65,7 +65,11 @@ func (t *Fetch) InputSchema() models.InputSchema {
 					"width":  map[string]any{"type": "integer", "description": "Viewport width in CSS pixels."},
 					"height": map[string]any{"type": "integer", "description": "Viewport height in CSS pixels."},
 				},
-				"description": "Optional viewport size for the session's page.",
+				"description": "Optional MANUAL viewport size for the session's page (an explicit option, never a default — pages launch plain with rod's own defaults; applied per-page via emulation incl. matching screen metrics). When both device and viewport are given, device wins.",
+			},
+			"device": map[string]any{
+				"type":        "string",
+				"description": "Optional go-rod device preset to emulate on the new page (the primary, opt-in emulation mechanism): a preset name or Title, case-insensitive, e.g. IPhoneX, iphone x, IPadPro, LaptopWithHiDPIScreen; 'clear' resets emulation. Applied after the page opens (re-navigate to re-fetch with the emulated UA). When both device and viewport are given, device wins.",
 			},
 			"user_agent": map[string]any{
 				"type":        "string",
@@ -86,18 +90,20 @@ type fetchArgs struct {
 	URL string `json:"url"`
 	// WaitFor is one of "load" | "idle" | "stable" (default "idle").
 	WaitFor string `json:"wait_for"`
-	// Viewport optionally overrides the page viewport size.
-	Viewport *viewportConfig `json:"viewport"`
+	// Viewport optionally overrides the page viewport size via a MANUAL
+	// SetViewport (nil = plain launch with rod's own defaults — no default
+	// size is forced). Ignored when Device is set (device wins).
+	Viewport *browsers.Viewport `json:"viewport"`
+	// Device optionally applies a go-rod device preset (lib/devices) to the
+	// new page via Page.Emulate — the primary, opt-in emulation mechanism.
+	// The name is case-insensitive on the preset Go identifier or its Title
+	// (e.g. "IPhoneX" / "iphone x"); "clear" resets emulation. When both
+	// Device and Viewport are given, Device wins.
+	Device string `json:"device"`
 	// UserAgent optionally overrides the page's User-Agent header.
 	UserAgent string `json:"user_agent"`
 	// TimeoutMS bounds the whole call in milliseconds (default 30000).
 	TimeoutMS int `json:"timeout_ms"`
-}
-
-// viewportConfig is the width/height pair carried by fetchArgs.Viewport.
-type viewportConfig struct {
-	Width  int `json:"width"`
-	Height int `json:"height"`
 }
 
 // validate checks fetchArgs for required fields and legal enum values. It is
@@ -113,6 +119,14 @@ func (a *fetchArgs) validate() error {
 	}
 	if a.Viewport != nil && (a.Viewport.Width <= 0 || a.Viewport.Height <= 0) {
 		return fmt.Errorf("viewport width and height must be positive")
+	}
+	if a.Device != "" {
+		// Engine-owned lookup so the tool layer never touches rod: the exact
+		// pinned error (unknown device %q ...) surfaces verbatim, prefixed by
+		// the caller ("fetch_page: ...").
+		if err := browsers.ValidateDeviceName(a.Device); err != nil {
+			return err
+		}
 	}
 	if a.TimeoutMS < 0 {
 		return fmt.Errorf("timeout_ms must be >= 0")
@@ -148,9 +162,23 @@ func (t *Fetch) Execute(ctx context.Context, args json.RawMessage) (string, erro
 	if err != nil {
 		return "", fmt.Errorf("fetch_page: %w", err)
 	}
-	p, err := b.NewPage(ctx, a.URL) // new tab; stealth applied by default
+	// Device wins over a manual viewport when both are given (user decision
+	// 2026-08-14): a device preset is the primary emulation mechanism, so the
+	// page opens PLAIN and the preset is applied right after (before the
+	// readiness wait) via Page.Emulate; the manual viewport is only applied
+	// when no device was requested.
+	vp := a.Viewport
+	if a.Device != "" {
+		vp = nil
+	}
+	p, err := b.NewPage(ctx, a.URL, vp) // new tab; stealth applied by default
 	if err != nil {
 		return "", fmt.Errorf("fetch_page: %w", err)
+	}
+	if a.Device != "" {
+		if err := p.Emulate(ctx, a.Device); err != nil {
+			return "", fmt.Errorf("fetch_page: %w", err)
+		}
 	}
 	if err := t.waitForPage(ctx, p, a.WaitFor); err != nil {
 		return "", fmt.Errorf("fetch_page: %w", err)

@@ -26,6 +26,7 @@ func NewFetchCmd(mgr *browsers.Manager) *cobra.Command {
 		asJSON    bool
 		waitFor   string
 		timeoutMS int
+		viewport  string
 	)
 
 	cmd := &cobra.Command{
@@ -42,6 +43,11 @@ func NewFetchCmd(mgr *browsers.Manager) *cobra.Command {
 				return fmt.Errorf("fetch: %w", err)
 			}
 			if err := pageops.ValidateWait(waitFor); err != nil {
+				return fmt.Errorf("fetch: %w", err)
+			}
+			// Parse --viewport "WxH" (empty/absent = browser default).
+			vp, err := pageops.ParseViewport(viewport)
+			if err != nil {
 				return fmt.Errorf("fetch: %w", err)
 			}
 
@@ -62,7 +68,7 @@ func NewFetchCmd(mgr *browsers.Manager) *cobra.Command {
 			// the in-process path below, which works exactly as before.
 			if cl := dialServe(cmd); cl != nil {
 				defer cl.Close()
-				return fetchViaIPC(cmd, ctx, cl, urlStr, waitFor, asJSON)
+				return fetchViaIPC(cmd, ctx, cl, urlStr, waitFor, asJSON, vp)
 			}
 			printServeHint(cmd)
 
@@ -72,7 +78,7 @@ func NewFetchCmd(mgr *browsers.Manager) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("fetch: %w", err)
 			}
-			p, err := b.NewPage(ctx, urlStr) // new tab; stealth applied by default
+			p, err := b.NewPage(ctx, urlStr, vp) // new tab; stealth applied by default
 			if err != nil {
 				return fmt.Errorf("fetch: %w", err)
 			}
@@ -106,6 +112,8 @@ func NewFetchCmd(mgr *browsers.Manager) *cobra.Command {
 		"wait strategy before returning: idle (no network requests for ~500ms), load (window.onload), stable (DOM unchanged for ~500ms)")
 	cmd.Flags().IntVar(&timeoutMS, "timeout-ms", 30000,
 		"per-call timeout in milliseconds (default 30000)")
+	cmd.Flags().StringVar(&viewport, "viewport", "",
+		"viewport size as WxH, e.g. 1440x900 (default: 1920x1080 per-page via emulation)")
 	return cmd
 }
 
@@ -113,13 +121,13 @@ func NewFetchCmd(mgr *browsers.Manager) *cobra.Command {
 // opens the browser (idempotent — mirrors Manager.Open's laziness) and the
 // page over IPC, then prints the summary byte-identically to the in-process
 // path (the IPC page.open result IS the pageops.FetchSummary shape).
-func fetchViaIPC(cmd *cobra.Command, ctx context.Context, cl *ipc.Client, urlStr, waitFor string, asJSON bool) error {
+func fetchViaIPC(cmd *cobra.Command, ctx context.Context, cl *ipc.Client, urlStr, waitFor string, asJSON bool, vp *browsers.Viewport) error {
 	var open ipc.BrowserOpenResult
 	if err := cl.Call(ctx, ipc.MethodBrowserOpen, &ipc.BrowserOpenParams{}, &open); err != nil {
 		return fmt.Errorf("fetch: %w", err)
 	}
 	var summary ipc.PageOpenResult
-	if err := cl.Call(ctx, ipc.MethodPageOpen, &ipc.PageOpenParams{URL: urlStr, Wait: waitFor}, &summary); err != nil {
+	if err := cl.Call(ctx, ipc.MethodPageOpen, &ipc.PageOpenParams{URL: urlStr, Wait: waitFor, Viewport: vp}, &summary); err != nil {
 		return fmt.Errorf("fetch: %w", err)
 	}
 

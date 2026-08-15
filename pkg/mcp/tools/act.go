@@ -45,7 +45,9 @@ func (t *Act) Name() string {
 func (t *Act) Description() string {
 	return "Interacts with a live page opened by fetch_page: click, input, " +
 		"type, eval (run arbitrary JavaScript — the primary escape hatch), " +
-		"navigate, back, forward, reload, hover, scroll, select, or wait. " +
+		"navigate, back, forward, reload, hover, scroll, select, wait, " +
+		"set_viewport (change the live page's viewport size), or emulate " +
+		"(apply a go-rod device preset via the device param). " +
 		"Pass the session_id returned by fetch_page plus action=...; most " +
 		"actions take a CSS/XPath selector, and input/type/eval/navigate/select " +
 		"take a value."
@@ -66,9 +68,9 @@ func (t *Act) InputSchema() models.InputSchema {
 				"type": "string",
 				"enum": []string{
 					"click", "input", "type", "eval", "navigate",
-					"back", "forward", "reload", "hover", "scroll", "select", "wait",
+					"back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport",
 				},
-				"description": "The interaction to perform: click (CSS/XPath selector), input (set field value), type (type keystrokes), eval (run JS — the primary escape hatch), navigate (go to a URL), back/forward/reload (history), hover (selector), scroll (by x/y pixels), select (option by value), wait (wait_mode: load/idle/stable/interactable/ms).",
+				"description": "The interaction to perform: click (CSS/XPath selector), input (set field value), type (type keystrokes), eval (run JS — the primary escape hatch), navigate (go to a URL), back/forward/reload (history), hover (selector), scroll (by x/y pixels), select (option by value), wait (wait_mode: load/idle/stable/interactable/ms), set_viewport (change the live page's viewport size via the viewport param).",
 			},
 			"selector": map[string]any{
 				"type":        "string",
@@ -96,6 +98,14 @@ func (t *Act) InputSchema() models.InputSchema {
 				"default":     "ms",
 				"description": "What to wait for (wait action): 'load' = window.onload, 'idle' = no network requests for ~500ms, 'stable' = DOM unchanged for ~500ms, 'interactable' = the element matched by selector is clickable, 'ms' = sleep for timeout_ms. Defaults to 'ms'.",
 			},
+			"viewport": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"width":  map[string]any{"type": "integer", "description": "Viewport width in CSS pixels."},
+					"height": map[string]any{"type": "integer", "description": "Viewport height in CSS pixels."},
+				},
+				"description": "Target viewport size for the set_viewport action (required with action=set_viewport).",
+			},
 		},
 		Required: []string{"session_id", "action"},
 	}
@@ -121,6 +131,9 @@ type actArgs struct {
 	// WaitMode selects the readiness level the wait action waits for:
 	// "load" | "idle" | "stable" | "interactable" | "ms" (default "ms").
 	WaitMode string `json:"wait_mode"`
+	// Viewport is the target viewport size for the set_viewport action
+	// (required when action is "set_viewport").
+	Viewport *browsers.Viewport `json:"viewport"`
 }
 
 // Execute parses the page_act arguments, resolves the session and dispatches to
@@ -136,6 +149,18 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 	}
 	if a.Action == "" {
 		return "", fmt.Errorf("page_act: missing required argument %q", "action")
+	}
+
+	// set_viewport carries its target size in the viewport param: reject a
+	// missing or non-positive pair before any browser work, with the same
+	// positivity pin as fetch_page.
+	if a.Action == "set_viewport" {
+		if a.Viewport == nil {
+			return "", fmt.Errorf("page_act: set_viewport requires a viewport")
+		}
+		if a.Viewport.Width <= 0 || a.Viewport.Height <= 0 {
+			return "", fmt.Errorf("page_act: viewport width and height must be positive")
+		}
 	}
 
 	// Enforce an explicit per-call timeout so a wedged page (or a stuck wait)
@@ -180,8 +205,10 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 		out, err = t.actSelect(ctx, p, a.Selector, a.Value)
 	case "wait":
 		out, err = t.actWait(ctx, p, a.WaitMode, a.Selector, a.TimeoutMS)
+	case "set_viewport":
+		out, err = t.actSetViewport(ctx, p, a.Viewport)
 	default:
-		return "", fmt.Errorf("page_act: unknown action=%q (must be one of click, input, type, eval, navigate, back, forward, reload, hover, scroll, select, wait)", a.Action)
+		return "", fmt.Errorf("page_act: unknown action=%q (must be one of click, input, type, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport)", a.Action)
 	}
 	if err != nil {
 		return "", fmt.Errorf("page_act: %w", err)
@@ -511,6 +538,24 @@ func (t *Act) actWait(ctx context.Context, p *browsers.Page, mode, selector stri
 	default:
 		return "", fmt.Errorf("page_act.actWait: unknown wait_mode %q (must be one of load, idle, stable, interactable, ms)", mode)
 	}
+}
+
+// actSetViewport changes the live page's viewport size to vp (width × height
+// CSS pixels) via the engine seam Page.SetViewport (Emulation.setDeviceMetrics
+// Override with a device scale factor of 1, desktop, no mobile emulation, and
+// matching screen metrics — screen.width tracks window.innerWidth), so an
+// agent can re-verify a responsive layout or a WAF after a resize. The engine
+// method owns the page lock and the nil-Rod guard; Execute validates that vp
+// is non-nil and positive before dispatch, and the nil check here is defensive
+// for direct callers. Returns a short confirmation for the LLM.
+func (t *Act) actSetViewport(ctx context.Context, p *browsers.Page, vp *browsers.Viewport) (string, error) {
+	if vp == nil {
+		return "", fmt.Errorf("page_act.actSetViewport: set_viewport requires a viewport")
+	}
+	if err := p.SetViewport(ctx, vp); err != nil {
+		return "", fmt.Errorf("page_act.actSetViewport: %w", err)
+	}
+	return fmt.Sprintf("set viewport to %dx%d", vp.Width, vp.Height), nil
 }
 
 // waitForPage blocks until the page satisfies the requested readiness mode. It

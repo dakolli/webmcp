@@ -63,8 +63,16 @@ func (b *Browser) Launch(ctx context.Context) error {
 		return fmt.Errorf("browsers: launch browser: %w", err)
 	}
 
-	l := launcher.New().NoSandbox(true).Headless(b.headless) // headful by default
-	u, err := l.Launch()                                     // error form; no Must*
+	// Pages launch PLAIN by default (per user decision 2026-08-14): no
+	// window-size / device-scale / emulation launcher flags here. Screen-size
+	// emulation is page-scoped and opt-in — a caller passes an explicit
+	// viewport to NewPage, or applies a go-rod devices.X preset via
+	// Page.Emulate after creation. A bare launch gets rod's own defaults.
+	// The launcher is ctx-bound (l.Context) so a hung first-run Chromium
+	// download honors the caller's deadline instead of running on a background
+	// ctx.
+	l := launcher.New().NoSandbox(true).Headless(b.headless).Context(ctx) // headful by default
+	u, err := l.Launch()                                                  // error form; no Must*
 	if err != nil {
 		return fmt.Errorf("browsers: launch chromium: %w", err)
 	}
@@ -72,7 +80,10 @@ func (b *Browser) Launch(ctx context.Context) error {
 		return fmt.Errorf("browsers: launch browser: %w", err)
 	}
 
-	rb := rod.New().ControlURL(u)
+	// The rod browser clone is ctx-bound before Connect so the websocket dial
+	// is caller-bounded (Browser.Context — rod context.go); a wedged dial
+	// cannot outlive the tool call.
+	rb := rod.New().Context(ctx).ControlURL(u)
 	if err := rb.Connect(); err != nil {
 		return fmt.Errorf("browsers: connect: %w", err)
 	}
@@ -86,8 +97,14 @@ func (b *Browser) Launch(ctx context.Context) error {
 // NewPage opens a new tab in the Browser, navigates it to url (when non-empty)
 // and registers it in the pages map under a fresh PageID. Stealth is applied
 // to every new page by default and skipped only when the Browser was
-// constructed with stealth=false.
-func (b *Browser) NewPage(ctx context.Context, url string) (*Page, error) {
+// constructed with stealth=false. The page launches PLAIN — no screen-size
+// override of any kind unless the caller explicitly passes one: a non-nil
+// viewport applies a manual override via Page.SetViewport
+// (Emulation.setDeviceMetricsOverride, ctx-bound, with matching screen
+// metrics) BEFORE navigating; nil leaves rod's own defaults in place (device
+// presets are applied separately via Page.Emulate, which is the primary
+// mechanism — see session.go).
+func (b *Browser) NewPage(ctx context.Context, url string, vp *Viewport) (*Page, error) {
 	b.mu.Lock()
 	if b.rod == nil {
 		b.mu.Unlock()
@@ -106,6 +123,29 @@ func (b *Browser) NewPage(ctx context.Context, url string) (*Page, error) {
 		return nil, fmt.Errorf("browsers: new page: %w", err)
 	}
 
+	// Wrap the rod handle in the engine Page so every operation below goes
+	// through the engine seams (Page.SetViewport owns the page lock, the
+	// nil-Rod guard and the "browsers: set viewport" error wrap). The page is
+	// not yet registered in the pages map, so no other goroutine can see it;
+	// ID, URL and lastAccess are filled at registration below.
+	page := &Page{Rod: p}
+
+	// Apply a manual viewport override in the same pre-registration window as
+	// Navigate: the fresh page is not yet in the pages map, so no other
+	// goroutine can see it and no new lock is needed — Page.SetViewport takes
+	// it. The call is ctx-bound so a hung CDP call cannot outlive the tool
+	// call (the previous review flagged the un-bound SetViewport). The
+	// override replaces both the emulated viewport and the screen metrics
+	// (proto ScreenWidth/ScreenHeight are *int); nil = plain launch (rod
+	// defaults, no manual screen-size override — device presets via
+	// Page.Emulate are the opt-in path).
+	if vp != nil {
+		if err := page.SetViewport(ctx, vp); err != nil {
+			_ = p.Close() // do not leak the orphaned tab (mirror the navigate failure path)
+			return nil, err
+		}
+	}
+
 	if url != "" {
 		// Bound to ctx so a hung navigation cannot outlive the tool call.
 		pc := p.Context(ctx)
@@ -122,12 +162,9 @@ func (b *Browser) NewPage(ctx context.Context, url string) (*Page, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.nextID++
-	page := &Page{
-		ID:         PageID(fmt.Sprintf("page-%d", b.nextID)),
-		URL:        url,
-		Rod:        p,
-		lastAccess: time.Now(),
-	}
+	page.ID = PageID(fmt.Sprintf("page-%d", b.nextID))
+	page.URL = url
+	page.lastAccess = time.Now()
 	b.pages[page.ID] = page
 	return page, nil
 }
@@ -225,13 +262,13 @@ const (
 )
 
 // Focus raises the Browser's OS window to the foreground via pure CDP (no
-// wmctrl/xdotool): it resolves the OS window id of the window containing any
-// live page's devtools target (all pages live in the same window) with
-// proto.BrowserGetWindowForTarget, then applies the requested window state
-// with proto.BrowserSetWindowBounds. The default state (normal) restores a
-// minimized window and re-asserts its current bounds — the standard
-// best-effort raise; maximize/fullscreen are state-only, because the proto doc
-// forbids combining those states with left/top/width/height.
+// wmctrl/xdotool): it resolves the OS window of the window containing any
+// live page's devtools target (all pages live in the same window) with rod's
+// Page.GetWindow, then applies the requested window state with rod's
+// Page.SetWindow(bounds). The default state (normal) restores a minimized
+// window and re-asserts its current bounds — the standard best-effort raise;
+// maximize/fullscreen are state-only, because the proto doc forbids combining
+// those states with left/top/width/height.
 //
 // Focus is NOT a launch trigger and never closes the browser: with no browser
 // launched it fails (mirroring the NewPage guard), and with no live page it
@@ -252,21 +289,23 @@ func (b *Browser) Focus(ctx context.Context, state WindowState) error {
 		b.mu.Unlock()
 		return fmt.Errorf("browsers: focus: browser not launched")
 	}
-	// Collect EVERY live page's target id under the locks: map iteration is
+	// Collect EVERY live page handle under the locks: map iteration is
 	// unordered, and a crashed tab whose rod handle survived (the WEB-47 case)
-	// would fail BrowserGetWindowForTarget with "No target with given id
-	// found". The candidates are tried in order below until one resolves the
-	// OS window, so a single dead tab cannot block the focus.
-	var pageIDs []proto.TargetTargetID
+	// would fail GetWindow with "No target with given id found". The
+	// candidates are tried in order below until one resolves the OS window, so
+	// a single dead tab cannot block the focus. Holding a *Page is safe: every
+	// access below happens under the page's own lock, under which the eviction
+	// path nils p.Rod.
+	var pages []*Page
 	for _, p := range b.pages {
 		p.mu.Lock()
 		if p.Rod != nil {
-			pageIDs = append(pageIDs, p.Rod.TargetID) // immutable after page creation
+			pages = append(pages, p)
 		}
 		p.mu.Unlock()
 	}
 	b.mu.Unlock()
-	if len(pageIDs) == 0 {
+	if len(pages) == 0 {
 		return fmt.Errorf("browsers: focus: no pages open; open a page first")
 	}
 
@@ -274,20 +313,36 @@ func (b *Browser) Focus(ctx context.Context, state WindowState) error {
 	// candidate that resolves the OS window wins; a dead target's failure is
 	// skipped so a healthy tab still resolves the window (all pages share the
 	// same browser window).
-	var res *proto.BrowserGetWindowForTargetResult
+	var win *Page
+	var winBounds *proto.BrowserBounds
 	var lastErr error
-	for _, pageID := range pageIDs {
-		r, err := proto.BrowserGetWindowForTarget{TargetID: pageID}.Call(rb.Context(ctx))
+	for _, p := range pages {
+		p.mu.Lock()
+		if p.Rod == nil {
+			lastErr = fmt.Errorf("browsers: focus: page rod handle is nil")
+			p.mu.Unlock()
+			continue
+		}
+		bounds, err := p.Rod.Context(ctx).GetWindow()
+		p.mu.Unlock()
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		res = r
+		win = p
+		winBounds = bounds
 		break
 	}
-	if res == nil {
+	if win == nil {
 		return fmt.Errorf("browsers: focus: no live page window: %w", lastErr)
 	}
+
+	win.mu.Lock()
+	defer win.mu.Unlock()
+	if win.Rod == nil {
+		return fmt.Errorf("browsers: focus: page rod handle is nil")
+	}
+	page := win.Rod.Context(ctx)
 
 	switch state {
 	case WindowStateNormal:
@@ -295,26 +350,26 @@ func (b *Browser) Focus(ctx context.Context, state WindowState) error {
 		// result) is the standard best-effort raise. Bounds fields may be nil
 		// (e.g. minimized); nil fields are left unchanged per the proto doc.
 		bounds := &proto.BrowserBounds{WindowState: proto.BrowserWindowStateNormal}
-		if res.Bounds != nil {
-			bounds.Left = res.Bounds.Left
-			bounds.Top = res.Bounds.Top
-			bounds.Width = res.Bounds.Width
-			bounds.Height = res.Bounds.Height
+		if winBounds != nil {
+			bounds.Left = winBounds.Left
+			bounds.Top = winBounds.Top
+			bounds.Width = winBounds.Width
+			bounds.Height = winBounds.Height
 		}
-		if err := (proto.BrowserSetWindowBounds{WindowID: res.WindowID, Bounds: bounds}).Call(rb.Context(ctx)); err != nil {
+		if err := page.SetWindow(bounds); err != nil {
 			return fmt.Errorf("browsers: focus: set window bounds: %w", err)
 		}
 		return nil
 	case WindowStateMaximized:
 		// State-only: the proto doc forbids combining maximized with
 		// left/top/width/height.
-		if err := (proto.BrowserSetWindowBounds{WindowID: res.WindowID, Bounds: &proto.BrowserBounds{WindowState: proto.BrowserWindowStateMaximized}}).Call(rb.Context(ctx)); err != nil {
+		if err := page.SetWindow(&proto.BrowserBounds{WindowState: proto.BrowserWindowStateMaximized}); err != nil {
 			return fmt.Errorf("browsers: focus: set window state: %w", err)
 		}
 		return nil
 	case WindowStateFullscreen:
 		// State-only, same proto constraint as maximized.
-		if err := (proto.BrowserSetWindowBounds{WindowID: res.WindowID, Bounds: &proto.BrowserBounds{WindowState: proto.BrowserWindowStateFullscreen}}).Call(rb.Context(ctx)); err != nil {
+		if err := page.SetWindow(&proto.BrowserBounds{WindowState: proto.BrowserWindowStateFullscreen}); err != nil {
 			return fmt.Errorf("browsers: focus: set window state: %w", err)
 		}
 		return nil

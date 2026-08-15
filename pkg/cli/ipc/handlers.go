@@ -180,13 +180,17 @@ func (s *Server) handlePageOpen(ctx context.Context, params json.RawMessage) (an
 	if err := pageops.ValidateWait(wait); err != nil {
 		return nil, &Error{Code: CodeInvalidParams, Message: fmt.Sprintf("page.open: %v", err)}
 	}
+	// A viewport override must be positive when given (nil = browser default).
+	if p.Viewport != nil && (p.Viewport.Width <= 0 || p.Viewport.Height <= 0) {
+		return nil, &Error{Code: CodeInvalidParams, Message: "page.open: viewport width and height must be positive"}
+	}
 
 	start := time.Now() // load timing for the summary
 	b, err := s.mgr.Open(ctx)
 	if err != nil {
 		return nil, serverError(err)
 	}
-	page, err := b.NewPage(ctx, p.URL)
+	page, err := b.NewPage(ctx, p.URL, p.Viewport)
 	if err != nil {
 		return nil, serverError(err)
 	}
@@ -283,9 +287,9 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 
 // handlePageAct implements page.act: it performs the requested action on a
 // live page — click, input, hover, scroll, select, eval, navigate, back,
-// forward, reload or wait — mirroring the CLI page act command. type is
-// accepted for parity but stays deferred (the MCP page_act type action is
-// still stubbed), returning a -32000 "not implemented" error. An unknown
+// forward, reload, wait or set_viewport — mirroring the CLI page act command.
+// type is accepted for parity but stays deferred (the MCP page_act type action
+// is still stubbed), returning a -32000 "not implemented" error. An unknown
 // action is a -32602 invalid-params error.
 func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any, *Error) {
 	p, rpcErr := decodeParams[PageActParams](params)
@@ -299,11 +303,11 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		return nil, &Error{Code: CodeInvalidParams, Message: `page.act: missing required param "action"`}
 	}
 	switch p.Action {
-	case "click", "input", "type", "eval", "navigate", "back", "forward", "reload", "hover", "scroll", "select", "wait":
+	case "click", "input", "type", "eval", "navigate", "back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport":
 	default:
 		return nil, &Error{
 			Code:    CodeInvalidParams,
-			Message: fmt.Sprintf("page.act: unknown action=%q (must be one of click, input, type, eval, navigate, back, forward, reload, hover, scroll, select, wait)", p.Action),
+			Message: fmt.Sprintf("page.act: unknown action=%q (must be one of click, input, type, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport)", p.Action),
 		}
 	}
 	// type stays deferred (MCP parity — the MCP page_act type action is still
@@ -324,6 +328,17 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 	if p.Action == "wait" {
 		if err := pageops.ValidateWait(p.WaitMode); err != nil {
 			return nil, &Error{Code: CodeInvalidParams, Message: fmt.Sprintf("page.act: %v", err)}
+		}
+	}
+	// set_viewport carries its target size in the viewport param: reject a
+	// missing or non-positive pair before any browser work (mirrors the MCP
+	// page_act validation).
+	if p.Action == "set_viewport" {
+		if p.Viewport == nil {
+			return nil, &Error{Code: CodeInvalidParams, Message: "page.act: set_viewport requires a viewport"}
+		}
+		if p.Viewport.Width <= 0 || p.Viewport.Height <= 0 {
+			return nil, &Error{Code: CodeInvalidParams, Message: "page.act: viewport width and height must be positive"}
 		}
 	}
 
@@ -356,6 +371,8 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		out, err = pageops.PageSelect(ctx, page, p.Selector, p.Value)
 	case "wait":
 		out, err = pageops.PageWait(ctx, page, p.WaitMode, p.Selector, time.Duration(p.TimeoutMS)*time.Millisecond)
+	case "set_viewport":
+		out, err = pageops.PageSetViewport(ctx, page, p.Viewport.Width, p.Viewport.Height)
 	}
 	if err != nil {
 		return nil, serverError(err)

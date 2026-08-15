@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"html"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -67,6 +68,34 @@ func ValidateWait(waitFor string) error {
 	default:
 		return fmt.Errorf("invalid --wait %q (must be one of idle, load, stable, interactable, ms)", waitFor)
 	}
+}
+
+// ParseViewport parses a "WxH" viewport string (e.g. "1440x900") into a
+// browsers.Viewport. An empty or absent flag yields nil — the browser default
+// (the launch-time 1920×1080 window size) applies. Any malformed or
+// non-positive value fails with the exact pinned error so the CLI and IPC
+// layers share one parse surface (mirrors the ValidateURL/ValidateWait
+// pattern).
+func ParseViewport(s string) (*browsers.Viewport, error) {
+	if s == "" {
+		return nil, nil
+	}
+	parts := strings.Split(s, "x")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid viewport %q (must be WxH, e.g. 1440x900)", s)
+	}
+	w, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("invalid viewport %q (must be WxH, e.g. 1440x900)", s)
+	}
+	h, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("invalid viewport %q (must be WxH, e.g. 1440x900)", s)
+	}
+	if w <= 0 || h <= 0 {
+		return nil, fmt.Errorf("invalid viewport %q (must be WxH, e.g. 1440x900)", s)
+	}
+	return &browsers.Viewport{Width: w, Height: h}, nil
 }
 
 // WaitForPage blocks until the page satisfies the requested readiness level.
@@ -960,6 +989,21 @@ func PageReload(ctx context.Context, p *browsers.Page) (string, error) {
 		return "", fmt.Errorf("wait for load: %w", err)
 	}
 	return "reloaded page", nil
+}
+
+// PageSetViewport changes the live page's viewport size to w × h CSS pixels
+// via the engine seam Page.SetViewport (Emulation.setDeviceMetricsOverride
+// with a device scale factor of 1, desktop, no mobile emulation, and matching
+// screen metrics — screen.width tracks window.innerWidth). The engine method
+// owns the page lock and the nil-Rod guard. Callers validate that w and h are
+// positive (the CLI --width/--height flags and the IPC page.act handler do);
+// a non-positive value would disable the override per the proto semantics.
+// Returns the same confirmation string as the MCP page_act set_viewport.
+func PageSetViewport(ctx context.Context, p *browsers.Page, w, h int) (string, error) {
+	if err := p.SetViewport(ctx, &browsers.Viewport{Width: w, Height: h}); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("set viewport to %dx%d", w, h), nil
 }
 
 // PageWait blocks until the page satisfies the requested readiness level, or
