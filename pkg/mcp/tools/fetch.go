@@ -181,7 +181,19 @@ func (t *Fetch) Execute(ctx context.Context, args json.RawMessage) (string, erro
 		return "", fmt.Errorf("fetch_page: %w", err)
 	}
 	if err := waitForPage(ctx, p, a.WaitFor); err != nil {
-		return "", fmt.Errorf("fetch_page: %w", err)
+		// MED-1 (WEB-60): a wait timeout must not leak the loaded tab. NewPage
+		// already registered the session, so close it — ClosePage evicts the
+		// session unconditionally and bounds the close off the manager-owned
+		// baseCtx, because the request ctx is precisely what may have expired
+		// here — and tell the caller the session is gone, not still open.
+		// The eviction happened even if the tab close itself reports an error
+		// ("not found" only means a concurrent sweep already removed it, so the
+		// session is gone either way); surface that close error truthfully.
+		closeErr := b.ClosePage(ctx, p.ID)
+		if closeErr != nil {
+			return "", fmt.Errorf("fetch_page: %w (session %s closed, but close reported: %v)", err, p.ID, closeErr)
+		}
+		return "", fmt.Errorf("fetch_page: %w (session %s closed)", err, p.ID)
 	}
 	return t.pageSummary(ctx, p, start)
 }

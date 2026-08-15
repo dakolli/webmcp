@@ -117,6 +117,15 @@ type Manager struct {
 	// inject one with WithLogger. Read-only after construction, so it is safe
 	// to use without holding mu.
 	logger *slog.Logger
+	// baseCtx is the manager-owned, process-lifetime context every Browser's
+	// rod default ctx is bound to (WEB-59): canceled only by Shutdown, so no
+	// transient tool-call ctx can ever poison the browser (a poisoned default
+	// ctx leaked ~100 MB per fetch_page and made closes report "context
+	// canceled"). Relaunches after Close reuse it, so a fresh Browser is never
+	// re-poisoned.
+	baseCtx context.Context
+	// cancelBase releases baseCtx; called exactly once by Shutdown.
+	cancelBase context.CancelFunc
 }
 
 // NewManager constructs a Manager with the given options applied over sensible
@@ -124,11 +133,18 @@ type Manager struct {
 // per-page idle TTL enforced by a background sweeper. The Browser itself is NOT
 // launched here — that happens lazily on the first Open call.
 func NewManager(opts ...Option) *Manager {
+	// The manager-owned lifetime ctx: every Browser's rod default ctx hangs
+	// off it (WEB-59), so no tool-call ctx can ever poison the browser. It is
+	// canceled only by Shutdown — Close keeps it alive so a relaunch after
+	// Close is never re-poisoned.
+	baseCtx, cancelBase := context.WithCancel(context.Background())
 	m := &Manager{
 		stealth:       true,
 		ttl:           defaultTTL,
 		sweepInterval: sweepIntervalForTTL(defaultTTL),
 		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		baseCtx:       baseCtx,
+		cancelBase:    cancelBase,
 	}
 	for _, o := range opts {
 		o(m)
@@ -219,7 +235,7 @@ func (m *Manager) Open(ctx context.Context) (*Browser, error) {
 // caller receives the winner, so no Chromium instance is orphaned and the
 // sweeper is started exactly once (by the winner's insert).
 func (m *Manager) launch(ctx context.Context) (*Browser, error) {
-	b := NewBrowser(m.headless, m.stealth)
+	b := NewBrowser(m.baseCtx, m.headless, m.stealth)
 	if err := b.Launch(ctx); err != nil {
 		return nil, fmt.Errorf("browsers: launch browser: %w", err)
 	}
@@ -352,8 +368,9 @@ func (m *Manager) Close(ctx context.Context) error {
 
 // Shutdown is the graceful-teardown entry point, intended to be called from
 // main() when the server shuts down: it stops the background sweeper, closes
-// the Browser and all of its pages, and marks the manager as terminated. After
-// Shutdown the manager must not be reused — further Open calls fail.
+// the Browser and all of its pages, marks the manager as terminated, and
+// releases the manager-owned lifetime ctx (WEB-59) — after Shutdown the
+// manager must not be reused, and further Open calls fail.
 func (m *Manager) Shutdown(ctx context.Context) error {
 	m.mu.Lock()
 	m.shutdown = true
@@ -362,10 +379,15 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	m.browser = nil
 	m.mu.Unlock()
 
-	if b == nil {
-		return nil
+	var err error
+	if b != nil {
+		err = b.Close(ctx)
 	}
-	return b.Close(ctx)
+	// The manager is terminal and its Browser is closed, so nothing needs the
+	// lifetime ctx anymore. Canceled AFTER the teardown: Browser.Close derives
+	// its close timeouts from this ctx.
+	m.cancelBase()
+	return err
 }
 
 // startSweeperLocked launches the background TTL sweep goroutine unless one is

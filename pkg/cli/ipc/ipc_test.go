@@ -56,7 +56,10 @@ func (s *stubbedManager) Page(ctx context.Context, id browsers.PageID) (*browser
 // newStubServer returns a Server wired to a stub manager whose Browser is
 // unlaunched and empty (no pages) — safe for any wire-contract test.
 func newStubServer() *Server {
-	return newServer(&stubbedManager{browser: browsers.NewBrowser(false, false)})
+	// context.Background() as the manager-owned base ctx: the stub browser is
+	// never launched, so the ctx is only read by Close-timeout derivation on
+	// paths that no-op on a nil rod.
+	return newServer(&stubbedManager{browser: browsers.NewBrowser(context.Background(), false, false)})
 }
 
 // startServer binds s at a fresh temp-dir socket, serves it in a goroutine and

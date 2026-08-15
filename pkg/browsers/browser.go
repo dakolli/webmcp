@@ -18,9 +18,15 @@ import (
 //
 // Thread safety: the pages map is guarded by the Browser mutex; each Page
 // carries its own mutex because rod Pages are not thread-safe (see session.go).
+// Page creation is additionally serialized by createMu so the failed-create
+// orphan cleanup (closeOrphanedTab) can identify the tabs it owns.
 type Browser struct {
 	// mu guards the pages map and the rod browser pointer.
 	mu sync.Mutex
+	// createMu serializes page creation (the Target.createTarget + orphan
+	// cleanup window in createPage), so closeOrphanedTab never races a
+	// concurrent NewPage. Taken after mu, never while holding it.
+	createMu sync.Mutex
 	// rod is the live go-rod browser handle; nil until Launch succeeds.
 	rod *rod.Browser
 	// pages maps page IDs to their live pages.
@@ -31,16 +37,26 @@ type Browser struct {
 	headless bool
 	// stealth applies go-rod/stealth to every new page (default: on).
 	stealth bool
+	// baseCtx is the manager-owned, process-lifetime context the rod browser's
+	// default ctx is bound to (WEB-59): a transient tool-call ctx can never
+	// poison it, so canceling a request aborts a call but never the browser
+	// itself. Every engine rod call chains its own per-call ctx via
+	// .Context(callCtx); derived timeouts (closes, orphan cleanup) hang off
+	// this base so teardown outlives the request that triggered it.
+	baseCtx context.Context
 }
 
-// NewBrowser constructs a Browser ready to be launched. headless selects
-// headless Chromium (headful is the default); stealth enables go-rod/stealth
-// on every new page. No browser process is started until Launch.
-func NewBrowser(headless, stealth bool) *Browser {
+// NewBrowser constructs a Browser ready to be launched. baseCtx is the
+// manager-owned, process-lifetime context the rod browser's default ctx will
+// be bound to at Launch (never a transient tool-call ctx — see WEB-59);
+// headless selects headless Chromium (headful is the default); stealth enables
+// go-rod/stealth on every new page. No browser process is started until Launch.
+func NewBrowser(baseCtx context.Context, headless, stealth bool) *Browser {
 	return &Browser{
 		pages:    make(map[PageID]*Page),
 		headless: headless,
 		stealth:  stealth,
+		baseCtx:  baseCtx,
 	}
 }
 
@@ -48,6 +64,14 @@ func NewBrowser(headless, stealth bool) *Browser {
 // Chromium runs headful by default (`.Headless(false)`) unless the Browser was
 // constructed with headless=true; NoSandbox is always set, as required in
 // containers. Launch is idempotent: it is a no-op once the browser is up.
+//
+// The rod browser's DEFAULT ctx is bound to the manager-owned baseCtx the
+// Browser was constructed with — never to the caller's ctx — so a transient
+// tool-call ctx cannot poison the browser (WEB-58: a poisoned default ctx
+// leaked one ~100 MB renderer per fetch_page and made browser_close report
+// "context canceled"). Every engine rod call afterwards chains its own
+// per-call ctx via .Context(callCtx) instead. The launch-time operations
+// (first-run Chromium download, early bail) stay bounded by the caller's ctx.
 func (b *Browser) Launch(ctx context.Context) error {
 	b.mu.Lock()
 	if b.rod != nil {
@@ -76,17 +100,30 @@ func (b *Browser) Launch(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("browsers: launch chromium: %w", err)
 	}
+	// The Chromium process is now live (WEB-60): if anything below fails — a
+	// caller ctx that expired during launch, or a failed websocket connect —
+	// kill it best-effort so a failed launch never orphans a background
+	// browser process.
+	connected := false
+	defer func() {
+		if !connected {
+			l.Kill() // best-effort; kills the just-launched Chromium process
+		}
+	}()
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("browsers: launch browser: %w", err)
 	}
 
-	// The rod browser clone is ctx-bound before Connect so the websocket dial
-	// is caller-bounded (Browser.Context — rod context.go); a wedged dial
-	// cannot outlive the tool call.
-	rb := rod.New().Context(ctx).ControlURL(u)
+	// The rod browser's default ctx is the manager-owned baseCtx, not the
+	// caller's tool-call ctx: a canceled request must abort calls, never the
+	// browser itself (WEB-59). The websocket dial inside Connect is a fast
+	// localhost op; the launcher above is where real blocking (first-run
+	// download) happens, and it stays caller-bounded.
+	rb := rod.New().Context(b.baseCtx).ControlURL(u)
 	if err := rb.Connect(); err != nil {
 		return fmt.Errorf("browsers: connect: %w", err)
 	}
+	connected = true // Chromium is wired up; the launch is a success
 
 	b.mu.Lock()
 	b.rod = rb
@@ -116,7 +153,9 @@ func (b *Browser) Launch(ctx context.Context) error {
 //
 // Empty strings skip their step, so a plain call (nil viewport, empty device,
 // empty userAgent) makes ZERO emulation calls on the default path. Any failure
-// closes the orphaned tab (no leak) and wraps the error with %w.
+// closes the orphaned tab (no leak) and wraps the error with %w: a create
+// failure additionally triggers closeOrphanedTab, because rod's own
+// leak-prevention defer only covers post-create failures (WEB-58/WEB-59).
 func (b *Browser) NewPage(
 	ctx context.Context,
 	url string,
@@ -125,19 +164,17 @@ func (b *Browser) NewPage(
 	userAgent string,
 ) (*Page, error) {
 	b.mu.Lock()
-	if b.rod == nil {
-		b.mu.Unlock()
+	rb := b.rod
+	b.mu.Unlock()
+	if rb == nil {
 		return nil, fmt.Errorf("browsers: browser not launched")
 	}
-	b.mu.Unlock()
 
-	var p *rod.Page
-	var err error
-	if b.stealth {
-		p, err = stealth.Page(b.rod) // stealth on by default (error form)
-	} else {
-		p, err = b.rod.Page(proto.TargetCreateTarget{})
-	}
+	// Chain the per-call ctx explicitly: the rod browser's default ctx is the
+	// manager-owned baseCtx (WEB-59), so a stale/poisoned default is never
+	// inherited here, and the create-target CDP round trip is bounded by the
+	// tool call.
+	p, err := b.createPage(rb.Context(ctx))
 	if err != nil {
 		return nil, fmt.Errorf("browsers: new page: %w", err)
 	}
@@ -160,7 +197,7 @@ func (b *Browser) NewPage(
 	// Page.Emulate are the opt-in path).
 	if vp != nil {
 		if err := page.SetViewport(ctx, vp); err != nil {
-			_ = p.Close() // do not leak the orphaned tab (mirror the navigate failure path)
+			b.closeUnregisteredPage(p) // do not leak the orphaned tab (mirror the navigate failure path)
 			return nil, err
 		}
 	}
@@ -172,7 +209,7 @@ func (b *Browser) NewPage(
 	// not yet in the pages map, so no other goroutine can see it.
 	if device != "" {
 		if err := page.Emulate(ctx, device); err != nil {
-			_ = p.Close() // do not leak the orphaned tab
+			b.closeUnregisteredPage(p) // do not leak the orphaned tab
 			return nil, err
 		}
 	}
@@ -184,7 +221,7 @@ func (b *Browser) NewPage(
 	// window no lock is needed — no other goroutine can see the page yet.
 	if userAgent != "" {
 		if err := p.Context(ctx).SetUserAgent(&proto.NetworkSetUserAgentOverride{UserAgent: userAgent}); err != nil {
-			_ = p.Close() // do not leak the orphaned tab
+			b.closeUnregisteredPage(p) // do not leak the orphaned tab
 			return nil, fmt.Errorf("browsers: set user agent: %w", err)
 		}
 	}
@@ -193,11 +230,11 @@ func (b *Browser) NewPage(
 		// Bound to ctx so a hung navigation cannot outlive the tool call.
 		pc := p.Context(ctx)
 		if err := pc.Navigate(url); err != nil {
-			_ = p.Close() // do not leak the orphaned tab
+			b.closeUnregisteredPage(p) // do not leak the orphaned tab
 			return nil, fmt.Errorf("browsers: navigate: %w", err)
 		}
 		if err := pc.WaitLoad(); err != nil {
-			_ = p.Close() // do not leak the orphaned tab
+			b.closeUnregisteredPage(p) // do not leak the orphaned tab
 			return nil, fmt.Errorf("browsers: wait load: %w", err)
 		}
 	}
@@ -210,6 +247,92 @@ func (b *Browser) NewPage(
 	page.lastAccess = time.Now()
 	b.pages[page.ID] = page
 	return page, nil
+}
+
+// createPage creates a new rod tab, applying go-rod/stealth by default (skipped
+// only when the Browser was constructed with stealth=false). rb is a
+// ctx-chained rod browser clone whose ctx bounds the create (the per-call tool
+// ctx — never the poisoned default). Creation is serialized by b.createMu so a
+// failed create's orphan cleanup (closeOrphanedTab) can identify the tabs it
+// owns without racing a concurrent NewPage.
+func (b *Browser) createPage(rb *rod.Browser) (*rod.Page, error) {
+	b.createMu.Lock()
+	defer b.createMu.Unlock()
+
+	var p *rod.Page
+	var err error
+	if b.stealth {
+		p, err = stealth.Page(rb) // stealth on by default (error form)
+	} else {
+		p, err = rb.Page(proto.TargetCreateTarget{})
+	}
+	if err != nil {
+		// rod's Browser.Page registers its leak-prevention close-target defer
+		// only AFTER Target.createTarget succeeds (rod/browser.go:195-200): a
+		// create that failed after the CDP write was delivered (response wait
+		// aborted at lib/cdp/client.go:100-110, e.g. the per-call ctx was
+		// canceled mid-call) leaks the freshly created about:blank tab. Close
+		// it best-effort before surfacing the error.
+		b.closeOrphanedTab(rb)
+		return nil, err
+	}
+	return p, nil
+}
+
+// closeOrphanedTab is a best-effort cleanup for a page-create failure (see
+// createPage): it closes every about:blank PAGE target that is not a registered
+// page's tab. Called only under b.createMu, so no concurrent NewPage can
+// interleave — the tabs it finds are the failed create's own orphan — and the
+// registration membership check protects pages an agent deliberately parked at
+// about:blank. The listing/close runs on a fresh timeout off the manager-owned
+// baseCtx because the per-call ctx is precisely what may be canceled here.
+// Best-effort by design: a wedged CDP connection degrades to the same orphan
+// the bug already produced, never a crash.
+func (b *Browser) closeOrphanedTab(rb *rod.Browser) {
+	// Protect registered pages parked at about:blank (deliberate agent
+	// navigations): their TargetIDs are never closed by this cleanup.
+	b.mu.Lock()
+	protected := make(map[proto.TargetTargetID]struct{}, len(b.pages))
+	for _, p := range b.pages {
+		p.mu.Lock()
+		if p.Rod != nil {
+			protected[p.Rod.TargetID] = struct{}{}
+		}
+		p.mu.Unlock()
+	}
+	b.mu.Unlock()
+
+	closeCtx, cancel := context.WithTimeout(b.baseCtx, closePageTimeout)
+	defer cancel()
+	res, err := proto.TargetGetTargets{}.Call(rb.Context(closeCtx))
+	if err != nil {
+		return
+	}
+	for _, ti := range res.TargetInfos {
+		if ti.Type != proto.TargetTargetInfoTypePage || ti.URL != "about:blank" {
+			continue
+		}
+		if _, ok := protected[ti.TargetID]; ok {
+			continue
+		}
+		_, _ = proto.TargetCloseTarget{TargetID: ti.TargetID}.Call(rb.Context(closeCtx))
+	}
+}
+
+// closeUnregisteredPage best-effort closes a freshly created page whose session
+// was never registered, bounding the close off the manager-owned baseCtx so a
+// canceled per-call ctx cannot skip the close (WEB-59). The page's default ctx
+// IS the per-call tool ctx it was created under (inherited via rb.Context(ctx)
+// → stealth.Page/PageFromTarget): rod's Page.Close issues proto.PageClose on
+// p.GetContext(), so with a canceled ctx the cdp client returns ctx.Err()
+// immediately and the close is a NO-OP — the tab and its ~100 MB renderer leak
+// until browser_close (WEB-58). A fresh closePageTimeout derived from the
+// baseCtx — which outlives any single request — guarantees the close is
+// actually delivered. Best-effort by design, like closeOrphanedTab.
+func (b *Browser) closeUnregisteredPage(p *rod.Page) {
+	closeCtx, cancel := context.WithTimeout(b.baseCtx, closePageTimeout)
+	defer cancel()
+	_ = p.Context(closeCtx).Close()
 }
 
 // Page returns the live page with the given ID, or an error when no page with
@@ -435,39 +558,89 @@ func (b *Browser) Pages() []PageInfo {
 }
 
 // ClosePage closes the page with the given ID, removing it from the pages map
-// and releasing its browser tab.
+// and releasing its browser tab. The session is evicted unconditionally — even
+// if the underlying tab close fails — so a wedged/dead CDP connection cannot
+// leave a phantom session that session_list keeps reporting (WEB-60 MED-1).
+// The rod handle is captured and nilled under the locks (mirroring
+// Browser.Close) and closed strictly afterwards, outside any lock, so a slow
+// close cannot block other browser operations. The close runs on a fresh
+// timeout derived from the manager-owned baseCtx — never the caller's ctx — so
+// a mid-close request abort cannot surface "context canceled" for a teardown
+// that already succeeded (the caller's ctx is kept only for API symmetry with
+// the other lifecycle methods).
 func (b *Browser) ClosePage(ctx context.Context, id PageID) error {
 	b.mu.Lock()
 	p, ok := b.pages[id]
-	b.mu.Unlock()
 	if !ok {
+		b.mu.Unlock()
 		return fmt.Errorf("browsers: page %q not found", id)
 	}
+	// Evict unconditionally: capture the handle and nil p.Rod under the
+	// per-page mutex (Browser.Close pattern), then drop the map entry, all
+	// while holding the browser mutex. A wedged close must not keep the
+	// session visible to session_list; the handle is closed outside, below.
+	p.mu.Lock()
+	handle := p.Rod
+	p.Rod = nil
+	delete(b.pages, id)
+	p.mu.Unlock()
+	b.mu.Unlock()
 
-	if err := p.Close(ctx); err != nil {
+	if handle == nil {
+		return nil
+	}
+	closeCtx, cancel := context.WithTimeout(b.baseCtx, closePageTimeout)
+	defer cancel()
+	if err := closeRodPage(closeCtx, handle); err != nil {
 		return fmt.Errorf("browsers: close page %q: %w", id, err)
 	}
-
-	b.mu.Lock()
-	delete(b.pages, id)
-	b.mu.Unlock()
 	return nil
 }
 
 // Close closes the Browser and all of its live pages, releasing the underlying
 // Chromium process. After Close the Browser must not be reused.
+//
+// Every live page handle and the rod browser are captured under the locks and
+// closed strictly afterwards, outside any lock (mirroring the sweeper's
+// capture-under-lock/close-outside pattern): the closes are network round
+// trips that would block every other browser operation if done under b.mu, and
+// an in-flight tool call on a page can race the close (closeRodPage's
+// panic-recover absorbs that). Each close runs on a fresh timeout derived from
+// the manager-owned baseCtx — never the caller's ctx — so a canceled request
+// ctx cannot abort a teardown that already succeeded (HIGH-2: browser_close
+// reported "context canceled" despite successful Chromium teardown).
 func (b *Browser) Close(ctx context.Context) error {
+	// Capture the live page handles (nil-ing p.Rod so no later close can
+	// double-close) and the rod browser under the locks.
 	b.mu.Lock()
+	var handles []*rod.Page
 	for _, p := range b.pages {
-		_ = p.Close(ctx) // best-effort per-page close
+		p.mu.Lock()
+		if p.Rod != nil {
+			handles = append(handles, p.Rod)
+			p.Rod = nil
+		}
+		p.mu.Unlock()
 	}
 	b.pages = make(map[PageID]*Page)
 	rb := b.rod
 	b.rod = nil
 	b.mu.Unlock()
 
+	// Close the captured pages outside the locks, each bounded by a fresh
+	// per-close timeout off the manager-owned baseCtx (the caller's ctx may
+	// already be canceled — it must not abort teardown). Best-effort per-page,
+	// like the sweeper: a wedged tab cannot block the rest of the teardown.
+	for _, h := range handles {
+		closeCtx, cancel := context.WithTimeout(b.baseCtx, closePageTimeout)
+		_ = closeRodPage(closeCtx, h)
+		cancel()
+	}
+
 	if rb == nil {
 		return nil
 	}
-	return rb.Close() // error form; no Must*
+	closeCtx, cancel := context.WithTimeout(b.baseCtx, closePageTimeout)
+	defer cancel()
+	return rb.Context(closeCtx).Close() // error form; no Must*
 }
