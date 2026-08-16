@@ -6,6 +6,7 @@ package cmd
 // resolution rules are pure functions over a synthetic []browsers.PageInfo.
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -196,7 +197,7 @@ func TestParseActArgs(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parseActArgs(%v, %+v) error = %v, want nil", tt.args, tt.flags, err)
 			}
-			if got != tt.want {
+			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("parseActArgs(%v, %+v) = %+v, want %+v", tt.args, tt.flags, got, tt.want)
 			}
 		})

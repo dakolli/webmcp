@@ -812,17 +812,38 @@ func PageEval(ctx context.Context, p *browsers.Page, js string) (string, error) 
 	return res.Value.JSON("", ""), nil // gson marshals to compact JSON text
 }
 
-// PageClick clicks the element matched by selector (CSS or XPath). It resolves
-// the element, waits until it is interactable, then clicks it with the left
-// button. Returns the same confirmation string as the MCP page_act click.
-func PageClick(ctx context.Context, p *browsers.Page, selector string) (string, error) {
+// parseMouseButton resolves a mouse button string ("left", "right", "middle") to proto.InputMouseButton.
+func parseMouseButton(button string) (proto.InputMouseButton, error) {
+	switch strings.ToLower(strings.TrimSpace(button)) {
+	case "", "left":
+		return proto.InputMouseButtonLeft, nil
+	case "right":
+		return proto.InputMouseButtonRight, nil
+	case "middle":
+		return proto.InputMouseButtonMiddle, nil
+	default:
+		return "", fmt.Errorf("unknown mouse button %q (must be left, right, or middle)", button)
+	}
+}
+
+// PageClickOpts clicks the element matched by selector with optional button and click count.
+// button can be "left" (default), "right", or "middle"; clickCount defaults to 1 (2 for double click).
+func PageClickOpts(ctx context.Context, p *browsers.Page, selector string, button string, clickCount int) (string, error) {
 	p.Lock()
 	defer p.Unlock()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}
 
-	page := p.Rod.Context(ctx) // bound to ctx so a missing element aborts
+	btn, err := parseMouseButton(button)
+	if err != nil {
+		return "", fmt.Errorf("click: %w", err)
+	}
+	if clickCount <= 0 {
+		clickCount = 1
+	}
+
+	page := p.Rod.Context(ctx)
 
 	el, err := page.Element(selector)
 	if err != nil {
@@ -831,10 +852,190 @@ func PageClick(ctx context.Context, p *browsers.Page, selector string) (string, 
 	if _, err := el.WaitInteractable(); err != nil {
 		return "", fmt.Errorf("click: element %q: %w", selector, err)
 	}
-	if err := el.Click(proto.InputMouseButtonLeft, 1); err != nil {
+	if err := el.Click(btn, clickCount); err != nil {
 		return "", fmt.Errorf("click: element %q: %w", selector, err)
 	}
-	return fmt.Sprintf("clicked selector=%q", selector), nil
+	if (button == "" || button == "left") && clickCount == 1 {
+		return fmt.Sprintf("clicked selector=%q", selector), nil
+	}
+	btnName := button
+	if btnName == "" {
+		btnName = "left"
+	}
+	return fmt.Sprintf("clicked selector=%q button=%s count=%d", selector, btnName, clickCount), nil
+}
+
+// PageClick clicks the element matched by selector (CSS or XPath) with the left mouse button once.
+func PageClick(ctx context.Context, p *browsers.Page, selector string) (string, error) {
+	return PageClickOpts(ctx, p, selector, "left", 1)
+}
+
+// PagePressKey presses a specific key or key combination (e.g., "Enter", "Escape", "Control+a", "Meta+c").
+// If selector is non-empty, it focuses the element matched by selector first.
+func PagePressKey(ctx context.Context, p *browsers.Page, selector, keyStr string) (string, error) {
+	p.Lock()
+	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
+
+	mods, mainKey, err := parseKeyCombo(keyStr)
+	if err != nil {
+		return "", fmt.Errorf("press_key: %w", err)
+	}
+
+	page := p.Rod.Context(ctx)
+
+	if selector != "" {
+		el, err := page.Element(selector)
+		if err != nil {
+			return "", fmt.Errorf("press_key: element %q: %w", selector, err)
+		}
+		if err := el.Focus(); err != nil {
+			return "", fmt.Errorf("press_key: focus element %q: %w", selector, err)
+		}
+	}
+
+	actions := page.KeyActions()
+	if len(mods) > 0 {
+		actions.Press(mods...)
+	}
+	actions.Press(mainKey)
+	actions.Release(mainKey)
+	if len(mods) > 0 {
+		actions.Release(mods...)
+	}
+
+	if err := actions.Do(); err != nil {
+		return "", fmt.Errorf("press_key %q: %w", keyStr, err)
+	}
+
+	if selector != "" {
+		return fmt.Sprintf("pressed key %q in selector=%q", keyStr, selector), nil
+	}
+	return fmt.Sprintf("pressed key %q", keyStr), nil
+}
+
+// PageClickAt moves the mouse cursor to absolute coordinates (x, y) and clicks.
+// button can be "left", "right", or "middle"; clickCount defaults to 1.
+func PageClickAt(ctx context.Context, p *browsers.Page, x, y float64, button string, clickCount int) (string, error) {
+	p.Lock()
+	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
+
+	btn, err := parseMouseButton(button)
+	if err != nil {
+		return "", fmt.Errorf("click_at: %w", err)
+	}
+	if clickCount <= 0 {
+		clickCount = 1
+	}
+
+	page := p.Rod.Context(ctx)
+	if err := page.Mouse.MoveTo(proto.Point{X: x, Y: y}); err != nil {
+		return "", fmt.Errorf("click_at move to (%.1f, %.1f): %w", x, y, err)
+	}
+	if err := page.Mouse.Click(btn, clickCount); err != nil {
+		return "", fmt.Errorf("click_at (%.1f, %.1f): %w", x, y, err)
+	}
+
+	btnName := button
+	if btnName == "" {
+		btnName = "left"
+	}
+	return fmt.Sprintf("clicked at (%.1f, %.1f) button=%s count=%d", x, y, btnName, clickCount), nil
+}
+
+// PageHoverAt moves the mouse cursor to absolute coordinates (x, y).
+func PageHoverAt(ctx context.Context, p *browsers.Page, x, y float64) (string, error) {
+	p.Lock()
+	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
+
+	page := p.Rod.Context(ctx)
+	if err := page.Mouse.MoveTo(proto.Point{X: x, Y: y}); err != nil {
+		return "", fmt.Errorf("hover_at (%.1f, %.1f): %w", x, y, err)
+	}
+	return fmt.Sprintf("hovered at (%.1f, %.1f)", x, y), nil
+}
+
+// PageDragAndDrop performs a mouse drag-and-drop operation from source coordinates/selector to target coordinates/selector.
+func PageDragAndDrop(ctx context.Context, p *browsers.Page, fromX, fromY, toX, toY float64, selector, targetSelector string) (string, error) {
+	p.Lock()
+	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
+
+	page := p.Rod.Context(ctx)
+
+	if selector != "" {
+		el, err := page.Element(selector)
+		if err != nil {
+			return "", fmt.Errorf("drag_and_drop: source element %q: %w", selector, err)
+		}
+		shape, err := el.Shape()
+		if err != nil {
+			return "", fmt.Errorf("drag_and_drop: source element %q shape: %w", selector, err)
+		}
+		box := shape.Box()
+		fromX, fromY = box.X+box.Width/2, box.Y+box.Height/2
+	}
+
+	if targetSelector != "" {
+		el, err := page.Element(targetSelector)
+		if err != nil {
+			return "", fmt.Errorf("drag_and_drop: target element %q: %w", targetSelector, err)
+		}
+		shape, err := el.Shape()
+		if err != nil {
+			return "", fmt.Errorf("drag_and_drop: target element %q shape: %w", targetSelector, err)
+		}
+		box := shape.Box()
+		toX, toY = box.X+box.Width/2, box.Y+box.Height/2
+	}
+
+	if err := page.Mouse.MoveTo(proto.Point{X: fromX, Y: fromY}); err != nil {
+		return "", fmt.Errorf("drag_and_drop: move to source (%.1f, %.1f): %w", fromX, fromY, err)
+	}
+	if err := page.Mouse.Down(proto.InputMouseButtonLeft, 1); err != nil {
+		return "", fmt.Errorf("drag_and_drop: mouse down: %w", err)
+	}
+	if err := page.Mouse.MoveLinear(proto.Point{X: toX, Y: toY}, 10); err != nil {
+		return "", fmt.Errorf("drag_and_drop: move to target (%.1f, %.1f): %w", toX, toY, err)
+	}
+	if err := page.Mouse.Up(proto.InputMouseButtonLeft, 1); err != nil {
+		return "", fmt.Errorf("drag_and_drop: mouse up: %w", err)
+	}
+
+	return fmt.Sprintf("dragged from (%.1f, %.1f) to (%.1f, %.1f)", fromX, fromY, toX, toY), nil
+}
+
+// PageUploadFile attaches local file paths to a file input element matched by selector.
+func PageUploadFile(ctx context.Context, p *browsers.Page, selector string, paths []string) (string, error) {
+	p.Lock()
+	defer p.Unlock()
+	if p.Rod == nil {
+		return "", fmt.Errorf("page session is closed")
+	}
+
+	if len(paths) == 0 {
+		return "", fmt.Errorf("upload_file: no file paths provided")
+	}
+
+	page := p.Rod.Context(ctx)
+	el, err := page.Element(selector)
+	if err != nil {
+		return "", fmt.Errorf("upload_file: element %q: %w", selector, err)
+	}
+	if err := el.SetFiles(paths); err != nil {
+		return "", fmt.Errorf("upload_file: element %q: %w", selector, err)
+	}
+	return fmt.Sprintf("uploaded files %v to selector=%q", paths, selector), nil
 }
 
 // PageInput sets the value of the element matched by selector: it selects all

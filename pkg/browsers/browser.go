@@ -3,9 +3,12 @@ package browsers
 import (
 	"context"
 	"fmt"
+	"os/exec"
 	"sort"
 	"sync"
 	"time"
+
+	"webmcp/pkg/config"
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
@@ -13,12 +16,26 @@ import (
 	"github.com/go-rod/stealth"
 )
 
+// DefaultBinPath detects the default browser binary on PATH:
+// it prefers Brave ("brave-browser", "brave"), then Google Chrome / Chromium.
+// Returns empty string if no known browser binary is found on PATH.
+func DefaultBinPath() string {
+	for _, name := range []string{"brave-browser", "brave", "google-chrome", "chrome", "chromium"} {
+		if path, err := exec.LookPath(name); err == nil {
+			return path
+		}
+	}
+	return ""
+}
+
 // Browser owns a single live Chromium instance (a *rod.Browser) and the map of
 // its live Pages (browser tabs, a.k.a. MCP sessions).
 //
 // Thread safety: the pages map is guarded by the Browser mutex; each Page
 // carries its own mutex because rod Pages are not thread-safe (see session.go).
 type Browser struct {
+	// id is the unique BrowserID assigned by Manager (e.g. "browser-1").
+	id BrowserID
 	// mu guards the pages map and the rod browser pointer.
 	mu sync.Mutex
 	// rod is the live go-rod browser handle; nil until Launch succeeds.
@@ -31,6 +48,12 @@ type Browser struct {
 	headless bool
 	// stealth applies go-rod/stealth to every new page (default: on).
 	stealth bool
+	// binPath specifies a custom browser executable path.
+	binPath string
+	// profileDir specifies a custom browser user data profile directory path.
+	profileDir string
+	// position specifies initial window placement ("left", "right", "max", "normal").
+	position string
 	// baseCtx is the manager-owned, process-lifetime context the rod browser's
 	// default ctx is bound to (WEB-59): a transient tool-call ctx can never
 	// poison it, so canceling a request aborts a call but never the browser
@@ -40,18 +63,53 @@ type Browser struct {
 	baseCtx context.Context
 }
 
-// NewBrowser constructs a Browser ready to be launched. baseCtx is the
-// manager-owned, process-lifetime context the rod browser's default ctx will
+// NewBrowser constructs a Browser ready to be launched. id is the unique BrowserID;
+// baseCtx is the manager-owned, process-lifetime context the rod browser's default ctx will
 // be bound to at Launch (never a transient tool-call ctx — see WEB-59);
 // headless selects headless Chromium (headful is the default); stealth enables
-// go-rod/stealth on every new page. No browser process is started until Launch.
-func NewBrowser(baseCtx context.Context, headless, stealth bool) *Browser {
-	return &Browser{
-		pages:    make(map[PageID]*Page),
-		headless: headless,
-		stealth:  stealth,
-		baseCtx:  baseCtx,
+// go-rod/stealth on every new page; binPath specifies a custom browser executable path; profileDir specifies a custom profile directory. No browser process is started until Launch.
+func NewBrowser(id BrowserID, baseCtx context.Context, headless, stealth bool, binPath, profileDir string, position ...string) *Browser {
+	pos := ""
+	if len(position) > 0 {
+		pos = position[0]
 	}
+	return &Browser{
+		id:         id,
+		pages:      make(map[PageID]*Page),
+		headless:   headless,
+		stealth:    stealth,
+		binPath:    binPath,
+		profileDir: profileDir,
+		position:   pos,
+		baseCtx:    baseCtx,
+	}
+}
+
+// Position returns the Browser's window position preset ("left", "right", "max", "normal").
+func (b *Browser) Position() string {
+	return b.position
+}
+
+// ID returns the Browser's unique BrowserID (e.g. "browser-1").
+func (b *Browser) ID() BrowserID {
+	return b.id
+}
+
+// BinPath returns the Browser's configured executable path.
+func (b *Browser) BinPath() string {
+	return b.binPath
+}
+
+// ProfileDir returns the Browser's configured profile directory path.
+func (b *Browser) ProfileDir() string {
+	return b.profileDir
+}
+
+// IsAlive checks whether the Browser has been launched and its rod connection is active.
+func (b *Browser) IsAlive(ctx context.Context) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.rod != nil
 }
 
 // Launch connects the Browser to a Chromium instance via the go-rod launcher.
@@ -89,8 +147,48 @@ func (b *Browser) Launch(ctx context.Context) error {
 	// The launcher is ctx-bound (l.Context) so a hung first-run Chromium
 	// download honors the caller's deadline instead of running on a background
 	// ctx.
-	l := launcher.New().NoSandbox(true).Headless(b.headless).Context(ctx) // headful by default
-	u, err := l.Launch()                                                  // error form; no Must*
+	l := launcher.New().Headless(b.headless).Context(ctx)   // headful by default
+	l.Delete("enable-automation")                           // remove "controlled by automated test software" infobar & webdriver flag
+	l.Set("disable-blink-features", "AutomationControlled") // hide navigator.webdriver from anti-bot detectors
+	l.Delete("disable-site-isolation-trials")               // remove "unsupported command-line flag: --disable-site-isolation-trials" infobar
+	l.Set("disable-infobars")                               // suppress warning infobars
+	l.Set("no-default-browser-check")                       // suppress "Chromium isn't your default browser" prompt
+	binPath := b.binPath
+	if binPath == "" {
+		binPath = DefaultBinPath()
+	}
+	if binPath != "" {
+		l.Bin(binPath)
+	}
+	profileDir := b.profileDir
+	if profileDir == "" {
+		if resolved, err := config.ResolveProfilePathWithBin("", binPath); err == nil {
+			profileDir = resolved
+		}
+	}
+	if profileDir != "" {
+		l.UserDataDir(profileDir)
+	}
+	if !b.headless {
+		switch b.position {
+		case "right":
+			l.Delete("start-maximized")
+			l.Delete("no-startup-window")
+			l.Set("window-position", "1280,0")
+			l.Set("window-size", "1280,1400")
+		case "max", "maximized":
+			l.Set("start-maximized")
+			l.Delete("no-startup-window")
+		case "left", "":
+			fallthrough
+		default:
+			l.Delete("start-maximized")
+			l.Delete("no-startup-window")
+			l.Set("window-position", "0,0")
+			l.Set("window-size", "1280,1400")
+		}
+	}
+	u, err := l.Launch() // error form; no Must*
 	if err != nil {
 		return fmt.Errorf("browsers: launch chromium: %w", err)
 	}
@@ -113,7 +211,7 @@ func (b *Browser) Launch(ctx context.Context) error {
 	// browser itself (WEB-59). The websocket dial inside Connect is a fast
 	// localhost op; the launcher above is where real blocking (first-run
 	// download) happens, and it stays caller-bounded.
-	rb := rod.New().Context(b.baseCtx).ControlURL(u)
+	rb := rod.New().Context(b.baseCtx).ControlURL(u).NoDefaultDevice()
 	if err := rb.Connect(); err != nil {
 		return fmt.Errorf("browsers: connect: %w", err)
 	}
@@ -234,6 +332,14 @@ func (b *Browser) NewPage(
 		if err := page.Emulate(ctx, device); err != nil {
 			b.closeUnregisteredPage(p) // do not leak the orphaned tab
 			return nil, err
+		}
+	} else if vp == nil {
+		if err := page.Emulate(ctx, "clear"); err != nil {
+			b.closeUnregisteredPage(p) // do not leak the orphaned tab
+			return nil, err
+		}
+		if !b.headless {
+			_ = p.SetWindow(&proto.BrowserBounds{WindowState: proto.BrowserWindowStateMaximized})
 		}
 	}
 

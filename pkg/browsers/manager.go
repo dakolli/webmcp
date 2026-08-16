@@ -17,6 +17,9 @@ import (
 	"github.com/go-rod/rod"
 )
 
+// BrowserID uniquely identifies a live Browser instance (e.g. "browser-1", "browser-2").
+type BrowserID string
+
 // defaultTTL is the per-page idle timeout applied by NewManager when no
 // WithTTL option is given. Pages that go unused for longer than the TTL are
 // closed by the manager's background sweeper.
@@ -58,6 +61,24 @@ func WithStealth(stealth bool) Option {
 	return func(m *Manager) { m.stealth = stealth }
 }
 
+// WithBin configures a custom browser binary executable path (e.g. "/usr/bin/brave-browser",
+// "brave", "google-chrome", or "chrome"). When empty, the launcher defaults to the
+// downloaded Chromium binary.
+func WithBin(binPath string) Option {
+	return func(m *Manager) { m.binPath = binPath }
+}
+
+// WithProfileDir configures a custom user data profile directory path for the browser.
+// When empty, the launcher creates a temporary user profile directory for the session.
+func WithProfileDir(profileDir string) Option {
+	return func(m *Manager) { m.profileDir = profileDir }
+}
+
+// WithPosition configures the initial window placement ("left", "right", "max", "normal").
+func WithPosition(position string) Option {
+	return func(m *Manager) { m.position = position }
+}
+
 // WithTTL sets the per-page idle timeout enforced by the manager's background
 // sweeper: pages that go unused for longer than ttl are closed and removed,
 // reclaiming leaked tabs. The default is 15 minutes; the sweep interval is
@@ -94,22 +115,25 @@ func WithLogger(logger *slog.Logger) Option {
 //     a browser_id → Browser map is the planned growth path when multi-browser
 //     support lands (AGENTS.md "Browser-first paradigm").
 type Manager struct {
-	// mu guards browser, shutdown, and the sweeper stop channel.
+	// mu guards browsers map, shutdown, and the sweeper stop channel.
 	mu sync.Mutex
-	// browser is the single Browser owned by this manager; nil until first Open.
-	browser *Browser
-	// relaunched is set when the manager observed its Browser's Chromium
-	// process die and (re)started it. While set, a session id that does not
-	// resolve on the current Browser is reported with an explicit "browser was
-	// restarted" error instead of a bare "not found", so the LLM knows the old
-	// sessions are gone. It is deliberately sticky: it is set under mu on every
-	// observed death and never cleared, because the restart it describes makes
-	// every pre-restart session id permanently unresolvable. Guarded by mu.
+	// browsers maps browser IDs (e.g. "browser-1", "browser-2") to live Browser instances.
+	browsers map[BrowserID]*Browser
+	// nextBrowserID is the counter used to mint fresh BrowserIDs.
+	nextBrowserID int
+	// relaunched is set when the manager observed a Browser's Chromium
+	// process die and (re)started it.
 	relaunched bool
-	// headless controls launcher headless mode (default: headful).
+	// headless controls default launcher headless mode (default: headful).
 	headless bool
 	// stealth controls per-page stealth (default: on).
 	stealth bool
+	// binPath specifies a custom default browser executable path (e.g. Brave, Chrome).
+	binPath string
+	// profileDir specifies a custom default user profile directory path.
+	profileDir string
+	// position specifies default window placement ("left", "right", "max", "normal").
+	position string
 	// shutdown marks the manager as terminated; Open rejects further calls.
 	shutdown bool
 	// ttl is the per-page idle timeout enforced by the background sweeper
@@ -139,8 +163,8 @@ type Manager struct {
 
 // NewManager constructs a Manager with the given options applied over sensible
 // defaults: headful Chromium, stealth on for every page, and a 15-minute
-// per-page idle TTL enforced by a background sweeper. The Browser itself is NOT
-// launched here — that happens lazily on the first Open call.
+// per-page idle TTL enforced by a background sweeper. Browsers are launched
+// lazily or created on demand via CreateBrowser / Open.
 func NewManager(opts ...Option) *Manager {
 	// The manager-owned lifetime ctx: every Browser's rod default ctx hangs
 	// off it (WEB-59), so no tool-call ctx can ever poison the browser. It is
@@ -148,6 +172,8 @@ func NewManager(opts ...Option) *Manager {
 	// Close is never re-poisoned.
 	baseCtx, cancelBase := context.WithCancel(context.Background())
 	m := &Manager{
+		browsers:      make(map[BrowserID]*Browser),
+		nextBrowserID: 1,
 		stealth:       true,
 		ttl:           defaultTTL,
 		sweepInterval: sweepIntervalForTTL(defaultTTL),
@@ -175,99 +201,133 @@ func sweepIntervalForTTL(ttl time.Duration) time.Duration {
 	return interval
 }
 
-// Open lazily launches the manager's single Browser on first use and returns
-// it; subsequent calls return the already-open Browser. The Browser runs
-// headful by default (unless WithHeadless(true) was set) with stealth applied
-// to every new page (unless WithStealth(false) was set).
-//
-// Open is safe for concurrent use: when two goroutines race the first launch,
-// exactly one Browser survives — the loser closes its own just-launched
-// Browser (best-effort, error form) and every caller receives the winner, so
-// no Chromium instance is orphaned.
-//
-// Open also verifies the cached Browser is still alive before returning it: a
-// dead Chromium process makes the cached *rod.Browser handle useless (rod has
-// no auto-reconnect), so on a failed liveness probe the stale Browser is torn
-// down — wiping its page map — and exactly one fresh Browser is relaunched.
-// Callers that reference pre-restart session ids then resolve to "not found"
-// (see Page for the explicit restart-aware error), while callers that just
-// want a browser (browser_create, fetch_page) silently heal.
-func (m *Manager) Open(ctx context.Context) (*Browser, error) {
+// DefaultBrowserID is the default BrowserID used when none is specified.
+const DefaultBrowserID BrowserID = "browser-1"
+
+// CreateBrowser creates and launches a new Browser instance with custom options
+// (e.g. WithBin, WithProfileDir, WithHeadless, WithStealth). It assigns a fresh
+// BrowserID (e.g. "browser-1", "browser-2") and registers it in the manager.
+func (m *Manager) CreateBrowser(ctx context.Context, opts ...Option) (BrowserID, *Browser, error) {
 	m.mu.Lock()
 	if m.shutdown {
 		m.mu.Unlock()
-		return nil, errors.New("browsers: manager has been shut down")
+		return "", nil, errors.New("browsers: manager has been shut down")
 	}
-	if m.browser == nil {
-		m.mu.Unlock()
-		return m.launch(ctx)
+
+	// Idempotent default browser reuse when no custom options provided
+	if len(opts) == 0 {
+		if b, ok := m.browsers[DefaultBrowserID]; ok && b.IsAlive(ctx) {
+			m.mu.Unlock()
+			return DefaultBrowserID, b, nil
+		}
 	}
-	b := m.browser
+
+	id := BrowserID(fmt.Sprintf("browser-%d", m.nextBrowserID))
+	m.nextBrowserID++
+
+	// Copy manager defaults
+	headless := m.headless
+	stealth := m.stealth
+	binPath := m.binPath
+	profileDir := m.profileDir
+	position := m.position
+
+	// Apply per-browser options if provided
+	tempMgr := &Manager{
+		headless:   headless,
+		stealth:    stealth,
+		binPath:    binPath,
+		profileDir: profileDir,
+		position:   position,
+	}
+	for _, o := range opts {
+		o(tempMgr)
+	}
+
+	// Avoid Chromium SingletonLock profile dir collisions across distinct browser instances:
+	// browser-1 holds the main persistent profile directory (~/.config/browser-mcp/profiles/...).
+	// Any secondary browser created while the main profile is in use uses an ephemeral
+	// profile (profileDir = "") so it auto-deletes on exit and never bloats the profiles directory.
+	for _, existing := range m.browsers {
+		if existing.IsAlive(ctx) && existing.profileDir != "" && existing.profileDir == tempMgr.profileDir {
+			tempMgr.profileDir = ""
+			break
+		}
+	}
 	m.mu.Unlock()
 
-	// Fast path: probe the cached Browser OUTSIDE m.mu (the probe is a network
-	// call that blocks until its ctx deadline on a dead websocket). On failure
-	// the stale Browser is torn down — identity-checked under m.mu so a
-	// concurrent observer that already observed the same death and relaunched
-	// hands us its winner instead of being double-closed — and the launch
-	// block below relaunches exactly one fresh Browser.
-	if err := probeBrowser(b); err != nil {
-		m.mu.Lock()
-		if m.browser != b {
-			// Another goroutine already observed the death and tore the stale
-			// Browser down (and possibly relaunched): hand out its winner, or
-			// join the launch race when it has not registered one yet.
-			winner := m.browser
-			m.mu.Unlock()
-			if winner != nil {
-				return winner, nil
-			}
-			return m.launch(ctx)
-		}
-		// We are the observer that still owns the stale handle: tear it down
-		// (best-effort; the process is already dead), record the restart, and
-		// relaunch below.
-		m.browser = nil
-		m.relaunched = true
-		m.stopSweeperLocked()
-		m.mu.Unlock()
-		_ = b.Close(ctx)
-		return m.launch(ctx)
-	}
-	return b, nil
-}
-
-// launch constructs a fresh Browser, launches it, and registers it under the
-// manager's mutex with the WEB-40 winner/loser double-check intact: when two
-// goroutines race a launch, exactly one Browser is registered — the loser
-// closes its own just-launched Browser (best-effort, error form) and every
-// caller receives the winner, so no Chromium instance is orphaned and the
-// sweeper is started exactly once (by the winner's insert).
-func (m *Manager) launch(ctx context.Context) (*Browser, error) {
-	b := NewBrowser(m.baseCtx, m.headless, m.stealth)
+	b := NewBrowser(id, m.baseCtx, tempMgr.headless, tempMgr.stealth, tempMgr.binPath, tempMgr.profileDir, tempMgr.position)
 	if err := b.Launch(ctx); err != nil {
-		return nil, fmt.Errorf("browsers: launch browser: %w", err)
+		return "", nil, fmt.Errorf("browsers: launch browser %s: %w", id, err)
 	}
 
 	m.mu.Lock()
 	if m.shutdown {
-		// Shutdown raced in while we were launching: do not register the fresh
-		// browser — close it so nothing leaks, and surface the shutdown error.
+		m.mu.Unlock()
+		_ = b.Close(ctx)
+		return "", nil, errors.New("browsers: manager has been shut down")
+	}
+	m.browsers[id] = b
+	if m.ttl > 0 {
+		m.startSweeperLocked()
+	}
+	m.mu.Unlock()
+
+	return id, b, nil
+}
+
+// Open lazily opens or returns the default browser ("browser-1").
+func (m *Manager) Open(ctx context.Context) (*Browser, error) {
+	return m.OpenBrowser(ctx, DefaultBrowserID)
+}
+
+// OpenBrowser lazily opens or returns a Browser with the specified ID.
+// If id is empty, DefaultBrowserID ("browser-1") is used.
+func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, error) {
+	if id == "" {
+		id = DefaultBrowserID
+	}
+
+	m.mu.Lock()
+	if m.shutdown {
+		m.mu.Unlock()
+		return nil, errors.New("browsers: manager has been shut down")
+	}
+
+	if b, ok := m.browsers[id]; ok {
+		m.mu.Unlock()
+		if err := probeBrowser(b); err == nil {
+			return b, nil
+		}
+		// Stale browser process died: remove and relaunch below
+		m.mu.Lock()
+		delete(m.browsers, id)
+		m.relaunched = true
+		m.mu.Unlock()
+		_ = b.Close(ctx)
+	} else {
+		m.mu.Unlock()
+	}
+
+	// Create and launch the target browser
+	b := NewBrowser(id, m.baseCtx, m.headless, m.stealth, m.binPath, m.profileDir)
+	if err := b.Launch(ctx); err != nil {
+		return nil, fmt.Errorf("browsers: launch browser %s: %w", id, err)
+	}
+
+	m.mu.Lock()
+	if m.shutdown {
 		m.mu.Unlock()
 		_ = b.Close(ctx)
 		return nil, errors.New("browsers: manager has been shut down")
 	}
-	if winner := m.browser; winner != nil {
-		// Another goroutine won the race and registered its Browser while we
-		// were launching. Close our just-launched Browser (best-effort, error
-		// form) so no Chromium is orphaned, and hand out the winner. The
-		// sweeper is left untouched: the winner's insert started it exactly
-		// once, and the loser must not stop it.
+	if winner, ok := m.browsers[id]; ok {
+		// Race condition loss: keep winner
 		m.mu.Unlock()
 		_ = b.Close(ctx)
 		return winner, nil
 	}
-	m.browser = b
+	m.browsers[id] = b
 	if m.ttl > 0 {
 		m.startSweeperLocked()
 	}
@@ -275,76 +335,50 @@ func (m *Manager) launch(ctx context.Context) (*Browser, error) {
 	return b, nil
 }
 
-// Page resolves the live page with the given ID, opening the Browser first if
-// needed (via Open). When the lookup misses and the Browser was restarted
-// after a process death (see relaunched), the error explains the situation in
-// LLM-actionable terms instead of a bare "not found", so an agent referencing
-// a pre-restart session id knows the old sessions are gone and must call
-// fetch_page again.
-func (m *Manager) Page(ctx context.Context, id PageID) (*Page, error) {
-	b, err := m.Open(ctx)
-	if err != nil {
-		return nil, err
-	}
-	p, err := b.Page(ctx, id)
-	if err != nil {
-		m.mu.Lock()
-		relaunched := m.relaunched
-		m.mu.Unlock()
-		if relaunched {
-			return nil, fmt.Errorf("session %q no longer exists: the browser process died and was restarted; all previous sessions are gone — call fetch_page to re-open URLs", id)
-		}
-		return nil, err
-	}
-	return p, nil
-}
-
-// Browser returns the manager's live Browser, or an error when no Browser has
-// been opened yet (call Open first). It probes the cached Browser so a dead
-// one is never reported as healthy: on a failed probe the stale Browser is
-// torn down (identity-checked under the lock, mirroring Open) and the error is
-// returned, so a list tool reports "no browser open" instead of stale pages.
-// Listing must not launch a browser — probing an existing one is fine.
-func (m *Manager) Browser() (*Browser, error) {
+// Browser returns the live Browser with the given ID, or the first open Browser
+// if id is empty. Does NOT lazily launch a new browser.
+func (m *Manager) Browser(id BrowserID) (*Browser, error) {
 	m.mu.Lock()
-	if m.browser == nil {
+	if len(m.browsers) == 0 {
 		m.mu.Unlock()
 		return nil, errors.New("browsers: no browser open; call Manager.Open first")
 	}
-	b := m.browser
+
+	var target *Browser
+	if id == "" || id == DefaultBrowserID {
+		if b, ok := m.browsers[DefaultBrowserID]; ok {
+			target = b
+		} else {
+			// Return first available open browser
+			for _, b := range m.browsers {
+				target = b
+				break
+			}
+		}
+	} else {
+		target = m.browsers[id]
+	}
 	m.mu.Unlock()
 
-	if err := probeBrowser(b); err != nil {
-		m.mu.Lock()
-		if m.browser == b {
-			m.browser = nil
-			m.relaunched = true
-			m.stopSweeperLocked()
-			m.mu.Unlock()
-			closeCtx, cancel := context.WithTimeout(context.Background(), probeTimeout)
-			defer cancel()
-			_ = b.Close(closeCtx) // best-effort; the process is already dead
-		} else {
-			m.mu.Unlock()
-		}
-		return nil, errors.New("browsers: no browser open; call Manager.Open first")
+	if target == nil {
+		return nil, fmt.Errorf("browsers: unknown browser_id %q", id)
 	}
-	return b, nil
-}
 
-// probeBrowser verifies the given Browser's Chromium process is still alive
-// with a Browser.getVersion round trip. It must NEVER be called while holding
-// m.mu or b.mu — it is a network call, and on a dead websocket it blocks until
-// its (short) timeout, which is exactly how it detects the death. b.rod is
-// captured under b.mu briefly (a field read); the network call itself runs
-// lock-free.
-//
-// The probe is deliberately NOT derived from the caller's ctx: rod cannot
-// distinguish a caller-cancelled ctx from a dead websocket (both surface
-// context.Canceled), so a caller whose ctx expired would wrongly condemn a
-// healthy Browser to teardown+relaunch. Instead the probe always runs on a
-// fixed 2s timeout off context.Background; the caller's own ctx still bounds
-// the rod work that follows (extractions, navigation).
+	if err := probeBrowser(target); err != nil {
+		m.mu.Lock()
+		delete(m.browsers, target.id)
+		m.relaunched = true
+		if len(m.browsers) == 0 {
+			m.stopSweeperLocked()
+		}
+		m.mu.Unlock()
+		closeCtx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+		defer cancel()
+		_ = target.Close(closeCtx)
+		return nil, fmt.Errorf("browsers: browser %s died", target.id)
+	}
+	return target, nil
+}
 func probeBrowser(b *Browser) error {
 	b.mu.Lock()
 	rb := b.rod
@@ -358,43 +392,93 @@ func probeBrowser(b *Browser) error {
 	return err
 }
 
-// Close closes the manager's Browser and all of its pages, so a fresh Browser
-// can be opened with a later Open call. It stops the background sweeper first
-// (idempotently — a second Close is a no-op when nothing is open); a later
-// Open restarts a fresh sweeper. It is a no-op when no Browser is open.
-func (m *Manager) Close(ctx context.Context) error {
+// Browsers returns a snapshot map of all currently open Browser instances.
+func (m *Manager) Browsers() map[BrowserID]*Browser {
 	m.mu.Lock()
-	m.stopSweeperLocked()
-	b := m.browser
-	m.browser = nil
+	defer m.mu.Unlock()
+	result := make(map[BrowserID]*Browser, len(m.browsers))
+	for id, b := range m.browsers {
+		result[id] = b
+	}
+	return result
+}
+
+// Page resolves the live page with the given PageID across all active browsers.
+func (m *Manager) Page(ctx context.Context, id PageID) (*Page, error) {
+	m.mu.Lock()
+	browsers := make([]*Browser, 0, len(m.browsers))
+	for _, b := range m.browsers {
+		browsers = append(browsers, b)
+	}
 	m.mu.Unlock()
 
-	if b == nil {
-		return nil
+	if len(browsers) == 0 {
+		b, err := m.Open(ctx)
+		if err != nil {
+			return nil, err
+		}
+		browsers = append(browsers, b)
 	}
+
+	for _, b := range browsers {
+		if p, err := b.Page(ctx, id); err == nil {
+			return p, nil
+		}
+	}
+
+	m.mu.Lock()
+	relaunched := m.relaunched
+	m.mu.Unlock()
+	if relaunched {
+		return nil, fmt.Errorf("session %q no longer exists: browser was restarted; call fetch_page to re-open URLs", id)
+	}
+	return nil, fmt.Errorf("session %q not found", id)
+}
+
+// CloseBrowser closes a specific Browser by BrowserID and all of its pages.
+// If id is empty, it closes ALL open browsers.
+func (m *Manager) CloseBrowser(ctx context.Context, id BrowserID) error {
+	m.mu.Lock()
+	if id == "" {
+		m.stopSweeperLocked()
+		targets := m.browsers
+		m.browsers = make(map[BrowserID]*Browser)
+		m.mu.Unlock()
+		var firstErr error
+		for _, b := range targets {
+			if err := b.Close(ctx); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		return firstErr
+	}
+
+	b, ok := m.browsers[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil // idempotent no-op
+	}
+	delete(m.browsers, id)
+	if len(m.browsers) == 0 {
+		m.stopSweeperLocked()
+	}
+	m.mu.Unlock()
+
 	return b.Close(ctx)
 }
 
-// Shutdown is the graceful-teardown entry point, intended to be called from
-// main() when the server shuts down: it stops the background sweeper, closes
-// the Browser and all of its pages, marks the manager as terminated, and
-// releases the manager-owned lifetime ctx (WEB-59) — after Shutdown the
-// manager must not be reused, and further Open calls fail.
+// Close closes all open Browser instances and their pages.
+func (m *Manager) Close(ctx context.Context) error {
+	return m.CloseBrowser(ctx, "")
+}
+
+// Shutdown gracefully closes all browsers and cancels the manager context.
 func (m *Manager) Shutdown(ctx context.Context) error {
 	m.mu.Lock()
 	m.shutdown = true
-	m.stopSweeperLocked()
-	b := m.browser
-	m.browser = nil
 	m.mu.Unlock()
 
-	var err error
-	if b != nil {
-		err = b.Close(ctx)
-	}
-	// The manager is terminal and its Browser is closed, so nothing needs the
-	// lifetime ctx anymore. Canceled AFTER the teardown: Browser.Close derives
-	// its close timeouts from this ctx.
+	err := m.CloseBrowser(ctx, "")
 	m.cancelBase()
 	return err
 }
@@ -453,62 +537,59 @@ func (m *Manager) sweep(stop <-chan struct{}) {
 // derived from it.
 func (m *Manager) sweepOnce(ctx context.Context) {
 	m.mu.Lock()
-	b := m.browser
+	browsers := make([]*Browser, 0, len(m.browsers))
+	for _, b := range m.browsers {
+		browsers = append(browsers, b)
+	}
 	ttl := m.ttl
 	m.mu.Unlock()
-	if b == nil || ttl <= 0 {
+	if len(browsers) == 0 || ttl <= 0 {
 		return
 	}
 
-	// Snapshot the idle candidates under the browser mutex. Every successful
-	// Browser.Page lookup touches the page under this same mutex, so a page
-	// looked up before this sweep tick reads as fresh and is spared.
-	b.mu.Lock()
-	var idle []PageID
-	now := time.Now()
-	for id, p := range b.pages {
-		p.mu.Lock()
-		idleSince := p.lastAccess
-		p.mu.Unlock()
-		if now.Sub(idleSince) > ttl {
-			idle = append(idle, id)
-		}
-	}
-	b.mu.Unlock()
-
-	for _, id := range idle {
-		// Re-check under the browser mutex that the page is still stale: a
-		// lookup may have touched it after the snapshot. If it is, capture its
-		// rod handle, remove it from the map, and nil p.Rod while still holding
-		// the locks — a later lookup then sees "page not found" instead of
-		// racing the close. The handle is closed below, outside the locks.
-		var handle *rod.Page
+	for _, b := range browsers {
+		// Snapshot the idle candidates under the browser mutex.
 		b.mu.Lock()
-		p, ok := b.pages[id]
-		if ok {
+		var idle []PageID
+		now := time.Now()
+		for id, p := range b.pages {
 			p.mu.Lock()
-			if time.Since(p.lastAccess) > ttl {
-				handle = p.Rod
-				p.Rod = nil
-				delete(b.pages, id)
-			}
+			idleSince := p.lastAccess
 			p.mu.Unlock()
+			if now.Sub(idleSince) > ttl {
+				idle = append(idle, id)
+			}
 		}
 		b.mu.Unlock()
-		if handle == nil {
-			continue // re-touched after the snapshot, or already gone
-		}
 
-		closeCtx, cancel := context.WithTimeout(ctx, closePageTimeout)
-		err := closeRodPage(closeCtx, handle)
-		cancel()
-		if err != nil {
-			// Best-effort by design: log once and move on. The page's map slot
-			// and rod handle are already reclaimed, so a tab that keeps failing
-			// to close is logged once (never once per sweep tick) through the
-			// injected logger (no-op by default).
-			m.logger.Warn("browsers: sweep: close page failed",
-				"page", id, "error", err)
+		for _, id := range idle {
+			var handle *rod.Page
+			b.mu.Lock()
+			p, ok := b.pages[id]
+			if ok {
+				p.mu.Lock()
+				if time.Since(p.lastAccess) > ttl {
+					handle = p.Rod
+					p.Rod = nil
+					delete(b.pages, id)
+				}
+				p.mu.Unlock()
+			}
+			b.mu.Unlock()
+			if handle == nil {
+				continue
+			}
+
+			closeCtx, cancel := context.WithTimeout(ctx, closePageTimeout)
+			err := closeRodPage(closeCtx, handle)
+			cancel()
+			if err != nil {
+				m.logger.Warn("sweeper: failed to close idle page",
+					slog.String("page_id", string(id)),
+					slog.String("browser_id", string(b.id)),
+					slog.String("error", err.Error()),
+				)
+			}
 		}
 	}
 }

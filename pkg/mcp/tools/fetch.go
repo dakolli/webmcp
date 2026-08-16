@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"webmcp/pkg/browsers"
+	"webmcp/pkg/cli/pageops"
 	"webmcp/pkg/mcp/models"
 )
 
@@ -53,6 +54,10 @@ func (t *Fetch) InputSchema() models.InputSchema {
 				"type":        "string",
 				"description": "The absolute URL (http/https) to open in a new browser session.",
 			},
+			"browser_id": map[string]any{
+				"type":        "string",
+				"description": "Optional target browser_id (e.g. 'browser-1', 'browser-2'). Defaults to the default or active browser.",
+			},
 			"wait_for": map[string]any{
 				"type":        "string",
 				"enum":        []string{"load", "idle", "stable"},
@@ -88,6 +93,8 @@ func (t *Fetch) InputSchema() models.InputSchema {
 type fetchArgs struct {
 	// URL is the absolute URL to open (required).
 	URL string `json:"url"`
+	// BrowserID optionally specifies the target browser (default "browser-1").
+	BrowserID string `json:"browser_id"`
 	// WaitFor is one of "load" | "idle" | "stable" (default "idle").
 	WaitFor string `json:"wait_for"`
 	// Viewport optionally overrides the page viewport size via a MANUAL
@@ -161,7 +168,7 @@ func (t *Fetch) Execute(ctx context.Context, args json.RawMessage) (string, erro
 
 	start := time.Now() // load timing for the summary
 
-	b, err := t.mgr.Open(ctx) // lazily launches the single Browser
+	b, err := t.mgr.OpenBrowser(ctx, browsers.BrowserID(a.BrowserID))
 	if err != nil {
 		return "", fmt.Errorf("fetch_page: %w", err)
 	}
@@ -180,7 +187,7 @@ func (t *Fetch) Execute(ctx context.Context, args json.RawMessage) (string, erro
 	if err != nil {
 		return "", fmt.Errorf("fetch_page: %w", err)
 	}
-	if err := waitForPage(ctx, p, a.WaitFor); err != nil {
+	if err := pageops.WaitForPage(ctx, p, a.WaitFor); err != nil {
 		// MED-1 (WEB-60): a wait timeout must not leak the loaded tab. NewPage
 		// already registered the session, so close it — ClosePage evicts the
 		// session unconditionally and bounds the close off the manager-owned

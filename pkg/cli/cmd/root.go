@@ -28,32 +28,32 @@ const singleBrowserID = "browser-1"
 // serve tree (serve, serve stop, serve mcp).
 func NewRootCmd(mgr *browsers.Manager) *cobra.Command {
 	root := &cobra.Command{
-		Use:   "web-cli",
+		Use:   "browser",
 		Short: "Drive the web-mcp live browser engine from the command line",
 		Long: `Drive the web-mcp live browser engine from the command line: open URLs in a
 real Chromium browser, read any aspect of the live page, and interact with it
 — the human-side knob over the same engine the MCP tools expose to LLM agents.
 
-Typical workflow: 'web-cli serve' starts the shared browser as a background
-daemon (optional — fetch launches it lazily); 'web-cli fetch <url>' opens a
-page and prints its session id (page-1); 'web-cli page fetch/act' read and
-drive the live page; 'web-cli page close' and 'web-cli serve stop' clean up.
+Typical workflow: 'browser serve' starts the shared browser as a background
+daemon (optional — fetch launches it lazily); 'browser fetch <url>' opens a
+page and prints its session id (page-1); 'browser page fetch/act' read and
+drive the live page; 'browser page close' and 'browser serve stop' clean up.
 With one page open the page id is optional; 'last' means the most recently
 opened page; a bare number resolves to page-N.`,
 		Example: `  # Start the shared browser as a background daemon (optional: fetch launches it lazily)
-  web-cli serve
+  browser serve
 
   # Open a URL — prints the session id (page-1) you use with the page commands
-  web-cli fetch https://news.ycombinator.com
+  browser fetch https://news.ycombinator.com
 
   # Read and drive the live page. With one page open, the id is optional.
-  web-cli page list
-  web-cli page fetch links
-  web-cli page act click "#search"
+  browser page list
+  browser page fetch links
+  browser page act click "#search"
 
   # Clean up
-  web-cli page close
-  web-cli serve stop`,
+  browser page close
+  browser serve stop`,
 	}
 
 	// --browser-id is inherited by every subcommand (mirrors browser_create's
@@ -64,7 +64,7 @@ opened page; a bare number resolves to page-N.`,
 	// consumed by serve itself and by the client-side command forwarding
 	// (WEB-29); it must not be redefined by any subcommand.
 	root.PersistentFlags().String("socket", "",
-		"path to the web-cli IPC socket (default: $XDG_RUNTIME_DIR/web-mcp.sock, else ~/.web-mcp.sock)")
+		"path to the browser IPC socket (default: $XDG_RUNTIME_DIR/web-mcp.sock, else ~/.web-mcp.sock)")
 
 	browserCmd := &cobra.Command{
 		Use:   "browser",
@@ -78,6 +78,7 @@ browser (browser-1), mirroring the MCP browser_create/list/close tools.`,
   web-cli browser focus --state maximize`,
 	}
 	browserCmd.AddCommand(
+		NewBrowserCreateCmd(mgr),
 		NewBrowserListCmd(mgr),
 		NewBrowserCloseCmd(mgr),
 		NewBrowserFocusCmd(mgr),
@@ -85,9 +86,14 @@ browser (browser-1), mirroring the MCP browser_create/list/close tools.`,
 
 	root.AddCommand(
 		browserCmd,
+		NewBrowserCreateCmd(mgr),
+		NewBrowserListCmd(mgr),
+		NewBrowserCloseCmd(mgr),
+		NewBrowserFocusCmd(mgr),
 		NewFetchCmd(mgr),
 		NewPageCmd(mgr),
 		NewServeCmd(),
+		NewServeStopCmd(),
 	)
 	return root
 }
@@ -118,20 +124,23 @@ exits 0, so listing is safe in scripts.`,
 			}
 			printServeHint(cmd)
 
-			// No blocking engine call here (Manager.Browser and Browser.Pages
-			// are non-blocking in-memory reads that take no context), so no
-			// 30s timeout is derived for this command.
-			// No lazy launch: listing must never start a browser.
-			b, err := mgr.Browser()
-			if err != nil {
-				// No browser open yet — nothing to list.
-				fmt.Printf("no browser running (%s not open); start one with 'web-cli serve'\n",
-					singleBrowserID)
+			active := mgr.Browsers()
+			if len(active) == 0 {
+				fmt.Println("no browsers running; start one with 'browser serve' or 'browser fetch <url>'")
 				return nil
 			}
-			fmt.Printf("browser_id: %s\n", singleBrowserID)
-			for _, p := range b.Pages() {
-				fmt.Printf("  %s\t%s\n", p.ID, p.URL)
+			for id, b := range active {
+				info := ""
+				if b.BinPath() != "" {
+					info += fmt.Sprintf(" (bin: %s)", b.BinPath())
+				}
+				if b.ProfileDir() != "" {
+					info += fmt.Sprintf(" (profile: %s)", b.ProfileDir())
+				}
+				fmt.Printf("browser_id: %s%s\n", id, info)
+				for _, p := range b.Pages() {
+					fmt.Printf("  %s\t%s\n", p.ID, p.URL)
+				}
 			}
 			return nil
 		},
@@ -153,36 +162,41 @@ serve daemon — stop that with 'web-cli serve stop'.`,
   web-cli browser close             # close the browser and every page in it
   web-cli browser focus             # raise the browser window (best-effort)
   web-cli browser focus --state maximize`,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			id, err := cmd.Flags().GetString("browser-id")
-			if err != nil {
-				return fmt.Errorf("browser close: read --browser-id: %w", err)
-			}
-			if id != singleBrowserID {
-				return fmt.Errorf("browser close: unknown browser id %q; this CLI manages a single browser (%q)",
-					id, singleBrowserID)
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, _ := cmd.Flags().GetString("browser-id")
+			if len(args) > 0 {
+				id = args[0]
 			}
 
 			ctx, cancel := context.WithTimeout(cmdCtx(cmd), 30*time.Second)
 			defer cancel()
 
-			// Forward to a live serve process when one is running (closes the
-			// serve process's browser, which stays alive for the next command);
-			// else fall back to the in-process path below.
 			if cl := dialServe(cmd); cl != nil {
 				defer cl.Close()
-				if err := cl.Call(ctx, ipc.MethodBrowserClose, nil, nil); err != nil {
+				params := map[string]string{}
+				if id != "" {
+					params["browser_id"] = id
+				}
+				if err := cl.Call(ctx, ipc.MethodBrowserClose, params, nil); err != nil {
 					return fmt.Errorf("browser close: %w", err)
 				}
-				fmt.Printf("browser %s closed\n", singleBrowserID)
+				if id != "" {
+					fmt.Printf("browser %s closed\n", id)
+				} else {
+					fmt.Println("all browsers closed")
+				}
 				return nil
 			}
 			printServeHint(cmd)
 
-			if err := mgr.Close(ctx); err != nil { // idempotent no-op when nothing is open
+			if err := mgr.CloseBrowser(ctx, browsers.BrowserID(id)); err != nil {
 				return fmt.Errorf("browser close: %w", err)
 			}
-			fmt.Printf("browser %s closed\n", singleBrowserID)
+			if id != "" {
+				fmt.Printf("browser %s closed\n", id)
+			} else {
+				fmt.Println("all browsers closed")
+			}
 			return nil
 		},
 	}
@@ -265,7 +279,7 @@ Focus never launches a browser: it operates on an already-running one.`,
 			printServeHint(cmd)
 
 			// No lazy launch: focus is a command on an already-running browser.
-			b, err := mgr.Browser()
+			b, err := mgr.Browser(browsers.BrowserID(id))
 			if err != nil {
 				// No browser open — nothing to focus; never start one.
 				fmt.Printf("no browser running (%s not open); start one with 'web-cli serve'\n",
@@ -315,22 +329,98 @@ func browserListViaIPC(cmd *cobra.Command, cl *ipc.Client) error {
 
 	var res ipc.BrowserListResult
 	if err := cl.Call(ctx, ipc.MethodBrowserList, nil, &res); err != nil {
-		// Only the server's own -32000 "no browser open" answer maps to the
-		// friendly hint + exit 0; a dead serve process, timeout or transport
-		// failure is a real error and must surface loudly.
 		var serverErr *ipc.ServerError
 		if errors.As(err, &serverErr) &&
 			serverErr.Code == ipc.CodeServerError &&
 			strings.Contains(serverErr.Message, "no browser open") {
-			fmt.Printf("no browser running (%s not open); start one with 'web-cli serve'\n",
-				singleBrowserID)
+			fmt.Println("no browsers running; start one with 'browser serve' or 'browser fetch <url>'")
 			return nil
 		}
 		return fmt.Errorf("browser list: %w", err)
 	}
-	fmt.Printf("browser_id: %s\n", singleBrowserID)
-	for _, p := range res.Pages {
-		fmt.Printf("  %s\t%s\n", p.ID, p.URL)
+	if len(res.Browsers) > 0 {
+		for _, b := range res.Browsers {
+			info := ""
+			if b.Bin != "" {
+				info += fmt.Sprintf(" (bin: %s)", b.Bin)
+			}
+			if b.ProfileDir != "" {
+				info += fmt.Sprintf(" (profile: %s)", b.ProfileDir)
+			}
+			fmt.Printf("browser_id: %s%s\n", b.BrowserID, info)
+			for _, p := range b.Pages {
+				fmt.Printf("  %s\t%s\n", p.ID, p.URL)
+			}
+		}
+	} else {
+		fmt.Printf("browser_id: %s\n", res.BrowserID)
+		for _, p := range res.Pages {
+			fmt.Printf("  %s\t%s\n", p.ID, p.URL)
+		}
 	}
 	return nil
+}
+
+// NewBrowserCreateCmd constructs the "browser create" command: launches a new
+// browser process with optional custom binary (--bin) and profile (--profile).
+func NewBrowserCreateCmd(mgr *browsers.Manager) *cobra.Command {
+	var bin, profile, position string
+	cmd := &cobra.Command{
+		Use:   "create",
+		Short: "Create and launch a new browser instance",
+		Long:  "Launches a new browser process with optional custom binary (--bin), profile (--profile), and window position (--position left|right|max|normal).",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			ctx, cancel := context.WithTimeout(cmdCtx(cmd), 30*time.Second)
+			defer cancel()
+
+			if cl := dialServe(cmd); cl != nil {
+				defer cl.Close()
+				params := map[string]any{
+					"bin":      bin,
+					"profile":  profile,
+					"position": position,
+				}
+				var res struct {
+					BrowserID string `json:"browser_id"`
+				}
+				if err := cl.Call(ctx, ipc.MethodBrowserOpen, params, &res); err != nil {
+					return fmt.Errorf("browser create: %w", err)
+				}
+				fmt.Printf("browser_id: %s\n", res.BrowserID)
+				return nil
+			}
+			printServeHint(cmd)
+
+			var opts []browsers.Option
+			if bin != "" {
+				opts = append(opts, browsers.WithBin(bin))
+			}
+			if profile != "" {
+				opts = append(opts, browsers.WithProfileDir(profile))
+			}
+			if position != "" {
+				opts = append(opts, browsers.WithPosition(position))
+			}
+			id, b, err := mgr.CreateBrowser(ctx, opts...)
+			if err != nil {
+				return fmt.Errorf("browser create: %w", err)
+			}
+			info := ""
+			if b.BinPath() != "" {
+				info += fmt.Sprintf(" (bin: %s)", b.BinPath())
+			}
+			if b.ProfileDir() != "" {
+				info += fmt.Sprintf(" (profile: %s)", b.ProfileDir())
+			}
+			if b.Position() != "" {
+				info += fmt.Sprintf(" (position: %s)", b.Position())
+			}
+			fmt.Printf("browser_id: %s%s\n", id, info)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&bin, "bin", "", "custom browser binary executable path or command")
+	cmd.Flags().StringVar(&profile, "profile", "", "profile name (brave, chrome, firefox, default) or custom directory path")
+	cmd.Flags().StringVar(&position, "position", "", "window position split screen preset: left, right, max, normal")
+	return cmd
 }

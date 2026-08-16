@@ -31,10 +31,11 @@ var whatVocab = map[string]bool{
 // and the page-id resolution nudge: `page act <arg>` whose first arg is one of
 // these words is an action, not a page id.
 var actionVocab = map[string]bool{
-	"click": true, "input": true, "type": true, "eval": true,
-	"navigate": true, "back": true, "forward": true, "reload": true,
-	"hover": true, "scroll": true, "select": true, "wait": true,
-	"set_viewport": true, "emulate": true,
+	"click": true, "input": true, "type": true, "press_key": true,
+	"click_at": true, "hover_at": true, "drag_and_drop": true,
+	"upload_file": true, "eval": true, "navigate": true, "back": true,
+	"forward": true, "reload": true, "hover": true, "scroll": true,
+	"select": true, "wait": true, "set_viewport": true, "emulate": true,
 }
 
 // actPayloadSpecs maps each page act action to its positional payload slots,
@@ -44,20 +45,25 @@ var actionVocab = map[string]bool{
 // same fields as the fallback). Each slot fills the same-named field of
 // actArgs (see parseActArgs).
 var actPayloadSpecs = map[string][]string{
-	"click":        {"selector"},
-	"hover":        {"selector"},
-	"select":       {"selector", "value"},
-	"input":        {"selector", "text"},
-	"navigate":     {"url"},
-	"eval":         {"js"},
-	"scroll":       {"x", "y"},
-	"wait":         {"mode"},
-	"set_viewport": {"w", "h"},
-	"emulate":      {"device"},
-	"back":         {},
-	"forward":      {},
-	"reload":       {},
-	"type":         {"selector", "text"},
+	"click":         {"selector"},
+	"hover":         {"selector"},
+	"select":        {"selector", "value"},
+	"input":         {"selector", "text"},
+	"navigate":      {"url"},
+	"eval":          {"js"},
+	"scroll":        {"x", "y"},
+	"wait":          {"mode"},
+	"set_viewport":  {"w", "h"},
+	"emulate":       {"device"},
+	"back":          {},
+	"forward":       {},
+	"reload":        {},
+	"type":          {"selector", "text"},
+	"press_key":     {"key"},
+	"click_at":      {"x", "y"},
+	"hover_at":      {"x", "y"},
+	"drag_and_drop": {"from_x", "from_y", "to_x", "to_y"},
+	"upload_file":   {"selector", "path"},
 }
 
 // resolvePageID resolves a user-supplied page id (possibly empty) to a live
@@ -93,7 +99,7 @@ func resolvePageID(ctx context.Context, cmd *cobra.Command, mgr *browsers.Manage
 		// mgr.Browser never launches the browser: with none open it errors,
 		// which we treat as zero pages (the resolution rules below produce the
 		// friendly "no open pages" answer).
-		if b, err := mgr.Browser(); err == nil {
+		if b, err := mgr.Browser(""); err == nil {
 			pages = b.Pages()
 		}
 	}
@@ -258,18 +264,20 @@ func parseFetchArgs(args []string, idFlag, whatFlag string) (id, what, url strin
 // override: a positional always wins over its flag counterpart, and the flag
 // is the fallback when the positional grammar leaves the field unfilled.
 type actArgFlags struct {
-	id, action, selector, value, waitMode, device string
-	x, y                                          float64
-	width, height                                 int
+	id, action, selector, value, key, button, targetSelector, waitMode, device string
+	x, y, targetX, targetY                                                     float64
+	clickCount, width, height                                                  int
+	paths                                                                      []string
 }
 
 // actArgs is the merged result of `page act` parsing: the effective
 // id/action/payload fields after the positionals (which win) are merged over
 // the flag values.
 type actArgs struct {
-	id, action, selector, value, waitMode, device string
-	x, y                                          float64
-	width, height                                 int
+	id, action, selector, value, key, button, targetSelector, waitMode, device string
+	x, y, targetX, targetY                                                     float64
+	clickCount, width, height                                                  int
+	paths                                                                      []string
 }
 
 // parseActArgs parses `page act` positional args against the flag values and
@@ -315,7 +323,7 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 	}
 
 	// Fill the per-action fields from the validated payload.
-	xSet, ySet, wSet, hSet := false, false, false, false
+	xSet, ySet, txSet, tySet, wSet, hSet := false, false, false, false, false, false
 	switch a.action {
 	case "click", "hover", "select", "input", "type":
 		if len(payload) >= 1 {
@@ -323,6 +331,53 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 		}
 		if len(payload) >= 2 {
 			a.value = payload[1]
+		}
+	case "press_key":
+		if len(payload) >= 1 {
+			a.key = payload[0]
+		}
+	case "click_at", "hover_at":
+		if len(payload) == 1 {
+			return a, fmt.Errorf("page act: %s requires both x and y; got 1 positional arg", a.action)
+		}
+		if len(payload) >= 2 {
+			x, err := strconv.ParseFloat(payload[0], 64)
+			if err != nil {
+				return a, fmt.Errorf("page act: %s x must be a number, got %q", a.action, payload[0])
+			}
+			y, err := strconv.ParseFloat(payload[1], 64)
+			if err != nil {
+				return a, fmt.Errorf("page act: %s y must be a number, got %q", a.action, payload[1])
+			}
+			a.x, a.y, xSet, ySet = x, y, true, true
+		}
+	case "drag_and_drop":
+		if len(payload) >= 4 {
+			fx, err := strconv.ParseFloat(payload[0], 64)
+			if err != nil {
+				return a, fmt.Errorf("page act: drag_and_drop from_x must be a number, got %q", payload[0])
+			}
+			fy, err := strconv.ParseFloat(payload[1], 64)
+			if err != nil {
+				return a, fmt.Errorf("page act: drag_and_drop from_y must be a number, got %q", payload[1])
+			}
+			tx, err := strconv.ParseFloat(payload[2], 64)
+			if err != nil {
+				return a, fmt.Errorf("page act: drag_and_drop to_x must be a number, got %q", payload[2])
+			}
+			ty, err := strconv.ParseFloat(payload[3], 64)
+			if err != nil {
+				return a, fmt.Errorf("page act: drag_and_drop to_y must be a number, got %q", payload[3])
+			}
+			a.x, a.y, a.targetX, a.targetY = fx, fy, tx, ty
+			xSet, ySet, txSet, tySet = true, true, true, true
+		}
+	case "upload_file":
+		if len(payload) >= 1 {
+			a.selector = payload[0]
+		}
+		if len(payload) >= 2 {
+			a.paths = payload[1:]
 		}
 	case "navigate", "eval":
 		if len(payload) >= 1 {
@@ -381,6 +436,21 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 	if a.value == "" {
 		a.value = f.value
 	}
+	if a.key == "" {
+		a.key = f.key
+	}
+	if a.button == "" {
+		a.button = f.button
+	}
+	if a.clickCount == 0 {
+		a.clickCount = f.clickCount
+	}
+	if a.targetSelector == "" {
+		a.targetSelector = f.targetSelector
+	}
+	if len(a.paths) == 0 {
+		a.paths = f.paths
+	}
 	if a.waitMode == "" {
 		a.waitMode = f.waitMode
 	}
@@ -392,6 +462,12 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 	}
 	if !ySet {
 		a.y = f.y
+	}
+	if !txSet {
+		a.targetX = f.targetX
+	}
+	if !tySet {
+		a.targetY = f.targetY
 	}
 	if !wSet {
 		a.width = f.width

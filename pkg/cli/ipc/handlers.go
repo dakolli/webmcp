@@ -18,14 +18,13 @@ import (
 // means a future Manager refactor is caught at compile time without widening
 // the public API (NewServer still accepts *browsers.Manager).
 type manager interface {
-	// Open lazily launches the single Browser on first use and returns it.
 	Open(ctx context.Context) (*browsers.Browser, error)
-	// Close closes the Browser and all of its pages (a no-op when none open).
+	OpenBrowser(ctx context.Context, id browsers.BrowserID) (*browsers.Browser, error)
+	CreateBrowser(ctx context.Context, opts ...browsers.Option) (browsers.BrowserID, *browsers.Browser, error)
 	Close(ctx context.Context) error
-	// Browser returns the live Browser, or an error when none is open yet.
-	Browser() (*browsers.Browser, error)
-	// Page resolves the live page with the given ID, opening the Browser if
-	// needed; it surfaces restart-aware errors for pre-restart session ids.
+	CloseBrowser(ctx context.Context, id browsers.BrowserID) error
+	Browser(id browsers.BrowserID) (*browsers.Browser, error)
+	Browsers() map[browsers.BrowserID]*browsers.Browser
 	Page(ctx context.Context, id browsers.PageID) (*browsers.Page, error)
 }
 
@@ -67,55 +66,86 @@ func (s *Server) handle(ctx context.Context, req Request) (any, *Error) {
 	}
 }
 
-// handleBrowserOpen implements browser.open: it lazily opens the manager's
-// single Browser (idempotent — Manager.Open returns the already-running
-// browser) and reports browser-1.
-//
-// Contract-parity note: the headless/stealth params are accepted and validated
-// (a non-boolean value fails with -32602) but CANNOT change the running
-// browser — Manager options are construction-time
-// (browsers.NewManager(WithHeadless, WithStealth)); the effective config is
-// fixed by `web-cli serve --headless/--stealth`. The client-side launch flow
-// must pass the flags to serve itself, not rely on these params.
 func (s *Server) handleBrowserOpen(ctx context.Context, params json.RawMessage) (any, *Error) {
-	p, rpcErr := decodeParams[BrowserOpenParams](params)
-	if rpcErr != nil {
-		return nil, rpcErr
+	var p struct {
+		Bin      string `json:"bin,omitempty"`
+		Profile  string `json:"profile,omitempty"`
+		Position string `json:"position,omitempty"`
+		Headless *bool  `json:"headless,omitempty"`
+		Stealth  *bool  `json:"stealth,omitempty"`
 	}
-	// p.Headless/p.Stealth are accepted for wire-contract parity only.
-	_ = p
+	if len(params) > 0 && string(params) != "null" {
+		_ = json.Unmarshal(params, &p)
+	}
 
-	if _, err := s.mgr.Open(ctx); err != nil {
+	var opts []browsers.Option
+	if p.Bin != "" {
+		opts = append(opts, browsers.WithBin(p.Bin))
+	}
+	if p.Profile != "" {
+		opts = append(opts, browsers.WithProfileDir(p.Profile))
+	}
+	if p.Position != "" {
+		opts = append(opts, browsers.WithPosition(p.Position))
+	}
+	if p.Headless != nil {
+		opts = append(opts, browsers.WithHeadless(*p.Headless))
+	}
+	if p.Stealth != nil {
+		opts = append(opts, browsers.WithStealth(*p.Stealth))
+	}
+
+	if len(opts) > 0 {
+		id, _, err := s.mgr.CreateBrowser(ctx, opts...)
+		if err != nil {
+			return nil, serverError(err)
+		}
+		return BrowserOpenResult{BrowserID: string(id)}, nil
+	}
+
+	b, err := s.mgr.Open(ctx)
+	if err != nil {
 		return nil, serverError(err)
 	}
-	return BrowserOpenResult{BrowserID: browserID}, nil
+	return BrowserOpenResult{BrowserID: string(b.ID())}, nil
 }
 
-// handleBrowserClose implements browser.close: it closes the manager's Browser
-// and all of its pages (an idempotent no-op when nothing is open). After close,
-// page.* methods fail with an actionable "no browser open" error from the
-// engine.
 func (s *Server) handleBrowserClose(ctx context.Context, params json.RawMessage) (any, *Error) {
-	if err := s.mgr.Close(ctx); err != nil {
+	var p struct {
+		BrowserID string `json:"browser_id,omitempty"`
+	}
+	if len(params) > 0 && string(params) != "null" {
+		_ = json.Unmarshal(params, &p)
+	}
+	if err := s.mgr.CloseBrowser(ctx, browsers.BrowserID(p.BrowserID)); err != nil {
 		return nil, serverError(err)
 	}
 	return BrowserCloseResult{OK: true}, nil
 }
 
-// handleBrowserList implements browser.list: it reports the live Browser's id
-// and its open pages. It never lazily launches the browser (Manager.Browser is
-// a non-blocking in-memory read, mirroring the CLI browser list command): with
-// no browser open it fails with an actionable -32000 error telling the caller
-// to run browser.open first.
 func (s *Server) handleBrowserList(ctx context.Context, params json.RawMessage) (any, *Error) {
-	b, err := s.mgr.Browser() // no lazy launch
-	if err != nil {
+	active := s.mgr.Browsers()
+	if len(active) == 0 {
 		return nil, &Error{
 			Code:    CodeServerError,
 			Message: "browser.list: no browser open; call browser.open first",
 		}
 	}
-	return BrowserListResult{BrowserID: browserID, Pages: b.Pages()}, nil
+	var list []BrowserEntry
+	for id, b := range active {
+		list = append(list, BrowserEntry{
+			BrowserID:  string(id),
+			Bin:        b.BinPath(),
+			ProfileDir: b.ProfileDir(),
+			Pages:      b.Pages(),
+		})
+	}
+	res := BrowserListResult{Browsers: list}
+	if len(list) > 0 {
+		res.BrowserID = list[0].BrowserID
+		res.Pages = list[0].Pages
+	}
+	return res, nil
 }
 
 // handleBrowserFocus implements browser.focus: it raises the serve process's
@@ -144,7 +174,7 @@ func (s *Server) handleBrowserFocus(ctx context.Context, params json.RawMessage)
 		}
 	}
 
-	b, err := s.mgr.Browser() // no lazy launch
+	b, err := s.mgr.Browser("") // no lazy launch
 	if err != nil {
 		return nil, &Error{
 			Code:    CodeServerError,
@@ -304,8 +334,9 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 }
 
 // handlePageAct implements page.act: it performs the requested action on a
-// live page — click, input, type, hover, scroll, select, eval, navigate, back,
-// forward, reload, wait or set_viewport — mirroring the CLI page act command.
+// live page — click, input, type, press_key, click_at, hover_at, drag_and_drop,
+// upload_file, hover, scroll, select, eval, navigate, back, forward, reload,
+// wait or set_viewport — mirroring the CLI page act command.
 // An unknown action is a -32602 invalid-params error.
 func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any, *Error) {
 	p, rpcErr := decodeParams[PageActParams](params)
@@ -319,11 +350,11 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		return nil, &Error{Code: CodeInvalidParams, Message: `page.act: missing required param "action"`}
 	}
 	switch p.Action {
-	case "click", "input", "type", "eval", "navigate", "back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport", "emulate":
+	case "click", "input", "type", "press_key", "click_at", "hover_at", "drag_and_drop", "upload_file", "eval", "navigate", "back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport", "emulate":
 	default:
 		return nil, &Error{
 			Code:    CodeInvalidParams,
-			Message: fmt.Sprintf("page.act: unknown action=%q (must be one of click, input, type, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate)", p.Action),
+			Message: fmt.Sprintf("page.act: unknown action=%q (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate)", p.Action),
 		}
 	}
 	if p.Action == "eval" && p.Value == "" {
@@ -368,11 +399,29 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 	var out string
 	switch p.Action {
 	case "click":
-		out, err = pageops.PageClick(ctx, page, p.Selector)
+		out, err = pageops.PageClickOpts(ctx, page, p.Selector, p.Button, p.ClickCount)
 	case "input":
 		out, err = pageops.PageInput(ctx, page, p.Selector, p.Value)
 	case "type":
 		out, err = pageops.PageType(ctx, page, p.Selector, p.Value)
+	case "press_key":
+		keyStr := p.Key
+		if keyStr == "" {
+			keyStr = p.Value
+		}
+		out, err = pageops.PagePressKey(ctx, page, p.Selector, keyStr)
+	case "click_at":
+		out, err = pageops.PageClickAt(ctx, page, p.X, p.Y, p.Button, p.ClickCount)
+	case "hover_at":
+		out, err = pageops.PageHoverAt(ctx, page, p.X, p.Y)
+	case "drag_and_drop":
+		out, err = pageops.PageDragAndDrop(ctx, page, p.X, p.Y, p.TargetX, p.TargetY, p.Selector, p.TargetSelector)
+	case "upload_file":
+		paths := p.Paths
+		if len(paths) == 0 && p.Value != "" {
+			paths = []string{p.Value}
+		}
+		out, err = pageops.PageUploadFile(ctx, page, p.Selector, paths)
 	case "eval":
 		out, err = pageops.PageEval(ctx, page, p.Value)
 	case "navigate":

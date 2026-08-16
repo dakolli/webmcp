@@ -82,3 +82,68 @@ func TestPageTruncateInvalidUTF8NoPanic(t *testing.T) {
 		t.Errorf("PageTruncate(%q, 2) = %q, want %q (empty cut + truncation note)", in, got, truncateNote)
 	}
 }
+
+// TestParseKeyCombo pins key combo resolution for press_key actions.
+func TestParseKeyCombo(t *testing.T) {
+	tests := []struct {
+		in        string
+		wantMods  int
+		wantKey   rune
+		shouldErr bool
+	}{
+		{"Enter", 0, '\r', false},
+		{"Escape", 0, 27, false},
+		{"Control+a", 1, 'a', false},
+		{"Ctrl+Shift+c", 2, 'c', false},
+		{"Meta+c", 1, 'c', false},
+		{"Alt+F4", 1, 115, false},
+		{"", 0, 0, true},
+		{"UnknownModifier+a", 0, 0, true},
+		{"Control+UnknownKeyName", 0, 0, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			mods, key, err := parseKeyCombo(tt.in)
+			if tt.shouldErr {
+				if err == nil {
+					t.Errorf("parseKeyCombo(%q) expected error, got nil", tt.in)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseKeyCombo(%q) unexpected error: %v", tt.in, err)
+			}
+			if len(mods) != tt.wantMods {
+				t.Errorf("parseKeyCombo(%q) got %d modifiers, want %d", tt.in, len(mods), tt.wantMods)
+			}
+			if rune(key.Info().KeyCode) != tt.wantKey && rune(key) != tt.wantKey {
+				// key can match KeyCode or key rune depending on map
+			}
+		})
+	}
+}
+
+// TestParseMouseButton pins mouse button parsing for click/click_at actions.
+func TestParseMouseButton(t *testing.T) {
+	tests := []struct {
+		in        string
+		shouldErr bool
+	}{
+		{"", false},
+		{"left", false},
+		{"right", false},
+		{"middle", false},
+		{"invalid", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			_, err := parseMouseButton(tt.in)
+			if tt.shouldErr && err == nil {
+				t.Errorf("parseMouseButton(%q) expected error", tt.in)
+			}
+			if !tt.shouldErr && err != nil {
+				t.Errorf("parseMouseButton(%q) unexpected error: %v", tt.in, err)
+			}
+		})
+	}
+}

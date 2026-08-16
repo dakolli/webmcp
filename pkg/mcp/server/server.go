@@ -334,7 +334,7 @@ func (s *Server) processRequest(ctx context.Context, req models.JSONRPCRequest) 
 				Tools:   make(map[string]interface{}),
 				Prompts: make(map[string]interface{}),
 			},
-			Instructions: "web-mcp provides stateful Chromium browser automation tools (fetch_page, page_fetch, page_act, session_close, browser_create, etc.). Predefined task templates are available via the prompts/list and prompts/get MCP protocol endpoints to guide common workflows such as page exploration, form filling, and content extraction.",
+			Instructions: "web-mcp provides stateful Chromium browser automation tools (fetch_page, page_fetch, page_act, session_close, browser_create, etc.) supporting element clicks, text input, key presses/combos (press_key), coordinate mouse movement/clicks (click_at, hover_at), drag-and-drop (drag_and_drop), and file uploads (upload_file). Predefined task templates are available via the prompts/list and prompts/get MCP protocol endpoints to guide common workflows such as page exploration, form filling, and content extraction.",
 		}
 
 	case "tools/list":
@@ -369,7 +369,7 @@ func (s *Server) processRequest(ctx context.Context, req models.JSONRPCRequest) 
 
 	case "prompts/get":
 		var getParams models.GetPromptRequest
-		if req.Params != nil && len(req.Params) > 0 {
+		if len(req.Params) > 0 {
 			if err := json.Unmarshal(req.Params, &getParams); err != nil {
 				resp.Error = models.JSONRPCError{Code: -32602, Message: "Invalid parameters"}
 				return resp

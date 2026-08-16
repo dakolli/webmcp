@@ -131,13 +131,19 @@ type BrowserCloseResult struct {
 	OK bool `json:"ok"`
 }
 
-// BrowserListResult is the result of browser.list: the Browser's id and its
-// open pages (reusing browsers.PageInfo, JSON-tagged id/url).
+type BrowserEntry struct {
+	BrowserID  string              `json:"browser_id"`
+	Bin        string              `json:"bin,omitempty"`
+	ProfileDir string              `json:"profile_dir,omitempty"`
+	Pages      []browsers.PageInfo `json:"pages"`
+}
+
+// BrowserListResult is the result of browser.list: the snapshot of open Browsers
+// and their open pages.
 type BrowserListResult struct {
-	// BrowserID identifies the live Browser.
-	BrowserID string `json:"browser_id"`
-	// Pages is the snapshot of the Browser's open pages.
-	Pages []browsers.PageInfo `json:"pages"`
+	Browsers  []BrowserEntry      `json:"browsers,omitempty"`
+	BrowserID string              `json:"browser_id,omitempty"`
+	Pages     []browsers.PageInfo `json:"pages,omitempty"`
 }
 
 // BrowserFocusParams carries the browser.focus parameters. State is the target
@@ -218,26 +224,41 @@ type PageFetchResult struct {
 }
 
 // PageActParams carries the page.act parameters. action ∈ click|input|type|
-// eval|navigate|back|forward|reload|hover|scroll|select|wait|set_viewport|
-// emulate; selector/value/x/y are the per-action payloads; viewport carries
-// the target size for set_viewport and device the preset for emulate;
-// timeout_ms bounds the action (default 30000) and sizes the wait action's
-// "ms" sleep; wait_mode selects what the wait action waits for: load|idle|
-// stable|interactable|ms (default ms).
+// press_key|click_at|hover_at|drag_and_drop|upload_file|eval|navigate|back|
+// forward|reload|hover|scroll|select|wait|set_viewport|emulate;
+// selector/value/key/button/click_count/x/y/target_x/target_y/target_selector/
+// paths are the per-action payloads; viewport carries the target size for
+// set_viewport and device the preset for emulate; timeout_ms bounds the action
+// (default 30000) and sizes the wait action's "ms" sleep; wait_mode selects
+// what the wait action waits for: load|idle|stable|interactable|ms (default ms).
 type PageActParams struct {
 	// SessionID identifies the live page to act on.
 	SessionID string `json:"session_id"`
 	// Action is the action to perform.
 	Action string `json:"action"`
-	// Value is the payload: a JS function for eval, text for input, URL for
-	// navigate, an option value for select.
+	// Value is the payload: a JS function for eval, text for input/type, URL for
+	// navigate, an option value for select, fallback key for press_key, or single path for upload_file.
 	Value string `json:"value,omitempty"`
 	// Selector targets an element for element actions.
 	Selector string `json:"selector,omitempty"`
-	// X is the horizontal offset for scroll.
+	// Key is the key or key combination for press_key (e.g. Enter, Escape, Control+A).
+	Key string `json:"key,omitempty"`
+	// Button selects the mouse button for click/click_at: left (default), right, middle.
+	Button string `json:"button,omitempty"`
+	// ClickCount is the number of clicks for click/click_at (1 for single click, 2 for double click).
+	ClickCount int `json:"click_count,omitempty"`
+	// X is the horizontal offset for scroll/click_at/hover_at/drag_and_drop source.
 	X float64 `json:"x,omitempty"`
-	// Y is the vertical offset for scroll.
+	// Y is the vertical offset for scroll/click_at/hover_at/drag_and_drop source.
 	Y float64 `json:"y,omitempty"`
+	// TargetX is the target horizontal coordinate for drag_and_drop.
+	TargetX float64 `json:"target_x,omitempty"`
+	// TargetY is the target vertical coordinate for drag_and_drop.
+	TargetY float64 `json:"target_y,omitempty"`
+	// TargetSelector is the target element selector for drag_and_drop.
+	TargetSelector string `json:"target_selector,omitempty"`
+	// Paths is the list of local file paths for upload_file.
+	Paths []string `json:"paths,omitempty"`
 	// TimeoutMS bounds the action in milliseconds (0 → server default 30000);
 	// the wait action's "ms" mode sleeps for this long.
 	TimeoutMS int `json:"timeout_ms,omitempty"`

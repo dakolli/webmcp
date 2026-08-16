@@ -14,6 +14,7 @@ import (
 
 	"webmcp/pkg/browsers"
 	"webmcp/pkg/cli/ipc"
+	"webmcp/pkg/config"
 	mcpServer "webmcp/pkg/mcp/server"
 )
 
@@ -24,6 +25,10 @@ type serveRunOptions struct {
 	headless bool
 	// stealth applies go-rod/stealth to every page (default: on).
 	stealth bool
+	// bin specifies a custom browser executable binary path or command.
+	bin string
+	// profile specifies a custom profile name (brave, chrome, firefox, default) or directory path.
+	profile string
 	// socket is the IPC socket path to bind ("" → ipc.DefaultSocketPath()).
 	socket string
 	// mcpPort is the HTTP port for the in-process MCP server; 0 disables the
@@ -36,6 +41,8 @@ type serveRunOptions struct {
 type serveFlags struct {
 	headless   bool
 	stealth    bool
+	bin        string
+	profile    string
 	foreground bool
 }
 
@@ -71,10 +78,10 @@ func NewServeCmd() *cobra.Command {
 		Short: "Serve the live browser over a local IPC socket",
 		Long: `Serve starts the shared browser as a persistent background daemon and
 exposes it over a local JSON-RPC 2.0 unix socket (newline-delimited JSON):
-it returns to the prompt once the daemon answers ping, and the other web-cli
+it returns to the prompt once the daemon answers ping, and the other browser
 commands and local clients connect to the socket to drive the SAME live
 browser, so pages persist across invocations. Stop the daemon with
-'web-cli serve stop'.
+'browser serve stop'.
 
   --foreground  run in the foreground instead of daemonizing (Ctrl-C stops it;
                 the headful Chromium window stays open until then)
@@ -86,13 +93,13 @@ browser, so pages persist across invocations. Stop the daemon with
 Subcommands:
   stop  Stop the serve daemon (server.shutdown over IPC)
   mcp   Daemonize with the MCP HTTP/SSE server on --port as well`,
-		Example: `  web-cli serve                    # daemonize the shared browser (headful, stealth on)
-  web-cli serve --headless         # headless Chromium daemon
-  web-cli serve --foreground       # run in this terminal (Ctrl-C stops it)
-  web-cli serve stop               # stop the daemon
+		Example: `  browser serve                    # daemonize the shared browser (headful, stealth on)
+  browser serve --headless         # headless Chromium daemon
+  browser serve --foreground       # run in this terminal (Ctrl-C stops it)
+  browser serve stop               # stop the daemon
 
-  web-cli serve mcp                # daemonize + host the MCP SSE server on :4099
-  web-cli serve mcp --port 4089    # pick a different port`,
+  browser serve mcp                # daemonize + host the MCP SSE server on :4099
+  browser serve mcp --port 4089    # pick a different port`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			flags, err := serveFlagsFromCmd(cmd)
 			if err != nil {
@@ -105,6 +112,8 @@ Subcommands:
 			opts := serveRunOptions{
 				headless: flags.headless,
 				stealth:  flags.stealth,
+				bin:      flags.bin,
+				profile:  flags.profile,
 				socket:   path,
 			}
 			if flags.foreground {
@@ -115,6 +124,8 @@ Subcommands:
 				"--foreground",
 				"--headless=" + strconv.FormatBool(flags.headless),
 				"--stealth=" + strconv.FormatBool(flags.stealth),
+				"--bin=" + flags.bin,
+				"--profile=" + flags.profile,
 				"--socket=" + path,
 			}
 			if err := daemonizeServe(cmd, opts, childArgs); err != nil {
@@ -128,6 +139,10 @@ Subcommands:
 		"run the browser headless instead of headful (default: headful)")
 	serveCmd.PersistentFlags().BoolVar(&serveFlagsVar.stealth, "stealth", true,
 		"apply go-rod/stealth to every page (default: on)")
+	serveCmd.PersistentFlags().StringVar(&serveFlagsVar.bin, "bin", "",
+		"optional custom browser executable path or command (e.g. /usr/bin/brave-browser, brave, google-chrome)")
+	serveCmd.PersistentFlags().StringVar(&serveFlagsVar.profile, "profile", "",
+		"optional browser user profile name (brave, chrome, firefox, default) or custom directory path")
 	serveCmd.PersistentFlags().BoolVar(&serveFlagsVar.foreground, "foreground", false,
 		"run in the foreground instead of daemonizing (Ctrl-C stops it)")
 
@@ -146,6 +161,12 @@ func serveFlagsFromCmd(cmd *cobra.Command) (serveFlags, error) {
 	}
 	if f.stealth, err = cmd.Flags().GetBool("stealth"); err != nil {
 		return f, fmt.Errorf("read --stealth: %w", err)
+	}
+	if f.bin, err = cmd.Flags().GetString("bin"); err != nil {
+		return f, fmt.Errorf("read --bin: %w", err)
+	}
+	if f.profile, err = cmd.Flags().GetString("profile"); err != nil {
+		return f, fmt.Errorf("read --profile: %w", err)
 	}
 	if f.foreground, err = cmd.Flags().GetBool("foreground"); err != nil {
 		return f, fmt.Errorf("read --foreground: %w", err)
@@ -236,6 +257,8 @@ browser. Stop the daemon with 'web-cli serve stop'.
 			opts := serveRunOptions{
 				headless: flags.headless,
 				stealth:  flags.stealth,
+				bin:      flags.bin,
+				profile:  flags.profile,
 				socket:   path,
 				mcpPort:  port,
 			}
@@ -248,6 +271,8 @@ browser. Stop the daemon with 'web-cli serve stop'.
 				"--port=" + strconv.Itoa(port),
 				"--headless=" + strconv.FormatBool(flags.headless),
 				"--stealth=" + strconv.FormatBool(flags.stealth),
+				"--bin=" + flags.bin,
+				"--profile=" + flags.profile,
 				"--socket=" + path,
 			}
 			if err := daemonizeServe(cmd, opts, childArgs); err != nil {
@@ -339,9 +364,16 @@ func daemonizeServe(cmd *cobra.Command, opts serveRunOptions, childArgs []string
 // cancelled (SIGINT/SIGTERM) or a server.shutdown request arrives — then the
 // loop stops and the process tears the browser down via mgr.Shutdown.
 func runServeForeground(ctx context.Context, opts serveRunOptions) error {
+	profileDir, err := config.ResolveProfilePath(opts.profile)
+	if err != nil {
+		return fmt.Errorf("serve: resolve profile path: %w", err)
+	}
+
 	mgr := browsers.NewManager(
 		browsers.WithHeadless(opts.headless),
 		browsers.WithStealth(opts.stealth),
+		browsers.WithBin(opts.bin),
+		browsers.WithProfileDir(profileDir),
 	)
 	// Graceful teardown of the browser and all of its pages when the loop
 	// stops (SIGINT/SIGTERM cancels ctx, or a server.shutdown request makes

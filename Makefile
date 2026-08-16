@@ -1,26 +1,27 @@
 # web-mcp Makefile
 # test    — run the full Go test suite
-# install — stop any running serve daemon, then build and install the web-cli
-#           binary onto PATH (go install ./cmd/web-cli)
+# install — stop any running serve daemon, then build and install the browser
+#           binary onto PATH (go install ./cmd/browser)
 # launch  — stop any running serve daemon, then start the MCP/SSE server
-#           daemonized on port 4089 (web-cli serve mcp --port 4089)
+#           daemonized on port 4089 (browser serve mcp --port 4089)
 
 .PHONY: test install launch stop
 
-# stop — stop any running web-cli serve daemon, tolerantly: no daemon running
-# (or web-cli not yet on PATH) must never abort install/launch, so the
+# stop — stop any running browser serve daemon, tolerantly: no daemon running
+# (or browser not yet on PATH) must never abort install/launch, so the
 # leading '-' ignores the command's exit status.
 stop:
+	-browser serve stop
 	-web-cli serve stop
 
 test:
 	go test ./...
 
 install: stop
-	go install ./cmd/web-cli
+	go install ./cmd/browser
 
 launch: stop
-	web-cli serve mcp --port 4089
+	browser serve mcp --port 4089
 	@echo "MCP SSE endpoint is at http://127.0.0.1:4089/sse"
 
 # fetch-example — download a file from go-rod into ./examples/

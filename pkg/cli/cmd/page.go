@@ -96,7 +96,7 @@ which sessions are still alive before acting on or closing them.`,
 			// No lazy launch: listing must never start a browser (mirrors
 			// `browser list`). With no browser open there are no pages — the
 			// same "no open pages" answer below is the friendly result.
-			b, err := mgr.Browser()
+			b, err := mgr.Browser("")
 			if err != nil {
 				fmt.Println("no open pages")
 				return nil
@@ -302,29 +302,37 @@ shapes. Screenshots print a data:image/png;base64,... data-URI.`,
 }
 
 // newPageActCmd builds `page act`: it performs an action on a live page —
-// click, input, type, hover, scroll, select, eval, navigate, back, forward,
-// reload, wait, set_viewport and emulate (mirroring the MCP page_act surface).
+// click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file,
+// hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport
+// and emulate (mirroring the MCP page_act surface).
 func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 	var (
-		id            string
-		action        string
-		selector      string
-		value         string
-		x, y          float64
-		waitMode      string
-		timeoutMS     int
-		width, height int
-		device        string
+		id             string
+		action         string
+		selector       string
+		value          string
+		key            string
+		button         string
+		clickCount     int
+		x, y           float64
+		targetX        float64
+		targetY        float64
+		targetSelector string
+		paths          []string
+		waitMode       string
+		timeoutMS      int
+		width, height  int
+		device         string
 	)
 	cmd := &cobra.Command{
 		Use:   "act [id] [action] [payload...]",
 		Short: "Perform an action on a live page",
-		Long: `Performs an action on a live page (click, input, hover, scroll, select,
-eval, navigate, back, forward, reload, wait, set_viewport, emulate) and prints
-the confirmation. The page id is optional when only one page is open; 'last'
-means the most recently opened page; a bare number resolves to page-N.
-Positional payloads fill each action's fields — the --selector/--value/--x/
---y/--width/--height/--device flags remain as fallbacks.
+		Long: `Performs an action on a live page (click, input, type, press_key, click_at,
+hover_at, drag_and_drop, upload_file, hover, scroll, select, eval, navigate, back,
+forward, reload, wait, set_viewport, emulate) and prints the confirmation. The page id
+is optional when only one page is open; 'last' means the most recently opened page;
+a bare number resolves to page-N.
+Positional payloads fill each action's fields — flags remain as fallbacks.
 
   [id] [action] [payload...]   e.g. "12 click \"#submit\"", "last eval '() => document.title'"
 
@@ -333,6 +341,11 @@ Positional payloads fill each action's fields — the --selector/--value/--x/
   hover        [selector]
   select       [selector] [value]
   input        [selector] [text]
+  press_key    [key]
+  click_at     [x] [y]
+  hover_at     [x] [y]
+  drag_and_drop [from_x] [from_y] [to_x] [to_y]
+  upload_file  [selector] [path...]
   navigate     [url]
   eval         [js]
   scroll       [x] [y]
@@ -340,42 +353,27 @@ Positional payloads fill each action's fields — the --selector/--value/--x/
   set_viewport [w] [h]
   emulate      [device]
   back/forward/reload    (none)
-  type         [selector] [text]
-
-  --action click|input|hover|scroll|select|eval|navigate|back|forward|reload|wait|set_viewport|emulate
-                 the interaction to perform (the positional [action] wins when
-                 both are given)
-  --selector <css>  target element (click/input/hover/select/wait interactable)
-  --value <v>       payload for eval (JS function), input (text), navigate (URL),
-                    select (option value)
-  --x, --y <n>      scroll offsets in pixels (scroll)
-  --wait <mode>     what to wait for (wait action): load, idle, stable,
-                    interactable (needs --selector), ms (sleep --timeout-ms;
-                    default ms)
-  --width, --height <n>  target viewport size in CSS pixels (set_viewport)
-  --device <preset>  go-rod device preset to apply (emulate action), e.g.
-                    IPhoneX, IPadPro
-  --timeout-ms <n>  per-action timeout in milliseconds (default 30000)
-
-Interaction confirmation strings match the MCP page_act surface; eval prints
-the JSON result.`,
+  type         [selector] [text]`,
 		Example: `  web-cli page act click "#submit"                          # click on the single open page
   web-cli page act 12 input "#search" "pizza"               # type into a search box
+  web-cli page act 12 press_key "Enter"                     # press Enter key
+  web-cli page act 12 click_at 100 200                     # click at x=100 y=200
   web-cli page act 12 navigate https://news.ycombinator.com # go somewhere
   web-cli page act last eval '() => document.title'         # run JS on the latest page`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Positional args win over the --flags; payload counts are
 			// validated here, before any browser work.
 			parsed, err := parseActArgs(args, actArgFlags{
-				id: id, action: action, selector: selector, value: value,
-				waitMode: waitMode, device: device, x: x, y: y,
-				width: width, height: height,
+				id: id, action: action, selector: selector, value: value, key: key,
+				button: button, clickCount: clickCount, targetSelector: targetSelector,
+				paths: paths, waitMode: waitMode, device: device, x: x, y: y,
+				targetX: targetX, targetY: targetY, width: width, height: height,
 			})
 			if err != nil {
 				return err
 			}
-			id, action, selector, value, waitMode, device = parsed.id, parsed.action, parsed.selector, parsed.value, parsed.waitMode, parsed.device
-			x, y = parsed.x, parsed.y
+			id, action, selector, value, key, button, clickCount, targetSelector, paths, waitMode, device = parsed.id, parsed.action, parsed.selector, parsed.value, parsed.key, parsed.button, parsed.clickCount, parsed.targetSelector, parsed.paths, parsed.waitMode, parsed.device
+			x, y, targetX, targetY = parsed.x, parsed.y, parsed.targetX, parsed.targetY
 			width, height = parsed.width, parsed.height
 
 			// Enforce an explicit per-call timeout so a wedged page (or a
@@ -390,17 +388,14 @@ the JSON result.`,
 			defer cancel()
 
 			switch action {
-			case "click", "input", "type", "eval", "navigate", "back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport", "emulate":
+			case "click", "input", "type", "press_key", "click_at", "hover_at", "drag_and_drop", "upload_file", "eval", "navigate", "back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport", "emulate":
 			default:
-				return fmt.Errorf("page act: unknown action=%q (must be one of click, input, type, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate)", action)
+				return fmt.Errorf("page act: unknown action=%q (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate)", action)
 			}
 
 			if action == "set_viewport" && (width <= 0 || height <= 0) {
 				return fmt.Errorf("page act: viewport width and height must be positive")
 			}
-			// emulate carries its target preset in --device: reject a missing
-			// or unknown device before any browser work (mirrors the MCP
-			// page_act validation; the engine also guards inside Page.Emulate).
 			if action == "emulate" {
 				if device == "" {
 					return fmt.Errorf("page act: emulate requires a device")
@@ -418,8 +413,6 @@ the JSON result.`,
 				}
 			}
 
-			// Fail-fast switch passed: forward to a live serve process when one
-			// is running; else fall back to the in-process path below.
 			var vp *browsers.Viewport
 			if action == "set_viewport" {
 				vp = &browsers.Viewport{Width: width, Height: height}
@@ -430,7 +423,7 @@ the JSON result.`,
 				if err != nil {
 					return err
 				}
-				return pageActViaIPC(cmd, ctx, cl, rid, action, selector, value, waitMode, x, y, timeoutMS, vp, device)
+				return pageActViaIPC(cmd, ctx, cl, rid, action, selector, value, key, button, clickCount, x, y, targetX, targetY, targetSelector, paths, waitMode, timeoutMS, vp, device)
 			}
 			printServeHint(cmd)
 
@@ -446,11 +439,29 @@ the JSON result.`,
 			var out string
 			switch action {
 			case "click":
-				out, err = pageops.PageClick(ctx, p, selector)
+				out, err = pageops.PageClickOpts(ctx, p, selector, button, clickCount)
 			case "input":
 				out, err = pageops.PageInput(ctx, p, selector, value)
 			case "type":
 				out, err = pageops.PageType(ctx, p, selector, value)
+			case "press_key":
+				keyStr := key
+				if keyStr == "" {
+					keyStr = value
+				}
+				out, err = pageops.PagePressKey(ctx, p, selector, keyStr)
+			case "click_at":
+				out, err = pageops.PageClickAt(ctx, p, x, y, button, clickCount)
+			case "hover_at":
+				out, err = pageops.PageHoverAt(ctx, p, x, y)
+			case "drag_and_drop":
+				out, err = pageops.PageDragAndDrop(ctx, p, x, y, targetX, targetY, selector, targetSelector)
+			case "upload_file":
+				pList := paths
+				if len(pList) == 0 && value != "" {
+					pList = []string{value}
+				}
+				out, err = pageops.PageUploadFile(ctx, p, selector, pList)
 			case "eval":
 				out, err = pageops.PageEval(ctx, p, value)
 			case "navigate":
@@ -482,11 +493,18 @@ the JSON result.`,
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to act on (optional with one page open; 'last'; or a bare number)")
-	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate")
+	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate")
 	cmd.Flags().StringVar(&selector, "selector", "", "CSS selector targeting the element (element actions)")
 	cmd.Flags().StringVar(&value, "value", "", "value for eval (JS function), input (text), type (text), navigate (URL), select (option value)")
-	cmd.Flags().Float64Var(&x, "x", 0, "horizontal scroll offset in pixels (scroll)")
-	cmd.Flags().Float64Var(&y, "y", 0, "vertical scroll offset in pixels (scroll)")
+	cmd.Flags().StringVar(&key, "key", "", "key or key combo for press_key action (e.g. Enter, Escape, Control+A)")
+	cmd.Flags().StringVar(&button, "button", "left", "mouse button for click and click_at: left, right, middle")
+	cmd.Flags().IntVar(&clickCount, "click-count", 1, "click count for click and click_at (1 for single click, 2 for double click)")
+	cmd.Flags().Float64Var(&x, "x", 0, "horizontal coordinate in pixels (scroll, click_at, hover_at, drag_and_drop)")
+	cmd.Flags().Float64Var(&y, "y", 0, "vertical coordinate in pixels (scroll, click_at, hover_at, drag_and_drop)")
+	cmd.Flags().Float64Var(&targetX, "target-x", 0, "target horizontal coordinate in pixels (drag_and_drop)")
+	cmd.Flags().Float64Var(&targetY, "target-y", 0, "target vertical coordinate in pixels (drag_and_drop)")
+	cmd.Flags().StringVar(&targetSelector, "target-selector", "", "target element selector (drag_and_drop)")
+	cmd.Flags().StringArrayVar(&paths, "path", nil, "file paths for upload_file action")
 	cmd.Flags().StringVar(&waitMode, "wait", "ms", "wait mode (wait action): load, idle, stable, interactable (needs --selector), ms (sleep --timeout-ms; default ms)")
 	cmd.Flags().IntVar(&timeoutMS, "timeout-ms", 30000, "per-action timeout in milliseconds (default 30000)")
 	cmd.Flags().IntVar(&width, "width", 0, "target viewport width in CSS pixels (set_viewport action)")
@@ -609,22 +627,29 @@ func pageFetchViaIPC(cmd *cobra.Command, ctx context.Context, cl *ipc.Client, id
 }
 
 // pageActViaIPC implements `page act` against a live serve process: it
-// forwards the action (with its selector/value/x/y/timeout/wait/viewport/
-// device params) to page.act and prints the confirmation byte-identically to
-// the in-process path.
-func pageActViaIPC(cmd *cobra.Command, ctx context.Context, cl *ipc.Client, id, action, selector, value, waitMode string, x, y float64, timeoutMS int, vp *browsers.Viewport, device string) error {
+// forwards the action (with its selector/value/key/button/click_count/x/y/
+// target_x/target_y/target_selector/paths/timeout/wait/viewport/device params)
+// to page.act and prints the confirmation byte-identically to the in-process path.
+func pageActViaIPC(cmd *cobra.Command, ctx context.Context, cl *ipc.Client, id, action, selector, value, key, button string, clickCount int, x, y, targetX, targetY float64, targetSelector string, paths []string, waitMode string, timeoutMS int, vp *browsers.Viewport, device string) error {
 	var res ipc.PageActResult
 	if err := cl.Call(ctx, ipc.MethodPageAct, &ipc.PageActParams{
-		SessionID: id,
-		Action:    action,
-		Selector:  selector,
-		Value:     value,
-		X:         x,
-		Y:         y,
-		TimeoutMS: timeoutMS,
-		WaitMode:  waitMode,
-		Viewport:  vp,
-		Device:    device,
+		SessionID:      id,
+		Action:         action,
+		Selector:       selector,
+		Value:          value,
+		Key:            key,
+		Button:         button,
+		ClickCount:     clickCount,
+		X:              x,
+		Y:              y,
+		TargetX:        targetX,
+		TargetY:        targetY,
+		TargetSelector: targetSelector,
+		Paths:          paths,
+		TimeoutMS:      timeoutMS,
+		WaitMode:       waitMode,
+		Viewport:       vp,
+		Device:         device,
 	}, &res); err != nil {
 		return fmt.Errorf("page act: %w", err)
 	}

@@ -1,6 +1,6 @@
 ---
 name: web-mcp
-description: Drive a live, stateful Chromium browser over MCP. Open pages (sessions) inside a persistent browser instance, inspect page state (meta, text, links, DOM snapshot, HTML, CSS/JS resources, screenshot), and execute interactions (click, input, type, eval, navigate, back, forward, reload, scroll, wait, set_viewport, emulate). Use whenever a real browser is needed for scraping JS-rendered content, testing web UIs, filling forms, exploring multi-page sites, or verifying live web behavior.
+description: Drive a live, stateful Chromium browser over MCP. Open pages (sessions) inside a persistent browser instance, inspect page state (meta, text, links, DOM snapshot, HTML, CSS/JS resources, screenshot), and execute interactions (click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, scroll, select, wait, set_viewport, emulate). Use whenever a real browser is needed for scraping JS-rendered content, testing web UIs, filling forms, exploring multi-page sites, or verifying live web behavior.
 disable-model-invocation: true
 ---
 
@@ -12,7 +12,8 @@ Drive Chromium via MCP tools using stateful sessions, structured DOM/text extrac
 
 ## Core Architecture and Mental Model
 
-- **Browser (`browser_id`, e.g., `browser-1`)**: The underlying Chromium process managed by the server. Created lazily or via `browser_create`, closed with `browser_close`.
+- **Browser (`browser_id`, e.g., `browser-1`)**: The underlying Chromium/Brave process managed by the server. Created lazily or via `browser_create`, closed with `browser_close`. Auto-detects Brave (`brave-browser` / `brave`) as the default browser when available.
+- **Persistent Profiles & Zero Bloat**: `browser-1` automatically uses the persistent user profile at `~/.config/browser-mcp/profiles/<browser_name>` (e.g. `profiles/brave` or `profiles/default`), persisting cookies, storage, and logins across runs. Calling `browser_create` or `fetch_page` while `browser-1` is active reuses `browser-1` idempotently. Any secondary concurrent browser instance runs in ephemeral mode (`profileDir = ""`), auto-deleting on exit to guarantee zero directory bloat.
 - **Session (`session_id`, e.g., `page-1`, `page-2`)**: A distinct browser tab created by `fetch_page`. All read (`page_fetch`) and interaction (`page_act`) operations require a valid `session_id`.
 - **Navigation Continuity**: A session maintains state across navigations, redirects, and history traversal (`back`/`forward`). Reading after a navigation reads the new page.
 - **Resource Management**: Always close sessions with `session_close` and shut down browsers with `browser_close` when workflows conclude.
@@ -28,7 +29,7 @@ Drive Chromium via MCP tools using stateful sessions, structured DOM/text extrac
 | `browser_create` | `{ headless?: boolean, stealth?: boolean }` | Launches Chromium instance. Returns `{ browser_id }`. |
 | `browser_list` | `{}` | Lists all active browsers and their pages. |
 | `browser_close` | `{ browser_id: string }` | Terminates Chromium instance and all open tabs. |
-| `fetch_page` | `{ url: string, wait_for?: "load"\|"idle"\|"stable", timeout_ms?: number, viewport?: { width, height }, device?: string, user_agent?: string }` | Opens URL in a new tab. Accept optional `device` (e.g., `"IPhoneX"`) to apply device emulation prior to page navigation, avoiding post-load layout reflows. Returns `{ session_id, title, url, text_snippet, html_bytes, load_ms }`. |
+| `fetch_page` | `{ url: string, wait_for?: "load"\|"stable", timeout_ms?: number, viewport?: { width, height }, device?: string, user_agent?: string }` | Opens URL in a new tab. **NEVER use `wait_for: "idle"`** — the idle network-wait hangs on JS-heavy sites (bot WAFs, trackers, infinite polling) and stalls the call. Prefer `wait_for: "load"` or `"stable"`, or open with the default and follow up with `page_act wait wait_mode=ms`. Accept optional `device` (e.g., `"IPhoneX"`) to apply device emulation prior to page navigation, avoiding post-load layout reflows. Returns `{ session_id, title, url, text_snippet, html_bytes, load_ms }`. |
 | `session_list` | `{}` | Lists all live sessions across browsers: `[{ id, url }]`. |
 | `session_close` | `{ session_id: string }` | Closes tab and invalidates `session_id`. |
 | `page_list` | `{ browser_id: string }` | Lists open pages for a specific browser. |
@@ -58,17 +59,23 @@ page_fetch {
 
 ### 3. Interaction Tool: `page_act`
 
-Executes user actions, navigations, or JavaScript on a live session.
+Executes user actions, navigations, keyboard/mouse events, file uploads, or JavaScript on a live session.
 
 ```
 page_act {
   session_id: string,
-  action: "click" | "input" | "type" | "eval" | "navigate" | "back" | "forward" | "reload" | "scroll" | "select" | "wait" | "set_viewport" | "emulate",
-  selector?: string,     // CSS selector or XPath (click, input, type, hover, select, wait interactable)
-  value?: string,        // String payload for input/type, JS function for eval, URL for navigate, option value for select
+  action: "click" | "input" | "type" | "press_key" | "click_at" | "hover_at" | "drag_and_drop" | "upload_file" | "eval" | "navigate" | "back" | "forward" | "reload" | "hover" | "scroll" | "select" | "wait" | "set_viewport" | "emulate",
+  selector?: string,     // CSS selector targeting element (click, input, type, press_key, upload_file, hover, select, wait interactable)
+  value?: string,        // Payload for input/type, JS function for eval, URL for navigate, option value for select
+  key?: string,          // Key or key combo for action="press_key" (e.g., "Enter", "Escape", "Tab", "Control+a", "Meta+c", "Shift+Tab")
+  button?: "left" | "right" | "middle", // Mouse button for click, click_at, drag_and_drop (default: "left")
+  click_count?: number,  // Click count for click and click_at (1=single, 2=double click; default: 1)
+  target_x?: number, target_y?: number, // Target coordinates for action="drag_and_drop"
+  target_selector?: string,             // Target element selector for action="drag_and_drop"
+  paths?: string[],      // Array of local file paths for action="upload_file"
   wait_mode?: "load" | "idle" | "stable" | "interactable" | "ms", // For action="wait"
   timeout_ms?: number,   // Per-call timeout / sleep duration for wait_mode="ms"
-  x?: number, y?: number,// Coordinates for action="scroll"
+  x?: number, y?: number,// Coordinates for action="scroll", "click_at", "hover_at", "drag_and_drop"
   viewport?: { width: number, height: number }, // For action="set_viewport"
   device?: string        // Device preset (e.g., "IPhoneX", "IPadPro", "clear") for action="emulate"
 }
@@ -82,9 +89,9 @@ page_act {
 
 Never fetch unscoped raw HTML on modern web pages (many pages exceed 2MB). Use this 3-step sequence:
 
-1. **Open Page**:
+1. **Open Page** (never `wait_for: "idle"` — it hangs on JS-heavy/WAF pages; use `"load"`/`"stable"` or omit and wait explicitly):
    ```json
-   { "tool": "fetch_page", "arguments": { "url": "https://example.com", "wait_for": "idle", "timeout_ms": 15000 } }
+   { "tool": "fetch_page", "arguments": { "url": "https://example.com", "wait_for": "stable", "timeout_ms": 15000 } }
    ```
 2. **Read Meta and Links (Parallel)**:
    ```json
@@ -96,16 +103,35 @@ Never fetch unscoped raw HTML on modern web pages (many pages exceed 2MB). Use t
    { "tool": "page_fetch", "arguments": { "session_id": "page-1", "what": "text", "selector": "main" } }
    ```
 
-### 2. Form Input and Search
+### 2. Form Input, Key Presses, and File Uploads
 
 - **Direct Value Setting**: Use `input` to clear existing content and set value.
   ```json
   { "tool": "page_act", "arguments": { "session_id": "page-1", "action": "input", "selector": "input[name='q']", "value": "search query" } }
   ```
-- **Keystroke Simulation**: Use `type` when forms use autocomplete, keyup triggers, or character-by-character validation.
-- **Form Submission**: If clicking submit does not trigger SPA navigation, use `eval` to submit or `navigate` to the direct search URL.
+- **Keystroke & Shortcut Actions (`press_key`)**: Submit forms with `Enter`, dismiss modals with `Escape`, or execute keyboard shortcuts (`Control+a`, `Meta+c`, `Shift+Tab`).
+  ```json
+  { "tool": "page_act", "arguments": { "session_id": "page-1", "action": "press_key", "selector": "input[name='q']", "key": "Enter" } }
+  { "tool": "page_act", "arguments": { "session_id": "page-1", "action": "press_key", "key": "Escape" } }
+  ```
+- **File Upload (`upload_file`)**: Attach local files to `<input type="file">` elements.
+  ```json
+  { "tool": "page_act", "arguments": { "session_id": "page-1", "action": "upload_file", "selector": "input[type='file']", "paths": ["/path/to/doc.pdf"] } }
+  ```
 
-### 3. JavaScript Execution (`eval`)
+### 3. Mouse Movement, Coordinates & Context Menus
+
+- **Coordinate Clicking (`click_at`) & Hovering (`hover_at`)**: Drive interactive canvas elements or map widgets by exact `{x, y}` coordinates.
+  ```json
+  { "tool": "page_act", "arguments": { "session_id": "page-1", "action": "click_at", "x": 150, "y": 250, "button": "right" } }
+  { "tool": "page_act", "arguments": { "session_id": "page-1", "action": "hover_at", "x": 300, "y": 400 } }
+  ```
+- **Drag and Drop (`drag_and_drop`)**: Drag elements or mouse pointers from source to target coordinates or selectors.
+  ```json
+  { "tool": "page_act", "arguments": { "session_id": "page-1", "action": "drag_and_drop", "x": 100, "y": 100, "target_x": 300, "target_y": 300 } }
+  ```
+
+### 4. JavaScript Execution (`eval`)
 
 `eval` is the primary mechanism for custom DOM queries, handling complex widgets, extracting structured JSON, and triggering synthetic events.
 
@@ -123,7 +149,7 @@ Never fetch unscoped raw HTML on modern web pages (many pages exceed 2MB). Use t
   }
   ```
 
-### 4. Handling Overlays, Hidden SPA Elements, and Consent Modals
+### 5. Handling Overlays, Hidden SPA Elements, and Consent Modals
 
 When clicks fail or pages show empty content due to cookie banners, overlays, or collapsed menus:
 
@@ -151,7 +177,7 @@ When clicks fail or pages show empty content due to cookie banners, overlays, or
    }
    ```
 
-### 5. Mobile and Responsive Testing
+### 6. Mobile and Responsive Testing
 
 Test mobile rendering or bypass desktop-specific layouts:
 
@@ -182,7 +208,7 @@ Test mobile rendering or bypass desktop-specific layouts:
 1. browser_create
    -> { browser_id: "browser-1" }
 
-2. fetch_page { url: "https://news.google.com", wait_for: "idle" }
+2. fetch_page { url: "https://news.google.com", wait_for: "load" }
    -> { session_id: "page-1", title: "Google News", ... }
 
 3. page_fetch { session_id: "page-1", what: "meta" }

@@ -3,35 +3,26 @@ package tools
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"time"
 
-	"github.com/go-rod/rod"
-	"github.com/go-rod/rod/lib/proto"
-
 	"webmcp/pkg/browsers"
+	"webmcp/pkg/cli/pageops"
 	"webmcp/pkg/mcp/models"
 )
 
 // defaultActTimeout bounds every page_act helper so a missing element (sleeper
-// retries) or a wedged page cannot block the server: each helper clones the
-// live page bound to this timeout before touching rod.
+// retries) or a wedged page cannot block the server.
 const defaultActTimeout = 30 * time.Second
 
 // waitSleepMargin gives the wait action's "ms" sleep room to complete: the
 // sleep is bounded by timeout_ms, but the tool-call deadline would otherwise
-// be set to the same duration and fire first — the deadline timer is armed
-// before the sleep timer, so any pre-select latency (args parse, page lookup)
-// leaves the deadline with strictly less remaining time than the sleep.
+// be set to the same duration and fire first.
 const waitSleepMargin = 5 * time.Second
 
 // Act implements the "page_act" tool: it interacts with a LIVE page that was
-// previously opened with fetch_page. The action enum covers the common fast
-// paths (click, input, type, navigate, back, forward, reload, hover, scroll,
-// select, wait) and "eval" — the primary escape hatch for arbitrary page
-// manipulation via JavaScript (p.Rod.Eval). Rod built-ins are the fast path;
-// eval is the general path for anything not covered by a built-in.
+// previously opened with fetch_page. Interaction logic is backed by package
+// pageops, shared byte-for-byte with the CLI and IPC server.
 type Act struct {
 	// mgr is the shared browsers.Manager owning the single Browser and its
 	// live pages (sessions).
@@ -50,19 +41,15 @@ func (t *Act) Name() string {
 
 // Description returns a customer/LLM-facing description of page_act.
 func (t *Act) Description() string {
-	return "Interacts with a live page opened by fetch_page: click, input, " +
-		"type, eval (run arbitrary JavaScript — the primary escape hatch), " +
-		"navigate, back, forward, reload, hover, scroll, select, wait, " +
-		"set_viewport (change the live page's viewport size), or emulate " +
-		"(apply a go-rod device preset via the device param). " +
-		"Pass the session_id returned by fetch_page plus action=...; most " +
-		"actions take a CSS/XPath selector, and input/type/eval/navigate/select " +
-		"take a value."
+	return "Interacts with a live page opened by fetch_page: click (supports button selection & double-click), " +
+		"input, type, press_key (send keys/combos like Enter, Escape, Control+A, Meta+C), " +
+		"click_at / hover_at (coordinate-based mouse actions), drag_and_drop (mouse drag), " +
+		"upload_file (set files on <input type='file'>), eval (run JS — the primary escape hatch), " +
+		"navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, or emulate. " +
+		"Pass session_id plus action=... and any required parameters."
 }
 
-// InputSchema returns the JSON Schema for page_act's arguments: a required
-// session_id and action, plus optional selector / value / x / y / timeout_ms /
-// wait_mode.
+// InputSchema returns the JSON Schema for page_act's arguments.
 func (t *Act) InputSchema() models.InputSchema {
 	return models.InputSchema{
 		Type: "object",
@@ -74,36 +61,70 @@ func (t *Act) InputSchema() models.InputSchema {
 			"action": map[string]any{
 				"type": "string",
 				"enum": []string{
-					"click", "input", "type", "eval", "navigate",
-					"back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport", "emulate",
+					"click", "input", "type", "press_key", "click_at", "hover_at",
+					"drag_and_drop", "upload_file", "eval", "navigate",
+					"back", "forward", "reload", "hover", "scroll", "select",
+					"wait", "set_viewport", "emulate",
 				},
-				"description": "The interaction to perform: click (CSS/XPath selector), input (set field value), type (type keystrokes), eval (run JS — the primary escape hatch), navigate (go to a URL), back/forward/reload (history), hover (selector), scroll (by x/y pixels), select (option by value), wait (wait_mode: load/idle/stable/interactable/ms), set_viewport (change the live page's viewport size via the viewport param), emulate (apply a go-rod device preset via the device param).",
+				"description": "The interaction to perform: click (selector), input (set field text), type (keystrokes), press_key (key/combo e.g. Enter, Escape, Control+A), click_at/hover_at ({x, y} coordinates), drag_and_drop (from {x,y}/selector to {target_x,target_y}/target_selector), upload_file (set file input paths), eval (run JS), navigate (URL), back/forward/reload, hover (selector), scroll (x/y), select (option value), wait (readiness mode), set_viewport (W x H), emulate (device preset).",
 			},
 			"selector": map[string]any{
 				"type":        "string",
-				"description": "CSS selector or XPath identifying the target element (click/input/type/hover/select/wait interactable).",
+				"description": "CSS selector or XPath identifying target element (click/input/type/press_key/hover/select/upload_file/drag_and_drop source).",
 			},
 			"value": map[string]any{
 				"type":        "string",
-				"description": "Value for input/type (text), eval (JavaScript function source), navigate (URL) or select (option value).",
+				"description": "Payload value for input/type (text), press_key (key combo fallback), eval (JS source), navigate (URL), select (option value), or upload_file (single path fallback).",
+			},
+			"key": map[string]any{
+				"type":        "string",
+				"description": "Key or key combination for press_key action (e.g., Enter, Escape, Tab, Backspace, ArrowDown, Control+A, Meta+C, Shift+Tab).",
+			},
+			"button": map[string]any{
+				"type":        "string",
+				"enum":        []string{"left", "right", "middle"},
+				"default":     "left",
+				"description": "Mouse button for click and click_at actions: left, right, or middle.",
+			},
+			"click_count": map[string]any{
+				"type":        "integer",
+				"default":     1,
+				"description": "Number of mouse clicks for click and click_at actions (1 for single click, 2 for double click).",
 			},
 			"x": map[string]any{
 				"type":        "number",
-				"description": "Horizontal scroll offset in pixels (scroll action).",
+				"description": "Horizontal coordinate in pixels (scroll, click_at, hover_at, drag_and_drop source).",
 			},
 			"y": map[string]any{
 				"type":        "number",
-				"description": "Vertical scroll offset in pixels (scroll action).",
+				"description": "Vertical coordinate in pixels (scroll, click_at, hover_at, drag_and_drop source).",
+			},
+			"target_x": map[string]any{
+				"type":        "number",
+				"description": "Target horizontal coordinate in pixels for drag_and_drop action.",
+			},
+			"target_y": map[string]any{
+				"type":        "number",
+				"description": "Target vertical coordinate in pixels for drag_and_drop action.",
+			},
+			"target_selector": map[string]any{
+				"type":        "string",
+				"description": "Target element selector for drag_and_drop action.",
+			},
+			"paths": map[string]any{
+				"type":        "array",
+				"items":       map[string]any{"type": "string"},
+				"description": "Array of local file paths for upload_file action.",
 			},
 			"timeout_ms": map[string]any{
 				"type":        "integer",
-				"description": "Optional per-call timeout in milliseconds (default 30000); the wait action's 'ms' mode sleeps for this long.",
+				"description": "Optional per-call timeout in milliseconds (default 30000); wait action sleeps for this long in ms mode.",
 			},
 			"wait_mode": map[string]any{
 				"type":        "string",
 				"enum":        []string{"load", "idle", "stable", "interactable", "ms"},
 				"default":     "ms",
-				"description": "What to wait for (wait action): 'load' = window.onload, 'idle' = no network requests for ~500ms, 'stable' = DOM unchanged for ~500ms, 'interactable' = the element matched by selector is clickable, 'ms' = sleep for timeout_ms. Defaults to 'ms'.",
+				"description": "What to wait for (wait action): load, idle, stable, interactable (needs selector), or ms (sleeps timeout_ms).",
 			},
 			"viewport": map[string]any{
 				"type": "object",
@@ -111,11 +132,11 @@ func (t *Act) InputSchema() models.InputSchema {
 					"width":  map[string]any{"type": "integer", "description": "Viewport width in CSS pixels."},
 					"height": map[string]any{"type": "integer", "description": "Viewport height in CSS pixels."},
 				},
-				"description": "Target viewport size for the set_viewport action (required with action=set_viewport).",
+				"description": "Target viewport size for set_viewport action.",
 			},
 			"device": map[string]any{
 				"type":        "string",
-				"description": "Go-rod device preset name for the emulate action (required with action=emulate), e.g. IPhoneX, iphone x, IPadPro, LaptopWithHiDPIScreen; 'clear' resets emulation.",
+				"description": "Go-rod device preset name for emulate action (e.g. IPhoneX, IPadPro, LaptopWithHiDPIScreen; 'clear' resets).",
 			},
 		},
 		Required: []string{"session_id", "action"},
@@ -124,35 +145,27 @@ func (t *Act) InputSchema() models.InputSchema {
 
 // actArgs is the strict decoding target for page_act arguments.
 type actArgs struct {
-	// SessionID identifies the live page/session to act on (required).
-	SessionID browsers.PageID `json:"session_id"`
-	// Action is the interaction to perform (required).
-	Action string `json:"action"`
-	// Selector is the CSS/XPath target for element actions.
-	Selector string `json:"selector"`
-	// Value is the payload for input/type/eval/navigate/select.
-	Value string `json:"value"`
-	// X is the horizontal scroll offset (scroll action).
-	X float64 `json:"x"`
-	// Y is the vertical scroll offset (scroll action).
-	Y float64 `json:"y"`
-	// TimeoutMS bounds the action in milliseconds (default 30000); the wait
-	// action's "ms" mode sleeps for this long.
-	TimeoutMS int `json:"timeout_ms"`
-	// WaitMode selects the readiness level the wait action waits for:
-	// "load" | "idle" | "stable" | "interactable" | "ms" (default "ms").
-	WaitMode string `json:"wait_mode"`
-	// Viewport is the target viewport size for the set_viewport action
-	// (required when action is "set_viewport").
-	Viewport *browsers.Viewport `json:"viewport"`
-	// Device is the go-rod device preset name for the emulate action
-	// (required when action is "emulate").
-	Device string `json:"device"`
+	SessionID      browsers.PageID    `json:"session_id"`
+	Action         string             `json:"action"`
+	Selector       string             `json:"selector"`
+	Value          string             `json:"value"`
+	Key            string             `json:"key"`
+	Button         string             `json:"button"`
+	ClickCount     int                `json:"click_count"`
+	X              float64            `json:"x"`
+	Y              float64            `json:"y"`
+	TargetX        float64            `json:"target_x"`
+	TargetY        float64            `json:"target_y"`
+	TargetSelector string             `json:"target_selector"`
+	Paths          []string           `json:"paths"`
+	TimeoutMS      int                `json:"timeout_ms"`
+	WaitMode       string             `json:"wait_mode"`
+	Viewport       *browsers.Viewport `json:"viewport"`
+	Device         string             `json:"device"`
 }
 
 // Execute parses the page_act arguments, resolves the session and dispatches to
-// the per-action helper. It returns a short JSON/text confirmation string for
-// the LLM.
+// the shared pageops implementation. It returns a short confirmation string.
 func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var a actArgs
 	if err := json.Unmarshal(args, &a); err != nil {
@@ -165,9 +178,6 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 		return "", fmt.Errorf("page_act: missing required argument %q", "action")
 	}
 
-	// set_viewport carries its target size in the viewport param: reject a
-	// missing or non-positive pair before any browser work, with the same
-	// positivity pin as fetch_page.
 	if a.Action == "set_viewport" {
 		if a.Viewport == nil {
 			return "", fmt.Errorf("page_act: set_viewport requires a viewport")
@@ -177,24 +187,10 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 		}
 	}
 
-	// emulate carries its target preset in the device param: reject a missing
-	// device before any browser work (the name itself is validated inside
-	// actEmulate via browsers.ValidateDeviceName, mirroring the set_viewport
-	// pre-validation split).
 	if a.Action == "emulate" && a.Device == "" {
 		return "", fmt.Errorf("page_act: emulate requires a device")
 	}
 
-	// Enforce an explicit per-call timeout so a wedged page (or a stuck wait)
-	// cannot block the server: default 30s, honoring timeout_ms from the
-	// caller. The derived ctx flows through the per-helper page clones and
-	// every rod call below.
-	//
-	// Exception: the wait action's "ms" mode (and its "" default) sleeps for
-	// exactly timeout_ms, so its tool deadline gets waitSleepMargin on top —
-	// without the margin the deadline timer (armed first) fires before the
-	// sleep timer and truncates the sleep with a misleading "context deadline
-	// exceeded". All other actions keep the timeout_ms-only binding.
 	timeout := defaultActTimeout
 	if a.Action == "wait" && (a.WaitMode == "" || a.WaitMode == "ms") {
 		if a.TimeoutMS > 0 {
@@ -206,7 +202,7 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	p, err := t.mgr.Page(ctx, a.SessionID) // opens the Browser if needed; probes for liveness
+	p, err := t.mgr.Page(ctx, a.SessionID)
 	if err != nil {
 		return "", fmt.Errorf("page_act: %w", err)
 	}
@@ -214,454 +210,62 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 	var out string
 	switch a.Action {
 	case "click":
-		out, err = t.actClick(ctx, p, a.Selector)
+		out, err = pageops.PageClickOpts(ctx, p, a.Selector, a.Button, a.ClickCount)
 	case "input":
-		out, err = t.actInput(ctx, p, a.Selector, a.Value)
+		out, err = pageops.PageInput(ctx, p, a.Selector, a.Value)
 	case "type":
-		out, err = t.actType(ctx, p, a.Selector, a.Value)
+		out, err = pageops.PageType(ctx, p, a.Selector, a.Value)
+	case "press_key":
+		keyStr := a.Key
+		if keyStr == "" {
+			keyStr = a.Value
+		}
+		out, err = pageops.PagePressKey(ctx, p, a.Selector, keyStr)
+	case "click_at":
+		out, err = pageops.PageClickAt(ctx, p, a.X, a.Y, a.Button, a.ClickCount)
+	case "hover_at":
+		out, err = pageops.PageHoverAt(ctx, p, a.X, a.Y)
+	case "drag_and_drop":
+		out, err = pageops.PageDragAndDrop(ctx, p, a.X, a.Y, a.TargetX, a.TargetY, a.Selector, a.TargetSelector)
+	case "upload_file":
+		paths := a.Paths
+		if len(paths) == 0 && a.Value != "" {
+			paths = []string{a.Value}
+		}
+		out, err = pageops.PageUploadFile(ctx, p, a.Selector, paths)
 	case "eval":
-		out, err = t.actEval(ctx, p, a.Value)
+		out, err = pageops.PageEval(ctx, p, a.Value)
 	case "navigate":
-		out, err = t.actNavigate(ctx, p, a.Value)
+		out, err = pageops.PageNavigate(ctx, p, a.Value)
 	case "back":
-		out, err = t.actBack(ctx, p)
+		out, err = pageops.PageBack(ctx, p)
 	case "forward":
-		out, err = t.actForward(ctx, p)
+		out, err = pageops.PageForward(ctx, p)
 	case "reload":
-		out, err = t.actReload(ctx, p)
+		out, err = pageops.PageReload(ctx, p)
 	case "hover":
-		out, err = t.actHover(ctx, p, a.Selector)
+		out, err = pageops.PageHover(ctx, p, a.Selector)
 	case "scroll":
-		out, err = t.actScroll(ctx, p, a.X, a.Y)
+		out, err = pageops.PageScroll(ctx, p, a.X, a.Y)
 	case "select":
-		out, err = t.actSelect(ctx, p, a.Selector, a.Value)
+		out, err = pageops.PageSelect(ctx, p, a.Selector, a.Value)
 	case "wait":
-		out, err = t.actWait(ctx, p, a.WaitMode, a.Selector, a.TimeoutMS)
+		d := timeout
+		if a.TimeoutMS > 0 {
+			d = time.Duration(a.TimeoutMS) * time.Millisecond
+		}
+		out, err = pageops.PageWait(ctx, p, a.WaitMode, a.Selector, d)
 	case "set_viewport":
-		out, err = t.actSetViewport(ctx, p, a.Viewport)
+		out, err = pageops.PageSetViewport(ctx, p, a.Viewport.Width, a.Viewport.Height)
 	case "emulate":
-		out, err = t.actEmulate(ctx, p, a.Device)
+		out, err = pageops.PageEmulate(ctx, p, a.Device)
 	default:
-		return "", fmt.Errorf("page_act: unknown action=%q (must be one of click, input, type, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate)", a.Action)
+		return "", fmt.Errorf("page_act: unknown action=%q (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate)", a.Action)
 	}
 	if err != nil {
 		return "", fmt.Errorf("page_act: %w", err)
 	}
 	return out, nil
-}
-
-// actClick clicks the element matched by selector (CSS or XPath). It resolves
-// the element, waits until it is interactable, then clicks it with the left
-// button. Returns a short confirmation for the LLM.
-func (t *Act) actClick(ctx context.Context, p *browsers.Page, selector string) (string, error) {
-	p.Lock()
-	defer p.Unlock()
-	if p.Rod == nil {
-		return "", fmt.Errorf("page_act.actClick: page is closed (nil rod handle)")
-	}
-
-	// Bind ctx once so every rod call honors the Execute ctx and a missing
-	// element (sleeper retries) cannot hang the server.
-	page := p.Rod.Context(ctx).Timeout(defaultActTimeout)
-
-	el, err := page.Element(selector)
-	if err != nil {
-		return "", fmt.Errorf("page_act.actClick: element %q: %w", selector, err)
-	}
-	if _, err := el.WaitInteractable(); err != nil {
-		return "", fmt.Errorf("page_act.actClick: element %q: %w", selector, err)
-	}
-	if err := el.Click(proto.InputMouseButtonLeft, 1); err != nil {
-		return "", fmt.Errorf("page_act.actClick: element %q: %w", selector, err)
-	}
-	return fmt.Sprintf("clicked selector=%q", selector), nil
-}
-
-// actInput sets the value of the element matched by selector: it selects all
-// existing text (el.SelectAllText) then types value via rod's Input, so the
-// field ends up exactly value. Returns a short confirmation for the LLM.
-func (t *Act) actInput(ctx context.Context, p *browsers.Page, selector, value string) (string, error) {
-	p.Lock()
-	defer p.Unlock()
-	if p.Rod == nil {
-		return "", fmt.Errorf("page_act.actInput: page is closed (nil rod handle)")
-	}
-
-	page := p.Rod.Context(ctx).Timeout(defaultActTimeout)
-
-	el, err := page.Element(selector)
-	if err != nil {
-		return "", fmt.Errorf("page_act.actInput: element %q: %w", selector, err)
-	}
-	if err := el.SelectAllText(); err != nil {
-		return "", fmt.Errorf("page_act.actInput: element %q: %w", selector, err)
-	}
-	if err := el.Input(value); err != nil {
-		return "", fmt.Errorf("page_act.actInput: element %q: %w", selector, err)
-	}
-	return fmt.Sprintf("set input selector=%q value=%q", selector, value), nil
-}
-
-// actType types keystrokes into the element matched by selector without
-// clearing it — unlike actInput (the input action selects all text first),
-// type is Focus + InsertText: it focuses the element (scrolling it into view
-// by user gesture) and pastes value at the current caret position. Returns a
-// short confirmation for the LLM.
-func (t *Act) actType(ctx context.Context, p *browsers.Page, selector, value string) (string, error) {
-	p.Lock()
-	defer p.Unlock()
-	if p.Rod == nil {
-		return "", fmt.Errorf("page_act.actType: page is closed (nil rod handle)")
-	}
-
-	page := p.Rod.Context(ctx).Timeout(defaultActTimeout)
-
-	el, err := page.Element(selector)
-	if err != nil {
-		return "", fmt.Errorf("page_act.actType: element %q: %w", selector, err)
-	}
-	if err := el.Focus(); err != nil {
-		return "", fmt.Errorf("page_act.actType: element %q: %w", selector, err)
-	}
-	if err := page.InsertText(value); err != nil {
-		return "", fmt.Errorf("page_act.actType: %w", err)
-	}
-	return fmt.Sprintf("typed selector=%q value=%q", selector, value), nil
-}
-
-// actEval runs arbitrary JavaScript in the page — the primary escape hatch for
-// any page manipulation not covered by a rod built-in. js must be a JS
-// function definition (Eval accepts only functions), e.g. "() => document.title".
-// The result is a plain JSON value: scalars are returned verbatim, objects and
-// arrays are pretty-printed JSON. JS exceptions surface as *rod.EvalError and
-// are returned verbatim so the LLM can fix its script.
-func (t *Act) actEval(ctx context.Context, p *browsers.Page, js string) (string, error) {
-	p.Lock()
-	defer p.Unlock()
-	if p.Rod == nil {
-		return "", fmt.Errorf("page_act.actEval: page is closed (nil rod handle)")
-	}
-
-	page := p.Rod.Context(ctx).Timeout(defaultActTimeout)
-
-	res, err := page.Eval(js)
-	if err != nil {
-		var evalErr *rod.EvalError
-		if errors.As(err, &evalErr) {
-			// Surface JS errors verbatim so the LLM can fix its script.
-			return "", evalErr
-		}
-		return "", fmt.Errorf("page_act.actEval: %w", err)
-	}
-
-	// res.Value is a gson.JSON: .Str() renders scalars (string/number/bool)
-	// as-is, .JSON() pretty-prints structured values.
-	out := res.Value.Str()
-	switch res.Value.Raw().(type) {
-	case nil, bool, float64, string:
-	default:
-		out = res.Value.JSON("", "  ")
-	}
-	return fmt.Sprintf("eval result: %s", out), nil
-}
-
-// actNavigate navigates the session's page to url and waits for the new page
-// to load (rod's Navigate returns after the response header, so WaitLoad is
-// mandatory). Returns the final URL and title for the LLM.
-func (t *Act) actNavigate(ctx context.Context, p *browsers.Page, url string) (string, error) {
-	p.Lock()
-	defer p.Unlock()
-	if p.Rod == nil {
-		return "", fmt.Errorf("page_act.actNavigate: page is closed (nil rod handle)")
-	}
-
-	page := p.Rod.Context(ctx).Timeout(defaultActTimeout)
-	if err := page.Navigate(url); err != nil {
-		return "", fmt.Errorf("page_act.actNavigate: %w", err)
-	}
-	if err := page.WaitLoad(); err != nil {
-		return "", fmt.Errorf("page_act.actNavigate: wait for load: %w", err)
-	}
-	// Info() reports the final URL (post-redirect) and title; fall back to the
-	// requested URL if the metadata read fails — the navigation already landed.
-	msg := fmt.Sprintf("navigated to %q", url)
-	if info, err := page.Info(); err == nil {
-		msg = fmt.Sprintf("navigated to %q (title %q)", info.URL, info.Title)
-	}
-	return msg, nil
-}
-
-// actBack navigates one step back in the page's history and waits for the
-// previous page to load (history.back() triggers a fresh navigation). Returns
-// the resulting URL.
-func (t *Act) actBack(ctx context.Context, p *browsers.Page) (string, error) {
-	p.Lock()
-	defer p.Unlock()
-	if p.Rod == nil {
-		return "", fmt.Errorf("page_act.actBack: page is closed (nil rod handle)")
-	}
-
-	page := p.Rod.Context(ctx).Timeout(defaultActTimeout)
-	if err := page.NavigateBack(); err != nil {
-		return "", fmt.Errorf("page_act.actBack: %w", err)
-	}
-	// WaitLoad returns immediately if no navigation happened (no history); when
-	// it does, the URL below reflects the previous page.
-	if err := page.WaitLoad(); err != nil {
-		return "", fmt.Errorf("page_act.actBack: wait for load: %w", err)
-	}
-	info, err := page.Info()
-	if err != nil {
-		return "", fmt.Errorf("page_act.actBack: read page info: %w", err)
-	}
-	return fmt.Sprintf("navigated back to %q", info.URL), nil
-}
-
-// actForward navigates one step forward in the page's history and waits for
-// the page to load. Returns the resulting URL.
-func (t *Act) actForward(ctx context.Context, p *browsers.Page) (string, error) {
-	p.Lock()
-	defer p.Unlock()
-	if p.Rod == nil {
-		return "", fmt.Errorf("page_act.actForward: page is closed (nil rod handle)")
-	}
-
-	page := p.Rod.Context(ctx).Timeout(defaultActTimeout)
-	if err := page.NavigateForward(); err != nil {
-		return "", fmt.Errorf("page_act.actForward: %w", err)
-	}
-	if err := page.WaitLoad(); err != nil {
-		return "", fmt.Errorf("page_act.actForward: wait for load: %w", err)
-	}
-	info, err := page.Info()
-	if err != nil {
-		return "", fmt.Errorf("page_act.actForward: read page info: %w", err)
-	}
-	return fmt.Sprintf("navigated forward to %q", info.URL), nil
-}
-
-// actReload reloads the page and waits for it to load again. Returns a short
-// confirmation for the LLM.
-func (t *Act) actReload(ctx context.Context, p *browsers.Page) (string, error) {
-	p.Lock()
-	defer p.Unlock()
-	if p.Rod == nil {
-		return "", fmt.Errorf("page_act.actReload: page is closed (nil rod handle)")
-	}
-
-	page := p.Rod.Context(ctx).Timeout(defaultActTimeout)
-	if err := page.Reload(); err != nil {
-		return "", fmt.Errorf("page_act.actReload: %w", err)
-	}
-	if err := page.WaitLoad(); err != nil {
-		return "", fmt.Errorf("page_act.actReload: wait for load: %w", err)
-	}
-	return "reloaded page", nil
-}
-
-// actHover moves the mouse over the element matched by selector (CSS or
-// XPath), triggering hover-dependent UI. Returns a short confirmation.
-func (t *Act) actHover(ctx context.Context, p *browsers.Page, selector string) (string, error) {
-	p.Lock()
-	defer p.Unlock()
-	if p.Rod == nil {
-		return "", fmt.Errorf("page_act.actHover: page is closed (nil rod handle)")
-	}
-
-	page := p.Rod.Context(ctx).Timeout(defaultActTimeout)
-
-	el, err := page.Element(selector)
-	if err != nil {
-		return "", fmt.Errorf("page_act.actHover: element %q: %w", selector, err)
-	}
-	if err := el.Hover(); err != nil {
-		return "", fmt.Errorf("page_act.actHover: element %q: %w", selector, err)
-	}
-	return fmt.Sprintf("hovered selector=%q", selector), nil
-}
-
-// actScroll scrolls the window by x/y pixels (window.scrollBy via Eval — the
-// primary path) and returns the resulting scroll position [scrollX, scrollY].
-// Missing x/y are treated as 0.
-func (t *Act) actScroll(ctx context.Context, p *browsers.Page, x, y float64) (string, error) {
-	p.Lock()
-	defer p.Unlock()
-	if p.Rod == nil {
-		return "", fmt.Errorf("page_act.actScroll: page is closed (nil rod handle)")
-	}
-
-	page := p.Rod.Context(ctx).Timeout(defaultActTimeout)
-
-	res, err := page.Eval(
-		"(x, y) => { window.scrollBy(x, y); return [window.scrollX, window.scrollY]; }",
-		x, y,
-	)
-	if err != nil {
-		return "", fmt.Errorf("page_act.actScroll: %w", err)
-	}
-	return fmt.Sprintf("scrolled to %s", res.Value.JSON("", "  ")), nil
-}
-
-// actSelect selects an <option> with the given value in the element matched by
-// selector. rod v0.116.2 has no SelectorTypeValue, so the option is matched
-// with a CSS attribute selector [value="..."]. Returns a short confirmation.
-func (t *Act) actSelect(ctx context.Context, p *browsers.Page, selector, value string) (string, error) {
-	p.Lock()
-	defer p.Unlock()
-	if p.Rod == nil {
-		return "", fmt.Errorf("page_act.actSelect: page is closed (nil rod handle)")
-	}
-
-	page := p.Rod.Context(ctx).Timeout(defaultActTimeout)
-
-	el, err := page.Element(selector)
-	if err != nil {
-		return "", fmt.Errorf("page_act.actSelect: element %q: %w", selector, err)
-	}
-	opt := `[value="` + value + `"]`
-	if err := el.Select([]string{opt}, true, rod.SelectorTypeCSSSector); err != nil {
-		return "", fmt.Errorf("page_act.actSelect: element %q: %w", selector, err)
-	}
-	return fmt.Sprintf("selected option value=%q in selector=%q", value, selector), nil
-}
-
-// actWait blocks until the page satisfies the requested readiness level, or
-// sleeps for a fixed duration. It supports the readiness modes shared with
-// fetch_page ("load", "idle", "stable"), an element-level "interactable" mode
-// (requires selector), and the default "ms" mode — a ctx-aware sleep honoring
-// timeout_ms (default 30000) that lets in-flight requests and animations
-// settle before the next action. The "ms" sleep is bounded by timeout_ms plus
-// a waitSleepMargin (applied in Execute) so the tool deadline never truncates
-// the sleep itself. The "ms" sleep touches no rod state, so it does not take
-// the page lock; every rod-backed mode is fully locked.
-func (t *Act) actWait(ctx context.Context, p *browsers.Page, mode, selector string, timeoutMS int) (string, error) {
-	// Synchronized read (under p.mu, like every other nil guard): the eviction
-	// path can nil p.Rod concurrently, so the check must not run lock-free. The
-	// lock is released before the mode switch — rod-backed modes re-lock (and
-	// re-check) themselves below.
-	p.Lock()
-	if p.Rod == nil {
-		p.Unlock()
-		return "", fmt.Errorf("page_act.actWait: page is closed (nil rod handle)")
-	}
-	p.Unlock()
-
-	switch mode {
-	case "", "ms":
-		// Backward-compatible default: sleep (ctx-aware) for timeout_ms.
-		d := time.Duration(timeoutMS) * time.Millisecond
-		if d <= 0 {
-			d = defaultActTimeout
-		}
-		select {
-		case <-time.After(d):
-			return fmt.Sprintf("waited %s", d), nil
-		case <-ctx.Done():
-			return "", fmt.Errorf("page_act.actWait: %w", ctx.Err())
-		}
-
-	case "load", "idle", "stable":
-		// waitForPage takes the page lock itself (shared with fetch_page).
-		if err := waitForPage(ctx, p, mode); err != nil {
-			return "", fmt.Errorf("page_act.actWait: %w", err)
-		}
-		return fmt.Sprintf("waited for %q", mode), nil
-
-	case "interactable":
-		if selector == "" {
-			return "", fmt.Errorf("page_act.actWait: interactable mode requires a selector")
-		}
-		p.Lock()
-		defer p.Unlock()
-		// Re-check under the lock: a concurrent eviction may have nilled p.Rod
-		// since the entry check above released the lock.
-		if p.Rod == nil {
-			return "", fmt.Errorf("page_act.actWait: page is closed (nil rod handle)")
-		}
-		page := p.Rod.Context(ctx).Timeout(defaultActTimeout)
-		el, err := page.Element(selector)
-		if err != nil {
-			return "", fmt.Errorf("page_act.actWait: element %q: %w", selector, err)
-		}
-		if _, err := el.WaitInteractable(); err != nil {
-			return "", fmt.Errorf("page_act.actWait: element %q: %w", selector, err)
-		}
-		return fmt.Sprintf("element %q is interactable", selector), nil
-
-	default:
-		return "", fmt.Errorf("page_act.actWait: unknown wait_mode %q (must be one of load, idle, stable, interactable, ms)", mode)
-	}
-}
-
-// actSetViewport changes the live page's viewport size to vp (width × height
-// CSS pixels) via the engine seam Page.SetViewport (Emulation.setDeviceMetrics
-// Override with a device scale factor of 1, desktop, no mobile emulation, and
-// matching screen metrics — screen.width tracks window.innerWidth), so an
-// agent can re-verify a responsive layout or a WAF after a resize. The engine
-// method owns the page lock and the nil-Rod guard; Execute validates that vp
-// is non-nil and positive before dispatch, and the nil check here is defensive
-// for direct callers. Returns a short confirmation for the LLM.
-func (t *Act) actSetViewport(ctx context.Context, p *browsers.Page, vp *browsers.Viewport) (string, error) {
-	if vp == nil {
-		return "", fmt.Errorf("page_act.actSetViewport: set_viewport requires a viewport")
-	}
-	if err := p.SetViewport(ctx, vp); err != nil {
-		return "", fmt.Errorf("page_act.actSetViewport: %w", err)
-	}
-	return fmt.Sprintf("set viewport to %dx%d", vp.Width, vp.Height), nil
-}
-
-// actEmulate applies a go-rod device preset (lib/devices, v0.116.2) to the
-// live page via the engine seam Page.Emulate — the primary, opt-in emulation
-// mechanism — so an agent can switch a live page to a mobile/desktop preset
-// (device UA + metrics + touch) without re-opening it. The name resolves
-// case-insensitively ("clear" resets); the engine method owns the page lock,
-// the nil-Rod guard and the pinned unknown-device error. The name is
-// pre-flighted via browsers.ValidateDeviceName so an unknown preset fails
-// before any CDP round trip. Execute pre-validates that device is non-empty;
-// the empty check here is defensive for direct callers (mirrors
-// actSetViewport). Returns the preset name for the LLM.
-func (t *Act) actEmulate(ctx context.Context, p *browsers.Page, device string) (string, error) {
-	if device == "" {
-		return "", fmt.Errorf("page_act.actEmulate: emulate requires a device")
-	}
-	if err := browsers.ValidateDeviceName(device); err != nil {
-		return "", err
-	}
-	if err := p.Emulate(ctx, device); err != nil {
-		return "", fmt.Errorf("page_act.actEmulate: %w", err)
-	}
-	return fmt.Sprintf("emulated device: %s", device), nil
-}
-
-// waitForPage blocks until the page satisfies the requested readiness mode. It
-// is the single shared mapping of the readiness levels used by fetch_page
-// (wait_for) and page_act (wait_mode): "load" → WaitLoad, "idle" →
-// WaitRequestIdle (its returned blocking func is invoked), "stable" →
-// WaitDOMStable; an empty mode is treated as "idle". The wait is bound to ctx
-// (via a page clone) so cancellation aborts a stuck wait. The page_act-only
-// "interactable" and "ms" modes are handled in actWait, not here.
-func waitForPage(ctx context.Context, p *browsers.Page, mode string) error {
-	p.Lock()
-	defer p.Unlock()
-	if p.Rod == nil {
-		return fmt.Errorf("waitForPage: page is closed (nil rod handle)")
-	}
-
-	pc := p.Rod.Context(ctx)
-	switch mode {
-	case "", "idle":
-		// WaitRequestIdle RETURNS a blocking func() — call it, do not return it.
-		wait := pc.WaitRequestIdle(500*time.Millisecond, nil, nil, nil)
-		wait()
-	case "load":
-		return pc.WaitLoad()
-	case "stable":
-		return pc.WaitDOMStable(500*time.Millisecond, 0.05)
-	default:
-		return fmt.Errorf("waitForPage: unknown wait mode %q (must be one of load, idle, stable)", mode)
-	}
-	return nil
 }
 
 // Ensure Act satisfies the Tool interface at compile time.

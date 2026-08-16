@@ -6,3 +6,7 @@ ipc-guide.md
 lane-planning.md
 /_examples
 smoketest.md
+/docs
+# Browser profile runtime artifacts (profiles launched into the workspace root)
+/brave
+/chrome

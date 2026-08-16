@@ -35,26 +35,38 @@ func (t *BrowserCreate) Name() string {
 
 // Description returns a customer/LLM-facing description of browser_create.
 func (t *BrowserCreate) Description() string {
-	return "Lazily launches the shared live browser (one Chromium instance) and " +
-		"returns its browser_id. Call this before fetch_page to ensure a " +
-		"browser is running; pages opened afterwards live inside it. The " +
-		"optional headless/stealth flags are reserved for future per-browser " +
-		"configuration."
+	return "Lazily launches the shared live browser (Brave by default, or Chromium) and " +
+		"returns its browser_id (browser-1). Reuses browser-1 idempotently when running. " +
+		"Uses persistent user profile at ~/.config/browser-mcp/profiles/<browser_name> for browser-1; " +
+		"secondary instances run in ephemeral mode to prevent profile directory bloat."
 }
 
 // InputSchema returns the JSON Schema for browser_create's arguments: optional
-// boolean headless/stealth flags; no required args.
+// bin, profile, headless, and stealth parameters.
 func (t *BrowserCreate) InputSchema() models.InputSchema {
 	return models.InputSchema{
 		Type: "object",
 		Properties: map[string]any{
+			"bin": map[string]any{
+				"type":        "string",
+				"description": "Optional custom browser binary path or command (e.g. 'brave-browser', 'google-chrome').",
+			},
+			"profile": map[string]any{
+				"type":        "string",
+				"description": "Optional profile name ('brave', 'chrome', 'firefox', 'default') or custom directory path.",
+			},
 			"headless": map[string]any{
 				"type":        "boolean",
-				"description": "Reserved: run the browser headless instead of headful (default follows the manager configuration).",
+				"description": "Run the browser headless instead of headful (default follows manager configuration).",
 			},
 			"stealth": map[string]any{
 				"type":        "boolean",
-				"description": "Reserved: apply go-rod/stealth to every page (default follows the manager configuration).",
+				"description": "Apply go-rod/stealth to every page (default follows manager configuration).",
+			},
+			"position": map[string]any{
+				"type":        "string",
+				"enum":        []string{"left", "right", "max", "normal"},
+				"description": "Optional window position split screen preset: 'left' (left screen half), 'right' (right screen half), 'max', 'normal'.",
 			},
 		},
 	}
@@ -62,28 +74,45 @@ func (t *BrowserCreate) InputSchema() models.InputSchema {
 
 // browserCreateArgs is the strict decoding target for browser_create arguments.
 type browserCreateArgs struct {
-	// Headless, when set, requests a headless browser (reserved; see Execute).
-	Headless *bool `json:"headless"`
-	// Stealth, when set, toggles per-page stealth (reserved; see Execute).
-	Stealth *bool `json:"stealth"`
+	Bin      string `json:"bin,omitempty"`
+	Profile  string `json:"profile,omitempty"`
+	Position string `json:"position,omitempty"`
+	Headless *bool  `json:"headless,omitempty"`
+	Stealth  *bool  `json:"stealth,omitempty"`
 }
 
-// Execute parses the optional flags, lazily opens the manager's single Browser
-// via Manager.Open (stub) and returns its browser_id as a JSON string.
+// Execute parses options and creates a new distinct Browser via Manager.CreateBrowser.
 func (t *BrowserCreate) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var a browserCreateArgs
-	if err := json.Unmarshal(args, &a); err != nil {
-		return "", fmt.Errorf("browser_create: invalid arguments: %w", err)
+	if len(args) > 0 && string(args) != "{}" {
+		if err := json.Unmarshal(args, &a); err != nil {
+			return "", fmt.Errorf("browser_create: invalid arguments: %w", err)
+		}
 	}
-	// TODO(web-mcp): map headless/stealth to per-browser functional options
-	// once the Manager supports per-open options. The flags are accepted and
-	// type-checked here (json.Unmarshal rejects non-boolean values) but not
-	// applied: the shared Manager is constructed once in the Registry with
-	// browsers.WithHeadless / browsers.WithStealth.
-	if _, err := t.mgr.Open(ctx); err != nil { // lazily launches the single Browser
+
+	var opts []browsers.Option
+	if a.Bin != "" {
+		opts = append(opts, browsers.WithBin(a.Bin))
+	}
+	if a.Profile != "" {
+		opts = append(opts, browsers.WithProfileDir(a.Profile))
+	}
+	if a.Position != "" {
+		opts = append(opts, browsers.WithPosition(a.Position))
+	}
+	if a.Headless != nil {
+		opts = append(opts, browsers.WithHeadless(*a.Headless))
+	}
+	if a.Stealth != nil {
+		opts = append(opts, browsers.WithStealth(*a.Stealth))
+	}
+
+	id, _, err := t.mgr.CreateBrowser(ctx, opts...)
+	if err != nil {
 		return "", fmt.Errorf("browser_create: %w", err)
 	}
-	data, err := json.Marshal(map[string]string{"browser_id": singleBrowserID})
+
+	data, err := json.Marshal(map[string]string{"browser_id": string(id)})
 	if err != nil {
 		return "", fmt.Errorf("browser_create: %w", err)
 	}
@@ -127,20 +156,31 @@ func (t *BrowserList) InputSchema() models.InputSchema {
 	}
 }
 
-// Execute returns the manager's browser id and its pages via Browser.Pages;
-// when no browser is open it returns an empty JSON array instead of failing
-// (a list tool should not error on absence). It deliberately does NOT lazily
-// launch the browser.
+// Execute returns the snapshot of all live browsers and their open pages.
 func (t *BrowserList) Execute(ctx context.Context, args json.RawMessage) (string, error) {
-	b, err := t.mgr.Browser() // no lazy launch: listing must not start a browser
-	if err != nil {
-		// No browser open yet — nothing to list.
+	active := t.mgr.Browsers()
+	if len(active) == 0 {
 		return "[]", nil
 	}
-	data, err := json.MarshalIndent(map[string]any{
-		"browser_id": singleBrowserID,
-		"pages":      b.Pages(),
-	}, "", "  ")
+
+	type browserEntry struct {
+		BrowserID  string              `json:"browser_id"`
+		Bin        string              `json:"bin,omitempty"`
+		ProfileDir string              `json:"profile_dir,omitempty"`
+		Pages      []browsers.PageInfo `json:"pages"`
+	}
+
+	var result []browserEntry
+	for id, b := range active {
+		result = append(result, browserEntry{
+			BrowserID:  string(id),
+			Bin:        b.BinPath(),
+			ProfileDir: b.ProfileDir(),
+			Pages:      b.Pages(),
+		})
+	}
+
+	data, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("browser_list: %w", err)
 	}
@@ -151,10 +191,9 @@ func (t *BrowserList) Execute(ctx context.Context, args json.RawMessage) (string
 var _ Tool = (*BrowserList)(nil)
 
 // BrowserClose implements the "browser_close" tool: it tears down the manager's
-// single Browser and all of its open pages, so a later browser_create (or
-// fetch_page) can launch a fresh browser.
+// specified Browser and all of its open pages.
 type BrowserClose struct {
-	// mgr is the shared browsers.Manager owning the single Browser.
+	// mgr is the shared browsers.Manager owning the browsers.
 	mgr *browsers.Manager
 }
 
@@ -172,49 +211,41 @@ func (t *BrowserClose) Name() string {
 // Description returns a customer/LLM-facing description of browser_close.
 func (t *BrowserClose) Description() string {
 	return "Closes the live browser and all of its open pages, releasing the " +
-		"underlying Chromium process. A later browser_create or fetch_page " +
-		"will launch a fresh browser. Call this when you are done with the " +
-		"browser to free resources."
+		"underlying Chromium process. Pass browser_id to close a specific browser, " +
+		"or omit to close all browsers."
 }
 
-// InputSchema returns the JSON Schema for browser_close's arguments: a required
-// browser_id.
+// InputSchema returns the JSON Schema for browser_close's arguments: an optional browser_id.
 func (t *BrowserClose) InputSchema() models.InputSchema {
 	return models.InputSchema{
 		Type: "object",
 		Properties: map[string]any{
 			"browser_id": map[string]any{
 				"type":        "string",
-				"description": "The browser_id returned by browser_create for the browser to close.",
+				"description": "Optional browser_id returned by browser_create to close. Omit to close all browsers.",
 			},
 		},
-		Required: []string{"browser_id"},
 	}
 }
 
 // browserCloseArgs is the strict decoding target for browser_close arguments.
 type browserCloseArgs struct {
-	// BrowserID identifies the browser to close (required).
 	BrowserID string `json:"browser_id"`
 }
 
-// Execute validates the browser_id and closes the manager's Browser via
-// Manager.Close (browser + pages torn down; a later Open can launch a fresh
-// one). This is thin glue around Manager.Close and is implemented fully (no
-// browser work lives here).
+// Execute closes the target browser or all browsers.
 func (t *BrowserClose) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var a browserCloseArgs
-	if err := json.Unmarshal(args, &a); err != nil {
-		return "", fmt.Errorf("browser_close: invalid arguments: %w", err)
+	if len(args) > 0 && string(args) != "{}" {
+		if err := json.Unmarshal(args, &a); err != nil {
+			return "", fmt.Errorf("browser_close: invalid arguments: %w", err)
+		}
+	}
+	if err := t.mgr.CloseBrowser(ctx, browsers.BrowserID(a.BrowserID)); err != nil {
+		return "", fmt.Errorf("browser_close: %w", err)
 	}
 	if a.BrowserID == "" {
-		return "", fmt.Errorf("browser_close: missing required argument %q", "browser_id")
-	}
-	// TODO(web-mcp): the id is accepted/validated but the Manager owns a single
-	// Browser (AGENTS.md browser-first paradigm); multi-browser support will
-	// resolve it against a browser_id → Browser map instead.
-	if err := t.mgr.Close(ctx); err != nil {
-		return "", fmt.Errorf("browser_close: %w", err)
+		return "all browsers closed", nil
 	}
 	return fmt.Sprintf("browser %s closed", a.BrowserID), nil
 }
