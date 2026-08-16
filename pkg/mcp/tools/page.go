@@ -39,13 +39,15 @@ const fullPageScreenshotTimeout = 90 * time.Second
 // that was previously opened with fetch_page. The session_id from fetch_page
 // identifies which browser tab to read; what selects the aspect:
 //
-//	html | dom | text | css | js | links | screenshot | meta
+//	html | dom | text | css | js | links | screenshot | meta | interactives
 //
 // The "dom" output is the page's DOM re-nested from the flattened Documents
 // array + Strings table produced by CaptureDOMSnapshot into a compact,
 // LLM-friendly tree (iframes, shadow DOM and all). "css"/"js" enumerate the
 // page's resource tree and fetch the matching resources. "screenshot" returns
-// a base64 PNG data-URI.
+// a base64 PNG data-URI. "interactives" returns a dense action map of every
+// visible, non-inert clickable/typeable element (with stable handles for
+// page_act).
 type Page struct {
 	// mgr is the shared browsers.Manager owning the single Browser and its
 	// live pages (sessions).
@@ -66,7 +68,9 @@ func (t *Page) Name() string {
 func (t *Page) Description() string {
 	return "Reads an aspect of a live page that was opened with fetch_page: " +
 		"html, dom (full flattened DOM snapshot, LLM-friendly), text, css, js, " +
-		"links, screenshot (base64 PNG data-URI), or meta. Pass the session_id " +
+		"links, screenshot (base64 PNG data-URI), interactives (dense action " +
+		"map of every visible clickable/typeable element with stable handles " +
+		"for page_act), or meta. Pass the session_id " +
 		"returned by fetch_page plus what=<aspect>; use selector to scope " +
 		"extraction, target to fetch exactly one css/js resource's full content " +
 		"(instead of the resource list), full_page to capture the whole " +
@@ -88,8 +92,8 @@ func (t *Page) InputSchema() models.InputSchema {
 			},
 			"what": map[string]any{
 				"type":        "string",
-				"enum":        []string{"html", "dom", "text", "css", "js", "links", "screenshot", "meta"},
-				"description": "The aspect of the page to extract: html (outerHTML), dom (flattened DOM snapshot), text (visible text), css (style resources), js (script resources), links (anchor hrefs), screenshot (base64 PNG data-URI; full_page captures the whole scrollable page), meta (title/url/description).",
+				"enum":        []string{"html", "dom", "text", "css", "js", "links", "screenshot", "meta", "interactives"},
+				"description": "The aspect of the page to extract: html (outerHTML), dom (flattened DOM snapshot), text (visible text), css (style resources), js (script resources), links (anchor hrefs), screenshot (base64 PNG data-URI; full_page captures the whole scrollable page), interactives (dense action map of every visible clickable/typeable element — with stable handles usable as page_act's handle arg; whole-page by design, the selector arg is ignored), meta (title/url/description).",
 			},
 			"selector": map[string]any{
 				"type":        "string",
@@ -178,8 +182,10 @@ func (t *Page) Execute(ctx context.Context, args json.RawMessage) (string, error
 		out, err = t.extractScreenshot(ctx, p, a.FullPage)
 	case "meta":
 		out, err = t.extractMeta(ctx, p)
+	case "interactives":
+		out, err = t.extractInteractives(ctx, p)
 	default:
-		return "", fmt.Errorf("page_fetch: unknown what=%q (must be one of html, dom, text, css, js, links, screenshot, meta)", a.What)
+		return "", fmt.Errorf("page_fetch: unknown what=%q (must be one of html, dom, text, css, js, links, screenshot, meta, interactives)", a.What)
 	}
 	if err != nil {
 		return "", fmt.Errorf("page_fetch: %w", err)
@@ -187,8 +193,12 @@ func (t *Page) Execute(ctx context.Context, args json.RawMessage) (string, error
 	// Screenshots bypass truncate: the data-URI is binary-as-text and cutting
 	// it mid-stream would produce an undecodable image. Image size scales with
 	// the viewport (or full-page height), not max_bytes — the 50KB truncation
-	// convention applies to text extractions only.
-	if a.What == "screenshot" {
+	// convention applies to text extractions only. Interactives bypass it too:
+	// the snapshot is a machine-parseable JSON envelope whose designed
+	// incompleteness signal is the "truncated" field (the MaxInteractives cap),
+	// not a byte cut — truncating would emit invalid JSON plus a misleading
+	// "narrow the selector" hint (interactives ignores selector by design).
+	if a.What == "screenshot" || a.What == "interactives" {
 		return out, nil
 	}
 	return t.truncate(out, a.MaxBytes), nil
@@ -792,6 +802,27 @@ func (t *Page) extractMeta(ctx context.Context, p *browsers.Page) (string, error
 	b, err := json.Marshal(out)
 	if err != nil {
 		return "", fmt.Errorf("encode page meta: %w", err)
+	}
+	return string(b), nil
+}
+
+// extractInteractives returns the page's interactive elements as a dense,
+// LLM-friendly action map: every visible, non-inert clickable/typeable element
+// with a stable handle, role, text, href, input type and center x/y — the
+// whole-page snapshot an agent uses to act immediately (page_act
+// { handle: ... }) without selector guesswork. It is a thin wrapper over the
+// engine method Page.Interactives (pkg/browsers): that method owns the page
+// lock and the nil-Rod guard, so this helper deliberately does NOT lock, and
+// the result's json tags ARE the wire shape, so marshaling it directly keeps
+// the MCP and CLI surfaces identical by construction.
+func (t *Page) extractInteractives(ctx context.Context, p *browsers.Page) (string, error) {
+	res, err := p.Interactives(ctx)
+	if err != nil {
+		return "", err
+	}
+	b, err := json.Marshal(res)
+	if err != nil {
+		return "", fmt.Errorf("encode interactives: %w", err)
 	}
 	return string(b), nil
 }

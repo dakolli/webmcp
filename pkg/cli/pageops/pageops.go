@@ -1,8 +1,9 @@
 // Package pageops holds the cobra-free page helpers shared by the web-cli
 // commands (pkg/cli/cmd) and the IPC server (pkg/cli/ipc): fetching page
 // summaries, extracting page aspects (html, dom, text, css, js, links,
-// screenshot, meta), performing page actions (click, input, hover, scroll,
-// select, eval, navigate, back, forward, reload, wait) and truncating output.
+// screenshot, meta, interactives), performing page actions (click, input,
+// hover, scroll, select, eval, navigate, back, forward, reload, wait) and
+// truncating output.
 // The helpers own the per-page Lock/Unlock discipline required because rod
 // Pages are not thread-safe (pkg/browsers session.go) — callers must not lock
 // themselves. Only this package drives rod on the CLI side; cmd/ipc never
@@ -30,8 +31,10 @@ import (
 // DefaultPageMaxBytes caps how much of any page fetch extraction is returned
 // in one call (the CLI --max-bytes default and the IPC page.fetch default).
 // Huge pages are dehydrated to a first slice; the caller can re-run with a
-// narrower selector or a higher max_bytes. Screenshots are the documented
-// exception: the data-URI bypasses PageTruncate entirely.
+// narrower selector or a higher max_bytes. Screenshots and interactives are
+// the documented exceptions: the data-URI (screenshot) and the
+// machine-parseable JSON envelope with its own "truncated" field
+// (interactives) bypass PageTruncate entirely.
 const DefaultPageMaxBytes = 50_000
 
 // defaultActTimeout bounds the page_act-style helpers' "ms" wait-mode sleep
@@ -355,6 +358,28 @@ func PageMeta(ctx context.Context, p *browsers.Page) (string, error) {
 	b, err := json.Marshal(out)
 	if err != nil {
 		return "", fmt.Errorf("encode page meta: %w", err)
+	}
+	return string(b), nil
+}
+
+// PageInteractives returns the page's interactive elements as a dense JSON
+// action map: every visible, non-inert clickable/typeable element with a
+// stable handle, role, text, href, input type and center x/y — the whole-page
+// snapshot used to act immediately (page act { handle: ... }) without selector
+// guesswork. Mirrors the MCP page_fetch what=interactives shape exactly.
+//
+// Deliberately does NOT lock: the engine method Page.Interactives takes the
+// page lock itself and owns the nil-Rod guard (mirroring PageSetViewport/
+// PageEmulate's engine-seam pattern) — an exception to the pageops
+// self-locking convention, so callers must not pre-lock either.
+func PageInteractives(ctx context.Context, p *browsers.Page) (string, error) {
+	res, err := p.Interactives(ctx)
+	if err != nil {
+		return "", err
+	}
+	b, err := json.Marshal(res)
+	if err != nil {
+		return "", fmt.Errorf("encode interactives: %w", err)
 	}
 	return string(b), nil
 }

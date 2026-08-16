@@ -229,11 +229,12 @@ func (s *Server) handlePageList(ctx context.Context, params json.RawMessage) (an
 // handlePageFetch implements page.fetch: it extracts an aspect of a live page —
 // html, text, links, meta (selector scoping html/text), dom (nested DOM JSON),
 // css/js (resource list or one target resource), screenshot (base64 PNG
-// data-URI; full_page captures the whole page) — mirroring the CLI page fetch
-// command. Results are truncated to max_bytes (default
-// pageops.DefaultPageMaxBytes) except screenshots, which bypass truncation
-// (mirrors the CLI/MCP truncation exception). An unknown extractor is a -32602
-// invalid-params error.
+// data-URI; full_page captures the whole page), interactives (dense action map
+// of every visible clickable/typeable element with stable handles) —
+// mirroring the CLI page fetch command. Results are truncated to max_bytes
+// (default pageops.DefaultPageMaxBytes) except screenshots and interactives,
+// which bypass truncation (mirrors the CLI/MCP truncation exception). An
+// unknown extractor is a -32602 invalid-params error.
 func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (any, *Error) {
 	p, rpcErr := decodeParams[PageFetchParams](params)
 	if rpcErr != nil {
@@ -243,13 +244,13 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 		return nil, &Error{Code: CodeInvalidParams, Message: `page.fetch: missing required param "session_id"`}
 	}
 	switch p.What {
-	case "html", "text", "links", "meta", "dom", "css", "js", "screenshot":
+	case "html", "text", "links", "meta", "dom", "css", "js", "screenshot", "interactives":
 	case "":
 		return nil, &Error{Code: CodeInvalidParams, Message: `page.fetch: missing required param "what"`}
 	default:
 		return nil, &Error{
 			Code:    CodeInvalidParams,
-			Message: fmt.Sprintf("page.fetch: unknown what=%q (must be one of html, text, links, meta, dom, css, js, screenshot)", p.What),
+			Message: fmt.Sprintf("page.fetch: unknown what=%q (must be one of html, text, links, meta, dom, css, js, screenshot, interactives)", p.What),
 		}
 	}
 
@@ -276,6 +277,8 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 		out, err = pageops.PageJS(ctx, page, p.Target)
 	case "screenshot":
 		out, err = pageops.PageScreenshot(ctx, page, p.FullPage)
+	case "interactives":
+		out, err = pageops.PageInteractives(ctx, page)
 	}
 	if err != nil {
 		return nil, serverError(err)
@@ -284,8 +287,12 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 	// Screenshots bypass truncate: the data-URI is binary-as-text and cutting
 	// it mid-stream would produce an undecodable image. Image size scales with
 	// the viewport (or full-page height), not max_bytes (mirrors the CLI and
-	// MCP truncation exception).
-	if p.What == "screenshot" {
+	// MCP truncation exception). Interactives bypass it too: the snapshot is a
+	// machine-parseable JSON envelope whose designed incompleteness signal is
+	// the "truncated" field (the MaxInteractives cap), not a byte cut —
+	// truncating would emit invalid JSON plus a misleading "narrow the
+	// selector" hint (interactives ignores selector by design).
+	if p.What == "screenshot" || p.What == "interactives" {
 		return PageFetchResult{Data: out}, nil
 	}
 

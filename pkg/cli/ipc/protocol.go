@@ -36,7 +36,7 @@ const (
 	MethodPageOpen = "page.open"
 	// MethodPageList lists the Browser's open pages.
 	MethodPageList = "page.list"
-	// MethodPageFetch extracts an aspect of a live page (html/dom/text/css/js/links/screenshot/meta).
+	// MethodPageFetch extracts an aspect of a live page (html/dom/text/css/js/links/screenshot/meta/interactives).
 	MethodPageFetch = "page.fetch"
 	// MethodPageAct performs an action on a live page (click/input/hover/scroll/select/eval/navigate/back/forward/reload/wait/set_viewport/emulate).
 	MethodPageAct = "page.act"
@@ -187,16 +187,17 @@ type PageListResult struct {
 }
 
 // PageFetchParams carries the page.fetch parameters. what ∈ html|dom|text|css|
-// js|links|screenshot|meta; selector scopes html/text; target fetches exactly
+// js|links|screenshot|meta|interactives; selector scopes html/text (ignored
+// for interactives, which is whole-page by design); target fetches exactly
 // one css/js resource's content instead of the {url,type,size} list; full_page
 // captures the whole scrollable page in a screenshot; max_bytes caps the
-// returned data (default pageops.DefaultPageMaxBytes; screenshots are never
-// truncated).
+// returned data (default pageops.DefaultPageMaxBytes; screenshots and
+// interactives are never truncated).
 type PageFetchParams struct {
 	// SessionID identifies the live page to fetch from.
 	SessionID string `json:"session_id"`
 	// What is the aspect to extract: html, dom, text, css, js, links,
-	// screenshot, meta.
+	// screenshot, meta, interactives.
 	What string `json:"what"`
 	// Selector optionally scopes html/text extraction to a CSS match.
 	Selector string `json:"selector,omitempty"`

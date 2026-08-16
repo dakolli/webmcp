@@ -42,7 +42,7 @@ first and reads the aspect in one go.
 
 Subcommands:
   list   List the browser's open pages (id, url)
-  fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta); a URL opens a new page first
+  fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta, interactives); a URL opens a new page first
   act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate)
   close  Close an open page
 
@@ -115,9 +115,10 @@ which sessions are still alive before acting on or closing them.`,
 }
 
 // newPageFetchCmd builds `page fetch`: it extracts an aspect of a live page
-// (html, text, links, meta, dom, css, js, screenshot) and prints it, truncating
-// to --max-bytes on a UTF-8 rune boundary. Screenshots are the exception: the
-// base64 data-URI bypasses truncation (see RunE).
+// (html, text, links, meta, dom, css, js, screenshot, interactives) and prints
+// it, truncating to --max-bytes on a UTF-8 rune boundary. Screenshots and
+// interactives are the exceptions: the base64 data-URI (screenshot) and the
+// machine-parseable JSON envelope (interactives) bypass truncation (see RunE).
 func newPageFetchCmd(mgr *browsers.Manager) *cobra.Command {
 	var (
 		id       string
@@ -132,18 +133,19 @@ func newPageFetchCmd(mgr *browsers.Manager) *cobra.Command {
 		Use:   "fetch [id|url] [what]",
 		Short: "Extract an aspect of a live page",
 		Long: `Extracts an aspect of a live page (html, text, links, meta, dom, css,
-js, screenshot) and prints it. The page id is optional when only one page is
-open; 'last' means the most recently opened page; a bare number resolves to
-page-N. A URL in the [id] slot opens a NEW page for it first — creating the
-browser if needed, exactly like 'web-cli fetch <url>' — and then extracts the
-aspect from that fresh page (one step, no separate "open first" dance).
+js, screenshot, interactives) and prints it. The page id is optional when only
+one page is open; 'last' means the most recently opened page; a bare number
+resolves to page-N. A URL in the [id] slot opens a NEW page for it first —
+creating the browser if needed, exactly like 'web-cli fetch <url>' — and then
+extracts the aspect from that fresh page (one step, no separate "open first"
+dance).
 
   [id]    the page/session id to read (optional with one page; 'last'; or a
           bare number, e.g. 12 → page-12)
   [url]   an absolute URL (contains "://") to open in a new page first, then
           extract the aspect — mirrors 'web-cli fetch <url>' (wait: idle)
   [what]  the aspect to extract: html, text, links, meta, dom, css, js,
-          screenshot (default: text)
+          screenshot, interactives (default: text)
 
   --id <session>     the page/session id (the positional [id] wins when both
                      are given; never treated as a URL)
@@ -153,8 +155,8 @@ aspect from that fresh page (one step, no separate "open first" dance).
   --target <url>     fetch exactly one css/js resource's full content instead
                      of the {url,type,size} list (with --what css|js)
   --full-page        capture the entire scrollable page (screenshot only)
-  --max-bytes <n>    cap output size (default 50000; screenshots are never
-                     truncated)
+  --max-bytes <n>    cap output size (default 50000; screenshots and
+                     interactives are never truncated)
 
 links, meta, dom and the css/js lists print JSON, mirroring the MCP page_fetch
 shapes. Screenshots print a data:image/png;base64,... data-URI.`,
@@ -186,9 +188,9 @@ shapes. Screenshots print a data:image/png;base64,... data-URI.`,
 			}
 
 			switch what {
-			case "html", "text", "links", "meta", "dom", "css", "js", "screenshot":
+			case "html", "text", "links", "meta", "dom", "css", "js", "screenshot", "interactives":
 			default:
-				return fmt.Errorf("page fetch: unknown what=%q (must be one of html, text, links, meta, dom, css, js, screenshot)", what)
+				return fmt.Errorf("page fetch: unknown what=%q (must be one of html, text, links, meta, dom, css, js, screenshot, interactives)", what)
 			}
 
 			// Fail-fast switch passed: forward to a live serve process when one
@@ -266,6 +268,8 @@ shapes. Screenshots print a data:image/png;base64,... data-URI.`,
 				out, err = pageops.PageJS(ctx, p, target)
 			case "screenshot":
 				out, err = pageops.PageScreenshot(ctx, p, fullPage)
+			case "interactives":
+				out, err = pageops.PageInteractives(ctx, p)
 			}
 			if err != nil {
 				return fmt.Errorf("page fetch: %w", err)
@@ -274,9 +278,13 @@ shapes. Screenshots print a data:image/png;base64,... data-URI.`,
 			// and cutting it mid-stream would produce an undecodable image.
 			// Image size scales with the viewport (or full-page height), not
 			// max_bytes — the 50KB truncation convention applies to text
-			// extractions only. Mirrors the MCP page_fetch truncation
-			// exception.
-			if what == "screenshot" {
+			// extractions only. Interactives bypass it too: the snapshot is a
+			// machine-parseable JSON envelope whose designed incompleteness
+			// signal is the "truncated" field (the MaxInteractives cap), not a
+			// byte cut — truncating would emit invalid JSON plus a misleading
+			// "narrow the selector" hint (interactives ignores selector by
+			// design). Mirrors the MCP page_fetch truncation exception.
+			if what == "screenshot" || what == "interactives" {
 				fmt.Println(out)
 				return nil
 			}
@@ -285,7 +293,7 @@ shapes. Screenshots print a data:image/png;base64,... data-URI.`,
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to fetch (optional with one page open; 'last'; or a bare number)")
-	cmd.Flags().StringVar(&what, "what", "", "aspect to extract: html, text, links, meta, dom, css, js, screenshot (default text)")
+	cmd.Flags().StringVar(&what, "what", "", "aspect to extract: html, text, links, meta, dom, css, js, screenshot, interactives (default text)")
 	cmd.Flags().StringVar(&selector, "selector", "", "optional CSS selector scoping html/text extraction")
 	cmd.Flags().StringVar(&target, "target", "", "resource URL to fetch exactly one css/js resource's content (with --what css|js)")
 	cmd.Flags().BoolVar(&fullPage, "full-page", false, "capture the entire scrollable page instead of the visible viewport (screenshot only)")

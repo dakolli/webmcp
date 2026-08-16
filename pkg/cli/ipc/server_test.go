@@ -261,7 +261,7 @@ func TestServerBadParamsPageFetchUnknownWhat(t *testing.T) {
 	if resp.Error == nil || resp.Error.Code != CodeInvalidParams {
 		t.Fatalf("error = %+v, want code %d (-32602)", resp.Error, CodeInvalidParams)
 	}
-	if want := `page.fetch: unknown what="bogus" (must be one of html, text, links, meta, dom, css, js, screenshot)`; resp.Error.Message != want {
+	if want := `page.fetch: unknown what="bogus" (must be one of html, text, links, meta, dom, css, js, screenshot, interactives)`; resp.Error.Message != want {
 		t.Errorf("error message = %q, want %q", resp.Error.Message, want)
 	}
 }

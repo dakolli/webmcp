@@ -24,6 +24,7 @@ import (
 var whatVocab = map[string]bool{
 	"html": true, "text": true, "links": true, "meta": true,
 	"dom": true, "css": true, "js": true, "screenshot": true,
+	"interactives": true,
 }
 
 // actionVocab is the page-act action vocabulary shared by `page act` parsing
