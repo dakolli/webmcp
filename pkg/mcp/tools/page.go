@@ -851,3 +851,49 @@ func (t *Page) truncate(s string, maxBytes int) string {
 
 // Ensure Page satisfies the Tool interface at compile time.
 var _ Tool = (*Page)(nil)
+
+// InspectPageDecompositionPrompt is a co-located prompt definition for page_fetch.
+type InspectPageDecompositionPrompt struct{}
+
+// NewInspectPageDecompositionPrompt constructs the inspect_page_decomposition prompt template.
+func NewInspectPageDecompositionPrompt() *InspectPageDecompositionPrompt {
+	return &InspectPageDecompositionPrompt{}
+}
+
+// Name returns the prompt template name "inspect_page_decomposition".
+func (p *InspectPageDecompositionPrompt) Name() string { return "inspect_page_decomposition" }
+
+// Description returns a description of the prompt template.
+func (p *InspectPageDecompositionPrompt) Description() string {
+	return "Provides structured guidance to decompose a live session into metadata, navigation links, and DOM tree snapshot."
+}
+
+// Arguments returns the parameter list accepted by the prompt template.
+func (p *InspectPageDecompositionPrompt) Arguments() []models.PromptArgument {
+	return []models.PromptArgument{
+		{Name: "session_id", Description: "ID of the active page session to decompose", Required: true},
+	}
+}
+
+// GetMessages builds the prompt messages payload for the given argument map.
+func (p *InspectPageDecompositionPrompt) GetMessages(args map[string]string) ([]models.PromptMessage, error) {
+	sessionID := args["session_id"]
+	if sessionID == "" {
+		sessionID = "page-1"
+	}
+	text := fmt.Sprintf("Please inspect and decompose the live session %q:\n"+
+		"1. Call page_fetch with session_id: %q and what: \"meta\" to confirm title and canonical URL.\n"+
+		"2. Call page_fetch with session_id: %q and what: \"links\" (max_bytes: 20000) to map navigation destinations.\n"+
+		"3. Call page_fetch with session_id: %q and what: \"dom\" (scoped via selector if needed) to analyze layout tree.\n"+
+		"4. Present the structured page decomposition.", sessionID, sessionID, sessionID, sessionID)
+
+	return []models.PromptMessage{
+		{
+			Role:    "user",
+			Content: models.TextContent{Type: "text", Text: text},
+		},
+	}, nil
+}
+
+// Ensure InspectPageDecompositionPrompt satisfies the Prompt interface at compile time.
+var _ Prompt = (*InspectPageDecompositionPrompt)(nil)

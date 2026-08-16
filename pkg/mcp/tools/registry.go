@@ -33,12 +33,13 @@ type Tool interface {
 	Execute(ctx context.Context, args json.RawMessage) (string, error)
 }
 
-// Registry manages a collection of tools and dispatches execution calls.
+// Registry manages a collection of tools and prompts, and dispatches execution calls.
 type Registry struct {
-	tools map[string]Tool
+	tools   map[string]Tool
+	prompts map[string]Prompt
 }
 
-// NewRegistry constructs a Registry and registers all available tools,
+// NewRegistry constructs a Registry and registers all available tools and prompts,
 // wiring them to a single shared browsers.Manager.
 func NewRegistry() *Registry {
 	r := NewEmptyRegistry()
@@ -52,19 +53,31 @@ func NewRegistry() *Registry {
 	r.Register(NewBrowserList(mgr))
 	r.Register(NewBrowserClose(mgr))
 	r.Register(NewPageList(mgr))
+
+	r.RegisterPrompt(NewFetchAndSummarizePrompt())
+	r.RegisterPrompt(NewInspectPageDecompositionPrompt())
+	r.RegisterPrompt(NewFormSearchAndSubmitPrompt())
+	r.RegisterPrompt(NewBrowserSetupAndEmulatePrompt())
+	r.RegisterPrompt(NewManageSessionLifecyclePrompt())
 	return r
 }
 
-// NewEmptyRegistry constructs a Registry without registering any tools.
+// NewEmptyRegistry constructs a Registry without registering any tools or prompts.
 func NewEmptyRegistry() *Registry {
 	return &Registry{
-		tools: make(map[string]Tool),
+		tools:   make(map[string]Tool),
+		prompts: make(map[string]Prompt),
 	}
 }
 
 // Register adds a tool to the registry, keyed by its Name.
 func (r *Registry) Register(t Tool) {
 	r.tools[t.Name()] = t
+}
+
+// RegisterPrompt adds a prompt template to the registry, keyed by its Name.
+func (r *Registry) RegisterPrompt(p Prompt) {
+	r.prompts[p.Name()] = p
 }
 
 // List returns all registered tools as models.MCPTool, sorted
@@ -83,6 +96,39 @@ func (r *Registry) List() []models.MCPTool {
 		return list[i].Name < list[j].Name
 	})
 	return list
+}
+
+// ListPrompts returns all registered prompts as models.MCPPrompt, sorted
+// deterministically by prompt name.
+func (r *Registry) ListPrompts() []models.MCPPrompt {
+	list := make([]models.MCPPrompt, 0, len(r.prompts))
+	for _, p := range r.prompts {
+		list = append(list, models.MCPPrompt{
+			Name:        p.Name(),
+			Description: p.Description(),
+			Arguments:   p.Arguments(),
+		})
+	}
+	sort.SliceStable(list, func(i, j int) bool {
+		return list[i].Name < list[j].Name
+	})
+	return list
+}
+
+// GetPrompt builds a GetPromptResult for the prompt with the given name and arguments.
+func (r *Registry) GetPrompt(name string, args map[string]string) (*models.GetPromptResult, error) {
+	p, ok := r.prompts[name]
+	if !ok {
+		return nil, fmt.Errorf("prompt not found: %s", name)
+	}
+	msgs, err := p.GetMessages(args)
+	if err != nil {
+		return nil, fmt.Errorf("building prompt %s: %w", name, err)
+	}
+	return &models.GetPromptResult{
+		Description: p.Description(),
+		Messages:    msgs,
+	}, nil
 }
 
 // Execute runs a call to the registered tool with the given name.

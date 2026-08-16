@@ -31,6 +31,7 @@ type InitializeResult struct {
 	ProtocolVersion string             `json:"protocolVersion"`
 	ServerInfo      ServerInfo         `json:"serverInfo"`
 	Capabilities    ServerCapabilities `json:"capabilities"`
+	Instructions    string             `json:"instructions,omitempty"`
 }
 
 // ServerInfo contains metadata details about this server.
@@ -41,7 +42,51 @@ type ServerInfo struct {
 
 // ServerCapabilities defines features the server supports.
 type ServerCapabilities struct {
-	Tools map[string]any `json:"tools"`
+	Tools   map[string]any `json:"tools"`
+	Prompts map[string]any `json:"prompts,omitempty"`
+}
+
+// MCPPrompt represents a reusable prompt template exposed to the client.
+type MCPPrompt struct {
+	Name        string           `json:"name"`
+	Description string           `json:"description,omitempty"`
+	Arguments   []PromptArgument `json:"arguments,omitempty"`
+}
+
+// PromptArgument defines an argument accepted by a prompt template.
+type PromptArgument struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Required    bool   `json:"required,omitempty"`
+}
+
+// ListPromptsResult represents the list of prompts returned to the client.
+type ListPromptsResult struct {
+	Prompts []MCPPrompt `json:"prompts"`
+}
+
+// GetPromptRequest represents parameters to fetch a prompt template.
+type GetPromptRequest struct {
+	Name      string            `json:"name"`
+	Arguments map[string]string `json:"arguments,omitempty"`
+}
+
+// GetPromptResult represents the generated prompt messages payload.
+type GetPromptResult struct {
+	Description string          `json:"description,omitempty"`
+	Messages    []PromptMessage `json:"messages"`
+}
+
+// PromptMessage represents a message in a prompt conversation template.
+type PromptMessage struct {
+	Role    string      `json:"role"`
+	Content TextContent `json:"content"`
+}
+
+// TextContent represents a simple text content block within a prompt message.
+type TextContent struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
 }
 
 // MCPTool represents an operational tool exposed to the AI client.

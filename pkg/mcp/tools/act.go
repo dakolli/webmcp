@@ -666,3 +666,61 @@ func waitForPage(ctx context.Context, p *browsers.Page, mode string) error {
 
 // Ensure Act satisfies the Tool interface at compile time.
 var _ Tool = (*Act)(nil)
+
+// FormSearchAndSubmitPrompt is a co-located prompt definition for page_act.
+type FormSearchAndSubmitPrompt struct{}
+
+// NewFormSearchAndSubmitPrompt constructs the form_search_and_submit prompt template.
+func NewFormSearchAndSubmitPrompt() *FormSearchAndSubmitPrompt {
+	return &FormSearchAndSubmitPrompt{}
+}
+
+// Name returns the prompt template name "form_search_and_submit".
+func (p *FormSearchAndSubmitPrompt) Name() string { return "form_search_and_submit" }
+
+// Description returns a description of the prompt template.
+func (p *FormSearchAndSubmitPrompt) Description() string {
+	return "Provides step-by-step guidance for inputting text into search/form fields and submitting the form."
+}
+
+// Arguments returns the parameter list accepted by the prompt template.
+func (p *FormSearchAndSubmitPrompt) Arguments() []models.PromptArgument {
+	return []models.PromptArgument{
+		{Name: "session_id", Description: "ID of the active page session", Required: true},
+		{Name: "search_query", Description: "Text query to input into search field", Required: true},
+		{Name: "selector", Description: "Optional CSS selector for search field (default: input[type='text'])", Required: false},
+	}
+}
+
+// GetMessages builds the prompt messages payload for the given argument map.
+func (p *FormSearchAndSubmitPrompt) GetMessages(args map[string]string) ([]models.PromptMessage, error) {
+	sessionID := args["session_id"]
+	if sessionID == "" {
+		sessionID = "page-1"
+	}
+	searchQuery := args["search_query"]
+	if searchQuery == "" {
+		searchQuery = "search query"
+	}
+	selector := args["selector"]
+	if selector == "" {
+		selector = "input[type='text'], input[name='q'], input.search"
+	}
+
+	text := fmt.Sprintf("Please enter search query %q into session %q:\n"+
+		"1. Call page_act with session_id: %q, action: \"input\", selector: %q, value: %q.\n"+
+		"2. Verify input value using page_act action: \"eval\" with value: \"() => document.querySelector(%q).value\".\n"+
+		"3. Call page_act with action: \"click\" on search button or submit form.\n"+
+		"4. Call page_act with action: \"wait\", wait_mode: \"load\" to ensure results land.",
+		searchQuery, sessionID, sessionID, selector, searchQuery, selector)
+
+	return []models.PromptMessage{
+		{
+			Role:    "user",
+			Content: models.TextContent{Type: "text", Text: text},
+		},
+	}, nil
+}
+
+// Ensure FormSearchAndSubmitPrompt satisfies the Prompt interface at compile time.
+var _ Prompt = (*FormSearchAndSubmitPrompt)(nil)

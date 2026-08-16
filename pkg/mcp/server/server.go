@@ -16,6 +16,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -146,14 +147,48 @@ func registerAll(mgr *browsers.Manager) *tools.Registry {
 	return r
 }
 
-// handleHome serves a simple diagnostics text page.
+// handleHome serves a simple diagnostics text page, or routes to SSE/JSON-RPC
+// when appropriate based on request method and Accept headers.
 func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method == http.MethodPost {
+		s.handleMessage(w, r)
+		return
+	}
+	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
+		s.handleSSE(w, r)
+		return
+	}
 	w.Header().Set("Content-Type", "text/plain")
 	fmt.Fprintf(w, "web-mcp Server is active on port %s.\nUse /sse (SSE Connection) and /message (POST requests) for MCP operations.\n", s.addr)
 }
 
-// handleSSE establishes the Server-Sent Events stream.
+// handleSSE establishes the Server-Sent Events stream (or delegates POST requests to handleMessage).
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if r.Method == http.MethodPost {
+		s.handleMessage(w, r)
+		return
+	}
+
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
@@ -204,7 +239,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization")
 
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
@@ -296,8 +331,10 @@ func (s *Server) processRequest(ctx context.Context, req models.JSONRPCRequest) 
 				Version: "0.1.0",
 			},
 			Capabilities: models.ServerCapabilities{
-				Tools: make(map[string]interface{}),
+				Tools:   make(map[string]interface{}),
+				Prompts: make(map[string]interface{}),
 			},
+			Instructions: "web-mcp provides stateful Chromium browser automation tools (fetch_page, page_fetch, page_act, session_close, browser_create, etc.). Predefined task templates are available via the prompts/list and prompts/get MCP protocol endpoints to guide common workflows such as page exploration, form filling, and content extraction.",
 		}
 
 	case "tools/list":
@@ -324,6 +361,30 @@ func (s *Server) processRequest(ctx context.Context, req models.JSONRPCRequest) 
 				},
 			},
 		}
+
+	case "prompts/list":
+		resp.Result = models.ListPromptsResult{
+			Prompts: s.registry.ListPrompts(),
+		}
+
+	case "prompts/get":
+		var getParams models.GetPromptRequest
+		if req.Params != nil && len(req.Params) > 0 {
+			if err := json.Unmarshal(req.Params, &getParams); err != nil {
+				resp.Error = models.JSONRPCError{Code: -32602, Message: "Invalid parameters"}
+				return resp
+			}
+		}
+		if getParams.Name == "" {
+			resp.Error = models.JSONRPCError{Code: -32602, Message: "Missing prompt name"}
+			return resp
+		}
+		promptRes, err := s.registry.GetPrompt(getParams.Name, getParams.Arguments)
+		if err != nil {
+			resp.Error = models.JSONRPCError{Code: -32603, Message: err.Error()}
+			return resp
+		}
+		resp.Result = promptRes
 
 	default:
 		resp.Error = models.JSONRPCError{Code: -32601, Message: fmt.Sprintf("Method not found: %s", req.Method)}

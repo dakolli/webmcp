@@ -138,3 +138,42 @@ func (t *SessionList) Execute(ctx context.Context, args json.RawMessage) (string
 // Ensure both session tools satisfy the Tool interface at compile time.
 var _ Tool = (*SessionClose)(nil)
 var _ Tool = (*SessionList)(nil)
+
+// ManageSessionLifecyclePrompt is a co-located prompt definition for session management tools.
+type ManageSessionLifecyclePrompt struct{}
+
+// NewManageSessionLifecyclePrompt constructs the manage_session_lifecycle prompt template.
+func NewManageSessionLifecyclePrompt() *ManageSessionLifecyclePrompt {
+	return &ManageSessionLifecyclePrompt{}
+}
+
+// Name returns the prompt template name "manage_session_lifecycle".
+func (p *ManageSessionLifecyclePrompt) Name() string { return "manage_session_lifecycle" }
+
+// Description returns a description of the prompt template.
+func (p *ManageSessionLifecyclePrompt) Description() string {
+	return "Provides guidance for inspecting active sessions and releasing unused browser tabs."
+}
+
+// Arguments returns the parameter list accepted by the prompt template.
+func (p *ManageSessionLifecyclePrompt) Arguments() []models.PromptArgument {
+	return []models.PromptArgument{}
+}
+
+// GetMessages builds the prompt messages payload for the given argument map.
+func (p *ManageSessionLifecyclePrompt) GetMessages(args map[string]string) ([]models.PromptMessage, error) {
+	text := "Please audit open browser sessions:\n" +
+		"1. Call session_list to obtain active tab session_ids and URLs.\n" +
+		"2. Identify completed or inactive sessions.\n" +
+		"3. Call session_close with session_id for each stale tab to free browser resources."
+
+	return []models.PromptMessage{
+		{
+			Role:    "user",
+			Content: models.TextContent{Type: "text", Text: text},
+		},
+	}, nil
+}
+
+// Ensure ManageSessionLifecyclePrompt satisfies the Prompt interface at compile time.
+var _ Prompt = (*ManageSessionLifecyclePrompt)(nil)

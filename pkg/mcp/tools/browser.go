@@ -297,3 +297,47 @@ func (t *PageList) Execute(ctx context.Context, args json.RawMessage) (string, e
 
 // Ensure PageList satisfies the Tool interface at compile time.
 var _ Tool = (*PageList)(nil)
+
+// BrowserSetupAndEmulatePrompt is a co-located prompt definition for browser_create.
+type BrowserSetupAndEmulatePrompt struct{}
+
+// NewBrowserSetupAndEmulatePrompt constructs the browser_setup_and_emulate prompt template.
+func NewBrowserSetupAndEmulatePrompt() *BrowserSetupAndEmulatePrompt {
+	return &BrowserSetupAndEmulatePrompt{}
+}
+
+// Name returns the prompt template name "browser_setup_and_emulate".
+func (p *BrowserSetupAndEmulatePrompt) Name() string { return "browser_setup_and_emulate" }
+
+// Description returns a description of the prompt template.
+func (p *BrowserSetupAndEmulatePrompt) Description() string {
+	return "Provides guidance for initializing a browser session and setting up optional device emulation."
+}
+
+// Arguments returns the parameter list accepted by the prompt template.
+func (p *BrowserSetupAndEmulatePrompt) Arguments() []models.PromptArgument {
+	return []models.PromptArgument{
+		{Name: "device", Description: "Optional device preset to emulate (e.g. IPhoneX, IPadPro)", Required: false},
+	}
+}
+
+// GetMessages builds the prompt messages payload for the given argument map.
+func (p *BrowserSetupAndEmulatePrompt) GetMessages(args map[string]string) ([]models.PromptMessage, error) {
+	device := args["device"]
+	text := "Please set up a live browser session:\n" +
+		"1. Call browser_create to initialize the Chromium instance.\n" +
+		"2. Call fetch_page with target URL to open an initial tab."
+	if device != "" {
+		text += fmt.Sprintf("\n3. Call page_act with action: \"emulate\" and device: %q to apply device settings.", device)
+	}
+
+	return []models.PromptMessage{
+		{
+			Role:    "user",
+			Content: models.TextContent{Type: "text", Text: text},
+		},
+	}, nil
+}
+
+// Ensure BrowserSetupAndEmulatePrompt satisfies the Prompt interface at compile time.
+var _ Prompt = (*BrowserSetupAndEmulatePrompt)(nil)

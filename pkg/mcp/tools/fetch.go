@@ -254,3 +254,49 @@ func (t *Fetch) pageSummary(ctx context.Context, p *browsers.Page, loadStarted t
 
 // Ensure Fetch satisfies the Tool interface at compile time.
 var _ Tool = (*Fetch)(nil)
+
+// FetchAndSummarizePrompt is a co-located prompt definition for fetch_page.
+type FetchAndSummarizePrompt struct{}
+
+// NewFetchAndSummarizePrompt constructs the fetch_and_summarize prompt template.
+func NewFetchAndSummarizePrompt() *FetchAndSummarizePrompt {
+	return &FetchAndSummarizePrompt{}
+}
+
+// Name returns the prompt template name "fetch_and_summarize".
+func (p *FetchAndSummarizePrompt) Name() string { return "fetch_and_summarize" }
+
+// Description returns a description of the prompt template.
+func (p *FetchAndSummarizePrompt) Description() string {
+	return "Loads a web page and provides step-by-step instructions to read metadata and extract main content."
+}
+
+// Arguments returns the parameter list accepted by the prompt template.
+func (p *FetchAndSummarizePrompt) Arguments() []models.PromptArgument {
+	return []models.PromptArgument{
+		{Name: "url", Description: "Target web page URL to fetch and summarize", Required: true},
+	}
+}
+
+// GetMessages builds the prompt messages payload for the given argument map.
+func (p *FetchAndSummarizePrompt) GetMessages(args map[string]string) ([]models.PromptMessage, error) {
+	targetURL := args["url"]
+	if targetURL == "" {
+		targetURL = "https://example.com"
+	}
+	text := fmt.Sprintf("Please perform a token-efficient exploration of %s:\n"+
+		"1. Call fetch_page with url: %q and wait_for: \"idle\".\n"+
+		"2. Call page_fetch with session_id from step 1 and what: \"meta\".\n"+
+		"3. Call page_fetch with what: \"text\" and selector: \"main\" (or \"article\") to extract clean content.\n"+
+		"4. Summarize key findings for the user.", targetURL, targetURL)
+
+	return []models.PromptMessage{
+		{
+			Role:    "user",
+			Content: models.TextContent{Type: "text", Text: text},
+		},
+	}, nil
+}
+
+// Ensure FetchAndSummarizePrompt satisfies the Prompt interface at compile time.
+var _ Prompt = (*FetchAndSummarizePrompt)(nil)
