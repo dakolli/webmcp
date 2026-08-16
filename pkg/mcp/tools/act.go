@@ -19,6 +19,13 @@ import (
 // live page bound to this timeout before touching rod.
 const defaultActTimeout = 30 * time.Second
 
+// waitSleepMargin gives the wait action's "ms" sleep room to complete: the
+// sleep is bounded by timeout_ms, but the tool-call deadline would otherwise
+// be set to the same duration and fire first — the deadline timer is armed
+// before the sleep timer, so any pre-select latency (args parse, page lookup)
+// leaves the deadline with strictly less remaining time than the sleep.
+const waitSleepMargin = 5 * time.Second
+
 // Act implements the "page_act" tool: it interacts with a LIVE page that was
 // previously opened with fetch_page. The action enum covers the common fast
 // paths (click, input, type, navigate, back, forward, reload, hover, scroll,
@@ -182,8 +189,18 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 	// cannot block the server: default 30s, honoring timeout_ms from the
 	// caller. The derived ctx flows through the per-helper page clones and
 	// every rod call below.
+	//
+	// Exception: the wait action's "ms" mode (and its "" default) sleeps for
+	// exactly timeout_ms, so its tool deadline gets waitSleepMargin on top —
+	// without the margin the deadline timer (armed first) fires before the
+	// sleep timer and truncates the sleep with a misleading "context deadline
+	// exceeded". All other actions keep the timeout_ms-only binding.
 	timeout := defaultActTimeout
-	if a.TimeoutMS > 0 {
+	if a.Action == "wait" && (a.WaitMode == "" || a.WaitMode == "ms") {
+		if a.TimeoutMS > 0 {
+			timeout = time.Duration(a.TimeoutMS)*time.Millisecond + waitSleepMargin
+		}
+	} else if a.TimeoutMS > 0 {
 		timeout = time.Duration(a.TimeoutMS) * time.Millisecond
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
@@ -260,9 +277,9 @@ func (t *Act) actClick(ctx context.Context, p *browsers.Page, selector string) (
 	return fmt.Sprintf("clicked selector=%q", selector), nil
 }
 
-// actInput sets the value of the element matched by selector. rod's Input
-// focuses the element, clears its existing content and types the new value.
-// Returns a short confirmation for the LLM.
+// actInput sets the value of the element matched by selector: it selects all
+// existing text (el.SelectAllText) then types value via rod's Input, so the
+// field ends up exactly value. Returns a short confirmation for the LLM.
 func (t *Act) actInput(ctx context.Context, p *browsers.Page, selector, value string) (string, error) {
 	p.Lock()
 	defer p.Unlock()
@@ -276,6 +293,9 @@ func (t *Act) actInput(ctx context.Context, p *browsers.Page, selector, value st
 	if err != nil {
 		return "", fmt.Errorf("page_act.actInput: element %q: %w", selector, err)
 	}
+	if err := el.SelectAllText(); err != nil {
+		return "", fmt.Errorf("page_act.actInput: element %q: %w", selector, err)
+	}
 	if err := el.Input(value); err != nil {
 		return "", fmt.Errorf("page_act.actInput: element %q: %w", selector, err)
 	}
@@ -283,10 +303,10 @@ func (t *Act) actInput(ctx context.Context, p *browsers.Page, selector, value st
 }
 
 // actType types keystrokes into the element matched by selector without
-// clearing it — unlike actInput (rod's Input clears the field first), type is
-// Focus + InsertText: it focuses the element (scrolling it into view by user
-// gesture) and pastes value at the current caret position. Returns a short
-// confirmation for the LLM.
+// clearing it — unlike actInput (the input action selects all text first),
+// type is Focus + InsertText: it focuses the element (scrolling it into view
+// by user gesture) and pastes value at the current caret position. Returns a
+// short confirmation for the LLM.
 func (t *Act) actType(ctx context.Context, p *browsers.Page, selector, value string) (string, error) {
 	p.Lock()
 	defer p.Unlock()
@@ -510,8 +530,10 @@ func (t *Act) actSelect(ctx context.Context, p *browsers.Page, selector, value s
 // fetch_page ("load", "idle", "stable"), an element-level "interactable" mode
 // (requires selector), and the default "ms" mode — a ctx-aware sleep honoring
 // timeout_ms (default 30000) that lets in-flight requests and animations
-// settle before the next action. The "ms" sleep touches no rod state, so it
-// does not take the page lock; every rod-backed mode is fully locked.
+// settle before the next action. The "ms" sleep is bounded by timeout_ms plus
+// a waitSleepMargin (applied in Execute) so the tool deadline never truncates
+// the sleep itself. The "ms" sleep touches no rod state, so it does not take
+// the page lock; every rod-backed mode is fully locked.
 func (t *Act) actWait(ctx context.Context, p *browsers.Page, mode, selector string, timeoutMS int) (string, error) {
 	// Synchronized read (under p.mu, like every other nil guard): the eviction
 	// path can nil p.Rod concurrently, so the check must not run lock-free. The

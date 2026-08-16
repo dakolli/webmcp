@@ -384,14 +384,14 @@ func PageScreenshot(ctx context.Context, p *browsers.Page, fullPage bool) (strin
 // {url, type, size} entries, or — when target is non-empty — the full content
 // of exactly that one stylesheet. Mirrors the MCP extractCSS.
 func PageCSS(ctx context.Context, p *browsers.Page, target string) (string, error) {
-	return PageResources(ctx, p, target, proto.NetworkResourceTypeStylesheet)
+	return PageResources(ctx, p, target, "css", proto.NetworkResourceTypeStylesheet)
 }
 
 // PageJS returns the page's script resources: a JSON list of {url, type, size}
 // entries, or — when target is non-empty — the full content of exactly that one
 // script. Mirrors the MCP extractJS.
 func PageJS(ctx context.Context, p *browsers.Page, target string) (string, error) {
-	return PageResources(ctx, p, target, proto.NetworkResourceTypeScript)
+	return PageResources(ctx, p, target, "js", proto.NetworkResourceTypeScript)
 }
 
 // PageResources is the shared backend of PageCSS and PageJS. It enumerates the
@@ -405,9 +405,13 @@ func PageJS(ctx context.Context, p *browsers.Page, target string) (string, error
 //     by PageTruncate (re-request with --what css|js --target <url> for full
 //     content).
 //
+// what is the tool's own what value for the kind ("css" or "js"); it is used
+// in the hint so the suggested re-request uses a valid enum value (the CDP
+// resource type string, e.g. "Stylesheet", is not part of the what enum).
+//
 // The per-page mutex is held for the whole extraction because rod pages are
 // not thread-safe. Mirrors the MCP extractResources.
-func PageResources(ctx context.Context, p *browsers.Page, target string, kind proto.NetworkResourceType) (string, error) {
+func PageResources(ctx context.Context, p *browsers.Page, target, what string, kind proto.NetworkResourceType) (string, error) {
 	p.Lock()
 	defer p.Unlock()
 	if p.Rod == nil {
@@ -443,7 +447,7 @@ func PageResources(ctx context.Context, p *browsers.Page, target string, kind pr
 	// dehydration convention: "first 50KB; use what=css&target=URL to fetch
 	// more").
 	return string(b) + "\n// hint: to fetch one resource's full content, re-request with what=" +
-		strings.ToLower(string(kind)) + "&target=<url>", nil
+		what + "&target=<url>", nil
 }
 
 // collectResources walks the resource tree depth-first, appending every
@@ -808,9 +812,10 @@ func PageClick(ctx context.Context, p *browsers.Page, selector string) (string, 
 	return fmt.Sprintf("clicked selector=%q", selector), nil
 }
 
-// PageInput sets the value of the element matched by selector. rod's Input
-// focuses the element, clears its existing content and types the new value.
-// Returns the same confirmation string as the MCP page_act input.
+// PageInput sets the value of the element matched by selector: it selects all
+// existing text (el.SelectAllText) then types value via rod's Input, so the
+// field ends up exactly value. Returns the same confirmation string as the MCP
+// page_act input.
 func PageInput(ctx context.Context, p *browsers.Page, selector, value string) (string, error) {
 	p.Lock()
 	defer p.Unlock()
@@ -824,6 +829,9 @@ func PageInput(ctx context.Context, p *browsers.Page, selector, value string) (s
 	if err != nil {
 		return "", fmt.Errorf("input: element %q: %w", selector, err)
 	}
+	if err := el.SelectAllText(); err != nil {
+		return "", fmt.Errorf("input: element %q: %w", selector, err)
+	}
 	if err := el.Input(value); err != nil {
 		return "", fmt.Errorf("input: element %q: %w", selector, err)
 	}
@@ -831,10 +839,10 @@ func PageInput(ctx context.Context, p *browsers.Page, selector, value string) (s
 }
 
 // PageType types keystrokes into the element matched by selector without
-// clearing it — unlike PageInput (rod's Input clears the field first), type is
-// Focus + InsertText: it focuses the element (scrolling it into view by user
-// gesture) and pastes value at the current caret position. Returns the same
-// confirmation string as the MCP page_act type.
+// clearing it — unlike PageInput (the input action selects all text first),
+// type is Focus + InsertText: it focuses the element (scrolling it into view
+// by user gesture) and pastes value at the current caret position. Returns the
+// same confirmation string as the MCP page_act type.
 func PageType(ctx context.Context, p *browsers.Page, selector, value string) (string, error) {
 	p.Lock()
 	defer p.Unlock()

@@ -27,6 +27,14 @@ const defaultMaxBytes = 50_000
 // server. Every extraction inherits this bound via p.Rod.Context(ctx).
 const defaultPageTimeout = 30 * time.Second
 
+// fullPageScreenshotTimeout bounds a full_page screenshot capture. A full-page
+// capture scrolls, composites and encodes a potentially very tall image, which
+// can exceed the 30s per-call default on heavy pages; this dedicated budget is
+// decoupled from the caller's deadline (via context.WithoutCancel) so a heavy
+// capture gets room, while a genuinely wedged page still fails at 90s (no
+// infinite block). Viewport-only captures keep the 30s default.
+const fullPageScreenshotTimeout = 90 * time.Second
+
 // Page implements the "page_fetch" tool: it reads any aspect of a LIVE page
 // that was previously opened with fetch_page. The session_id from fetch_page
 // identifies which browser tab to read; what selects the aspect:
@@ -62,8 +70,10 @@ func (t *Page) Description() string {
 		"returned by fetch_page plus what=<aspect>; use selector to scope " +
 		"extraction, target to fetch exactly one css/js resource's full content " +
 		"(instead of the resource list), full_page to capture the whole " +
-		"scrollable page in a screenshot (default: visible viewport), and " +
-		"max_bytes to cap the response size."
+		"scrollable page in a screenshot (default: visible viewport; full-page " +
+		"captures of tall/heavy pages get an extended internal budget of ~90s " +
+		"and may still time out on extreme pages), and max_bytes to cap the " +
+		"response size."
 }
 
 // InputSchema returns the JSON Schema for page_fetch's arguments: a required
@@ -93,7 +103,7 @@ func (t *Page) InputSchema() models.InputSchema {
 			"full_page": map[string]any{
 				"type":        "boolean",
 				"default":     false,
-				"description": "Capture the entire scrollable page instead of the visible viewport.",
+				"description": "Capture the entire scrollable page instead of the visible viewport. Tall/heavy pages get an extended internal capture budget (~90s) and may still time out on extreme pages.",
 			},
 			"target": map[string]any{
 				"type":        "string",
@@ -586,7 +596,7 @@ func rareString(strs []string, rd *proto.DOMSnapshotRareStringData, i int) strin
 // of exactly that one stylesheet. Backed by proto.PageGetResourceTree
 // enumeration + p.Rod.GetResource(url).
 func (t *Page) extractCSS(ctx context.Context, p *browsers.Page, target string) (string, error) {
-	return t.extractResources(ctx, p, target, proto.NetworkResourceTypeStylesheet)
+	return t.extractResources(ctx, p, target, "css", proto.NetworkResourceTypeStylesheet)
 }
 
 // extractJS returns the page's script resources: a JSON list of
@@ -594,7 +604,7 @@ func (t *Page) extractCSS(ctx context.Context, p *browsers.Page, target string) 
 // of exactly that one script. Backed by proto.PageGetResourceTree enumeration
 // + p.Rod.GetResource(url).
 func (t *Page) extractJS(ctx context.Context, p *browsers.Page, target string) (string, error) {
-	return t.extractResources(ctx, p, target, proto.NetworkResourceTypeScript)
+	return t.extractResources(ctx, p, target, "js", proto.NetworkResourceTypeScript)
 }
 
 // extractResources is the shared backend of extractCSS and extractJS. It
@@ -607,9 +617,13 @@ func (t *Page) extractJS(ctx context.Context, p *browsers.Page, target string) (
 //   - without target: the JSON list of matching resources, capped downstream
 //     by truncate (re-request with what=css&target=URL for full content).
 //
+// what is the tool's own what value for the kind ("css" or "js"); it is used
+// in the hint so the suggested re-request uses a valid enum value (the CDP
+// resource type string, e.g. "Stylesheet", is not part of the what enum).
+//
 // The per-page mutex is held for the whole extraction because rod pages are
 // not thread-safe.
-func (t *Page) extractResources(ctx context.Context, p *browsers.Page, target string, kind proto.NetworkResourceType) (string, error) {
+func (t *Page) extractResources(ctx context.Context, p *browsers.Page, target, what string, kind proto.NetworkResourceType) (string, error) {
 	p.Lock()
 	defer p.Unlock()
 
@@ -644,7 +658,7 @@ func (t *Page) extractResources(ctx context.Context, p *browsers.Page, target st
 	// to fetch a single resource's full content (AGENTS.md dehydration
 	// convention: "first 50KB; use what=css&target=URL to fetch more").
 	return string(b) + "\n// hint: to fetch one resource's full content, re-request with what=" +
-		strings.ToLower(string(kind)) + "&target=<url>", nil
+		what + "&target=<url>", nil
 }
 
 // collectResources walks the resource tree depth-first, appending every
@@ -724,7 +738,21 @@ func (t *Page) extractScreenshot(ctx context.Context, p *browsers.Page, fullPage
 		return "", fmt.Errorf("page session is closed")
 	}
 
-	b, err := p.Rod.Context(ctx).Screenshot(fullPage, nil)
+	// A full-page capture scrolls the whole page, composites the tiles and
+	// encodes a large PNG, so a tall/heavy page can exceed the 30s per-call
+	// budget. Give it a dedicated, longer bound decoupled from the caller's
+	// deadline: context.WithoutCancel keeps the value chain but drops the 30s
+	// cancellation, and WithTimeout caps the capture at
+	// fullPageScreenshotTimeout. Viewport-only captures keep the caller's ctx
+	// and its 30s bound.
+	captureCtx := ctx
+	if fullPage {
+		var cancel context.CancelFunc
+		captureCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), fullPageScreenshotTimeout)
+		defer cancel()
+	}
+
+	b, err := p.Rod.Context(captureCtx).Screenshot(fullPage, nil)
 	if err != nil {
 		return "", fmt.Errorf("capture screenshot (full_page=%t): %w", fullPage, err)
 	}

@@ -26,6 +26,15 @@ const defaultTTL = 15 * time.Minute
 // background sweeper, so a single hung tab cannot stall the sweep loop.
 const closePageTimeout = 30 * time.Second
 
+// teardownBudget bounds the WHOLE Browser.Close teardown (all per-page closes
+// plus the browser close, sharing one deadline) and each ClosePage call: N
+// stuck pages × a per-close timeout would blow any single call deadline, which
+// is why probe-based self-heal appeared hung (WEB-72). 10s keeps the entire
+// teardown inside a 30s tool-call deadline with room for the manager's 2s
+// liveness probes. Sweeper per-page closes keep closePageTimeout — the sweep is
+// background and never holds a request deadline.
+const teardownBudget = 10 * time.Second
+
 // probeTimeout bounds every liveness probe (browser-level and per-page): rod
 // has no auto-reconnect, so on a dead CDP websocket a Call blocks until its
 // ctx deadline. Probes therefore always derive a short timeout off the caller's
