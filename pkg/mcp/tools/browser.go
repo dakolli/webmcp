@@ -38,7 +38,11 @@ func (t *BrowserCreate) Description() string {
 	return "Lazily launches the shared live browser (Brave by default, or Chromium) and " +
 		"returns its browser_id (browser-1). Reuses browser-1 idempotently when running. " +
 		"Uses persistent user profile at ~/.config/browser-mcp/profiles/<browser_name> for browser-1; " +
-		"secondary instances run in ephemeral mode to prevent profile directory bloat."
+		"secondary instances run in ephemeral mode to prevent profile directory bloat. " +
+		"Passing any option (headless, profile, bin, …) creates a NEW browser id rather than " +
+		"reusing browser-1, and fails with a Chromium SingletonLock error if another running " +
+		"browser holds the same profile — pass a distinct profile name per browser. " +
+		"Example: { \"headless\": true, \"profile\": \"audit\" }."
 }
 
 // InputSchema returns the JSON Schema for browser_create's arguments: optional
@@ -212,7 +216,9 @@ func (t *BrowserClose) Name() string {
 func (t *BrowserClose) Description() string {
 	return "Closes the live browser and all of its open pages, releasing the " +
 		"underlying Chromium process. Pass browser_id to close a specific browser, " +
-		"or omit to close all browsers."
+		"or omit to close all browsers. An unknown browser_id returns a not-found " +
+		"error listing the running ids — call browser_list first to confirm ids. " +
+		"Example: { \"browser_id\": \"browser-1\" } (omit to close all)."
 }
 
 // InputSchema returns the JSON Schema for browser_close's arguments: an optional browser_id.
@@ -276,7 +282,9 @@ func (t *PageList) Name() string {
 func (t *PageList) Description() string {
 	return "Lists all open pages (id, url) of the given browser as a JSON " +
 		"array. Use it to see which sessions/tabs are still open inside the " +
-		"browser before closing them with session_close."
+		"browser before closing them with session_close. An unknown browser_id " +
+		"returns a not-found error listing the running ids. " +
+		"Example: { \"browser_id\": \"browser-1\" }."
 }
 
 // InputSchema returns the JSON Schema for page_list's arguments: a required
@@ -300,10 +308,9 @@ type pageListArgs struct {
 	BrowserID string `json:"browser_id"`
 }
 
-// Execute validates the browser_id, ensures the browser is open via
-// Manager.Open, and returns its pages as an indented JSON array via
-// Browser.Pages. This is thin glue around Manager.Open -> Browser.Pages and is
-// implemented fully (no browser work lives here).
+// Execute validates the browser_id, resolves it against the manager's live
+// browsers (without launching one), and returns its pages as an indented JSON
+// array via Browser.Pages.
 func (t *PageList) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var a pageListArgs
 	if err := json.Unmarshal(args, &a); err != nil {
@@ -312,10 +319,7 @@ func (t *PageList) Execute(ctx context.Context, args json.RawMessage) (string, e
 	if a.BrowserID == "" {
 		return "", fmt.Errorf("page_list: missing required argument %q", "browser_id")
 	}
-	// TODO(web-mcp): the id is accepted/validated but the Manager owns a single
-	// Browser (AGENTS.md browser-first paradigm); multi-browser support will
-	// resolve it against a browser_id → Browser map instead.
-	b, err := t.mgr.Open(ctx) // lazily launches (or returns) the single Browser
+	b, err := t.mgr.Browser(browsers.BrowserID(a.BrowserID))
 	if err != nil {
 		return "", fmt.Errorf("page_list: %w", err)
 	}

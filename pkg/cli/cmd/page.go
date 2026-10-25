@@ -42,7 +42,7 @@ first and reads the aspect in one go.
 
 Subcommands:
   list   List the browser's open pages (id, url)
-  fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, console); a URL opens a new page first
+  fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, console, article, marks); a URL opens a new page first
   act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate, clear_logs)
   close  Close an open page
 
@@ -116,11 +116,12 @@ which sessions are still alive before acting on or closing them.`,
 
 // newPageFetchCmd builds `page fetch`: it extracts an aspect of a live page
 // (html, text, links, meta, dom, css, js, screenshot, interactives, a11y,
-// network, console) and prints it, truncating to --max-bytes on a UTF-8 rune
-// boundary. Screenshots, interactives, a11y, network and console are the
-// exceptions: the base64 data-URI (screenshot) and the machine-parseable JSON
-// envelopes (interactives, a11y, network, console) bypass truncation (see
-// RunE).
+// network, console, article, marks) and prints it, truncating to --max-bytes on
+// a UTF-8 rune boundary. Screenshots, interactives, a11y, network, console,
+// article and marks are the exceptions: the base64 data-URI (screenshot),
+// the machine-parseable JSON envelopes (interactives, a11y, network, console),
+// the self-capped article markdown and the marks screenshot data-URI bypass
+// truncation (see RunE).
 func newPageFetchCmd(mgr *browsers.Manager) *cobra.Command {
 	var (
 		id       string
@@ -135,7 +136,8 @@ func newPageFetchCmd(mgr *browsers.Manager) *cobra.Command {
 		Use:   "fetch [id|url] [what]",
 		Short: "Extract an aspect of a live page",
 		Long: `Extracts an aspect of a live page (html, text, links, meta, dom, css,
-js, screenshot, interactives, a11y, network, console) and prints it. The page id is optional when
+js, screenshot, interactives, a11y, network, console, article, marks) and prints
+it. The page id is optional when
 only one page is open; 'last' means the most recently opened page; a bare number
 resolves to page-N. A URL in the [id] slot opens a NEW page for it first —
 creating the browser if needed, exactly like 'web-cli fetch <url>' — and then
@@ -147,7 +149,8 @@ dance).
   [url]   an absolute URL (contains "://") to open in a new page first, then
           extract the aspect — mirrors 'web-cli fetch <url>' (wait: idle)
   [what]  the aspect to extract: html, text, links, meta, dom, css, js,
-          screenshot, interactives, a11y, network, console (default: text)
+          screenshot, interactives, a11y, network, console, article, marks
+          (default: text)
 
   --id <session>     the page/session id (the positional [id] wins when both
                      are given; never treated as a URL)
@@ -158,17 +161,24 @@ dance).
                      of the {url,type,size} list (with --what css|js)
   --full-page        capture the entire scrollable page (screenshot only)
   --max-bytes <n>    cap output size (default 50000; screenshots,
-                     interactives, a11y, network and console are never truncated)
+                     interactives, a11y, network, console, article and marks
+                     are never truncated)
 
-links, meta, dom, interactives, a11y, network, console and the css/js lists print
-JSON, mirroring the MCP page_fetch shapes. Screenshots print a
-data:image/png;base64,... data-URI. network/console emit
+links, meta, dom, interactives, a11y, network, console, article and marks print
+JSON, mirroring the MCP page_fetch shapes. article is the readable prose body as
+markdown ({title, byline?, excerpt?, text, words, truncated, url}); prefer it
+over text when you want the article rather than the whole page. marks is the
+numbered overlay ({marks:[{index, role, text?, x, y, width, height}], screenshot,
+viewport_width, viewport_height, truncated}) whose x/y feed 'page act click_at'.
+Screenshots print a data:image/png;base64,... data-URI. network/console emit
 {entries,count,dropped,truncated} over the newest 100 buffered entries; capture is
 cumulative from page creation, so clear with 'page act clear_logs' right before the
 step you want to observe, then filter client-side.`,
 		Example: `  web-cli page fetch links                              # single open page → its links
   web-cli page fetch 12 dom                             # page-12's DOM tree
   web-cli page fetch 12 text --selector ".article"      # scoped text extraction
+  web-cli page fetch 12 article                         # readable body as markdown
+  web-cli page fetch 12 marks                           # numbered boxes + annotated screenshot
   web-cli page fetch last screenshot --full-page        # full-page capture of the latest page
   web-cli page fetch last a11y                          # semantic roles + names + handles
   web-cli page fetch last network  # last 100 network requests + dropped count
@@ -196,9 +206,9 @@ step you want to observe, then filter client-side.`,
 			}
 
 			switch what {
-			case "html", "text", "links", "meta", "dom", "css", "js", "screenshot", "interactives", "a11y", "network", "console":
+			case "html", "text", "links", "meta", "dom", "css", "js", "screenshot", "interactives", "a11y", "network", "console", "article", "marks":
 			default:
-				return fmt.Errorf("page fetch: unknown what=%q (must be one of html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console)", what)
+				return fmt.Errorf("page fetch: unknown what=%q (must be one of html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, article, marks)", what)
 			}
 
 			// Fail-fast switch passed: forward to a live serve process when one
@@ -284,6 +294,10 @@ step you want to observe, then filter client-side.`,
 				out, err = pageops.PageNetwork(ctx, p)
 			case "console":
 				out, err = pageops.PageConsole(ctx, p)
+			case "article":
+				out, err = pageops.PageArticle(ctx, p)
+			case "marks":
+				out, err = pageops.PageMarks(ctx, p)
 			}
 			if err != nil {
 				return fmt.Errorf("page fetch: %w", err)
@@ -298,9 +312,14 @@ step you want to observe, then filter client-side.`,
 			// MaxInteractives / MaxA11yNodes / MaxLogEmit cap) plus, for the
 			// logs, the "dropped" ring-overflow counter — not a byte cut.
 			// Truncating would emit invalid JSON plus a misleading "narrow the
-			// selector" hint. Mirrors the MCP page_fetch truncation exception.
+			// selector" hint. Article and marks bypass it for the same reason:
+			// article self-caps at browsers.MaxArticleRunes and reports it
+			// through "truncated", while marks carries an annotated screenshot
+			// data-URI that a byte cut would corrupt. Mirrors the MCP page_fetch
+			// truncation exception.
 			if what == "screenshot" || what == "interactives" || what == "a11y" ||
-				what == "network" || what == "console" {
+				what == "network" || what == "console" || what == "article" ||
+				what == "marks" {
 				fmt.Println(out)
 				return nil
 			}
@@ -309,7 +328,7 @@ step you want to observe, then filter client-side.`,
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to fetch (optional with one page open; 'last'; or a bare number)")
-	cmd.Flags().StringVar(&what, "what", "", "aspect to extract: html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console (default text)")
+	cmd.Flags().StringVar(&what, "what", "", "aspect to extract: html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, article, marks (default text)")
 	cmd.Flags().StringVar(&selector, "selector", "", "optional CSS selector scoping html/text extraction")
 	cmd.Flags().StringVar(&target, "target", "", "resource URL to fetch exactly one css/js resource's content (with --what css|js)")
 	cmd.Flags().BoolVar(&fullPage, "full-page", false, "capture the entire scrollable page instead of the visible viewport (screenshot only)")
@@ -465,6 +484,8 @@ you want to observe, then run 'page fetch last network|console' and filter clien
 				return fmt.Errorf("page act: %w", err)
 			}
 
+			before, stateErr := pageops.PageStateOf(ctx, p)
+
 			var out string
 			switch action {
 			case "click":
@@ -518,6 +539,10 @@ you want to observe, then run 'page fetch last network|console' and filter clien
 			}
 			if err != nil {
 				return fmt.Errorf("page act: %w", err)
+			}
+			if stateErr == nil {
+				after := pageops.PageStateAfterAct(ctx, p, action, before)
+				out += pageops.ActStateDeltaFor(action, before, after)
 			}
 			fmt.Println(out)
 			return nil

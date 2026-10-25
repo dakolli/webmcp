@@ -29,11 +29,11 @@ Drive Chromium via MCP tools using stateful sessions, structured DOM/text extrac
 |---|---|---|
 | `browser_create` | `{ bin?: string, profile?: string, headless?: boolean, stealth?: boolean, position?: "left"\|"right"\|"max"\|"normal" }` | Launches a browser instance. Returns `{ browser_id }`. Omit all options to reuse `browser-1`. |
 | `browser_list` | `{}` | Lists all active browsers and their pages. |
-| `browser_close` | `{ browser_id: string }` | Terminates Chromium instance and all open tabs. |
-| `fetch_page` | `{ url: string, wait_for: "load"\|"idle"\|"stable", timeout_ms?: number, viewport?: { width, height }, device?: string, user_agent?: string }` | Opens URL in a new tab. **Always pass `wait_for`** — an omitted value currently fails with `invalid wait option ""` (the schema's `idle` default is advisory only). **Avoid `wait_for: "idle"`** — the idle network-wait hangs on JS-heavy sites (bot WAFs, trackers, infinite polling) and stalls the call. Prefer `"load"` or `"stable"`. Pass `device` (e.g. `"IPhoneX"`) to apply emulation *before* navigation. Returns `{ session_id, title, url, text_snippet, html_bytes, load_ms }`. |
+| `browser_close` | `{ browser_id?: string }` | Terminates that Chromium instance and all its open tabs, or every browser when `browser_id` is empty. An unknown id fails with `browser "browser-42" not found (running: browser-1)`. |
+| `fetch_page` | `{ url: string, browser_id?: string, wait_for?: "load"\|"idle"\|"stable", timeout_ms?: number, viewport?: { width, height }, device?: string, user_agent?: string }` | Opens URL in a new tab. `wait_for` defaults to `"idle"` when omitted. On JS-heavy sites (bot WAFs, trackers, infinite polling) the idle network-wait can stall, so pass `"load"` or `"stable"` there. Pass `device` (e.g. `"IPhoneX"`) to apply emulation *before* navigation. Returns `{ session_id, title, url, text_snippet, html_bytes, load_ms }`. |
 | `session_list` | `{}` | Lists live sessions as `[{ id, url }]` (today: the default browser's pages only). |
 | `session_close` | `{ session_id: string }` | Closes tab and invalidates `session_id`. |
-| `page_list` | `{ browser_id: string }` | Lists open pages. **`browser_id` is accepted but currently ignored** — it lists the default browser. |
+| `page_list` | `{ browser_id: string }` | Lists the open pages of that browser. `browser_id` is required. An unknown id fails with `browser "browser-42" not found (running: browser-1)`. |
 
 ### 2. Inspection Tool: `page_fetch`
 
@@ -42,8 +42,8 @@ Extracts data from a live session without mutating state.
 ```
 page_fetch {
   session_id: string,
-  what: "meta" | "text" | "links" | "dom" | "html" | "css" | "js" | "screenshot" | "interactives" | "a11y" | "network" | "console",
-  selector?: string,     // Scopes "text", "html", or "dom" to a CSS selector
+  what: "meta" | "text" | "links" | "dom" | "html" | "css" | "js" | "screenshot" | "interactives" | "a11y" | "network" | "console" | "article" | "marks",
+  selector?: string,     // Scopes "text" or "html" to a CSS selector
   max_bytes?: number,    // Response payload cap in bytes (default: 50000)
   target?: string,       // Specific URL when what="css"|"js" to fetch file content
   full_page?: boolean    // For what="screenshot", capture entire scrollable page
@@ -57,11 +57,13 @@ page_fetch {
 - `a11y`: **The semantic map.** `{ nodes: [{ handle?, depth, role, name?, value?, states? }], count, truncated }` — the accessibility tree in DFS order, flattened: computed `role` (button, textbox, link, heading, …), accessible `name` (from aria-label/label/content), `value` (inputs), `depth` (0 = root), and `states` holding only the flags whose value is true, among checked, expanded, selected, disabled, required, pressed, invalid, focused (`flag=mixed` for a mixed value). Capped at 400 (the rest counted in `truncated`), never byte-truncated. Text-fragment roles (StaticText, InlineTextBox, paragraph, code, …) and unnamed images are omitted, and `name`/`value` are clipped at 200 runes — use `text` for prose. DOM-backed nodes carry `handle` (`g<document>-b<backendNodeId>`) usable as `page_act`'s `handle`. Root frame only — iframes are separate trees. Use this to answer "what IS this control" rather than "where is it".
 - `network`: **Request truth.** `{ entries: [{ method, url, type?, status?, mime?, bytes?, ms?, failed?, error?, seq }], count, dropped, truncated }` — observed requests/responses. `entries` is the newest 100 buffered entries in chronological order; `dropped` counts true loss to the 200-entry ring, `truncated` counts buffered older entries left out. Never byte-truncated. `data:` URLs are skipped; `url`, `error` and `text` are clipped at 300, 200 and 500 bytes. Capture is **cumulative from page creation**, so call `page_act` `clear_logs` right before the step whose traffic you want, then filter client-side.
 - `console`: **Log truth.** Same envelope over `{ level, text, source?, line?, seq }` — `console.*` calls, uncaught exceptions, and browser log entries. Cumulative from page creation; same `clear_logs`-before-observe recipe.
-- `dom`: Compact structured tree of DOM nodes with tags, attributes, visibility, and bounding boxes; covers every document and iframe, including shadow DOM. Node shape: `{ tag, id?, class?, attrs?, text?, handle?, visible?, bounds?, frame_url?, children? }`; every element node carries `handle` (`g<document>-b<backendNodeId>`). Always set `max_bytes` or scope with `selector`.
+- `article`: **The prose, not the chrome.** `{ title, byline?, excerpt?, text, words, truncated, url }` — the densest `article`/`main`/`section` root rendered as markdown (headings, paragraphs, lists, code, quotes, links, images, tables), with nav/aside/footer/header/forms/scripts stripped and relative URLs made absolute. `text` holds the markdown body; `words` counts it; `text` is capped at 40000 runes and `truncated: true` says the cut happened. **Prefer `article` over `text` for articles, blog posts, docs and README-style pages** — `text` returns every visible string, boilerplate included. `selector`, `target` and `full_page` are ignored. Never byte-truncated (it reports its own `truncated`).
+- `marks`: **Numbered boxes for coordinate clicking.** `{ marks: [{ index, role, text?, x, y, width, height }], screenshot, viewport_width, viewport_height, truncated }` — draws one numbered box over every visible interactive element, captures the annotated viewport as a base64 PNG data-URI, then removes the overlay again (the page is left unchanged). `x`/`y` are the box's top-left and `width`/`height` its size, all in viewport CSS px, so pass `x + width/2`, `y + height/2` to `page_act` `click_at`. Capped at the first 60 marks, with `truncated` counting the remainder. Use it when the action map is ambiguous (icon-only buttons, canvas/custom widgets) or when you want to see what you are about to click. Never byte-truncated (the screenshot must stay decodable).
+- `dom`: Compact structured tree of DOM nodes with tags, attributes, visibility, and bounding boxes; covers every document and iframe, including shadow DOM. Node shape: `{ tag, id?, class?, attrs?, text?, handle?, visible?, bounds?, frame_url?, children? }`; every element node carries `handle` (`g<document>-b<backendNodeId>`). `selector` does not apply. Always set `max_bytes`.
 - `html`: Outer HTML markup. Use `selector` to avoid context explosion on large pages.
 - `css` / `js`: Lists loaded resource URLs with sizes; `size` is nullable. Re-request with `target: "<url>"` to read raw stylesheet/script contents.
 - `screenshot`: Returns base64 PNG data-URI; `full_page: true` captures the whole scrollable page (MCP gives that a 90s budget).
-- **Truncation**: `dom`, `links`, `meta`, and the css/js list are cut at `max_bytes` and can end mid-JSON. `interactives`, `a11y`, `network`, `console`, and `screenshot` are never truncated (network/console signal incompleteness through `truncated` + `dropped`).
+- **Truncation**: `dom`, `links` and `meta` stay parseable JSON at every size. When the result does not fit `max_bytes`, they return a JSON envelope that carries `truncated: true`, the applied `max_bytes`, and `omitted` — the number of entries that were dropped. Array aspects (`links`) return `{ items, omitted, truncated, max_bytes }`. Object aspects (`dom`, `meta`) keep their fields and trim the first array field. Raise `max_bytes` to see the whole result. `selector` does not apply to these three. `html`, `text` and the css/js list are cut at `max_bytes` as plain text. `interactives`, `a11y`, `network`, `console`, `article`, `marks`, and `screenshot` are never truncated. `interactives`, `a11y` and `article` report their own `truncated`. `network` and `console` signal incompleteness through `truncated` + `dropped`. `marks` carries a base64 screenshot.
 
 
 ### 3. Interaction Tool: `page_act`
@@ -95,7 +97,44 @@ page_act {
 { "tool": "page_act", "arguments": { "session_id": "page-1", "action": "click", "handle": "g3k9x2ab-b6" } }
 ```
 
+**Required arguments.** `page_act` checks its arguments before it touches the page and fails fast with a one-line hint.
+
+- `click`, `input`, `type`, `hover`, `select` and `upload_file` require `selector` or `handle`. A missing one fails with `page_act: click requires selector (or a handle from page_fetch what=interactives)`.
+- `click_at` and `hover_at` require both `x` and `y`. A missing one fails with `page_act: click_at requires x and y coordinates (e.g. {"action":"click_at","x":100,"y":200})`.
+- `eval` requires `value` (JavaScript function source).
+- `navigate` requires `value` (the target URL).
+- `set_viewport` requires `viewport`, and `emulate` requires `device`.
+
+**State delta.** When an action changes the page address or title, the result gains one final line. Only the fields that changed appear. A click that navigates reports the new destination:
+
+```json
+{ "tool": "page_act", "arguments": { "session_id": "page-1", "action": "click", "selector": "a.next" } }
+```
+
+```
+clicked selector="a.next"
+→ url=https://example.com/next title="Next page"
+```
+
+Nothing is added when the page did not change. `navigate` never adds the line because it reports the destination itself.
+
 **Observe one step.** Network/console capture is cumulative from page creation. To attribute traffic or logs to a single action: `page_act` `clear_logs` (returns `{"network":N,"console":M}`) → perform the action → `page_fetch` `what: "network"` / `"console"` → filter client-side.
+
+---
+
+## MCP Prompt Templates
+
+`prompts/list` returns five prompt templates. They are templates, not tools: each one returns a short step-by-step message that tells an agent which tools to call. They take no page state of their own.
+
+| Prompt | Purpose | Arguments |
+|---|---|---|
+| `fetch_and_summarize` | Open one URL, read `meta` and `text`, then summarize the page. | `url` (required) |
+| `inspect_page_decomposition` | Decompose a live session into `meta`, `links` and `dom`. | `session_id` (required) |
+| `form_search_and_submit` | Fill a search or form field, submit it, and wait for the result. | `session_id` and `search_query` (required), `selector` (optional) |
+| `browser_setup_and_emulate` | Create a browser, open a page, and apply an optional device preset. | `device` (optional) |
+| `manage_session_lifecycle` | Audit live sessions and close the stale ones. | none |
+
+Call `prompts/get` with the prompt name and its arguments to receive the message. The prompt only guides the workflow. You still run `fetch_page`, `page_fetch` and `page_act` yourself.
 
 ---
 
@@ -105,7 +144,7 @@ page_act {
 
 Never fetch unscoped raw HTML on modern web pages (many pages exceed 2MB). Use this 3-step sequence:
 
-1. **Open Page** (always pass `wait_for` — omitting it fails; never use `"idle"` — it hangs on JS-heavy/WAF pages):
+1. **Open Page** (`wait_for` defaults to `"idle"`. Pass `"stable"` on JS-heavy/WAF pages because the idle network-wait can stall):
    ```json
    { "tool": "fetch_page", "arguments": { "url": "https://example.com", "wait_for": "stable", "timeout_ms": 15000 } }
    ```
@@ -206,6 +245,32 @@ Test mobile rendering or bypass desktop-specific layouts:
 { "tool": "page_act", "arguments": { "session_id": "page-1", "action": "emulate", "device": "IPhoneX" } }
 { "tool": "page_act", "arguments": { "session_id": "page-1", "action": "set_viewport", "viewport": { "width": 375, "height": 812 } } }
 { "tool": "page_act", "arguments": { "session_id": "page-1", "action": "emulate", "device": "clear" } }
+```
+
+### 7. Read an Article as Markdown
+
+Use `article` instead of `text` when you want the readable body of a blog post, docs page or news story without nav/footer/ads.
+
+1. Open the page (`fetch_page`, `wait_for: "stable"`).
+2. Read the body: `page_fetch { what: "article" }` → `{ title, byline?, excerpt?, text, words, truncated, url }`, where `text` is markdown.
+3. Cite from `url`/`byline`. If `truncated` is `true` the body exceeded 40000 runes. Continue with a scoped `html`/`text` fetch for the part you still need.
+
+```json
+{ "tool": "page_fetch", "arguments": { "session_id": "page-1", "what": "article" } }
+```
+
+### 8. Click by Number with Marks
+
+Use `marks` when selectors are unreliable (icon-only buttons, canvas widgets) or when you want to see the target before clicking.
+
+1. Capture: `page_fetch { what: "marks" }` → `{ marks, screenshot, viewport_width, viewport_height, truncated }`. The screenshot is an annotated base64 PNG. `marks` is the table.
+2. Pick a mark by `role`/`text`, or by its number in the screenshot.
+3. Click its center: the box is `x`/`y` (top-left) plus `width`/`height`, all in viewport CSS px, so `click_at` takes `x + width/2`, `y + height/2`.
+4. After any navigation, scroll or layout change the boxes are stale — re-fetch `marks`. At most 60 marks are drawn; `truncated` counts the rest, so scroll and re-fetch for the remainder.
+
+```json
+{ "tool": "page_fetch", "arguments": { "session_id": "page-1", "what": "marks" } }
+{ "tool": "page_act", "arguments": { "session_id": "page-1", "action": "click_at", "x": 164, "y": 64 } }
 ```
 
 ---

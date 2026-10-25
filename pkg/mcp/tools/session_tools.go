@@ -34,7 +34,9 @@ func (t *SessionClose) Description() string {
 	return "Closes a live browser session opened by fetch_page, releasing its " +
 		"browser tab. Call this when you are done with a page to free memory; " +
 		"the session_id becomes invalid afterwards. Use session_list to see " +
-		"which sessions are still open."
+		"which sessions are still open. If no browser is running this may launch " +
+		"one with default options; call browser_create first when you want to " +
+		"control launch options. Example: { \"session_id\": \"page-1\" }."
 }
 
 // InputSchema returns the JSON Schema for session_close's arguments: a required
@@ -109,7 +111,9 @@ func (t *SessionList) Name() string {
 func (t *SessionList) Description() string {
 	return "Lists all live browser sessions (id, url, title, timestamps) as a " +
 		"JSON array. Use it to see which fetch_page sessions are still open " +
-		"before closing them with session_close."
+		"before closing them with session_close. If no browser is running this " +
+		"may launch one with default options; call browser_create first when you " +
+		"want to control launch options. Example: {}."
 }
 
 // InputSchema returns the JSON Schema for session_list's arguments: none.

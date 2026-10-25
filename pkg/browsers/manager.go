@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +21,9 @@ import (
 
 // BrowserID uniquely identifies a live Browser instance (e.g. "browser-1", "browser-2").
 type BrowserID string
+
+// ErrUnknownBrowser reports that a browser id does not match a live browser.
+var ErrUnknownBrowser = errors.New("unknown browser")
 
 // defaultTTL is the per-page idle timeout applied by NewManager when no
 // WithTTL option is given. Pages that go unused for longer than the TTL are
@@ -335,21 +340,15 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 	return b, nil
 }
 
-// Browser returns the live Browser with the given ID, or the first open Browser
-// if id is empty. Does NOT lazily launch a new browser.
+// Browser returns the live Browser with the given ID, or the default/first open
+// Browser when id is empty. Does NOT lazily launch a new browser.
 func (m *Manager) Browser(id BrowserID) (*Browser, error) {
 	m.mu.Lock()
-	if len(m.browsers) == 0 {
-		m.mu.Unlock()
-		return nil, errors.New("browsers: no browser open; call Manager.Open first")
-	}
-
 	var target *Browser
-	if id == "" || id == DefaultBrowserID {
+	if id == "" {
 		if b, ok := m.browsers[DefaultBrowserID]; ok {
 			target = b
 		} else {
-			// Return first available open browser
 			for _, b := range m.browsers {
 				target = b
 				break
@@ -358,10 +357,14 @@ func (m *Manager) Browser(id BrowserID) (*Browser, error) {
 	} else {
 		target = m.browsers[id]
 	}
+	running := m.runningIDsLocked()
 	m.mu.Unlock()
 
 	if target == nil {
-		return nil, fmt.Errorf("browsers: unknown browser_id %q", id)
+		if id == "" {
+			return nil, fmt.Errorf("no browser running (create one with browser_create): %w", ErrUnknownBrowser)
+		}
+		return nil, fmt.Errorf("browser %q not found (running: %s): %w", id, running, ErrUnknownBrowser)
 	}
 
 	if err := probeBrowser(target); err != nil {
@@ -401,6 +404,20 @@ func (m *Manager) Browsers() map[BrowserID]*Browser {
 		result[id] = b
 	}
 	return result
+}
+
+// runningIDsLocked returns a sorted comma-separated list of live browser ids,
+// or "none" when nothing is running. The caller must hold m.mu.
+func (m *Manager) runningIDsLocked() string {
+	ids := make([]string, 0, len(m.browsers))
+	for id := range m.browsers {
+		ids = append(ids, string(id))
+	}
+	if len(ids) == 0 {
+		return "none"
+	}
+	sort.Strings(ids)
+	return strings.Join(ids, ", ")
 }
 
 // Page resolves the live page with the given PageID across all active browsers.
@@ -455,8 +472,9 @@ func (m *Manager) CloseBrowser(ctx context.Context, id BrowserID) error {
 
 	b, ok := m.browsers[id]
 	if !ok {
+		running := m.runningIDsLocked()
 		m.mu.Unlock()
-		return nil // idempotent no-op
+		return fmt.Errorf("browser %q not found (running: %s): %w", id, running, ErrUnknownBrowser)
 	}
 	delete(m.browsers, id)
 	if len(m.browsers) == 0 {

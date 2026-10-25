@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/exec"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -190,6 +191,13 @@ func (b *Browser) Launch(ctx context.Context) error {
 	}
 	u, err := l.Launch() // error form; no Must*
 	if err != nil {
+		if profileDir != "" && strings.Contains(err.Error(), "SingletonLock") {
+			return fmt.Errorf(
+				"browsers: launch chromium: profile %q appears to be in use by another running browser — pass a distinct profile name: %w",
+				profileDir,
+				err,
+			)
+		}
 		return fmt.Errorf("browsers: launch chromium: %w", err)
 	}
 	// The Chromium process is now live (WEB-60): if anything below fails — a

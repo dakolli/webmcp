@@ -144,6 +144,12 @@ func registerAll(mgr *browsers.Manager) *tools.Registry {
 	r.Register(tools.NewBrowserList(mgr))   // browser_list
 	r.Register(tools.NewBrowserClose(mgr))  // browser_close
 	r.Register(tools.NewPageList(mgr))      // page_list
+
+	r.RegisterPrompt(tools.NewFetchAndSummarizePrompt())        // fetch_and_summarize
+	r.RegisterPrompt(tools.NewInspectPageDecompositionPrompt()) // inspect_page_decomposition
+	r.RegisterPrompt(tools.NewFormSearchAndSubmitPrompt())      // form_search_and_submit
+	r.RegisterPrompt(tools.NewBrowserSetupAndEmulatePrompt())   // browser_setup_and_emulate
+	r.RegisterPrompt(tools.NewManageSessionLifecyclePrompt())   // manage_session_lifecycle
 	return r
 }
 

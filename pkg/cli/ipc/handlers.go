@@ -262,11 +262,13 @@ func (s *Server) handlePageList(ctx context.Context, params json.RawMessage) (an
 // data-URI; full_page captures the whole page), interactives (dense action map
 // of every visible clickable/typeable element with stable handles), a11y
 // (flattened accessibility tree with roles/names/values/state flags and
-// handles), or network/console (bounded log envelopes) — mirroring the CLI page
-// fetch command. Results are truncated to max_bytes (default
-// pageops.DefaultPageMaxBytes) except screenshots, interactives, a11y, network
-// and console, which bypass truncation (mirrors the CLI/MCP truncation
-// exception). An unknown extractor is a -32602 invalid-params error.
+// handles), network/console (bounded log envelopes), article (readable body as
+// markdown) or marks (numbered overlay boxes plus the annotated viewport
+// screenshot) — mirroring the CLI page fetch command. Results are truncated to
+// max_bytes (default pageops.DefaultPageMaxBytes) except screenshots,
+// interactives, a11y, network, console, article and marks, which bypass
+// truncation (mirrors the CLI/MCP truncation exception). An unknown extractor
+// is a -32602 invalid-params error.
 func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (any, *Error) {
 	p, rpcErr := decodeParams[PageFetchParams](params)
 	if rpcErr != nil {
@@ -276,13 +278,13 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 		return nil, &Error{Code: CodeInvalidParams, Message: `page.fetch: missing required param "session_id"`}
 	}
 	switch p.What {
-	case "html", "text", "links", "meta", "dom", "css", "js", "screenshot", "interactives", "a11y", "network", "console":
+	case "html", "text", "links", "meta", "dom", "css", "js", "screenshot", "interactives", "a11y", "network", "console", "article", "marks":
 	case "":
 		return nil, &Error{Code: CodeInvalidParams, Message: `page.fetch: missing required param "what"`}
 	default:
 		return nil, &Error{
 			Code:    CodeInvalidParams,
-			Message: fmt.Sprintf("page.fetch: unknown what=%q (must be one of html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console)", p.What),
+			Message: fmt.Sprintf("page.fetch: unknown what=%q (must be one of html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, article, marks)", p.What),
 		}
 	}
 
@@ -317,6 +319,10 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 		out, err = pageops.PageNetwork(ctx, page)
 	case "console":
 		out, err = pageops.PageConsole(ctx, page)
+	case "article":
+		out, err = pageops.PageArticle(ctx, page)
+	case "marks":
+		out, err = pageops.PageMarks(ctx, page)
 	}
 	if err != nil {
 		return nil, serverError(err)
@@ -330,9 +336,13 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 	// incompleteness signal is their "truncated" field (the MaxInteractives /
 	// MaxA11yNodes / MaxLogEmit cap) plus, for the logs, the "dropped"
 	// ring-overflow counter — not a byte cut. Truncating would emit invalid JSON
-	// plus a misleading "narrow the selector" hint.
+	// plus a misleading "narrow the selector" hint. Article and marks bypass it
+	// for the same reason: article self-caps at browsers.MaxArticleRunes and
+	// reports it through "truncated", while marks carries an annotated
+	// screenshot data-URI that a byte cut would corrupt.
 	if p.What == "screenshot" || p.What == "interactives" || p.What == "a11y" ||
-		p.What == "network" || p.What == "console" {
+		p.What == "network" || p.What == "console" || p.What == "article" ||
+		p.What == "marks" {
 		return PageFetchResult{Data: out}, nil
 	}
 
@@ -406,6 +416,8 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		return nil, serverError(err)
 	}
 
+	before, stateErr := pageops.PageStateOf(ctx, page)
+
 	var out string
 	switch p.Action {
 	case "click":
@@ -459,6 +471,10 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 	}
 	if err != nil {
 		return nil, serverError(err)
+	}
+	if stateErr == nil {
+		after := pageops.PageStateAfterAct(ctx, page, p.Action, before)
+		out += pageops.ActStateDeltaFor(p.Action, before, after)
 	}
 	return PageActResult{Data: out}, nil
 }

@@ -551,6 +551,98 @@ func encodeLogs[T any](entries []T, dropped int, what string) (string, error) {
 	return string(b), nil
 }
 
+// PageState is the page address bar as reported by CDP: the current URL and
+// title.
+type PageState struct {
+	URL   string
+	Title string
+}
+
+// PageStateOf reads the page's current URL and title via CDP
+// Target.TargetInfo. It is cheap: no page JavaScript runs.
+func PageStateOf(ctx context.Context, p *browsers.Page) (PageState, error) {
+	p.Lock()
+	defer p.Unlock()
+	if p.Rod == nil {
+		return PageState{}, fmt.Errorf("page session is closed")
+	}
+
+	info, err := p.Rod.Context(ctx).Info()
+	if err != nil {
+		return PageState{}, fmt.Errorf("read page state: %w", err)
+	}
+	return PageState{URL: info.URL, Title: info.Title}, nil
+}
+
+// actSettleWindow bounds how long PageStateAfterAct waits for a click-driven
+// navigation to commit before it reports the unchanged state.
+const actSettleWindow = 900 * time.Millisecond
+
+// actMayNavigate reports whether an action can start a navigation without a
+// follow-up wait call.
+func actMayNavigate(action string) bool {
+	switch action {
+	case "click", "click_at", "press_key", "upload_file", "eval", "select":
+		return true
+	}
+	return false
+}
+
+// PageStateAfterAct reads the page state after an action. For actions that can
+// navigate, it polls for up to actSettleWindow so a click that starts a
+// navigation reports the new URL instead of the pre-navigation one.
+func PageStateAfterAct(ctx context.Context, p *browsers.Page, action string, before PageState) PageState {
+	after, err := PageStateOf(ctx, p)
+	if err != nil || !actMayNavigate(action) {
+		return after
+	}
+	if after.URL != before.URL || after.Title != before.Title {
+		return after
+	}
+	deadline := time.Now().Add(actSettleWindow)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return after
+		case <-time.After(50 * time.Millisecond):
+		}
+		next, err := PageStateOf(ctx, p)
+		if err != nil {
+			return after
+		}
+		after = next
+		if after.URL != before.URL || after.Title != before.Title {
+			return after
+		}
+	}
+	return after
+}
+
+// ActStateDeltaFor formats the state change for one action. Navigation actions
+// already report their destination, so they produce no suffix.
+func ActStateDeltaFor(action string, before, after PageState) string {
+	if action == "navigate" {
+		return ""
+	}
+	return ActStateDelta(before, after)
+}
+
+// ActStateDelta formats the change between two states as a one-line suffix.
+// It returns "" when neither URL nor title changed.
+func ActStateDelta(before, after PageState) string {
+	var parts []string
+	if before.URL != after.URL {
+		parts = append(parts, "url="+after.URL)
+	}
+	if before.Title != after.Title {
+		parts = append(parts, fmt.Sprintf("title=%q", after.Title))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "\n→ " + strings.Join(parts, " ")
+}
+
 // PageScreenshot returns a PNG screenshot of the page as a base64 data-URI
 // ("data:image/png;base64,…") that consumers can render directly. When fullPage
 // is true the entire scrollable page is captured; otherwise only the visible

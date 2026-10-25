@@ -261,8 +261,42 @@ func TestServerBadParamsPageFetchUnknownWhat(t *testing.T) {
 	if resp.Error == nil || resp.Error.Code != CodeInvalidParams {
 		t.Fatalf("error = %+v, want code %d (-32602)", resp.Error, CodeInvalidParams)
 	}
-	if want := `page.fetch: unknown what="bogus" (must be one of html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console)`; resp.Error.Message != want {
+	if want := `page.fetch: unknown what="bogus" (must be one of html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, article, marks)`; resp.Error.Message != want {
 		t.Errorf("error message = %q, want %q", resp.Error.Message, want)
+	}
+}
+
+// TestServerPageFetchAcceptsArticleAndMarks pins that the two newer extractors
+// pass the what validation: the stub has no live page, so the call must fail
+// later with a -32000 engine error, never -32602.
+func TestServerPageFetchAcceptsArticleAndMarks(t *testing.T) {
+	path := startServer(t, newStubServer())
+
+	for _, what := range []string{"article", "marks"} {
+		t.Run(what, func(t *testing.T) {
+			conn := dialRaw(t, path)
+			r := bufio.NewReader(conn)
+			_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+
+			req := `{"jsonrpc":"2.0","id":1,"method":"page.fetch","params":{"session_id":"page-1","what":"` + what + `"}}` + "\n"
+			if _, err := conn.Write([]byte(req)); err != nil {
+				t.Fatalf("write request: %v", err)
+			}
+			line := readLineFrom(t, r)
+			var resp Response
+			if err := json.Unmarshal(line, &resp); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if resp.Error == nil {
+				t.Fatalf("error = nil, want the stub's missing-page error")
+			}
+			if resp.Error.Code != CodeServerError {
+				t.Fatalf("code = %d (%q), want %d (-32000); what=%q must pass validation", resp.Error.Code, resp.Error.Message, CodeServerError, what)
+			}
+			if strings.Contains(resp.Error.Message, "unknown what") {
+				t.Errorf("message = %q, want the aspect rejected only after validation", resp.Error.Message)
+			}
+		})
 	}
 }
 

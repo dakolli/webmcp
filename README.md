@@ -20,12 +20,14 @@ Two things it is for:
   `back`/`forward` between tool calls.
 - 📐 **Granular decomposition**: `dom` (frames + shadow DOM + bounds + visibility), `interactives`
   (dense action map with `g<document>-b<backendNodeId>` handles), `a11y` (computed accessibility
-  tree: roles, accessible names, values, state flags), `css`/`js` resource trees with
+  tree: roles, accessible names, values, state flags), `article` (readable body as markdown),
+  `marks` (numbered overlay boxes + annotated screenshot), `css`/`js` resource trees with
   source fetch,
   `meta`, `links`, `text`, `html`, `screenshot`.
-- 🖱️ **19 interaction actions**: click, input, type, key combos (`Control+a`, `Meta+c`), coordinate
+- 🖱️ **20 interaction actions**: click, input, type, key combos (`Control+a`, `Meta+c`), coordinate
   mouse (`click_at`/`hover_at`), drag & drop, file upload, eval, navigate/history, hover, scroll,
-  select, wait modes (`load`/`idle`/`stable`/`interactable`/`ms`), viewport and device emulation.
+  select, wait modes (`load`/`idle`/`stable`/`interactable`/`ms`), viewport and device emulation,
+  and `clear_logs`.
 - 🧭 **Multi-browser aware**: a manager owns a map of browsers, each with its own pages; `browser-1`
   is the default.
 - 🥷 **Stealth on by default** (`go-rod/stealth`) and **persistent profiles** under
@@ -78,6 +80,8 @@ browser page fetch last meta
 browser page fetch last links
 browser page fetch last interactives            # handles + roles + text + x/y
 browser page fetch last dom --max-bytes 30000
+browser page fetch last article                  # readable body as markdown
+browser page fetch last marks                    # numbered boxes + annotated screenshot
 browser page fetch last network                 # newest 100 requests + counters
 browser page act click ".titleline a"
 browser page act last clear_logs                # reset both log buffers
@@ -104,20 +108,36 @@ browser page close last
 | :--- | :--- |
 | `browser_create` | Launch/reuse a browser (`bin`, `profile`, `headless`, `stealth`, `position`). |
 | `browser_list` | List live browsers and their pages. |
-| `browser_close` | Close one browser, or all when `browser_id` is empty. |
-| `fetch_page` | Open a URL in a new session and return `session_id` + summary. |
-| `page_list` | List the pages of a browser. |
+| `browser_close` | Close one browser, or all when `browser_id` is empty. An unknown id fails with `browser "browser-42" not found (running: browser-1)`. |
+| `fetch_page` | Open a URL in a new session and return `session_id` + summary. `wait_for` defaults to `idle`. |
+| `page_list` | List the pages of a browser. `browser_id` is required, and an unknown id fails with `browser "browser-42" not found (running: browser-1)`. |
 | `session_list` | List all live sessions. |
 | `session_close` | Close a session (tab). |
 | `page_fetch` | Read one aspect of a live page (see below). |
 | `page_act` | Perform one interaction action on a live page. |
 
+### MCP Prompts
+
+`prompts/list` returns five prompt templates. They are templates, not tools: each one returns a short
+step-by-step message that names the tools to call.
+
+| Prompt | Purpose | Arguments |
+| :--- | :--- | :--- |
+| `fetch_and_summarize` | Open one URL, read `meta` and `text`, then summarize the page. | `url` (required) |
+| `inspect_page_decomposition` | Decompose a live session into `meta`, `links` and `dom`. | `session_id` (required) |
+| `form_search_and_submit` | Fill a search or form field, submit it, and wait for the result. | `session_id` and `search_query` (required), `selector` (optional) |
+| `browser_setup_and_emulate` | Create a browser, open a page, and apply an optional device preset. | `device` (optional) |
+| `manage_session_lifecycle` | Audit live sessions and close the stale ones. | none |
+
+Call `prompts/get` with the prompt name and its arguments to receive the message. The prompt only
+guides the workflow. You still run `fetch_page`, `page_fetch` and `page_act` yourself.
+
 ---
 
 ## Page Extractions (`page_fetch`)
 
-`what` accepts twelve values. `selector` scopes `html`, `text`, and `dom`; `max_bytes` defaults to
-50000; `full_page` applies to screenshots.
+`what` accepts fourteen values. `selector` scopes `html` and `text`. `max_bytes` defaults to
+50000. `full_page` applies to screenshots.
 
 | `what` | Returns |
 | :--- | :--- |
@@ -126,6 +146,8 @@ browser page close last
 | `a11y` | `{nodes:[{handle?, depth, role, name?, value?, states?}], count, truncated}` — flattened accessibility tree in DFS order: computed roles, accessible names, values, and the state flags that are true (checked, expanded, selected, disabled, required, pressed, invalid, focused; `flag=mixed` when the value is mixed). Capped at 400. Handles on DOM-backed nodes are usable as `page_act`'s `handle`. Root frame only. Text-fragment roles (StaticText, InlineTextBox, paragraph, code, …) and unnamed images are omitted, and `name`/`value` are clipped at 200 runes — use `text` for prose. |
 | `network` | `{entries:[{method, url, type?, status?, mime?, bytes?, ms?, failed?, error?, seq}], count, dropped, truncated}` — observed requests/responses. Emits the newest 100 buffered entries in chronological order; `dropped` counts entries lost to the 200-entry ring, `truncated` counts buffered older entries omitted by the 100 cap. Capture is cumulative from page creation. `data:` URLs are skipped; `url`, `error` and `text` are clipped at 300, 200 and 500 bytes. |
 | `console` | Same envelope over `{level, text, source?, line?, seq}` — `console.*` calls, uncaught exceptions and browser log entries. Cumulative from page creation. |
+| `article` | `{title, byline?, excerpt?, text, words, truncated, url}` — the readable article body rendered as markdown (headings, paragraphs, lists, code, quotes, links, images, tables) with nav/aside/footer/forms/scripts stripped. `text` is capped at 40000 runes and `truncated` reports the cut. Prefer it over `text` for prose; never byte-truncated. |
+| `marks` | `{marks:[{index, role, text?, x, y, width, height}], screenshot, viewport_width, viewport_height, truncated}` — a numbered box over every visible interactive element plus the annotated viewport as a base64 PNG data-URI (`screenshot`). `x`/`y` are the box's top-left in viewport CSS px, so `x + width/2`, `y + height/2` feed `page_act`'s `click_at`. Capped at 60 marks; `truncated` counts the remainder. The overlay is removed again before returning. |
 | `links` | `[{text, href, handle?}]`, deduped by href, non-navigable schemes filtered; `handle` is the first anchor carrying that href. |
 | `meta` | `{title, url, meta:[{name/property/http-equiv/content/charset}]}`. |
 | `text` | Visible `innerText`. |
@@ -133,10 +155,17 @@ browser page close last
 | `css` / `js` | Loaded stylesheet/script resources as `[{url, type, size}]`; pass `target=<url>` to fetch one resource's raw source. |
 | `screenshot` | Base64 PNG data-URI; `full_page: true` captures the whole scrollable page. |
 
-`dom`, `links`, `meta`, and the css/js list are byte-truncated at `max_bytes`. `interactives`,
-`a11y`, `network`, `console`, and `screenshot` are never byte-truncated: `interactives` and `a11y`
-report `truncated` as an omitted-node count, `network` and `console` report `truncated` (buffered
-older entries left out) plus `dropped` (lost to the 200-entry ring).
+`dom`, `links` and `meta` always return parseable JSON. When the result does not fit `max_bytes`,
+the tool returns an envelope with `truncated: true`, the applied `max_bytes`, and `omitted` (the
+number of entries dropped). `links` returns `{items, omitted, truncated, max_bytes}`. `dom` and
+`meta` keep their fields and trim their first array field. Raise `max_bytes` to read the whole
+result. `selector` does not apply to these three. `html`, `text` and the css/js list are cut at
+`max_bytes` as plain text.
+
+`interactives`, `a11y`, `network`, `console`, `article`, `marks`, and `screenshot` are never
+byte-truncated: `interactives`, `a11y` and `article` report `truncated` as an omitted-node/cut-body
+signal, `network` and `console` report `truncated` (buffered older entries left out) plus `dropped`
+(lost to the 200-entry ring), and `marks` carries a screenshot that must stay decodable.
 
 ---
 
@@ -162,6 +191,27 @@ of a selector; the handle wins when both are supplied. Handles look like
 `g<document>-b<backendNodeId>` and go stale when the element is removed or re-rendered, or when the
 page navigates, reloads or redirects (the handle carries the document that minted it) — re-run the
 fetch to mint fresh ones.
+
+Arguments are checked before the page is touched, so a missing one fails fast with a one-line hint.
+`click`, `input`, `type`, `hover`, `select` and `upload_file` need `selector` or `handle`:
+
+```
+page_act: click requires selector (or a handle from page_fetch what=interactives)
+```
+
+`click_at` and `hover_at` need `x` and `y`. `eval` and `navigate` need `value`. `set_viewport` needs
+`viewport`, and `emulate` needs `device`.
+
+When an action changes the page address or title, the result gains one final line. Only the fields
+that changed appear. A click that navigates reports the new destination:
+
+```
+clicked selector="a.next"
+→ url=https://example.com/next title="Next page"
+```
+
+Nothing is added when the page did not change. `navigate` never adds the line because it reports the
+destination itself.
 
 ---
 
@@ -189,9 +239,11 @@ page by default), one-step `page fetch <url> [what]`, and `--max-bytes 0` for un
 
 - **Sessions expire** after 15 minutes idle. If a `session_id` disappears or the browser restarted,
   re-open the page; the error message says so.
-- **Always pass `wait_for`** to `fetch_page` (`load` or `stable`); omitting it currently fails rather
-  than defaulting.
-- **50 KB default output cap.** Narrow with `selector` / `target` rather than raising it blindly.
+- **`wait_for` defaults to `idle`.** Omit it on a normal page. Pass `load` or `stable` on JS-heavy
+  sites, where the idle network-wait can stall.
+- **50 KB default output cap.** Narrow with `selector` / `target` where those apply. Raise
+  `max_bytes` for `dom`, `links` and `meta`, which return a truncated envelope instead of cutting
+  the JSON.
 - **Local-only by default.** No auth, permissive CORS, arbitrary `eval` and `upload_file` paths.
 - Known gaps and the roadmap: `improvements.md` in this repo, plus the mininote ROADMAP.
 

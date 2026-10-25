@@ -62,7 +62,7 @@ func (t *Fetch) InputSchema() models.InputSchema {
 				"type":        "string",
 				"enum":        []string{"load", "idle", "stable"},
 				"default":     "idle",
-				"description": "How long to wait before returning: 'load' = window.onload, 'idle' = no network requests for ~500ms, 'stable' = DOM unchanged for ~500ms. Defaults to 'idle'.",
+				"description": "How long to wait before returning: 'load' = window.onload, 'idle' = no network requests for ~500ms, 'stable' = DOM unchanged for ~500ms. Defaults to 'idle' when omitted. Example: { \"url\": \"https://example.com\", \"wait_for\": \"load\" }.",
 			},
 			"viewport": map[string]any{
 				"type": "object",
@@ -122,8 +122,11 @@ func (a *fetchArgs) validate() error {
 	if a.URL == "" {
 		return fmt.Errorf("missing required argument %q", "url")
 	}
+	if a.WaitFor == "" {
+		a.WaitFor = "idle"
+	}
 	switch a.WaitFor {
-	case "", "load", "idle", "stable":
+	case "load", "idle", "stable":
 	default:
 		return fmt.Errorf("invalid wait_for %q (must be one of load, idle, stable)", a.WaitFor)
 	}

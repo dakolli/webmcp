@@ -36,7 +36,7 @@ const (
 	MethodPageOpen = "page.open"
 	// MethodPageList lists the Browser's open pages.
 	MethodPageList = "page.list"
-	// MethodPageFetch extracts an aspect of a live page (html/dom/text/css/js/links/screenshot/meta/interactives/a11y/network/console).
+	// MethodPageFetch extracts an aspect of a live page (html/dom/text/css/js/links/screenshot/meta/interactives/a11y/network/console/article/marks).
 	MethodPageFetch = "page.fetch"
 	// MethodPageAct performs an action on a live page (click/input/hover/scroll/select/eval/navigate/back/forward/reload/wait/set_viewport/emulate/clear_logs).
 	MethodPageAct = "page.act"
@@ -193,15 +193,16 @@ type PageListResult struct {
 }
 
 // PageFetchParams carries the page.fetch parameters. what ∈ html|dom|text|css|
-// js|links|screenshot|meta|interactives|a11y|network|console; dom element
-// nodes, matched links and DOM-backed a11y nodes carry a
+// js|links|screenshot|meta|interactives|a11y|network|console|article|marks; dom
+// element nodes, matched links and DOM-backed a11y nodes carry a
 // g<document>-b<backendNodeId> handle for page.act; selector scopes html/text
-// (ignored for interactives, a11y, network and console, which are whole-page by
-// design); target fetches exactly one css/js resource's content instead of the
-// {url,type,size} list; full_page captures the whole scrollable page in a
-// screenshot; max_bytes caps the returned data (default
-// pageops.DefaultPageMaxBytes; screenshots, interactives, a11y, network and
-// console are never truncated). network/console return
+// (ignored for interactives, a11y, network, console, article and marks, which
+// are whole-page by design); target fetches exactly one css/js resource's
+// content instead of the {url,type,size} list; full_page captures the whole
+// scrollable page in a screenshot; max_bytes caps the returned data (default
+// pageops.DefaultPageMaxBytes; screenshots, interactives, a11y, network,
+// console, article and marks are never truncated — article self-caps at
+// 40000 runes and marks carries a screenshot data-URI). network/console return
 // {entries,count,dropped,truncated} over the newest 100 buffered entries;
 // capture is cumulative from page creation, so clear with page.act clear_logs
 // before the step under observation.
@@ -209,7 +210,7 @@ type PageFetchParams struct {
 	// SessionID identifies the live page to fetch from.
 	SessionID string `json:"session_id"`
 	// What is the aspect to extract: html, dom, text, css, js, links,
-	// screenshot, meta, interactives, a11y, network, console.
+	// screenshot, meta, interactives, a11y, network, console, article, marks.
 	What string `json:"what"`
 	// Selector optionally scopes html/text extraction to a CSS match.
 	Selector string `json:"selector,omitempty"`

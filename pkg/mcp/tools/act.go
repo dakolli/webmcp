@@ -75,7 +75,7 @@ func (t *Act) InputSchema() models.InputSchema {
 			},
 			"selector": map[string]any{
 				"type":        "string",
-				"description": "CSS selector or XPath identifying target element (click/input/type/press_key/hover/select/upload_file/drag_and_drop source).",
+				"description": "CSS selector or XPath identifying the target element. Required by click, input, type, hover, select and upload_file; optional for press_key and the drag_and_drop source; unused by click_at/hover_at (pass x/y), eval/navigate (pass value), scroll and the navigation actions. Use handle= for an element handle from page_fetch. Example: { \"session_id\": \"page-1\", \"action\": \"click\", \"selector\": \"a.primary\" }.",
 			},
 			"handle": map[string]any{
 				"type":        "string",
@@ -174,6 +174,34 @@ type actArgs struct {
 	Device         string             `json:"device"`
 }
 
+// validate checks the arguments an action requires and returns a one-line
+// recovery hint when one is missing. provided is the raw argument object, so
+// optional numeric fields can be distinguished from an explicit zero.
+func (a *actArgs) validate(provided map[string]json.RawMessage) error {
+	switch a.Action {
+	case "click", "input", "type", "hover", "select", "upload_file":
+		if a.Handle == "" && a.Selector == "" {
+			return fmt.Errorf("%s requires selector (or a handle from page_fetch what=interactives)", a.Action)
+		}
+	case "click_at", "hover_at":
+		if _, ok := provided["x"]; !ok {
+			return fmt.Errorf("%s requires x and y coordinates (e.g. {\"action\":\"%s\",\"x\":100,\"y\":200})", a.Action, a.Action)
+		}
+		if _, ok := provided["y"]; !ok {
+			return fmt.Errorf("%s requires x and y coordinates (e.g. {\"action\":\"%s\",\"x\":100,\"y\":200})", a.Action, a.Action)
+		}
+	case "eval":
+		if a.Value == "" {
+			return fmt.Errorf("eval requires value (JavaScript function source, e.g. \"() => document.title\")")
+		}
+	case "navigate":
+		if a.Value == "" {
+			return fmt.Errorf("navigate requires value (the target URL)")
+		}
+	}
+	return nil
+}
+
 // Execute parses the page_act arguments, resolves the session and dispatches to
 // the shared pageops implementation. It returns a short confirmation string.
 func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error) {
@@ -186,6 +214,14 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 	}
 	if a.Action == "" {
 		return "", fmt.Errorf("page_act: missing required argument %q", "action")
+	}
+
+	var provided map[string]json.RawMessage
+	if err := json.Unmarshal(args, &provided); err != nil {
+		return "", fmt.Errorf("page_act: invalid arguments: %w", err)
+	}
+	if err := a.validate(provided); err != nil {
+		return "", fmt.Errorf("page_act: %w", err)
 	}
 
 	if a.Action == "set_viewport" {
@@ -216,6 +252,8 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 	if err != nil {
 		return "", fmt.Errorf("page_act: %w", err)
 	}
+
+	before, stateErr := pageops.PageStateOf(ctx, p)
 
 	var out string
 	switch a.Action {
@@ -276,6 +314,10 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 	}
 	if err != nil {
 		return "", fmt.Errorf("page_act: %w", err)
+	}
+	if stateErr == nil {
+		after := pageops.PageStateAfterAct(ctx, p, a.Action, before)
+		out += pageops.ActStateDeltaFor(a.Action, before, after)
 	}
 	return out, nil
 }
