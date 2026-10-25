@@ -722,6 +722,13 @@ func PageResources(ctx context.Context, p *browsers.Page, target, what string, k
 	for _, r := range resources {
 		list = append(list, resourceEntry{URL: r.URL, Type: string(r.Type), Size: r.ContentSize})
 	}
+	if kind == proto.NetworkResourceTypeStylesheet {
+		inline, err := collectInlineStyles(page)
+		if err != nil {
+			return "", fmt.Errorf("read inline styles: %w", err)
+		}
+		list = append(list, inline...)
+	}
 	b, err := json.Marshal(list)
 	if err != nil {
 		return "", fmt.Errorf("encode resource list: %w", err)
@@ -732,6 +739,36 @@ func PageResources(ctx context.Context, p *browsers.Page, target, what string, k
 	// more").
 	return string(b) + "\n// hint: to fetch one resource's full content, re-request with what=" +
 		what + "&target=<url>", nil
+}
+
+// collectInlineStyles returns one entry per inline <style> block so pages that
+// inject their CSS at runtime (SPAs, styled-components) still report it. The
+// caller holds the page lock.
+func collectInlineStyles(page *rod.Page) ([]resourceEntry, error) {
+	res, err := page.Eval(`() => [...document.querySelectorAll('style')].map(s => s.textContent || '')`)
+	if err != nil {
+		return nil, err
+	}
+	var bodies []string
+	if err := res.Value.Unmarshal(&bodies); err != nil {
+		return nil, fmt.Errorf("decode inline styles: %w", err)
+	}
+	return inlineStyleEntries(bodies), nil
+}
+
+// inlineStyleEntries shapes inline style bodies into resource entries numbered
+// from 1 with their byte length as size.
+func inlineStyleEntries(bodies []string) []resourceEntry {
+	entries := make([]resourceEntry, 0, len(bodies))
+	for i, body := range bodies {
+		size := float64(len(body))
+		entries = append(entries, resourceEntry{
+			URL:  fmt.Sprintf("inline-style[%d]", i+1),
+			Type: "inline-style",
+			Size: &size,
+		})
+	}
+	return entries
 }
 
 // collectResources walks the resource tree depth-first, appending every

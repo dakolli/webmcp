@@ -205,57 +205,11 @@ func (t *Fetch) Execute(ctx context.Context, args json.RawMessage) (string, erro
 		}
 		return "", fmt.Errorf("fetch_page: %w (session %s closed)", err, p.ID)
 	}
-	return t.pageSummary(ctx, p, start)
-}
-
-// pageSummaryResult is the JSON shape returned by fetch_page. It carries the
-// session_id the caller must pass to page_fetch/page_act, page metadata, and
-// compact size/timing hints — never the full HTML (first-50KB rule).
-type pageSummaryResult struct {
-	SessionID   string `json:"session_id"`
-	Title       string `json:"title"`
-	URL         string `json:"url"`
-	TextSnippet string `json:"text_snippet"`
-	HTMLBytes   int    `json:"html_bytes"`
-	LoadMs      int64  `json:"load_ms"`
-}
-
-// pageSummary renders a compact, LLM-friendly JSON summary of a live page: the
-// page ID, its title and URL (via p.Rod.Info()), plus a short text snippet
-// with byte-size hints so the caller can decide what to fetch next. loadStarted
-// anchors the load_ms timing (captured around launch → navigate → wait).
-func (t *Fetch) pageSummary(ctx context.Context, p *browsers.Page, loadStarted time.Time) (string, error) {
-	p.Lock()
-	defer p.Unlock()
-	if p.Rod == nil {
-		return "", fmt.Errorf("page session is closed")
-	}
-
-	// Bound each rod call by ctx so a stuck page cannot outlive the tool call.
-	info, err := p.Rod.Context(ctx).Info() // title + url
+	sum, err := pageops.PageSummary(ctx, p, start)
 	if err != nil {
-		return "", fmt.Errorf("fetch_page: page info: %w", err)
+		return "", fmt.Errorf("fetch_page: %w", err)
 	}
-
-	html, err := p.Rod.Context(ctx).HTML() // byte-size hint only; not shipped
-	if err != nil {
-		return "", fmt.Errorf("fetch_page: read html: %w", err)
-	}
-
-	text, err := p.Rod.Context(ctx).Eval(`() => document.body.innerText.slice(0, 500)`)
-	if err != nil {
-		return "", fmt.Errorf("fetch_page: read text: %w", err)
-	}
-
-	summary := pageSummaryResult{
-		SessionID:   string(p.ID),
-		Title:       info.Title,
-		URL:         info.URL,
-		TextSnippet: text.Value.Str(),
-		HTMLBytes:   len(html),
-		LoadMs:      time.Since(loadStarted).Milliseconds(),
-	}
-	out, err := json.Marshal(summary)
+	out, err := json.Marshal(sum)
 	if err != nil {
 		return "", fmt.Errorf("fetch_page: marshal summary: %w", err)
 	}
