@@ -260,11 +260,13 @@ func (s *Server) handlePageList(ctx context.Context, params json.RawMessage) (an
 // html, text, links, meta (selector scoping html/text), dom (nested DOM JSON),
 // css/js (resource list or one target resource), screenshot (base64 PNG
 // data-URI; full_page captures the whole page), interactives (dense action map
-// of every visible clickable/typeable element with stable handles) —
-// mirroring the CLI page fetch command. Results are truncated to max_bytes
-// (default pageops.DefaultPageMaxBytes) except screenshots and interactives,
-// which bypass truncation (mirrors the CLI/MCP truncation exception). An
-// unknown extractor is a -32602 invalid-params error.
+// of every visible clickable/typeable element with stable handles), a11y
+// (flattened accessibility tree with roles/names/values/state flags and
+// handles), or network/console (bounded log envelopes) — mirroring the CLI page
+// fetch command. Results are truncated to max_bytes (default
+// pageops.DefaultPageMaxBytes) except screenshots, interactives, a11y, network
+// and console, which bypass truncation (mirrors the CLI/MCP truncation
+// exception). An unknown extractor is a -32602 invalid-params error.
 func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (any, *Error) {
 	p, rpcErr := decodeParams[PageFetchParams](params)
 	if rpcErr != nil {
@@ -274,13 +276,13 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 		return nil, &Error{Code: CodeInvalidParams, Message: `page.fetch: missing required param "session_id"`}
 	}
 	switch p.What {
-	case "html", "text", "links", "meta", "dom", "css", "js", "screenshot", "interactives":
+	case "html", "text", "links", "meta", "dom", "css", "js", "screenshot", "interactives", "a11y", "network", "console":
 	case "":
 		return nil, &Error{Code: CodeInvalidParams, Message: `page.fetch: missing required param "what"`}
 	default:
 		return nil, &Error{
 			Code:    CodeInvalidParams,
-			Message: fmt.Sprintf("page.fetch: unknown what=%q (must be one of html, text, links, meta, dom, css, js, screenshot, interactives)", p.What),
+			Message: fmt.Sprintf("page.fetch: unknown what=%q (must be one of html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console)", p.What),
 		}
 	}
 
@@ -309,6 +311,12 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 		out, err = pageops.PageScreenshot(ctx, page, p.FullPage)
 	case "interactives":
 		out, err = pageops.PageInteractives(ctx, page)
+	case "a11y":
+		out, err = pageops.PageA11y(ctx, page)
+	case "network":
+		out, err = pageops.PageNetwork(ctx, page)
+	case "console":
+		out, err = pageops.PageConsole(ctx, page)
 	}
 	if err != nil {
 		return nil, serverError(err)
@@ -317,12 +325,14 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 	// Screenshots bypass truncate: the data-URI is binary-as-text and cutting
 	// it mid-stream would produce an undecodable image. Image size scales with
 	// the viewport (or full-page height), not max_bytes (mirrors the CLI and
-	// MCP truncation exception). Interactives bypass it too: the snapshot is a
-	// machine-parseable JSON envelope whose designed incompleteness signal is
-	// the "truncated" field (the MaxInteractives cap), not a byte cut —
-	// truncating would emit invalid JSON plus a misleading "narrow the
-	// selector" hint (interactives ignores selector by design).
-	if p.What == "screenshot" || p.What == "interactives" {
+	// MCP truncation exception). Interactives, a11y, network and console bypass
+	// it too: all four are machine-parseable JSON envelopes whose designed
+	// incompleteness signal is their "truncated" field (the MaxInteractives /
+	// MaxA11yNodes / MaxLogEmit cap) plus, for the logs, the "dropped"
+	// ring-overflow counter — not a byte cut. Truncating would emit invalid JSON
+	// plus a misleading "narrow the selector" hint.
+	if p.What == "screenshot" || p.What == "interactives" || p.What == "a11y" ||
+		p.What == "network" || p.What == "console" {
 		return PageFetchResult{Data: out}, nil
 	}
 
@@ -336,8 +346,8 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 // handlePageAct implements page.act: it performs the requested action on a
 // live page — click, input, type, press_key, click_at, hover_at, drag_and_drop,
 // upload_file, hover, scroll, select, eval, navigate, back, forward, reload,
-// wait or set_viewport — mirroring the CLI page act command.
-// An unknown action is a -32602 invalid-params error.
+// wait, set_viewport, emulate or clear_logs — mirroring the CLI page act
+// command. An unknown action is a -32602 invalid-params error.
 func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any, *Error) {
 	p, rpcErr := decodeParams[PageActParams](params)
 	if rpcErr != nil {
@@ -350,11 +360,11 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		return nil, &Error{Code: CodeInvalidParams, Message: `page.act: missing required param "action"`}
 	}
 	switch p.Action {
-	case "click", "input", "type", "press_key", "click_at", "hover_at", "drag_and_drop", "upload_file", "eval", "navigate", "back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport", "emulate":
+	case "click", "input", "type", "press_key", "click_at", "hover_at", "drag_and_drop", "upload_file", "eval", "navigate", "back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport", "emulate", "clear_logs":
 	default:
 		return nil, &Error{
 			Code:    CodeInvalidParams,
-			Message: fmt.Sprintf("page.act: unknown action=%q (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate)", p.Action),
+			Message: fmt.Sprintf("page.act: unknown action=%q (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs)", p.Action),
 		}
 	}
 	if p.Action == "eval" && p.Value == "" {
@@ -444,6 +454,8 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		out, err = pageops.PageSetViewport(ctx, page, p.Viewport.Width, p.Viewport.Height)
 	case "emulate":
 		out, err = pageops.PageEmulate(ctx, page, p.Device)
+	case "clear_logs":
+		out, err = pageops.PageClearLogs(page)
 	}
 	if err != nil {
 		return nil, serverError(err)

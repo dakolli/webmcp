@@ -19,7 +19,8 @@ Two things it is for:
 - 🌐 **Live, stateful browser**: sessions are real tabs that survive navigations, redirects, and
   `back`/`forward` between tool calls.
 - 📐 **Granular decomposition**: `dom` (frames + shadow DOM + bounds + visibility), `interactives`
-  (dense action map with `g<document>-b<backendNodeId>` handles), `css`/`js` resource trees with
+  (dense action map with `g<document>-b<backendNodeId>` handles), `a11y` (computed accessibility
+  tree: roles, accessible names, values, state flags), `css`/`js` resource trees with
   source fetch,
   `meta`, `links`, `text`, `html`, `screenshot`.
 - 🖱️ **19 interaction actions**: click, input, type, key combos (`Control+a`, `Meta+c`), coordinate
@@ -77,7 +78,9 @@ browser page fetch last meta
 browser page fetch last links
 browser page fetch last interactives            # handles + roles + text + x/y
 browser page fetch last dom --max-bytes 30000
+browser page fetch last network                 # newest 100 requests + counters
 browser page act click ".titleline a"
+browser page act last clear_logs                # reset both log buffers
 browser page act click --handle g3k9x2ab-b6      # handle from the same document only
 browser page act eval "() => document.title"
 browser page close last
@@ -113,13 +116,16 @@ browser page close last
 
 ## Page Extractions (`page_fetch`)
 
-`what` accepts nine values. `selector` scopes `html`, `text`, and `dom`; `max_bytes` defaults to
+`what` accepts twelve values. `selector` scopes `html`, `text`, and `dom`; `max_bytes` defaults to
 50000; `full_page` applies to screenshots.
 
 | `what` | Returns |
 | :--- | :--- |
 | `dom` | Re-nested DOM tree: every document/frame, `tag`, `id`, `class`, `attrs`, `text`, `handle`, `visible`, `bounds`, `frame_url`, `children`. Every element node carries a `g<document>-b<backendNodeId>` handle. Shadow DOM included, script/style bodies elided. |
 | `interactives` | `{interactives:[{handle, role, text, href, type, x, y, visible}], truncated}` — visible clickable/typeable elements, capped at 200. Handles are `g<document>-b<backendNodeId>`, usable as `page_act`'s `handle`. |
+| `a11y` | `{nodes:[{handle?, depth, role, name?, value?, states?}], count, truncated}` — flattened accessibility tree in DFS order: computed roles, accessible names, values, and the state flags that are true (checked, expanded, selected, disabled, required, pressed, invalid, focused; `flag=mixed` when the value is mixed). Capped at 400. Handles on DOM-backed nodes are usable as `page_act`'s `handle`. Root frame only. Text-fragment roles (StaticText, InlineTextBox, paragraph, code, …) and unnamed images are omitted, and `name`/`value` are clipped at 200 runes — use `text` for prose. |
+| `network` | `{entries:[{method, url, type?, status?, mime?, bytes?, ms?, failed?, error?, seq}], count, dropped, truncated}` — observed requests/responses. Emits the newest 100 buffered entries in chronological order; `dropped` counts entries lost to the 200-entry ring, `truncated` counts buffered older entries omitted by the 100 cap. Capture is cumulative from page creation. `data:` URLs are skipped; `url`, `error` and `text` are clipped at 300, 200 and 500 bytes. |
+| `console` | Same envelope over `{level, text, source?, line?, seq}` — `console.*` calls, uncaught exceptions and browser log entries. Cumulative from page creation. |
 | `links` | `[{text, href, handle?}]`, deduped by href, non-navigable schemes filtered; `handle` is the first anchor carrying that href. |
 | `meta` | `{title, url, meta:[{name/property/http-equiv/content/charset}]}`. |
 | `text` | Visible `innerText`. |
@@ -127,8 +133,10 @@ browser page close last
 | `css` / `js` | Loaded stylesheet/script resources as `[{url, type, size}]`; pass `target=<url>` to fetch one resource's raw source. |
 | `screenshot` | Base64 PNG data-URI; `full_page: true` captures the whole scrollable page. |
 
-`dom`, `links`, `meta`, and the css/js list are byte-truncated at `max_bytes`; `interactives` and
-`screenshot` are never truncated (interactives reports `truncated` as an omitted count).
+`dom`, `links`, `meta`, and the css/js list are byte-truncated at `max_bytes`. `interactives`,
+`a11y`, `network`, `console`, and `screenshot` are never byte-truncated: `interactives` and `a11y`
+report `truncated` as an omitted-node count, `network` and `console` report `truncated` (buffered
+older entries left out) plus `dropped` (lost to the 200-entry ring).
 
 ---
 
@@ -137,15 +145,19 @@ browser page close last
 ```
 click · input · type · press_key · click_at · hover_at · drag_and_drop · upload_file
 eval · navigate · back · forward · reload · hover · scroll · select · wait
-set_viewport · emulate
+set_viewport · emulate · clear_logs
 ```
 
 `press_key` accepts named keys and combos: `Enter`, `Escape`, `Tab`, `ArrowDown`, `F5`,
 `Control+a`, `Meta+c`, `Shift+Tab`. `input` selects-all then types (value is replaced); `type`
 inserts at the caret. `wait_mode` is one of `load`, `idle`, `stable`, `interactable`, `ms`.
+`clear_logs` takes no parameters and returns `{"network":N,"console":M}`. Network and console
+capture is cumulative from page creation, so the per-step recipe is
+`clear_logs` → act → `page_fetch` `network`/`console` → filter on the client side.
 
 Element actions (`click`, `input`, `type`, `press_key`, `hover`, `select`, `wait` in `interactable`
-mode, `upload_file`) also accept a `handle` from `page_fetch` (`interactives`, `dom`, `links`) instead
+mode, `upload_file`) also accept a `handle` from `page_fetch` (`interactives`, `dom`, `links`,
+`a11y`) instead
 of a selector; the handle wins when both are supplied. Handles look like
 `g<document>-b<backendNodeId>` and go stale when the element is removed or re-rendered, or when the
 page navigates, reloads or redirects (the handle carries the document that minted it) — re-run the

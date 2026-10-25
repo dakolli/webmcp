@@ -42,7 +42,7 @@ Extracts data from a live session without mutating state.
 ```
 page_fetch {
   session_id: string,
-  what: "meta" | "text" | "links" | "dom" | "html" | "css" | "js" | "screenshot" | "interactives",
+  what: "meta" | "text" | "links" | "dom" | "html" | "css" | "js" | "screenshot" | "interactives" | "a11y" | "network" | "console",
   selector?: string,     // Scopes "text", "html", or "dom" to a CSS selector
   max_bytes?: number,    // Response payload cap in bytes (default: 50000)
   target?: string,       // Specific URL when what="css"|"js" to fetch file content
@@ -54,11 +54,14 @@ page_fetch {
 - `text`: Visible page text. Use `selector` (e.g., `selector: "main"` or `selector: "article"`) to avoid nav/footer noise.
 - `links`: Array of `[{ text, href, handle? }]`. The navigation map of the page; `handle` is the first anchor carrying that href (usable as `page_act`'s `handle`).
 - `interactives`: **Start here when you intend to act.** `{ interactives: [{ handle, role, text, href, type, x, y, visible }], truncated }` — every visible clickable/typeable element, capped at 200 (the rest are counted in `truncated`). ~2–5 KB, never byte-truncated. Handles look like `g3k9x2ab-b1073741831` and can be passed straight to `page_act`'s `handle` argument (see below); otherwise use the `text`/`role`/`href`/`x`,`y` fields to choose a target and act with a selector or coordinates.
+- `a11y`: **The semantic map.** `{ nodes: [{ handle?, depth, role, name?, value?, states? }], count, truncated }` — the accessibility tree in DFS order, flattened: computed `role` (button, textbox, link, heading, …), accessible `name` (from aria-label/label/content), `value` (inputs), `depth` (0 = root), and `states` holding only the flags whose value is true, among checked, expanded, selected, disabled, required, pressed, invalid, focused (`flag=mixed` for a mixed value). Capped at 400 (the rest counted in `truncated`), never byte-truncated. Text-fragment roles (StaticText, InlineTextBox, paragraph, code, …) and unnamed images are omitted, and `name`/`value` are clipped at 200 runes — use `text` for prose. DOM-backed nodes carry `handle` (`g<document>-b<backendNodeId>`) usable as `page_act`'s `handle`. Root frame only — iframes are separate trees. Use this to answer "what IS this control" rather than "where is it".
+- `network`: **Request truth.** `{ entries: [{ method, url, type?, status?, mime?, bytes?, ms?, failed?, error?, seq }], count, dropped, truncated }` — observed requests/responses. `entries` is the newest 100 buffered entries in chronological order; `dropped` counts true loss to the 200-entry ring, `truncated` counts buffered older entries left out. Never byte-truncated. `data:` URLs are skipped; `url`, `error` and `text` are clipped at 300, 200 and 500 bytes. Capture is **cumulative from page creation**, so call `page_act` `clear_logs` right before the step whose traffic you want, then filter client-side.
+- `console`: **Log truth.** Same envelope over `{ level, text, source?, line?, seq }` — `console.*` calls, uncaught exceptions, and browser log entries. Cumulative from page creation; same `clear_logs`-before-observe recipe.
 - `dom`: Compact structured tree of DOM nodes with tags, attributes, visibility, and bounding boxes; covers every document and iframe, including shadow DOM. Node shape: `{ tag, id?, class?, attrs?, text?, handle?, visible?, bounds?, frame_url?, children? }`; every element node carries `handle` (`g<document>-b<backendNodeId>`). Always set `max_bytes` or scope with `selector`.
 - `html`: Outer HTML markup. Use `selector` to avoid context explosion on large pages.
 - `css` / `js`: Lists loaded resource URLs with sizes; `size` is nullable. Re-request with `target: "<url>"` to read raw stylesheet/script contents.
 - `screenshot`: Returns base64 PNG data-URI; `full_page: true` captures the whole scrollable page (MCP gives that a 90s budget).
-- **Truncation**: `dom`, `links`, `meta`, and the css/js list are cut at `max_bytes` and can end mid-JSON. `interactives` and `screenshot` are never truncated.
+- **Truncation**: `dom`, `links`, `meta`, and the css/js list are cut at `max_bytes` and can end mid-JSON. `interactives`, `a11y`, `network`, `console`, and `screenshot` are never truncated (network/console signal incompleteness through `truncated` + `dropped`).
 
 
 ### 3. Interaction Tool: `page_act`
@@ -68,7 +71,7 @@ Executes user actions, navigations, keyboard/mouse events, file uploads, or Java
 ```
 page_act {
   session_id: string,
-  action: "click" | "input" | "type" | "press_key" | "click_at" | "hover_at" | "drag_and_drop" | "upload_file" | "eval" | "navigate" | "back" | "forward" | "reload" | "hover" | "scroll" | "select" | "wait" | "set_viewport" | "emulate",
+  action: "click" | "input" | "type" | "press_key" | "click_at" | "hover_at" | "drag_and_drop" | "upload_file" | "eval" | "navigate" | "back" | "forward" | "reload" | "hover" | "scroll" | "select" | "wait" | "set_viewport" | "emulate" | "clear_logs",
   selector?: string,     // CSS selector targeting element (click, input, type, press_key, upload_file, hover, select, wait interactable)
   handle?: string,       // Element handle from page_fetch (g<document>-b<backendNodeId>); wins over selector when both are set
   value?: string,        // Payload for input/type, JS function for eval, URL for navigate, option value for select
@@ -86,11 +89,13 @@ page_act {
 }
 ```
 
-**Stable handles.** `page_fetch` mints a `handle` of the form `g<document>-b<backendNodeId>` (e.g. `g3k9x2ab-b1073741831`) on every element in `interactives`, on every element node in `dom`, and on matched `links` entries. Pass it as `handle` to `click`, `input`, `type`, `press_key`, `hover`, `select`, `wait` (`wait_mode: "interactable"`), or `upload_file`; a handle wins over `selector` when both are set. A handle lives only while its document does: navigation, reload, or a redirect makes every earlier handle fail with `handle "g…-bN" is stale — … (re-run page_fetch what=interactives to re-mint handles)`, and removing or re-rendering the element does the same. A malformed value fails with `invalid handle "x123" (expected g<document>-b<backendNodeId> minted by page_fetch what=interactives|dom|links)`.
+**Stable handles.** `page_fetch` mints a `handle` of the form `g<document>-b<backendNodeId>` (e.g. `g3k9x2ab-b1073741831`) on every element in `interactives`, on every element node in `dom`, on matched `links` entries, and on DOM-backed `a11y` nodes. Pass it as `handle` to `click`, `input`, `type`, `press_key`, `hover`, `select`, `wait` (`wait_mode: "interactable"`), or `upload_file`; a handle wins over `selector` when both are set. A handle lives only while its document does: navigation, reload, or a redirect makes every earlier handle fail with `handle "g…-bN" is stale — … (re-run page_fetch what=interactives to re-mint handles)`, and removing or re-rendering the element does the same. A malformed value fails with `invalid handle "x123" (expected g<document>-b<backendNodeId> minted by page_fetch what=interactives|dom|links)`.
 
 ```json
 { "tool": "page_act", "arguments": { "session_id": "page-1", "action": "click", "handle": "g3k9x2ab-b6" } }
 ```
+
+**Observe one step.** Network/console capture is cumulative from page creation. To attribute traffic or logs to a single action: `page_act` `clear_logs` (returns `{"network":N,"console":M}`) → perform the action → `page_fetch` `what: "network"` / `"console"` → filter client-side.
 
 ---
 

@@ -39,7 +39,7 @@ const fullPageScreenshotTimeout = 90 * time.Second
 // that was previously opened with fetch_page. The session_id from fetch_page
 // identifies which browser tab to read; what selects the aspect:
 //
-//	html | dom | text | css | js | links | screenshot | meta | interactives
+//	html | dom | text | css | js | links | screenshot | meta | interactives | a11y
 //
 // The "dom" output is the page's DOM re-nested from the flattened Documents
 // array + Strings table produced by CaptureDOMSnapshot into a compact,
@@ -47,7 +47,9 @@ const fullPageScreenshotTimeout = 90 * time.Second
 // page's resource tree and fetch the matching resources. "screenshot" returns
 // a base64 PNG data-URI. "interactives" returns a dense action map of every
 // visible, non-inert clickable/typeable element (with stable handles for
-// page_act).
+// page_act). "a11y" returns the flattened accessibility tree — computed
+// roles, accessible names, values and state flags — with handles on
+// DOM-backed nodes.
 type Page struct {
 	// mgr is the shared browsers.Manager owning the single Browser and its
 	// live pages (sessions).
@@ -70,7 +72,14 @@ func (t *Page) Description() string {
 		"html, dom (full flattened DOM snapshot, LLM-friendly), text, css, js, " +
 		"links, screenshot (base64 PNG data-URI), interactives (dense action " +
 		"map of every visible clickable/typeable element with stable handles " +
-		"for page_act), or meta. Pass the session_id " +
+		"for page_act), a11y (flattened accessibility tree: computed " +
+		"role/name/value/state flags plus depth, with handles on DOM-backed " +
+		"nodes usable as page_act's handle; root frame only), network and " +
+		"console (best-effort request and console logs as " +
+		"{\"entries\":[...],\"count\",\"dropped\",\"truncated\"} holding the " +
+		"newest 100 buffered entries; capture is cumulative from page creation, " +
+		"so filter client-side or call page_act action clear_logs right before " +
+		"the step whose traffic/logs you want to observe), or meta. Pass the session_id " +
 		"returned by fetch_page plus what=<aspect>; use selector to scope " +
 		"extraction, target to fetch exactly one css/js resource's full content " +
 		"(instead of the resource list), full_page to capture the whole " +
@@ -92,8 +101,8 @@ func (t *Page) InputSchema() models.InputSchema {
 			},
 			"what": map[string]any{
 				"type":        "string",
-				"enum":        []string{"html", "dom", "text", "css", "js", "links", "screenshot", "meta", "interactives"},
-				"description": "The aspect of the page to extract: html (outerHTML), dom (flattened DOM snapshot; every element node carries a g<document>-b<backendNodeId> handle usable as page_act's handle arg; the document token makes handles from a previous document stale after navigation), text (visible text), css (style resources), js (script resources), links (anchor hrefs, each with a handle where one matched), screenshot (base64 PNG data-URI; full_page captures the whole scrollable page), interactives (dense action map of every visible clickable/typeable element — with stable handles usable as page_act's handle arg; whole-page by design, the selector arg is ignored), meta (title/url/description).",
+				"enum":        []string{"html", "dom", "text", "css", "js", "links", "screenshot", "meta", "interactives", "a11y", "network", "console"},
+				"description": "The aspect of the page to extract: html (outerHTML), dom (flattened DOM snapshot; every element node carries a g<document>-b<backendNodeId> handle usable as page_act's handle arg; the document token makes handles from a previous document stale after navigation), text (visible text), css (style resources), js (script resources), links (anchor hrefs, each with a handle where one matched), screenshot (base64 PNG data-URI; full_page captures the whole scrollable page), interactives (dense action map of every visible clickable/typeable element — with stable handles usable as page_act's handle arg; whole-page by design, the selector arg is ignored), a11y (flattened accessibility tree in DFS order: computed role/name/value plus the state flags checked, expanded, selected, disabled, required, pressed, invalid, focused, and depth — e.g. what: \"a11y\" → {\"nodes\":[{\"role\":\"button\",\"name\":\"Sign in\",\"handle\":\"g3k9x2ab-b6\",…}],\"count\":N,\"truncated\":M}; DOM-backed nodes carry a handle usable as page_act's handle arg; root frame only — iframes are separate trees; selector/target/full_page are ignored), network/console (bounded log envelope: what: \"network\" → {\"entries\":[{\"method\":\"GET\",\"url\":\"…\",\"status\":200,…}],\"count\":N,\"dropped\":D,\"truncated\":M}; entries are the newest 100 buffered, oldest first, and dropped counts true ring overflow; capture is cumulative from page creation — filter client-side or call page_act action clear_logs right before the step under observation; selector/target/full_page are ignored), meta (title/url/description).",
 			},
 			"selector": map[string]any{
 				"type":        "string",
@@ -184,8 +193,14 @@ func (t *Page) Execute(ctx context.Context, args json.RawMessage) (string, error
 		out, err = t.extractMeta(ctx, p)
 	case "interactives":
 		out, err = t.extractInteractives(ctx, p)
+	case "a11y":
+		out, err = t.extractA11y(ctx, p)
+	case "network":
+		out, err = t.extractNetwork(ctx, p)
+	case "console":
+		out, err = t.extractConsole(ctx, p)
 	default:
-		return "", fmt.Errorf("page_fetch: unknown what=%q (must be one of html, dom, text, css, js, links, screenshot, meta, interactives)", a.What)
+		return "", fmt.Errorf("page_fetch: unknown what=%q (must be one of html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, console)", a.What)
 	}
 	if err != nil {
 		return "", fmt.Errorf("page_fetch: %w", err)
@@ -193,12 +208,14 @@ func (t *Page) Execute(ctx context.Context, args json.RawMessage) (string, error
 	// Screenshots bypass truncate: the data-URI is binary-as-text and cutting
 	// it mid-stream would produce an undecodable image. Image size scales with
 	// the viewport (or full-page height), not max_bytes — the 50KB truncation
-	// convention applies to text extractions only. Interactives bypass it too:
-	// the snapshot is a machine-parseable JSON envelope whose designed
-	// incompleteness signal is the "truncated" field (the MaxInteractives cap),
-	// not a byte cut — truncating would emit invalid JSON plus a misleading
-	// "narrow the selector" hint (interactives ignores selector by design).
-	if a.What == "screenshot" || a.What == "interactives" {
+	// convention applies to text extractions only. Interactives, a11y, network
+	// and console bypass it too: all four are machine-parseable JSON envelopes
+	// whose designed incompleteness signal is their "truncated" field (the
+	// MaxInteractives / MaxA11yNodes / MaxLogEmit cap) plus, for the logs, the
+	// "dropped" ring-overflow counter — not a byte cut. Truncating would emit
+	// invalid JSON plus a misleading "narrow the selector" hint.
+	if a.What == "screenshot" || a.What == "interactives" || a.What == "a11y" ||
+		a.What == "network" || a.What == "console" {
 		return out, nil
 	}
 	return t.truncate(out, a.MaxBytes), nil
@@ -506,6 +523,30 @@ func (t *Page) extractInteractives(ctx context.Context, p *browsers.Page) (strin
 		return "", fmt.Errorf("encode interactives: %w", err)
 	}
 	return string(b), nil
+}
+
+// extractA11y returns the page's flattened accessibility tree as a JSON
+// envelope: computed roles, accessible names, values and curated state flags,
+// with depth and a handle on every DOM-backed node. It is a thin wrapper over
+// pageops.PageA11y — the engine method Page.A11yNodes owns the page lock and
+// the nil-Rod guard, so this helper deliberately does NOT lock, and marshaling
+// happens in pageops so the MCP, CLI and IPC surfaces stay byte-identical.
+func (t *Page) extractA11y(ctx context.Context, p *browsers.Page) (string, error) {
+	return pageops.PageA11y(ctx, p)
+}
+
+// extractNetwork returns the newest buffered network entries as the bounded log
+// envelope. It is a thin wrapper over pageops.PageNetwork so the MCP, CLI and
+// IPC surfaces stay byte-identical.
+func (t *Page) extractNetwork(ctx context.Context, p *browsers.Page) (string, error) {
+	return pageops.PageNetwork(ctx, p)
+}
+
+// extractConsole returns the newest buffered console entries as the bounded log
+// envelope. It is a thin wrapper over pageops.PageConsole so the MCP, CLI and
+// IPC surfaces stay byte-identical.
+func (t *Page) extractConsole(ctx context.Context, p *browsers.Page) (string, error) {
+	return pageops.PageConsole(ctx, p)
 }
 
 // pageMeta is the JSON shape returned by extractMeta: the page title and URL

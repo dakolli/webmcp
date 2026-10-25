@@ -45,9 +45,13 @@ func (t *Act) Description() string {
 		"input, type, press_key (send keys/combos like Enter, Escape, Control+A, Meta+C), " +
 		"click_at / hover_at (coordinate-based mouse actions), drag_and_drop (mouse drag), " +
 		"upload_file (set files on <input type='file'>), eval (run JS — the primary escape hatch), " +
-		"navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, or emulate. " +
+		"navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, or " +
+		"clear_logs (empties the network and console buffers, returning the cleared counts, e.g. " +
+		"page_act { action: \"clear_logs\" } → {\"network\":12,\"console\":5}). " +
 		"Pass session_id plus action=... and any required parameters; element actions take a selector " +
-		"or a stable handle from page_fetch (handle wins when both are given)."
+		"or a stable handle from page_fetch (handle wins when both are given). Logs are cumulative " +
+		"from page creation, so call clear_logs right before the step whose traffic/logs you want to " +
+		"observe, then read page_fetch what=network|console and filter client-side."
 }
 
 // InputSchema returns the JSON Schema for page_act's arguments.
@@ -65,9 +69,9 @@ func (t *Act) InputSchema() models.InputSchema {
 					"click", "input", "type", "press_key", "click_at", "hover_at",
 					"drag_and_drop", "upload_file", "eval", "navigate",
 					"back", "forward", "reload", "hover", "scroll", "select",
-					"wait", "set_viewport", "emulate",
+					"wait", "set_viewport", "emulate", "clear_logs",
 				},
-				"description": "The interaction to perform: click (selector), input (set field text), type (keystrokes), press_key (key/combo e.g. Enter, Escape, Control+A), click_at/hover_at ({x, y} coordinates), drag_and_drop (from {x,y}/selector to {target_x,target_y}/target_selector), upload_file (set file input paths), eval (run JS), navigate (URL), back/forward/reload, hover (selector), scroll (x/y), select (option value), wait (readiness mode), set_viewport (W x H), emulate (device preset).",
+				"description": "The interaction to perform: click (selector), input (set field text), type (keystrokes), press_key (key/combo e.g. Enter, Escape, Control+A), click_at/hover_at ({x, y} coordinates), drag_and_drop (from {x,y}/selector to {target_x,target_y}/target_selector), upload_file (set file input paths), eval (run JS), navigate (URL), back/forward/reload, hover (selector), scroll (x/y), select (option value), wait (readiness mode), set_viewport (W x H), emulate (device preset), clear_logs (empty both log buffers; no parameters; returns {\"network\":N,\"console\":M} cleared counts). Logs are cumulative from page creation — filter client-side or clear_logs right before the step under observation.",
 			},
 			"selector": map[string]any{
 				"type":        "string",
@@ -265,8 +269,10 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 		out, err = pageops.PageSetViewport(ctx, p, a.Viewport.Width, a.Viewport.Height)
 	case "emulate":
 		out, err = pageops.PageEmulate(ctx, p, a.Device)
+	case "clear_logs":
+		out, err = pageops.PageClearLogs(p)
 	default:
-		return "", fmt.Errorf("page_act: unknown action=%q (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate)", a.Action)
+		return "", fmt.Errorf("page_act: unknown action=%q (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs)", a.Action)
 	}
 	if err != nil {
 		return "", fmt.Errorf("page_act: %w", err)

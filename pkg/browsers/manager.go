@@ -569,6 +569,7 @@ func (m *Manager) sweepOnce(ctx context.Context) {
 			if ok {
 				p.mu.Lock()
 				if time.Since(p.lastAccess) > ttl {
+					p.stopObservation()
 					handle = p.Rod
 					p.Rod = nil
 					delete(b.pages, id)

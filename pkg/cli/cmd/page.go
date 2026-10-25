@@ -42,8 +42,8 @@ first and reads the aspect in one go.
 
 Subcommands:
   list   List the browser's open pages (id, url)
-  fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta, interactives); a URL opens a new page first
-  act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate)
+  fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, console); a URL opens a new page first
+  act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate, clear_logs)
   close  Close an open page
 
 Run a subcommand with --help for its flags and examples.`,
@@ -115,10 +115,12 @@ which sessions are still alive before acting on or closing them.`,
 }
 
 // newPageFetchCmd builds `page fetch`: it extracts an aspect of a live page
-// (html, text, links, meta, dom, css, js, screenshot, interactives) and prints
-// it, truncating to --max-bytes on a UTF-8 rune boundary. Screenshots and
-// interactives are the exceptions: the base64 data-URI (screenshot) and the
-// machine-parseable JSON envelope (interactives) bypass truncation (see RunE).
+// (html, text, links, meta, dom, css, js, screenshot, interactives, a11y,
+// network, console) and prints it, truncating to --max-bytes on a UTF-8 rune
+// boundary. Screenshots, interactives, a11y, network and console are the
+// exceptions: the base64 data-URI (screenshot) and the machine-parseable JSON
+// envelopes (interactives, a11y, network, console) bypass truncation (see
+// RunE).
 func newPageFetchCmd(mgr *browsers.Manager) *cobra.Command {
 	var (
 		id       string
@@ -133,8 +135,8 @@ func newPageFetchCmd(mgr *browsers.Manager) *cobra.Command {
 		Use:   "fetch [id|url] [what]",
 		Short: "Extract an aspect of a live page",
 		Long: `Extracts an aspect of a live page (html, text, links, meta, dom, css,
-js, screenshot, interactives) and prints it. The page id is optional when only
-one page is open; 'last' means the most recently opened page; a bare number
+js, screenshot, interactives, a11y, network, console) and prints it. The page id is optional when
+only one page is open; 'last' means the most recently opened page; a bare number
 resolves to page-N. A URL in the [id] slot opens a NEW page for it first —
 creating the browser if needed, exactly like 'web-cli fetch <url>' — and then
 extracts the aspect from that fresh page (one step, no separate "open first"
@@ -145,7 +147,7 @@ dance).
   [url]   an absolute URL (contains "://") to open in a new page first, then
           extract the aspect — mirrors 'web-cli fetch <url>' (wait: idle)
   [what]  the aspect to extract: html, text, links, meta, dom, css, js,
-          screenshot, interactives (default: text)
+          screenshot, interactives, a11y, network, console (default: text)
 
   --id <session>     the page/session id (the positional [id] wins when both
                      are given; never treated as a URL)
@@ -155,15 +157,21 @@ dance).
   --target <url>     fetch exactly one css/js resource's full content instead
                      of the {url,type,size} list (with --what css|js)
   --full-page        capture the entire scrollable page (screenshot only)
-  --max-bytes <n>    cap output size (default 50000; screenshots and
-                     interactives are never truncated)
+  --max-bytes <n>    cap output size (default 50000; screenshots,
+                     interactives, a11y, network and console are never truncated)
 
-links, meta, dom and the css/js lists print JSON, mirroring the MCP page_fetch
-shapes. Screenshots print a data:image/png;base64,... data-URI.`,
+links, meta, dom, interactives, a11y, network, console and the css/js lists print
+JSON, mirroring the MCP page_fetch shapes. Screenshots print a
+data:image/png;base64,... data-URI. network/console emit
+{entries,count,dropped,truncated} over the newest 100 buffered entries; capture is
+cumulative from page creation, so clear with 'page act clear_logs' right before the
+step you want to observe, then filter client-side.`,
 		Example: `  web-cli page fetch links                              # single open page → its links
   web-cli page fetch 12 dom                             # page-12's DOM tree
   web-cli page fetch 12 text --selector ".article"      # scoped text extraction
   web-cli page fetch last screenshot --full-page        # full-page capture of the latest page
+  web-cli page fetch last a11y                          # semantic roles + names + handles
+  web-cli page fetch last network  # last 100 network requests + dropped count
   web-cli page fetch https://hackernews.com links       # open + extract in one step`,
 		Args: cobra.MaximumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -188,9 +196,9 @@ shapes. Screenshots print a data:image/png;base64,... data-URI.`,
 			}
 
 			switch what {
-			case "html", "text", "links", "meta", "dom", "css", "js", "screenshot", "interactives":
+			case "html", "text", "links", "meta", "dom", "css", "js", "screenshot", "interactives", "a11y", "network", "console":
 			default:
-				return fmt.Errorf("page fetch: unknown what=%q (must be one of html, text, links, meta, dom, css, js, screenshot, interactives)", what)
+				return fmt.Errorf("page fetch: unknown what=%q (must be one of html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console)", what)
 			}
 
 			// Fail-fast switch passed: forward to a live serve process when one
@@ -270,6 +278,12 @@ shapes. Screenshots print a data:image/png;base64,... data-URI.`,
 				out, err = pageops.PageScreenshot(ctx, p, fullPage)
 			case "interactives":
 				out, err = pageops.PageInteractives(ctx, p)
+			case "a11y":
+				out, err = pageops.PageA11y(ctx, p)
+			case "network":
+				out, err = pageops.PageNetwork(ctx, p)
+			case "console":
+				out, err = pageops.PageConsole(ctx, p)
 			}
 			if err != nil {
 				return fmt.Errorf("page fetch: %w", err)
@@ -278,13 +292,15 @@ shapes. Screenshots print a data:image/png;base64,... data-URI.`,
 			// and cutting it mid-stream would produce an undecodable image.
 			// Image size scales with the viewport (or full-page height), not
 			// max_bytes — the 50KB truncation convention applies to text
-			// extractions only. Interactives bypass it too: the snapshot is a
-			// machine-parseable JSON envelope whose designed incompleteness
-			// signal is the "truncated" field (the MaxInteractives cap), not a
-			// byte cut — truncating would emit invalid JSON plus a misleading
-			// "narrow the selector" hint (interactives ignores selector by
-			// design). Mirrors the MCP page_fetch truncation exception.
-			if what == "screenshot" || what == "interactives" {
+			// extractions only. Interactives, a11y, network and console bypass it
+			// too: all four are machine-parseable JSON envelopes whose designed
+			// incompleteness signal is their "truncated" field (the
+			// MaxInteractives / MaxA11yNodes / MaxLogEmit cap) plus, for the
+			// logs, the "dropped" ring-overflow counter — not a byte cut.
+			// Truncating would emit invalid JSON plus a misleading "narrow the
+			// selector" hint. Mirrors the MCP page_fetch truncation exception.
+			if what == "screenshot" || what == "interactives" || what == "a11y" ||
+				what == "network" || what == "console" {
 				fmt.Println(out)
 				return nil
 			}
@@ -293,7 +309,7 @@ shapes. Screenshots print a data:image/png;base64,... data-URI.`,
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to fetch (optional with one page open; 'last'; or a bare number)")
-	cmd.Flags().StringVar(&what, "what", "", "aspect to extract: html, text, links, meta, dom, css, js, screenshot, interactives (default text)")
+	cmd.Flags().StringVar(&what, "what", "", "aspect to extract: html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console (default text)")
 	cmd.Flags().StringVar(&selector, "selector", "", "optional CSS selector scoping html/text extraction")
 	cmd.Flags().StringVar(&target, "target", "", "resource URL to fetch exactly one css/js resource's content (with --what css|js)")
 	cmd.Flags().BoolVar(&fullPage, "full-page", false, "capture the entire scrollable page instead of the visible viewport (screenshot only)")
@@ -303,8 +319,8 @@ shapes. Screenshots print a data:image/png;base64,... data-URI.`,
 
 // newPageActCmd builds `page act`: it performs an action on a live page —
 // click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file,
-// hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport
-// and emulate (mirroring the MCP page_act surface).
+// hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport,
+// emulate and clear_logs (mirroring the MCP page_act surface).
 func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 	var (
 		id             string
@@ -330,11 +346,11 @@ func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 		Short: "Perform an action on a live page",
 		Long: `Performs an action on a live page (click, input, type, press_key, click_at,
 hover_at, drag_and_drop, upload_file, hover, scroll, select, eval, navigate, back,
-forward, reload, wait, set_viewport, emulate) and prints the confirmation. The page id
+forward, reload, wait, set_viewport, emulate, clear_logs) and prints the confirmation. The page id
 is optional when only one page is open; 'last' means the most recently opened page;
 a bare number resolves to page-N.
 Positional payloads fill each action's fields — flags remain as fallbacks.
-Element actions also accept --handle from page fetch interactives/dom/links, e.g.
+Element actions also accept --handle from page fetch interactives/dom/links/a11y, e.g.
 --handle g3k9x2ab-b6; when both --handle and --selector are given, the handle wins.
 A handle is scoped to the document that minted it: after a navigation, reload or
 redirect it is rejected as stale, so re-fetch before acting.
@@ -357,14 +373,20 @@ redirect it is rejected as stale, so re-fetch before acting.
   wait         [mode] (optional; default ms)
   set_viewport [w] [h]
   emulate      [device]
+  clear_logs   (none)
   back/forward/reload    (none)
-  type         [selector] [text]`,
+  type         [selector] [text]
+
+clear_logs empties the network and console buffers and prints {"network":N,"console":M}.
+Logs are cumulative from page creation: clear right before the step whose traffic/logs
+you want to observe, then run 'page fetch last network|console' and filter client-side.`,
 		Example: `  web-cli page act click "#submit"                          # click on the single open page
   web-cli page act 12 input "#search" "pizza"               # type into a search box
   web-cli page act 12 press_key "Enter"                     # press Enter key
   web-cli page act 12 click_at 100 200                     # click at x=100 y=200
   web-cli page act 12 navigate https://news.ycombinator.com # go somewhere
-  web-cli page act last eval '() => document.title'         # run JS on the latest page`,
+  web-cli page act last eval '() => document.title'         # run JS on the latest page
+  web-cli page act last clear_logs  # reset both buffers, print {network,console} counts`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Positional args win over the --flags; payload counts are
 			// validated here, before any browser work.
@@ -395,9 +417,9 @@ redirect it is rejected as stale, so re-fetch before acting.
 			defer cancel()
 
 			switch action {
-			case "click", "input", "type", "press_key", "click_at", "hover_at", "drag_and_drop", "upload_file", "eval", "navigate", "back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport", "emulate":
+			case "click", "input", "type", "press_key", "click_at", "hover_at", "drag_and_drop", "upload_file", "eval", "navigate", "back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport", "emulate", "clear_logs":
 			default:
-				return fmt.Errorf("page act: unknown action=%q (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate)", action)
+				return fmt.Errorf("page act: unknown action=%q (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs)", action)
 			}
 
 			if action == "set_viewport" && (width <= 0 || height <= 0) {
@@ -491,6 +513,8 @@ redirect it is rejected as stale, so re-fetch before acting.
 				out, err = pageops.PageSetViewport(ctx, p, width, height)
 			case "emulate":
 				out, err = pageops.PageEmulate(ctx, p, device)
+			case "clear_logs":
+				out, err = pageops.PageClearLogs(p)
 			}
 			if err != nil {
 				return fmt.Errorf("page act: %w", err)
@@ -500,7 +524,7 @@ redirect it is rejected as stale, so re-fetch before acting.
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to act on (optional with one page open; 'last'; or a bare number)")
-	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate")
+	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs")
 	cmd.Flags().StringVar(&selector, "selector", "", "CSS selector targeting the element (element actions)")
 	cmd.Flags().StringVar(&handle, "handle", "", "element handle from page fetch (g<document>-b<backendNodeId>, scoped to its document); wins over --selector (element actions)")
 	cmd.Flags().StringVar(&value, "value", "", "value for eval (JS function), input (text), type (text), navigate (URL), select (option value)")

@@ -452,6 +452,105 @@ func PageInteractives(ctx context.Context, p *browsers.Page) (string, error) {
 	return string(b), nil
 }
 
+// PageA11y returns the page's flattened accessibility tree as JSON:
+// {"nodes":[{handle?,depth,role,name?,value?,states?}],"count":N,"truncated":M}
+// — the computed semantics (roles, accessible names, values, state flags) an
+// agent uses to know what a control IS, not just where it is. Handles are
+// g<document>-b<backendNodeId> and usable as page act's handle arg.
+//
+// Deliberately does NOT lock: the engine method Page.A11yNodes takes the page
+// lock itself and owns the nil-Rod guard — the same engine-seam exception as
+// PageInteractives, so callers must not pre-lock either.
+func PageA11y(ctx context.Context, p *browsers.Page) (string, error) {
+	res, err := p.A11yNodes(ctx)
+	if err != nil {
+		return "", err
+	}
+	b, err := json.Marshal(res)
+	if err != nil {
+		return "", fmt.Errorf("encode a11y tree: %w", err)
+	}
+	return string(b), nil
+}
+
+// MaxLogEmit caps how many of the newest buffered network/console entries one
+// PageNetwork or PageConsole response emits; the envelope's truncated field
+// reports the older buffered entries left out.
+const MaxLogEmit = 100
+
+// logsEnvelope is the JSON shape shared by PageNetwork and PageConsole: the
+// emitted entries, their count, the engine ring's true overflow loss, and the
+// buffered older entries omitted by the MaxLogEmit cap.
+type logsEnvelope[T any] struct {
+	// Entries are the emitted entries, oldest first.
+	Entries []T `json:"entries"`
+	// Count is len(Entries).
+	Count int `json:"count"`
+	// Dropped counts entries lost to the engine ring bound.
+	Dropped int `json:"dropped"`
+	// Truncated counts buffered entries omitted by the emit cap.
+	Truncated int `json:"truncated"`
+}
+
+// logsCleared is the JSON shape returned by PageClearLogs: the number of
+// network and console entries emptied from both capture rings.
+type logsCleared struct {
+	// Network is the number of network entries cleared.
+	Network int `json:"network"`
+	// Console is the number of console entries cleared.
+	Console int `json:"console"`
+}
+
+// PageNetwork returns the newest buffered network entries, capped at MaxLogEmit
+// and ordered oldest first, as {"entries","count","dropped","truncated"}.
+// Deliberately does NOT lock: the engine read touches only the observer's own
+// mutex, so a closed page still answers from its in-memory buffer.
+func PageNetwork(_ context.Context, p *browsers.Page) (string, error) {
+	entries, dropped := p.NetworkEntries()
+	return encodeLogs(entries, dropped, "network")
+}
+
+// PageConsole returns the newest buffered console entries, capped at MaxLogEmit
+// and ordered oldest first, as {"entries","count","dropped","truncated"}.
+// Deliberately does NOT lock: the engine read touches only the observer's own
+// mutex, so a closed page still answers from its in-memory buffer.
+func PageConsole(_ context.Context, p *browsers.Page) (string, error) {
+	entries, dropped := p.ConsoleEntries()
+	return encodeLogs(entries, dropped, "console")
+}
+
+// PageClearLogs empties both capture rings, resets their dropped counters and
+// returns the cleared counts as {"network":N,"console":M}. It needs no context:
+// the call touches only the observer's in-memory state.
+func PageClearLogs(p *browsers.Page) (string, error) {
+	network, console := p.ClearLogs()
+	b, err := json.Marshal(logsCleared{Network: network, Console: console})
+	if err != nil {
+		return "", fmt.Errorf("encode cleared logs: %w", err)
+	}
+	return string(b), nil
+}
+
+// encodeLogs keeps the newest MaxLogEmit entries in chronological order and
+// marshals the shared log envelope; what names the log kind in an encode error.
+func encodeLogs[T any](entries []T, dropped int, what string) (string, error) {
+	truncated := 0
+	if len(entries) > MaxLogEmit {
+		truncated = len(entries) - MaxLogEmit
+		entries = entries[len(entries)-MaxLogEmit:]
+	}
+	b, err := json.Marshal(logsEnvelope[T]{
+		Entries:   entries,
+		Count:     len(entries),
+		Dropped:   dropped,
+		Truncated: truncated,
+	})
+	if err != nil {
+		return "", fmt.Errorf("encode %s log: %w", what, err)
+	}
+	return string(b), nil
+}
+
 // PageScreenshot returns a PNG screenshot of the page as a base64 data-URI
 // ("data:image/png;base64,…") that consumers can render directly. When fullPage
 // is true the entire scrollable page is captured; otherwise only the visible

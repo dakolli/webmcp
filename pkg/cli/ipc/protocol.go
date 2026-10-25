@@ -36,9 +36,9 @@ const (
 	MethodPageOpen = "page.open"
 	// MethodPageList lists the Browser's open pages.
 	MethodPageList = "page.list"
-	// MethodPageFetch extracts an aspect of a live page (html/dom/text/css/js/links/screenshot/meta/interactives).
+	// MethodPageFetch extracts an aspect of a live page (html/dom/text/css/js/links/screenshot/meta/interactives/a11y/network/console).
 	MethodPageFetch = "page.fetch"
-	// MethodPageAct performs an action on a live page (click/input/hover/scroll/select/eval/navigate/back/forward/reload/wait/set_viewport/emulate).
+	// MethodPageAct performs an action on a live page (click/input/hover/scroll/select/eval/navigate/back/forward/reload/wait/set_viewport/emulate/clear_logs).
 	MethodPageAct = "page.act"
 	// MethodPageClose closes an open page.
 	MethodPageClose = "page.close"
@@ -193,18 +193,23 @@ type PageListResult struct {
 }
 
 // PageFetchParams carries the page.fetch parameters. what ∈ html|dom|text|css|
-// js|links|screenshot|meta|interactives; dom element nodes and matched links
-// carry a g<document>-b<backendNodeId> handle for page.act; selector scopes html/text
-// (ignored for interactives, which is whole-page by design); target fetches
-// exactly one css/js resource's content instead of the {url,type,size} list;
-// full_page captures the whole scrollable page in a screenshot; max_bytes caps
-// the returned data (default pageops.DefaultPageMaxBytes; screenshots and
-// interactives are never truncated).
+// js|links|screenshot|meta|interactives|a11y|network|console; dom element
+// nodes, matched links and DOM-backed a11y nodes carry a
+// g<document>-b<backendNodeId> handle for page.act; selector scopes html/text
+// (ignored for interactives, a11y, network and console, which are whole-page by
+// design); target fetches exactly one css/js resource's content instead of the
+// {url,type,size} list; full_page captures the whole scrollable page in a
+// screenshot; max_bytes caps the returned data (default
+// pageops.DefaultPageMaxBytes; screenshots, interactives, a11y, network and
+// console are never truncated). network/console return
+// {entries,count,dropped,truncated} over the newest 100 buffered entries;
+// capture is cumulative from page creation, so clear with page.act clear_logs
+// before the step under observation.
 type PageFetchParams struct {
 	// SessionID identifies the live page to fetch from.
 	SessionID string `json:"session_id"`
 	// What is the aspect to extract: html, dom, text, css, js, links,
-	// screenshot, meta, interactives.
+	// screenshot, meta, interactives, a11y, network, console.
 	What string `json:"what"`
 	// Selector optionally scopes html/text extraction to a CSS match.
 	Selector string `json:"selector,omitempty"`
@@ -226,17 +231,19 @@ type PageFetchResult struct {
 
 // PageActParams carries the page.act parameters. action ∈ click|input|type|
 // press_key|click_at|hover_at|drag_and_drop|upload_file|eval|navigate|back|
-// forward|reload|hover|scroll|select|wait|set_viewport|emulate;
+// forward|reload|hover|scroll|select|wait|set_viewport|emulate|clear_logs;
 // selector/handle/value/key/button/click_count/x/y/target_x/target_y/
 // target_selector/paths are the per-action payloads (handle wins over selector
 // for element actions); viewport carries the target size for set_viewport and
 // device the preset for emulate; timeout_ms bounds the action (default 30000)
 // and sizes the wait action's "ms" sleep; wait_mode selects what the wait
-// action waits for: load|idle|stable|interactable|ms (default ms).
+// action waits for: load|idle|stable|interactable|ms (default ms). clear_logs
+// takes no payload: it empties both log buffers and returns the cleared counts.
 type PageActParams struct {
 	// SessionID identifies the live page to act on.
 	SessionID string `json:"session_id"`
-	// Action is the action to perform.
+	// Action is the action to perform (including clear_logs, which takes no
+	// payload and returns {"network":N,"console":M} cleared counts).
 	Action string `json:"action"`
 	// Value is the payload: a JS function for eval, text for input/type, URL for
 	// navigate, an option value for select, fallback key for press_key, or single path for upload_file.
@@ -244,7 +251,7 @@ type PageActParams struct {
 	// Selector targets an element for element actions.
 	Selector string `json:"selector,omitempty"`
 	// Handle is an element handle from a previous page.fetch
-	// (what=interactives|dom|links), e.g. "g3k9x2ab-b6". It carries the document
+	// (what=interactives|dom|links|a11y), e.g. "g3k9x2ab-b6". It carries the document
 	// that minted it, so a handle from a previous document is rejected as stale.
 	// It wins over Selector when both are set.
 	Handle string `json:"handle,omitempty"`

@@ -37,6 +37,13 @@ type Page struct {
 	// docMarkerInstalled reports whether the handle-scope marker script has
 	// been installed on this page (see CaptureSnapshot). Guarded by mu.
 	docMarkerInstalled bool
+	// observer holds the page's network/console capture rings. It is assigned
+	// once in the pre-registration window and never replaced, so read methods
+	// may use it without taking mu. Engine-internal: surfaces never touch it.
+	observer *pageObserver
+	// obsCancel disarms the capture subscription. It is set in the same
+	// pre-registration window and cleared by stopObservation. Guarded by mu.
+	obsCancel context.CancelFunc
 
 	// mu serializes access to the underlying rod.Page (rod is not thread-safe).
 	mu sync.Mutex
@@ -71,6 +78,7 @@ func (p *Page) Unlock() {
 func (p *Page) Close(ctx context.Context) error {
 	p.Lock()
 	defer p.Unlock()
+	p.stopObservation()
 	if p.Rod == nil {
 		return nil
 	}

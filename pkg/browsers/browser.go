@@ -291,6 +291,7 @@ func (b *Browser) NewPage(
 	// not yet registered in the pages map, so no other goroutine can see it;
 	// ID, URL and lastAccess are filled at registration below.
 	page := &Page{Rod: p}
+	page.startObservation()
 
 	// Apply the stealth preload script (the same JS stealth.Page injects,
 	// error form; no Must*) immediately after creation — before the
@@ -302,7 +303,7 @@ func (b *Browser) NewPage(
 	// until browser_close.
 	if b.stealth {
 		if _, err := p.Context(ctx).EvalOnNewDocument(stealth.JS); err != nil {
-			b.closeUnregisteredPage(p)
+			b.closeUnregisteredPage(page)
 			return nil, fmt.Errorf("browsers: apply stealth: %w", err)
 		}
 	}
@@ -318,7 +319,7 @@ func (b *Browser) NewPage(
 	// Page.Emulate are the opt-in path).
 	if vp != nil {
 		if err := page.SetViewport(ctx, vp); err != nil {
-			b.closeUnregisteredPage(p) // do not leak the orphaned tab (mirror the navigate failure path)
+			b.closeUnregisteredPage(page) // do not leak the orphaned tab (mirror the navigate failure path)
 			return nil, err
 		}
 	}
@@ -330,12 +331,12 @@ func (b *Browser) NewPage(
 	// not yet in the pages map, so no other goroutine can see it.
 	if device != "" {
 		if err := page.Emulate(ctx, device); err != nil {
-			b.closeUnregisteredPage(p) // do not leak the orphaned tab
+			b.closeUnregisteredPage(page) // do not leak the orphaned tab
 			return nil, err
 		}
 	} else if vp == nil {
 		if err := page.Emulate(ctx, "clear"); err != nil {
-			b.closeUnregisteredPage(p) // do not leak the orphaned tab
+			b.closeUnregisteredPage(page) // do not leak the orphaned tab
 			return nil, err
 		}
 		if !b.headless {
@@ -350,7 +351,7 @@ func (b *Browser) NewPage(
 	// window no lock is needed — no other goroutine can see the page yet.
 	if userAgent != "" {
 		if err := p.Context(ctx).SetUserAgent(&proto.NetworkSetUserAgentOverride{UserAgent: userAgent}); err != nil {
-			b.closeUnregisteredPage(p) // do not leak the orphaned tab
+			b.closeUnregisteredPage(page) // do not leak the orphaned tab
 			return nil, fmt.Errorf("browsers: set user agent: %w", err)
 		}
 	}
@@ -359,11 +360,11 @@ func (b *Browser) NewPage(
 		// Bound to ctx so a hung navigation cannot outlive the tool call.
 		pc := p.Context(ctx)
 		if err := pc.Navigate(url); err != nil {
-			b.closeUnregisteredPage(p) // do not leak the orphaned tab
+			b.closeUnregisteredPage(page) // do not leak the orphaned tab
 			return nil, fmt.Errorf("browsers: navigate: %w", err)
 		}
 		if err := pc.WaitLoad(); err != nil {
-			b.closeUnregisteredPage(p) // do not leak the orphaned tab
+			b.closeUnregisteredPage(page) // do not leak the orphaned tab
 			return nil, fmt.Errorf("browsers: wait load: %w", err)
 		}
 	}
@@ -379,20 +380,22 @@ func (b *Browser) NewPage(
 }
 
 // closeUnregisteredPage best-effort closes a freshly created page whose session
-// was never registered, bounding the close off the manager-owned baseCtx so a
-// canceled per-call ctx cannot skip the close (WEB-59). The page's default ctx
-// hangs off the manager-owned baseCtx too (WEB-63: NewPage attaches through the
-// baseCtx-bound browser via rod's Browser.Page), so rod's Page.Close on the
-// base handle would already be delivered — the fresh closePageTimeout derived
-// from the baseCtx still guarantees the close is bounded and outlives any
-// single request. Only called for post-create failures
-// (stealth/viewport/device/UA/navigate) — rod's built-in leak-prevention defer
-// inside Browser.Page already covers create/attach failures, so this never
-// needs to run on Page()'s own error path. Best-effort by design.
-func (b *Browser) closeUnregisteredPage(p *rod.Page) {
+// was never registered, disarming its capture subscription first, and bounding
+// the close off the manager-owned baseCtx so a canceled per-call ctx cannot skip
+// the close (WEB-59). The page's default ctx hangs off the manager-owned
+// baseCtx too (WEB-63: NewPage attaches through the baseCtx-bound browser via
+// rod's Browser.Page), so rod's Page.Close on the base handle would already be
+// delivered — the fresh closePageTimeout derived from the baseCtx still
+// guarantees the close is bounded and outlives any single request. Only called
+// for post-create failures (stealth/viewport/device/UA/navigate) — rod's
+// built-in leak-prevention defer inside Browser.Page already covers
+// create/attach failures, so this never needs to run on Page()'s own error path.
+// Best-effort by design.
+func (b *Browser) closeUnregisteredPage(page *Page) {
+	page.stopObservation()
 	closeCtx, cancel := context.WithTimeout(b.baseCtx, closePageTimeout)
 	defer cancel()
-	_ = p.Context(closeCtx).Close()
+	_ = page.Rod.Context(closeCtx).Close()
 }
 
 // Page returns the live page with the given ID, or an error when no page with
@@ -426,6 +429,7 @@ func (b *Browser) Page(ctx context.Context, id PageID) (*Page, error) {
 		b.mu.Lock()
 		if cur, ok := b.pages[id]; ok && cur == p {
 			p.mu.Lock()
+			p.stopObservation()
 			handle = p.Rod
 			p.Rod = nil
 			delete(b.pages, id)
@@ -642,6 +646,7 @@ func (b *Browser) ClosePage(ctx context.Context, id PageID) error {
 	// while holding the browser mutex. A wedged close must not keep the
 	// session visible to session_list; the handle is closed outside, below.
 	p.mu.Lock()
+	p.stopObservation()
 	handle := p.Rod
 	p.Rod = nil
 	delete(b.pages, id)
@@ -682,6 +687,7 @@ func (b *Browser) Close(ctx context.Context) error {
 	for _, p := range b.pages {
 		p.mu.Lock()
 		if p.Rod != nil {
+			p.stopObservation()
 			handles = append(handles, p.Rod)
 			p.Rod = nil
 		}
