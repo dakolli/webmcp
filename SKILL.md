@@ -13,7 +13,7 @@ Drive Chromium via MCP tools using stateful sessions, structured DOM/text extrac
 ## Core Architecture and Mental Model
 
 - **Browser (`browser_id`, e.g., `browser-1`)**: The underlying Chromium/Brave process managed by the server. Created lazily or via `browser_create`, closed with `browser_close`. Auto-detects Brave (`brave-browser` / `brave`) as the default browser when available.
-- **Persistent Profiles**: `browser-1` uses the persistent user profile at `~/.config/browser-mcp/profiles/<browser_name>` (e.g. `profiles/brave` or `profiles/default`), persisting cookies, storage, and logins across runs. `browser_create` with **no options** reuses a live `browser-1`; passing any option creates a new `browser-N`.
+- **Profiles**: `browser-1` uses the persistent profile at `~/.config/browser-mcp/profiles/<browser_name>` (e.g. `profiles/brave` or `profiles/default`) and keeps cookies, storage, and logins across runs. A bare `profile` name resolves under the config dir, an absolute path is used as given, and a relative path is rejected. A secondary `browser-N` is ephemeral by default and its profile is removed on close. Pass `persist: true` with a profile name to keep it. `browser_create` with **no options** reuses a live `browser-1`; passing any option creates a new `browser-N`.
 - **Sessions expire**: idle pages are closed after 15 minutes, and a crashed Chromium is relaunched under the same `browser_id`. A vanished `session_id` is normal — re-open the URL rather than retrying it.
 - **Session (`session_id`, e.g., `page-1`, `page-2`)**: A distinct browser tab created by `fetch_page`. All read (`page_fetch`) and interaction (`page_act`) operations require a valid `session_id`.
 - **Navigation Continuity**: A session maintains state across navigations, redirects, and history traversal (`back`/`forward`). Reading after a navigation reads the new page.
@@ -27,7 +27,7 @@ Drive Chromium via MCP tools using stateful sessions, structured DOM/text extrac
 
 | Tool | Parameters | Purpose and Returns |
 |---|---|---|
-| `browser_create` | `{ bin?: string, profile?: string, headless?: boolean, stealth?: boolean, position?: "left"\|"right"\|"max"\|"normal" }` | Launches a browser instance. Returns `{ browser_id }`. Omit all options to reuse `browser-1`. |
+| `browser_create` | `{ bin?: string, profile?: string, persist?: boolean, headless?: boolean, stealth?: boolean, position?: "left"\|"right"\|"max"\|"normal" }` | Launches a browser instance. Returns `{ browser_id }`. Omit all options to reuse `browser-1`. A bare `profile` resolves under the browser-mcp profiles dir. Secondary browsers are ephemeral unless `persist: true`. |
 | `browser_list` | `{}` | Lists all active browsers and their pages. |
 | `browser_close` | `{ browser_id?: string }` | Terminates that Chromium instance and all its open tabs, or every browser when `browser_id` is empty. An unknown id fails with `browser "browser-42" not found (running: browser-1)`. |
 | `fetch_page` | `{ url: string, browser_id?: string, wait_for?: "load"\|"idle"\|"stable", timeout_ms?: number, viewport?: { width, height }, device?: string, user_agent?: string }` | Opens URL in a new tab. `wait_for` defaults to `"idle"` when omitted. On JS-heavy sites (bot WAFs, trackers, infinite polling) the idle network-wait can stall, so pass `"load"` or `"stable"` there. Pass `device` (e.g. `"IPhoneX"`) to apply emulation *before* navigation. Returns `{ session_id, title, url, text_snippet, html_bytes, load_ms }`. |

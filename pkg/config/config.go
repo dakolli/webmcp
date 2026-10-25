@@ -50,48 +50,38 @@ func ProfilesDir() (string, error) {
 	return dir, nil
 }
 
-// ResolveProfilePath takes a profile name or directory path and resolves it.
+// ResolveProfilePath takes a profile name or absolute directory path and resolves it.
 // When profileArg is empty (""), it defaults to the matching profile directory:
 // - If binPath contains "brave", resolves to ~/.config/browser-mcp/profiles/brave.
 // - If binPath contains "chrome", resolves to ~/.config/browser-mcp/profiles/chrome.
 // - Otherwise, resolves to ~/.config/browser-mcp/profiles/<default_profile> (default: "default").
 // Shorthand names ("brave", "chrome", "firefox", "default") resolve under ~/.config/browser-mcp/profiles/<name>.
-// Absolute or relative paths (containing filepath separators or starting with ".") are used directly.
+// Absolute paths are used as given; relative paths are rejected.
 // The resolved directory is created with 0700 permissions if it does not exist.
 func ResolveProfilePath(profileArg string) (string, error) {
 	return ResolveProfilePathWithBin(profileArg, "")
 }
 
 // ResolveProfilePathWithBin resolves profileArg, inferring the default profile name from binPath when profileArg is empty.
+// Absolute paths are used as given; relative paths containing a separator are rejected; bare names resolve
+// under ~/.config/browser-mcp/profiles/<name>. The resolved directory is created with 0700 permissions.
 func ResolveProfilePathWithBin(profileArg, binPath string) (string, error) {
 	profileArg = strings.TrimSpace(profileArg)
 	if profileArg == "" {
-		lowerBin := strings.ToLower(binPath)
-		switch {
-		case strings.Contains(lowerBin, "brave"):
-			profileArg = "brave"
-		case strings.Contains(lowerBin, "chrome"):
-			profileArg = "chrome"
-		case strings.Contains(lowerBin, "firefox"):
-			profileArg = "firefox"
-		default:
-			cfg, err := LoadConfig()
-			if err == nil && cfg.DefaultProfile != "" {
-				profileArg = cfg.DefaultProfile
-			} else {
-				profileArg = "default"
-			}
-		}
+		profileArg = defaultProfileName(binPath)
 	}
 
 	var targetDir string
-	if strings.Contains(profileArg, string(filepath.Separator)) || strings.HasPrefix(profileArg, ".") {
-		absPath, err := filepath.Abs(profileArg)
-		if err != nil {
-			return "", fmt.Errorf("config: resolve profile path %q: %w", profileArg, err)
-		}
-		targetDir = absPath
-	} else {
+	switch {
+	case filepath.IsAbs(profileArg):
+		targetDir = filepath.Clean(profileArg)
+	case isRelativeProfilePath(profileArg):
+		return "", fmt.Errorf(
+			"config: profile %q is a relative path; pass an absolute path or a bare name (resolved under %s/profiles)",
+			profileArg,
+			DirName,
+		)
+	default:
 		profBase, err := ProfilesDir()
 		if err != nil {
 			return "", err
@@ -103,6 +93,124 @@ func ResolveProfilePathWithBin(profileArg, binPath string) (string, error) {
 		return "", fmt.Errorf("config: create profile directory %s: %w", targetDir, err)
 	}
 	return targetDir, nil
+}
+
+// ResolveProfile resolves a profile argument to a profile directory and reports
+// whether that directory is ephemeral (owned by one browser and removed on close).
+//
+// Absolute paths are always persistent and used as given. Relative paths are
+// rejected. A bare name resolves under the profiles dir when persist is true and
+// to a unique directory under profiles/.ephemeral when persist is false. An empty
+// argument resolves to the default profile when persist is true and to a unique
+// ephemeral directory otherwise.
+func ResolveProfile(profileArg, binPath, browserID string, persist bool) (dir string, ephemeral bool, err error) {
+	profileArg = strings.TrimSpace(profileArg)
+	if profileArg == "" {
+		if persist {
+			dir, err = ResolveProfilePathWithBin("", binPath)
+			if err != nil {
+				return "", false, err
+			}
+			return dir, false, nil
+		}
+		dir, err = newEphemeralProfileDir(safeProfileLabel(browserID))
+		if err != nil {
+			return "", false, err
+		}
+		return dir, true, nil
+	}
+
+	switch {
+	case filepath.IsAbs(profileArg):
+		dir = filepath.Clean(profileArg)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return "", false, fmt.Errorf("config: create profile directory %s: %w", dir, err)
+		}
+		return dir, false, nil
+	case isRelativeProfilePath(profileArg):
+		return "", false, fmt.Errorf(
+			"config: profile %q is a relative path; pass an absolute path or a bare name (resolved under %s/profiles)",
+			profileArg,
+			DirName,
+		)
+	}
+
+	name := strings.ToLower(profileArg)
+	if persist {
+		dir, err = ResolveProfilePathWithBin(name, binPath)
+		if err != nil {
+			return "", false, err
+		}
+		return dir, false, nil
+	}
+
+	dir, err = newEphemeralProfileDir(safeProfileLabel(name))
+	if err != nil {
+		return "", false, err
+	}
+	return dir, true, nil
+}
+
+// defaultProfileName returns the profile name inferred from binPath, or the
+// configured default when the binary matches no known shorthand.
+func defaultProfileName(binPath string) string {
+	lowerBin := strings.ToLower(binPath)
+	switch {
+	case strings.Contains(lowerBin, "brave"):
+		return "brave"
+	case strings.Contains(lowerBin, "chrome"):
+		return "chrome"
+	case strings.Contains(lowerBin, "firefox"):
+		return "firefox"
+	}
+	cfg, err := LoadConfig()
+	if err == nil && cfg.DefaultProfile != "" {
+		return cfg.DefaultProfile
+	}
+	return "default"
+}
+
+// isRelativeProfilePath reports whether arg is a relative filesystem path rather
+// than a bare profile name. Relative paths are never resolved against the
+// process working directory.
+func isRelativeProfilePath(arg string) bool {
+	return strings.ContainsAny(arg, `/\`) || strings.HasPrefix(arg, ".")
+}
+
+// newEphemeralProfileDir creates a unique profile directory under the profiles
+// directory's .ephemeral subdirectory with label as the name prefix.
+func newEphemeralProfileDir(label string) (string, error) {
+	profBase, err := ProfilesDir()
+	if err != nil {
+		return "", err
+	}
+	base := filepath.Join(profBase, ".ephemeral")
+	if err := os.MkdirAll(base, 0700); err != nil {
+		return "", fmt.Errorf("config: create ephemeral profiles directory %s: %w", base, err)
+	}
+	dir, err := os.MkdirTemp(base, label+"-")
+	if err != nil {
+		return "", fmt.Errorf("config: create ephemeral profile under %s: %w", base, err)
+	}
+	return dir, nil
+}
+
+// safeProfileLabel reduces s to a filesystem-safe name prefix: letters, digits,
+// '-' and '_' are kept and every other rune becomes '-'.
+func safeProfileLabel(s string) string {
+	var label strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			label.WriteRune(r)
+		default:
+			label.WriteRune('-')
+		}
+	}
+	if label.Len() == 0 {
+		return "profile"
+	}
+	return label.String()
 }
 
 // LoadConfig reads config.json from the browser-mcp config directory.

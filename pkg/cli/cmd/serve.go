@@ -374,6 +374,7 @@ func runServeForeground(ctx context.Context, opts serveRunOptions) error {
 		browsers.WithStealth(opts.stealth),
 		browsers.WithBin(opts.bin),
 		browsers.WithProfileDir(profileDir),
+		browsers.WithPersist(true),
 	)
 	// Graceful teardown of the browser and all of its pages when the loop
 	// stops (SIGINT/SIGTERM cancels ctx, or a server.shutdown request makes

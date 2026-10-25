@@ -11,12 +11,15 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-rod/rod"
+
+	"webmcp/pkg/config"
 )
 
 // BrowserID uniquely identifies a live Browser instance (e.g. "browser-1", "browser-2").
@@ -53,6 +56,13 @@ const probeTimeout = 2 * time.Second
 // NewManager(WithHeadless(...), WithStealth(...), ...).
 type Option func(*Manager)
 
+// profileRef is the ownership record for one profile directory: how many live
+// browsers use it and whether it must be removed when the last one closes.
+type profileRef struct {
+	count     int
+	ephemeral bool
+}
+
 // WithHeadless controls whether the launcher runs Chromium in headless mode.
 // The default is headful (headless=false); pass WithHeadless(true) for
 // headless Chromium.
@@ -74,9 +84,23 @@ func WithBin(binPath string) Option {
 }
 
 // WithProfileDir configures a custom user data profile directory path for the browser.
-// When empty, the launcher creates a temporary user profile directory for the session.
+// The path is expected to be already resolved (absolute); it is always treated as persistent.
 func WithProfileDir(profileDir string) Option {
 	return func(m *Manager) { m.profileDir = profileDir }
+}
+
+// WithProfileName configures a profile name (or absolute path) that the engine
+// resolves through pkg/config before launch. Bare names resolve under the
+// browser-mcp profiles directory, never against the process working directory.
+func WithProfileName(name string) Option {
+	return func(m *Manager) { m.profileName = name }
+}
+
+// WithPersist controls whether a named or default profile survives browser
+// close. When false, secondary browsers get a unique ephemeral profile that is
+// removed on close; browser-1 with no explicit profile stays persistent.
+func WithPersist(persist bool) Option {
+	return func(m *Manager) { m.persist = persist }
 }
 
 // WithPosition configures the initial window placement ("left", "right", "max", "normal").
@@ -137,6 +161,15 @@ type Manager struct {
 	binPath string
 	// profileDir specifies a custom default user profile directory path.
 	profileDir string
+	// profileName is the default profile name (or absolute path) resolved through
+	// pkg/config for browsers created without an explicit WithProfileDir.
+	profileName string
+	// persist keeps named/default profiles after close. Ephemeral profiles are
+	// removed when their last owning browser closes.
+	persist bool
+	// profileRefs tracks how many live browsers own each profile directory and
+	// whether the directory is ephemeral.
+	profileRefs map[string]*profileRef
 	// position specifies default window placement ("left", "right", "max", "normal").
 	position string
 	// shutdown marks the manager as terminated; Open rejects further calls.
@@ -183,6 +216,7 @@ func NewManager(opts ...Option) *Manager {
 		ttl:           defaultTTL,
 		sweepInterval: sweepIntervalForTTL(defaultTTL),
 		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		profileRefs:   make(map[string]*profileRef),
 		baseCtx:       baseCtx,
 		cancelBase:    cancelBase,
 	}
@@ -229,40 +263,55 @@ func (m *Manager) CreateBrowser(ctx context.Context, opts ...Option) (BrowserID,
 
 	id := BrowserID(fmt.Sprintf("browser-%d", m.nextBrowserID))
 	m.nextBrowserID++
-
-	// Copy manager defaults
-	headless := m.headless
-	stealth := m.stealth
-	binPath := m.binPath
-	profileDir := m.profileDir
-	position := m.position
-
-	// Apply per-browser options if provided
-	tempMgr := &Manager{
-		headless:   headless,
-		stealth:    stealth,
-		binPath:    binPath,
-		profileDir: profileDir,
-		position:   position,
+	for {
+		if _, exists := m.browsers[id]; !exists {
+			break
+		}
+		id = BrowserID(fmt.Sprintf("browser-%d", m.nextBrowserID))
+		m.nextBrowserID++
 	}
+
+	tempMgr := &Manager{
+		headless:    m.headless,
+		stealth:     m.stealth,
+		binPath:     m.binPath,
+		profileName: m.profileName,
+		persist:     m.persist,
+		position:    m.position,
+	}
+	defaultProfileDir := m.profileDir
+	m.mu.Unlock()
+
 	for _, o := range opts {
 		o(tempMgr)
 	}
 
-	// Avoid Chromium SingletonLock profile dir collisions across distinct browser instances:
-	// browser-1 holds the main persistent profile directory (~/.config/browser-mcp/profiles/...).
-	// Any secondary browser created while the main profile is in use uses an ephemeral
-	// profile (profileDir = "") so it auto-deletes on exit and never bloats the profiles directory.
-	for _, existing := range m.browsers {
-		if existing.IsAlive(ctx) && existing.profileDir != "" && existing.profileDir == tempMgr.profileDir {
-			tempMgr.profileDir = ""
-			break
+	persist := tempMgr.persist
+	if tempMgr.profileName == "" && id == DefaultBrowserID {
+		persist = true
+	}
+
+	profileDir := tempMgr.profileDir
+	ephemeral := false
+	if profileDir == "" {
+		if tempMgr.profileName == "" && id == DefaultBrowserID && defaultProfileDir != "" {
+			profileDir = defaultProfileDir
+		} else {
+			resolved, eph, err := config.ResolveProfile(tempMgr.profileName, tempMgr.binPath, string(id), persist)
+			if err != nil {
+				return "", nil, fmt.Errorf("browsers: resolve profile for %s: %w", id, err)
+			}
+			profileDir, ephemeral = resolved, eph
 		}
 	}
-	m.mu.Unlock()
 
-	b := NewBrowser(id, m.baseCtx, tempMgr.headless, tempMgr.stealth, tempMgr.binPath, tempMgr.profileDir, tempMgr.position)
+	m.retainProfile(profileDir, ephemeral)
+
+	b := NewBrowser(id, m.baseCtx, tempMgr.headless, tempMgr.stealth, tempMgr.binPath, profileDir, tempMgr.position)
+	b.ephemeral = ephemeral
+	b.profileCleanup = func() { m.releaseProfile(profileDir) }
 	if err := b.Launch(ctx); err != nil {
+		m.releaseProfile(profileDir)
 		return "", nil, fmt.Errorf("browsers: launch browser %s: %w", id, err)
 	}
 
@@ -314,9 +363,28 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 		m.mu.Unlock()
 	}
 
-	// Create and launch the target browser
-	b := NewBrowser(id, m.baseCtx, m.headless, m.stealth, m.binPath, m.profileDir)
+	profileDir := ""
+	ephemeral := false
+	if id == DefaultBrowserID {
+		m.mu.Lock()
+		profileDir = m.profileDir
+		m.mu.Unlock()
+	}
+	if profileDir == "" {
+		resolved, eph, err := config.ResolveProfile("", m.binPath, string(id), id == DefaultBrowserID)
+		if err != nil {
+			return nil, fmt.Errorf("browsers: resolve profile for %s: %w", id, err)
+		}
+		profileDir, ephemeral = resolved, eph
+	}
+
+	m.retainProfile(profileDir, ephemeral)
+
+	b := NewBrowser(id, m.baseCtx, m.headless, m.stealth, m.binPath, profileDir)
+	b.ephemeral = ephemeral
+	b.profileCleanup = func() { m.releaseProfile(profileDir) }
 	if err := b.Launch(ctx); err != nil {
+		m.releaseProfile(profileDir)
 		return nil, fmt.Errorf("browsers: launch browser %s: %w", id, err)
 	}
 
@@ -338,6 +406,66 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 	}
 	m.mu.Unlock()
 	return b, nil
+}
+
+// retainProfile records one more live browser owning dir. The directory is
+// marked ephemeral when any owner says so, so a shared directory is only ever
+// removed when every owner has released it.
+func (m *Manager) retainProfile(dir string, ephemeral bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	ref, ok := m.profileRefs[dir]
+	if !ok {
+		ref = &profileRef{}
+		m.profileRefs[dir] = ref
+	}
+	ref.count++
+	ref.ephemeral = ref.ephemeral || ephemeral
+}
+
+// releaseProfile releases one owner of dir. The directory is deleted once no
+// live browser uses it and it was created as an ephemeral profile; cleanup
+// failures are logged and never surfaced as close errors.
+func (m *Manager) releaseProfile(dir string) {
+	m.mu.Lock()
+	ref, ok := m.profileRefs[dir]
+	if !ok {
+		m.mu.Unlock()
+		return
+	}
+	ref.count--
+	if ref.count > 0 {
+		m.mu.Unlock()
+		return
+	}
+	ephemeral := ref.ephemeral
+	delete(m.profileRefs, dir)
+	m.mu.Unlock()
+
+	if !ephemeral {
+		return
+	}
+	// Chromium can still write a singleton file for a short time after the CDP
+	// close returns. Retry until the directory stays gone, so an ephemeral
+	// profile does not survive as an empty shell.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		err := os.RemoveAll(dir)
+		if err == nil {
+			if _, statErr := os.Stat(dir); os.IsNotExist(statErr) {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			m.logger.Warn("browsers: failed to remove ephemeral profile",
+				slog.String("profile_dir", dir),
+				slog.String("error", fmt.Sprint(err)),
+			)
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // Browser returns the live Browser with the given ID, or the default/first open

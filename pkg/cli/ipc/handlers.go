@@ -73,6 +73,7 @@ func (s *Server) handleBrowserOpen(ctx context.Context, params json.RawMessage) 
 		Position string `json:"position,omitempty"`
 		Headless *bool  `json:"headless,omitempty"`
 		Stealth  *bool  `json:"stealth,omitempty"`
+		Persist  *bool  `json:"persist,omitempty"`
 	}
 	if len(params) > 0 && string(params) != "null" {
 		_ = json.Unmarshal(params, &p)
@@ -83,7 +84,10 @@ func (s *Server) handleBrowserOpen(ctx context.Context, params json.RawMessage) 
 		opts = append(opts, browsers.WithBin(p.Bin))
 	}
 	if p.Profile != "" {
-		opts = append(opts, browsers.WithProfileDir(p.Profile))
+		opts = append(opts, browsers.WithProfileName(p.Profile))
+	}
+	if p.Persist != nil {
+		opts = append(opts, browsers.WithPersist(*p.Persist))
 	}
 	if p.Position != "" {
 		opts = append(opts, browsers.WithPosition(p.Position))

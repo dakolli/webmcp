@@ -13,4 +13,6 @@ smoketest.md
 # Browser profile runtime artifacts (profiles launched into the workspace root)
 /brave
 /chrome
-.agents/
+.agents/*
+!.agents/skills/
+.agents/skills/go-rod/

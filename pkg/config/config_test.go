@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -92,6 +93,112 @@ func TestResolveProfilePath(t *testing.T) {
 	}
 	if resCustom != customDir {
 		t.Errorf("ResolveProfilePath custom path got %q, want %q", resCustom, customDir)
+	}
+}
+
+func TestResolveProfile(t *testing.T) {
+	tmpConfig := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tmpConfig)
+	profilesDir := filepath.Join(tmpConfig, DirName, "profiles")
+	ephemeralDir := filepath.Join(profilesDir, ".ephemeral")
+
+	t.Run("bare name persists", func(t *testing.T) {
+		dir, ephemeral, err := ResolveProfile("Audit", "", "browser-2", true)
+		if err != nil {
+			t.Fatalf("ResolveProfile: %v", err)
+		}
+		want := filepath.Join(profilesDir, "audit")
+		if dir != want {
+			t.Errorf("dir = %q, want %q", dir, want)
+		}
+		if ephemeral {
+			t.Error("bare name with persist=true reported ephemeral")
+		}
+		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+			t.Errorf("profile directory %s was not created: %v", dir, err)
+		}
+	})
+
+	t.Run("bare name is ephemeral without persist", func(t *testing.T) {
+		dir, ephemeral, err := ResolveProfile("audit", "", "browser-2", false)
+		if err != nil {
+			t.Fatalf("ResolveProfile: %v", err)
+		}
+		if !ephemeral {
+			t.Error("bare name with persist=false reported persistent")
+		}
+		if filepath.Dir(dir) != ephemeralDir {
+			t.Errorf("dir = %q, want it under %q", dir, ephemeralDir)
+		}
+		if !strings.HasPrefix(filepath.Base(dir), "audit-") {
+			t.Errorf("dir base = %q, want prefix %q", filepath.Base(dir), "audit-")
+		}
+		if dir == filepath.Join(profilesDir, "audit") {
+			t.Error("ephemeral profile reused the persistent named profile")
+		}
+	})
+
+	t.Run("empty persists to default", func(t *testing.T) {
+		dir, ephemeral, err := ResolveProfile("", "", "browser-1", true)
+		if err != nil {
+			t.Fatalf("ResolveProfile: %v", err)
+		}
+		want := filepath.Join(profilesDir, "default")
+		if dir != want {
+			t.Errorf("dir = %q, want %q", dir, want)
+		}
+		if ephemeral {
+			t.Error("empty profile with persist=true reported ephemeral")
+		}
+	})
+
+	t.Run("empty is ephemeral without persist", func(t *testing.T) {
+		dir, ephemeral, err := ResolveProfile("", "", "browser-2", false)
+		if err != nil {
+			t.Fatalf("ResolveProfile: %v", err)
+		}
+		if !ephemeral {
+			t.Error("empty profile with persist=false reported persistent")
+		}
+		if filepath.Dir(dir) != ephemeralDir {
+			t.Errorf("dir = %q, want it under %q", dir, ephemeralDir)
+		}
+		if !strings.HasPrefix(filepath.Base(dir), "browser-2-") {
+			t.Errorf("dir base = %q, want prefix %q", filepath.Base(dir), "browser-2-")
+		}
+	})
+
+	t.Run("absolute path stays persistent", func(t *testing.T) {
+		want := filepath.Join(t.TempDir(), "absolute-profile")
+		dir, ephemeral, err := ResolveProfile(want, "", "browser-2", false)
+		if err != nil {
+			t.Fatalf("ResolveProfile: %v", err)
+		}
+		if dir != want {
+			t.Errorf("dir = %q, want %q", dir, want)
+		}
+		if ephemeral {
+			t.Error("absolute path reported ephemeral")
+		}
+		if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+			t.Errorf("absolute profile directory %s was not created: %v", dir, err)
+		}
+	})
+
+	for _, arg := range []string{"foo/bar", "./audit", "../audit"} {
+		t.Run("relative path rejected "+arg, func(t *testing.T) {
+			if _, _, err := ResolveProfile(arg, "", "browser-2", true); err == nil {
+				t.Errorf("ResolveProfile(%q) succeeded, want error", arg)
+			}
+		})
+	}
+}
+
+func TestResolveProfilePathWithBinRejectsRelativePath(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	if _, err := ResolveProfilePathWithBin("foo/bar", ""); err == nil {
+		t.Fatal("ResolveProfilePathWithBin(\"foo/bar\") succeeded, want error")
 	}
 }
 

@@ -53,6 +53,13 @@ type Browser struct {
 	binPath string
 	// profileDir specifies a custom browser user data profile directory path.
 	profileDir string
+	// ephemeral marks a profile owned by this browser and removed on close.
+	ephemeral bool
+	// profileCleanup releases the profile ownership recorded by Manager. It is
+	// nil for persistent profiles.
+	profileCleanup func()
+	// cleanupOnce guarantees the profile cleanup runs at most once.
+	cleanupOnce sync.Once
 	// position specifies initial window placement ("left", "right", "max", "normal").
 	position string
 	// baseCtx is the manager-owned, process-lifetime context the rod browser's
@@ -103,6 +110,8 @@ func (b *Browser) BinPath() string {
 
 // ProfileDir returns the Browser's configured profile directory path.
 func (b *Browser) ProfileDir() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return b.profileDir
 }
 
@@ -163,13 +172,13 @@ func (b *Browser) Launch(ctx context.Context) error {
 	}
 	profileDir := b.profileDir
 	if profileDir == "" {
-		if resolved, err := config.ResolveProfilePathWithBin("", binPath); err == nil {
-			profileDir = resolved
+		resolved, err := config.ResolveProfilePathWithBin("", binPath)
+		if err != nil {
+			return fmt.Errorf("browsers: resolve profile directory: %w", err)
 		}
+		profileDir = resolved
 	}
-	if profileDir != "" {
-		l.UserDataDir(profileDir)
-	}
+	l.UserDataDir(profileDir)
 	if !b.headless {
 		switch b.position {
 		case "right":
@@ -227,6 +236,7 @@ func (b *Browser) Launch(ctx context.Context) error {
 
 	b.mu.Lock()
 	b.rod = rb
+	b.profileDir = profileDir
 	b.mu.Unlock()
 	return nil
 }
@@ -719,8 +729,15 @@ func (b *Browser) Close(ctx context.Context) error {
 		_ = closeRodPage(teardownCtx, h)
 	}
 
-	if rb == nil {
-		return nil
+	var closeErr error
+	if rb != nil {
+		closeErr = rb.Context(teardownCtx).Close() // error form; no Must*
 	}
-	return rb.Context(teardownCtx).Close() // error form; no Must*
+
+	b.cleanupOnce.Do(func() {
+		if b.profileCleanup != nil {
+			b.profileCleanup()
+		}
+	})
+	return closeErr
 }

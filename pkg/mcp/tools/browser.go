@@ -37,16 +37,19 @@ func (t *BrowserCreate) Name() string {
 func (t *BrowserCreate) Description() string {
 	return "Lazily launches the shared live browser (Brave by default, or Chromium) and " +
 		"returns its browser_id (browser-1). Reuses browser-1 idempotently when running. " +
-		"Uses persistent user profile at ~/.config/browser-mcp/profiles/<browser_name> for browser-1; " +
-		"secondary instances run in ephemeral mode to prevent profile directory bloat. " +
+		"browser-1 with no profile uses the persistent profile at " +
+		"~/.config/browser-mcp/profiles/<browser_name>. A bare profile name resolves under " +
+		"~/.config/browser-mcp/profiles; an absolute path is used as given and relative paths " +
+		"are rejected. Secondary browsers default to an ephemeral profile that is deleted on close. " +
+		"Set persist=true with a profile name to keep that profile (and its logins) after close. " +
 		"Passing any option (headless, profile, bin, …) creates a NEW browser id rather than " +
 		"reusing browser-1, and fails with a Chromium SingletonLock error if another running " +
 		"browser holds the same profile — pass a distinct profile name per browser. " +
-		"Example: { \"headless\": true, \"profile\": \"audit\" }."
+		"Example: { \"headless\": true, \"profile\": \"audit\", \"persist\": true }."
 }
 
 // InputSchema returns the JSON Schema for browser_create's arguments: optional
-// bin, profile, headless, and stealth parameters.
+// bin, profile, persist, headless, stealth, and position parameters.
 func (t *BrowserCreate) InputSchema() models.InputSchema {
 	return models.InputSchema{
 		Type: "object",
@@ -57,7 +60,11 @@ func (t *BrowserCreate) InputSchema() models.InputSchema {
 			},
 			"profile": map[string]any{
 				"type":        "string",
-				"description": "Optional profile name ('brave', 'chrome', 'firefox', 'default') or custom directory path.",
+				"description": "Optional profile name ('brave', 'chrome', 'firefox', 'default' or any label) resolved under ~/.config/browser-mcp/profiles, or an absolute directory path. Relative paths are rejected.",
+			},
+			"persist": map[string]any{
+				"type":        "boolean",
+				"description": "Keep the profile (and its logins) after the browser closes. Default false: secondary browsers get an ephemeral profile deleted on close, while browser-1 with no explicit profile stays persistent.",
 			},
 			"headless": map[string]any{
 				"type":        "boolean",
@@ -83,6 +90,7 @@ type browserCreateArgs struct {
 	Position string `json:"position,omitempty"`
 	Headless *bool  `json:"headless,omitempty"`
 	Stealth  *bool  `json:"stealth,omitempty"`
+	Persist  *bool  `json:"persist,omitempty"`
 }
 
 // Execute parses options and creates a new distinct Browser via Manager.CreateBrowser.
@@ -99,7 +107,10 @@ func (t *BrowserCreate) Execute(ctx context.Context, args json.RawMessage) (stri
 		opts = append(opts, browsers.WithBin(a.Bin))
 	}
 	if a.Profile != "" {
-		opts = append(opts, browsers.WithProfileDir(a.Profile))
+		opts = append(opts, browsers.WithProfileName(a.Profile))
+	}
+	if a.Persist != nil {
+		opts = append(opts, browsers.WithPersist(*a.Persist))
 	}
 	if a.Position != "" {
 		opts = append(opts, browsers.WithPosition(a.Position))

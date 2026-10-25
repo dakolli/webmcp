@@ -362,13 +362,22 @@ func browserListViaIPC(cmd *cobra.Command, cl *ipc.Client) error {
 }
 
 // NewBrowserCreateCmd constructs the "browser create" command: launches a new
-// browser process with optional custom binary (--bin) and profile (--profile).
+// browser process with optional custom binary (--bin), profile (--profile),
+// persistence (--persist), and window position (--position).
 func NewBrowserCreateCmd(mgr *browsers.Manager) *cobra.Command {
 	var bin, profile, position string
+	var persist bool
 	cmd := &cobra.Command{
 		Use:   "create",
 		Short: "Create and launch a new browser instance",
-		Long:  "Launches a new browser process with optional custom binary (--bin), profile (--profile), and window position (--position left|right|max|normal).",
+		Long: `Launches a new browser process with optional custom binary (--bin), profile
+(--profile), and window position (--position left|right|max|normal).
+
+A bare profile name resolves under ~/.config/browser-mcp/profiles; an absolute
+path is used as given; relative paths are rejected. Secondary browsers default
+to an ephemeral profile that is deleted on close. Pass --persist to keep a named
+profile (and its logins) after close. browser-1 with no explicit profile is
+always persistent.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx, cancel := context.WithTimeout(cmdCtx(cmd), 30*time.Second)
 			defer cancel()
@@ -379,6 +388,9 @@ func NewBrowserCreateCmd(mgr *browsers.Manager) *cobra.Command {
 					"bin":      bin,
 					"profile":  profile,
 					"position": position,
+				}
+				if cmd.Flags().Changed("persist") {
+					params["persist"] = persist
 				}
 				var res struct {
 					BrowserID string `json:"browser_id"`
@@ -396,7 +408,10 @@ func NewBrowserCreateCmd(mgr *browsers.Manager) *cobra.Command {
 				opts = append(opts, browsers.WithBin(bin))
 			}
 			if profile != "" {
-				opts = append(opts, browsers.WithProfileDir(profile))
+				opts = append(opts, browsers.WithProfileName(profile))
+			}
+			if cmd.Flags().Changed("persist") {
+				opts = append(opts, browsers.WithPersist(persist))
 			}
 			if position != "" {
 				opts = append(opts, browsers.WithPosition(position))
@@ -420,7 +435,8 @@ func NewBrowserCreateCmd(mgr *browsers.Manager) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&bin, "bin", "", "custom browser binary executable path or command")
-	cmd.Flags().StringVar(&profile, "profile", "", "profile name (brave, chrome, firefox, default) or custom directory path")
+	cmd.Flags().StringVar(&profile, "profile", "", "profile name resolved under the config dir, or an absolute directory path")
+	cmd.Flags().BoolVar(&persist, "persist", false, "keep the profile (and its logins) after close; secondary browsers are otherwise ephemeral")
 	cmd.Flags().StringVar(&position, "position", "", "window position split screen preset: left, right, max, normal")
 	return cmd
 }

@@ -30,8 +30,9 @@ Two things it is for:
   and `clear_logs`.
 - 🧭 **Multi-browser aware**: a manager owns a map of browsers, each with its own pages; `browser-1`
   is the default.
-- 🥷 **Stealth on by default** (`go-rod/stealth`) and **persistent profiles** under
-  `~/.config/browser-mcp/profiles/<name>`, so cookies and logins survive restarts.
+- 🥷 **Stealth on by default** (`go-rod/stealth`) and **profiles under the config dir**
+  (`~/.config/browser-mcp/profiles/`). `browser-1` keeps its profile and logins across restarts.
+  Secondary browsers are ephemeral by default and their profile is removed on close.
 - 📱 **Opt-in device emulation** (`IPhoneX`, `IPadPro`, `LaptopWithHiDPIScreen`), applied before
   navigation; pages otherwise launch plain at your real display metrics.
 - ⚡ **Dual interface**: the `browser` CLI mirrors the MCP tools 1:1, plus a daemon over a Unix socket
@@ -70,6 +71,16 @@ browser serve --foreground                                          # stay attac
 `--port` defaults to `4099` when omitted; the Makefile and the examples here use `4089`.
 The MCP server binds all interfaces and has **no authentication** — keep it local-only.
 
+### Profiles
+
+- A bare profile name resolves under `~/.config/browser-mcp/profiles/<name>`.
+- An absolute path is used as given. A relative path with a separator is rejected.
+- `browser-1` with no profile uses the persistent default profile.
+- A secondary browser gets an ephemeral profile under `profiles/.ephemeral/`.
+  The manager removes that profile on close, shutdown, or launch failure.
+- Add `--persist` to keep a named profile and its logins after close.
+  The MCP equivalent is `"persist": true` on `browser_create`.
+
 ### 2. Use it from the CLI
 
 ```sh
@@ -106,7 +117,7 @@ browser page close last
 
 | Tool | Purpose |
 | :--- | :--- |
-| `browser_create` | Launch/reuse a browser (`bin`, `profile`, `headless`, `stealth`, `position`). |
+| `browser_create` | Launch/reuse a browser (`bin`, `profile`, `persist`, `headless`, `stealth`, `position`). |
 | `browser_list` | List live browsers and their pages. |
 | `browser_close` | Close one browser, or all when `browser_id` is empty. An unknown id fails with `browser "browser-42" not found (running: browser-1)`. |
 | `fetch_page` | Open a URL in a new session and return `session_id` + summary. `wait_for` defaults to `idle`. |
