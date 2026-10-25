@@ -19,11 +19,11 @@ const MaxInteractives = 200
 // the dense action-map entry an agent uses to act immediately via
 // page_act { handle: ... } without selector guesswork.
 type Interactive struct {
-	// Handle is the stable element handle "b<backendNodeId>" (the WEB-51
-	// scheme, minted from the snapshot's BackendNodeID parallel array — stable
-	// across snapshot calls while the node lives in the renderer); usable
-	// directly as page_act's handle arg. Omitted when the snapshot carried no
-	// backend node id for the element.
+	// Handle is the element handle "g<document>-b<backendNodeId>" minted from
+	// the snapshot's BackendNodeID parallel array. The document token scopes it
+	// to the document that minted it, so a handle from a previous document is
+	// rejected as stale; usable directly as page_act's handle arg. Omitted when
+	// the snapshot carried no backend node id for the element.
 	Handle string `json:"handle"`
 	// Role is the element's ARIA role attribute, else its lowercased tag
 	// (a/button/input/select/textarea/…).
@@ -66,36 +66,32 @@ type InteractivesResult struct {
 // input type and center x/y — the whole-page snapshot an agent uses to act
 // immediately (page_act { handle: ... }) without selector guesswork.
 //
-// The method takes the page lock itself (mirroring Page.Close): callers must
-// NOT pre-lock. The nil-Rod guard runs UNDER the lock and returns the exact
-// pinned "page session is closed" error. The snapshot is ONE
-// CaptureDOMSnapshot round trip (the same data source as the dom extractor),
-// then a purpose-built linear walk of the root document's nodes in document
-// order (later snapshot documents are iframes — for a first cut only the root
-// document is walked; the minted handles are renderer-global backendNodeIds,
-// so they remain valid for page_act regardless). No JS is evaluated: the
-// snapshot's layout tree only contains rendered nodes, so the visibility
-// filter is more accurate than an offsetParent heuristic (it does not wrongly
-// exclude visible position:fixed elements).
+// The method takes the page lock itself (via CaptureSnapshot, mirroring
+// Page.Close): callers must NOT pre-lock. The nil-Rod guard runs UNDER the
+// lock and returns the exact pinned "page session is closed" error. The
+// snapshot is ONE CaptureDOMSnapshot round trip plus the document-marker read
+// (the same data source as the dom extractor), then a purpose-built linear
+// walk of the root document's nodes in document order (later snapshot
+// documents are iframes — for a first cut only the root document is walked;
+// the minted handles are renderer-global backendNodeIds, so they remain valid
+// for page_act regardless). No page DOM JS is evaluated: the snapshot's layout
+// tree only contains rendered nodes, so the visibility filter is more accurate
+// than an offsetParent heuristic (it does not wrongly exclude visible
+// position:fixed elements).
 //
 // The walk applies the candidacy rules (tag/role/tabindex/onclick/
 // contenteditable), skips inert elements (disabled, aria-disabled="true",
 // aria-hidden="true" on the node or any ancestor) and unrendered nodes (no
 // layout entry), collapses nested interactives to the outermost, and caps the
 // result at MaxInteractives entries with the remainder reported via
-// InteractivesResult.Truncated. ctx is threaded through to the rod call so a
+// InteractivesResult.Truncated. ctx is threaded through to the rod calls so a
 // hung page cannot outlive the caller's deadline.
 func (p *Page) Interactives(ctx context.Context) (InteractivesResult, error) {
-	p.Lock()
-	defer p.Unlock()
-	if p.Rod == nil {
-		return InteractivesResult{}, fmt.Errorf("page session is closed")
-	}
-	snap, err := p.Rod.Context(ctx).CaptureDOMSnapshot() // error form; no Must*
+	snap, token, err := p.CaptureSnapshot(ctx)
 	if err != nil {
-		return InteractivesResult{}, fmt.Errorf("capture interactives snapshot: %w", err)
+		return InteractivesResult{}, err
 	}
-	res, err := decodeInteractives(snap)
+	res, err := decodeInteractives(snap, token)
 	if err != nil {
 		return InteractivesResult{}, fmt.Errorf("decode interactives: %w", err)
 	}
@@ -104,11 +100,12 @@ func (p *Page) Interactives(ctx context.Context) (InteractivesResult, error) {
 
 // decodeInteractives walks the root document of a DOM snapshot in document
 // order and collects every visible, non-inert interactive element into an
-// InteractivesResult. It is a pure function over the snapshot structs (no
-// rod), so it is unit-testable without Chromium: an empty-but-valid document
-// yields the empty result (never nil), while a snapshot with no root document
-// at all is a decode failure.
-func decodeInteractives(snap *proto.DOMSnapshotCaptureSnapshotResult) (InteractivesResult, error) {
+// InteractivesResult, minting each handle with docToken so the handle is
+// scoped to the document that produced the snapshot. It is a pure function
+// over the snapshot structs (no rod), so it is unit-testable without Chromium:
+// an empty-but-valid document yields the empty result (never nil), while a
+// snapshot with no root document at all is a decode failure.
+func decodeInteractives(snap *proto.DOMSnapshotCaptureSnapshotResult, docToken string) (InteractivesResult, error) {
 	res := InteractivesResult{Interactives: []Interactive{}}
 	if snap == nil || len(snap.Documents) == 0 || snap.Documents[0] == nil {
 		return res, fmt.Errorf("snapshot has no root document")
@@ -173,7 +170,7 @@ func decodeInteractives(snap *proto.DOMSnapshotCaptureSnapshotResult) (Interacti
 			continue
 		}
 		accepted[i] = true
-		res.Interactives = append(res.Interactives, buildInteractive(strs, doc, i, tag, attrs, li))
+		res.Interactives = append(res.Interactives, buildInteractive(strs, doc, i, tag, attrs, li, docToken))
 	}
 	return res, nil
 }
@@ -272,18 +269,19 @@ func buildInteractive(
 	tag string,
 	attrs map[string]string,
 	li int,
+	docToken string,
 ) Interactive {
 	it := Interactive{
 		Role:    roleOf(tag, attrs),
 		Text:    textOf(strs, doc, i, li, attrs),
 		Visible: true,
 	}
-	// Mirror WEB-51's buildDOMTree hoist exactly: the BackendNodeID parallel
-	// array is aligned with the node table — guard the bounds and skip when
-	// the id is absent or zero.
+	// Mirror DOM extraction exactly: the BackendNodeID parallel array is
+	// aligned with the node table — guard the bounds and skip when the id is
+	// absent or zero.
 	n := doc.Nodes
 	if i < len(n.BackendNodeID) && n.BackendNodeID[i] > 0 {
-		it.Handle = fmt.Sprintf("b%d", n.BackendNodeID[i])
+		it.Handle = MintHandle(docToken, n.BackendNodeID[i])
 	}
 	if tag == "a" {
 		it.Href = resolveHref(attrs["href"], str(strs, doc.DocumentURL))

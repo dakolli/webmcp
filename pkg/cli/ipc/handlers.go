@@ -399,17 +399,17 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 	var out string
 	switch p.Action {
 	case "click":
-		out, err = pageops.PageClickOpts(ctx, page, p.Selector, p.Button, p.ClickCount)
+		out, err = pageops.PageClickOpts(ctx, page, p.Handle, p.Selector, p.Button, p.ClickCount)
 	case "input":
-		out, err = pageops.PageInput(ctx, page, p.Selector, p.Value)
+		out, err = pageops.PageInput(ctx, page, p.Handle, p.Selector, p.Value)
 	case "type":
-		out, err = pageops.PageType(ctx, page, p.Selector, p.Value)
+		out, err = pageops.PageType(ctx, page, p.Handle, p.Selector, p.Value)
 	case "press_key":
 		keyStr := p.Key
 		if keyStr == "" {
 			keyStr = p.Value
 		}
-		out, err = pageops.PagePressKey(ctx, page, p.Selector, keyStr)
+		out, err = pageops.PagePressKey(ctx, page, p.Handle, p.Selector, keyStr)
 	case "click_at":
 		out, err = pageops.PageClickAt(ctx, page, p.X, p.Y, p.Button, p.ClickCount)
 	case "hover_at":
@@ -421,7 +421,7 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		if len(paths) == 0 && p.Value != "" {
 			paths = []string{p.Value}
 		}
-		out, err = pageops.PageUploadFile(ctx, page, p.Selector, paths)
+		out, err = pageops.PageUploadFile(ctx, page, p.Handle, p.Selector, paths)
 	case "eval":
 		out, err = pageops.PageEval(ctx, page, p.Value)
 	case "navigate":
@@ -433,13 +433,13 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 	case "reload":
 		out, err = pageops.PageReload(ctx, page)
 	case "hover":
-		out, err = pageops.PageHover(ctx, page, p.Selector)
+		out, err = pageops.PageHover(ctx, page, p.Handle, p.Selector)
 	case "scroll":
 		out, err = pageops.PageScroll(ctx, page, p.X, p.Y)
 	case "select":
-		out, err = pageops.PageSelect(ctx, page, p.Selector, p.Value)
+		out, err = pageops.PageSelect(ctx, page, p.Handle, p.Selector, p.Value)
 	case "wait":
-		out, err = pageops.PageWait(ctx, page, p.WaitMode, p.Selector, time.Duration(p.TimeoutMS)*time.Millisecond)
+		out, err = pageops.PageWait(ctx, page, p.WaitMode, p.Handle, p.Selector, time.Duration(p.TimeoutMS)*time.Millisecond)
 	case "set_viewport":
 		out, err = pageops.PageSetViewport(ctx, page, p.Viewport.Width, p.Viewport.Height)
 	case "emulate":

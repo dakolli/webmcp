@@ -310,6 +310,7 @@ func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 		id             string
 		action         string
 		selector       string
+		handle         string
 		value          string
 		key            string
 		button         string
@@ -333,6 +334,10 @@ forward, reload, wait, set_viewport, emulate) and prints the confirmation. The p
 is optional when only one page is open; 'last' means the most recently opened page;
 a bare number resolves to page-N.
 Positional payloads fill each action's fields — flags remain as fallbacks.
+Element actions also accept --handle from page fetch interactives/dom/links, e.g.
+--handle g3k9x2ab-b6; when both --handle and --selector are given, the handle wins.
+A handle is scoped to the document that minted it: after a navigation, reload or
+redirect it is rejected as stale, so re-fetch before acting.
 
   [id] [action] [payload...]   e.g. "12 click \"#submit\"", "last eval '() => document.title'"
 
@@ -364,7 +369,7 @@ Positional payloads fill each action's fields — flags remain as fallbacks.
 			// Positional args win over the --flags; payload counts are
 			// validated here, before any browser work.
 			parsed, err := parseActArgs(args, actArgFlags{
-				id: id, action: action, selector: selector, value: value, key: key,
+				id: id, action: action, selector: selector, handle: handle, value: value, key: key,
 				button: button, clickCount: clickCount, targetSelector: targetSelector,
 				paths: paths, waitMode: waitMode, device: device, x: x, y: y,
 				targetX: targetX, targetY: targetY, width: width, height: height,
@@ -372,7 +377,9 @@ Positional payloads fill each action's fields — flags remain as fallbacks.
 			if err != nil {
 				return err
 			}
-			id, action, selector, value, key, button, clickCount, targetSelector, paths, waitMode, device = parsed.id, parsed.action, parsed.selector, parsed.value, parsed.key, parsed.button, parsed.clickCount, parsed.targetSelector, parsed.paths, parsed.waitMode, parsed.device
+			id, action, selector, handle = parsed.id, parsed.action, parsed.selector, parsed.handle
+			value, key, button, clickCount = parsed.value, parsed.key, parsed.button, parsed.clickCount
+			targetSelector, paths, waitMode, device = parsed.targetSelector, parsed.paths, parsed.waitMode, parsed.device
 			x, y, targetX, targetY = parsed.x, parsed.y, parsed.targetX, parsed.targetY
 			width, height = parsed.width, parsed.height
 
@@ -423,7 +430,7 @@ Positional payloads fill each action's fields — flags remain as fallbacks.
 				if err != nil {
 					return err
 				}
-				return pageActViaIPC(cmd, ctx, cl, rid, action, selector, value, key, button, clickCount, x, y, targetX, targetY, targetSelector, paths, waitMode, timeoutMS, vp, device)
+				return pageActViaIPC(cmd, ctx, cl, rid, action, handle, selector, value, key, button, clickCount, x, y, targetX, targetY, targetSelector, paths, waitMode, timeoutMS, vp, device)
 			}
 			printServeHint(cmd)
 
@@ -439,17 +446,17 @@ Positional payloads fill each action's fields — flags remain as fallbacks.
 			var out string
 			switch action {
 			case "click":
-				out, err = pageops.PageClickOpts(ctx, p, selector, button, clickCount)
+				out, err = pageops.PageClickOpts(ctx, p, handle, selector, button, clickCount)
 			case "input":
-				out, err = pageops.PageInput(ctx, p, selector, value)
+				out, err = pageops.PageInput(ctx, p, handle, selector, value)
 			case "type":
-				out, err = pageops.PageType(ctx, p, selector, value)
+				out, err = pageops.PageType(ctx, p, handle, selector, value)
 			case "press_key":
 				keyStr := key
 				if keyStr == "" {
 					keyStr = value
 				}
-				out, err = pageops.PagePressKey(ctx, p, selector, keyStr)
+				out, err = pageops.PagePressKey(ctx, p, handle, selector, keyStr)
 			case "click_at":
 				out, err = pageops.PageClickAt(ctx, p, x, y, button, clickCount)
 			case "hover_at":
@@ -461,7 +468,7 @@ Positional payloads fill each action's fields — flags remain as fallbacks.
 				if len(pList) == 0 && value != "" {
 					pList = []string{value}
 				}
-				out, err = pageops.PageUploadFile(ctx, p, selector, pList)
+				out, err = pageops.PageUploadFile(ctx, p, handle, selector, pList)
 			case "eval":
 				out, err = pageops.PageEval(ctx, p, value)
 			case "navigate":
@@ -473,13 +480,13 @@ Positional payloads fill each action's fields — flags remain as fallbacks.
 			case "reload":
 				out, err = pageops.PageReload(ctx, p)
 			case "hover":
-				out, err = pageops.PageHover(ctx, p, selector)
+				out, err = pageops.PageHover(ctx, p, handle, selector)
 			case "scroll":
 				out, err = pageops.PageScroll(ctx, p, x, y)
 			case "select":
-				out, err = pageops.PageSelect(ctx, p, selector, value)
+				out, err = pageops.PageSelect(ctx, p, handle, selector, value)
 			case "wait":
-				out, err = pageops.PageWait(ctx, p, waitMode, selector, timeout)
+				out, err = pageops.PageWait(ctx, p, waitMode, handle, selector, timeout)
 			case "set_viewport":
 				out, err = pageops.PageSetViewport(ctx, p, width, height)
 			case "emulate":
@@ -495,6 +502,7 @@ Positional payloads fill each action's fields — flags remain as fallbacks.
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to act on (optional with one page open; 'last'; or a bare number)")
 	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate")
 	cmd.Flags().StringVar(&selector, "selector", "", "CSS selector targeting the element (element actions)")
+	cmd.Flags().StringVar(&handle, "handle", "", "element handle from page fetch (g<document>-b<backendNodeId>, scoped to its document); wins over --selector (element actions)")
 	cmd.Flags().StringVar(&value, "value", "", "value for eval (JS function), input (text), type (text), navigate (URL), select (option value)")
 	cmd.Flags().StringVar(&key, "key", "", "key or key combo for press_key action (e.g. Enter, Escape, Control+A)")
 	cmd.Flags().StringVar(&button, "button", "left", "mouse button for click and click_at: left, right, middle")
@@ -505,7 +513,7 @@ Positional payloads fill each action's fields — flags remain as fallbacks.
 	cmd.Flags().Float64Var(&targetY, "target-y", 0, "target vertical coordinate in pixels (drag_and_drop)")
 	cmd.Flags().StringVar(&targetSelector, "target-selector", "", "target element selector (drag_and_drop)")
 	cmd.Flags().StringArrayVar(&paths, "path", nil, "file paths for upload_file action")
-	cmd.Flags().StringVar(&waitMode, "wait", "ms", "wait mode (wait action): load, idle, stable, interactable (needs --selector), ms (sleep --timeout-ms; default ms)")
+	cmd.Flags().StringVar(&waitMode, "wait", "ms", "wait mode (wait action): load, idle, stable, interactable (needs --selector or --handle), ms (sleep --timeout-ms; default ms)")
 	cmd.Flags().IntVar(&timeoutMS, "timeout-ms", 30000, "per-action timeout in milliseconds (default 30000)")
 	cmd.Flags().IntVar(&width, "width", 0, "target viewport width in CSS pixels (set_viewport action)")
 	cmd.Flags().IntVar(&height, "height", 0, "target viewport height in CSS pixels (set_viewport action)")
@@ -627,15 +635,30 @@ func pageFetchViaIPC(cmd *cobra.Command, ctx context.Context, cl *ipc.Client, id
 }
 
 // pageActViaIPC implements `page act` against a live serve process: it
-// forwards the action (with its selector/value/key/button/click_count/x/y/
-// target_x/target_y/target_selector/paths/timeout/wait/viewport/device params)
-// to page.act and prints the confirmation byte-identically to the in-process path.
-func pageActViaIPC(cmd *cobra.Command, ctx context.Context, cl *ipc.Client, id, action, selector, value, key, button string, clickCount int, x, y, targetX, targetY float64, targetSelector string, paths []string, waitMode string, timeoutMS int, vp *browsers.Viewport, device string) error {
+// forwards the action (with its handle/selector/value/key/button/click_count/
+// x/y/target_x/target_y/target_selector/paths/timeout/wait/viewport/device
+// params) to page.act and prints the confirmation byte-identically to the
+// in-process path.
+func pageActViaIPC(
+	cmd *cobra.Command,
+	ctx context.Context,
+	cl *ipc.Client,
+	id, action, handle, selector, value, key, button string,
+	clickCount int,
+	x, y, targetX, targetY float64,
+	targetSelector string,
+	paths []string,
+	waitMode string,
+	timeoutMS int,
+	vp *browsers.Viewport,
+	device string,
+) error {
 	var res ipc.PageActResult
 	if err := cl.Call(ctx, ipc.MethodPageAct, &ipc.PageActParams{
 		SessionID:      id,
 		Action:         action,
 		Selector:       selector,
+		Handle:         handle,
 		Value:          value,
 		Key:            key,
 		Button:         button,

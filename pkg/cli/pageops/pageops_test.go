@@ -4,9 +4,12 @@ package pageops
 // maxBytes semantics, and rune-safe cutting with the EXACT truncation note.
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/go-rod/rod/lib/proto"
 )
 
 // truncateNote is the exact suffix PageTruncate appends: a leading newline,
@@ -145,5 +148,111 @@ func TestParseMouseButton(t *testing.T) {
 				t.Errorf("parseMouseButton(%q) unexpected error: %v", tt.in, err)
 			}
 		})
+	}
+}
+
+// TestActTarget pins handle parsing and the exact stale-handle error strings
+// that MCP, CLI and IPC surface verbatim.
+func TestActTarget(t *testing.T) {
+	valid := []struct {
+		handle string
+		token  string
+		want   proto.DOMBackendNodeID
+	}{
+		{"g3k9x2ab-b6", "3k9x2ab", 6},
+		{"g0-b1073741831", "0", 1073741831},
+	}
+	for _, tt := range valid {
+		t.Run("valid "+tt.handle, func(t *testing.T) {
+			token, got, err := parseHandle(tt.handle)
+			if err != nil {
+				t.Fatalf("parseHandle(%q) unexpected error: %v", tt.handle, err)
+			}
+			if token != tt.token || got != tt.want {
+				t.Errorf("parseHandle(%q) = (%q, %d), want (%q, %d)", tt.handle, token, got, tt.token, tt.want)
+			}
+		})
+	}
+
+	for _, handle := range []string{"", "b", "b6", "b0", "b-3", "x123", "6", "g-b6", "g", "gabc", "gabc-b", "gabc-b0", "gabc6"} {
+		t.Run("invalid "+handle, func(t *testing.T) {
+			_, _, err := parseHandle(handle)
+			want := `invalid handle "` + handle + `" (expected g<document>-b<backendNodeId> minted by page_fetch what=interactives|dom|links)`
+			if err == nil || err.Error() != want {
+				t.Fatalf("parseHandle(%q) error = %v, want %q", handle, err, want)
+			}
+		})
+	}
+
+	if _, err := actTarget(nil, "", ""); err == nil || err.Error() != "either selector or handle is required" {
+		t.Errorf("actTarget(no target) error = %v", err)
+	}
+
+	resolveErr := errors.New("{-32000 No node with given id found }")
+	if got := staleResolveError("g3k9x2ab-b6", resolveErr).Error(); got != `handle "g3k9x2ab-b6" is stale — element no longer in the document (re-run page_fetch what=interactives to re-mint handles): {-32000 No node with given id found }` {
+		t.Errorf("staleResolveError = %q", got)
+	}
+	if got := staleDetachedError("g3k9x2ab-b6").Error(); got != `handle "g3k9x2ab-b6" is stale — element detached from the document (re-run page_fetch what=interactives to re-mint handles)` {
+		t.Errorf("staleDetachedError = %q", got)
+	}
+	if got := staleDocumentError("g3k9x2ab-b6").Error(); got != `handle "g3k9x2ab-b6" is stale — minted for a previous document (re-run page_fetch what=interactives to re-mint handles)` {
+		t.Errorf("staleDocumentError = %q", got)
+	}
+
+	if got := actionError("click", "", "#x", resolveErr).Error(); got != `click: element "#x": {-32000 No node with given id found }` {
+		t.Errorf("selector actionError = %q", got)
+	}
+	if got := actionError("click", "g3k9x2ab-b6", "#x", resolveErr).Error(); got != resolveErr.Error() {
+		t.Errorf("handle actionError re-wrapped: %q", got)
+	}
+}
+
+// TestLinkHandles pins first-anchor-wins handle matching from a DOM snapshot.
+func TestLinkHandles(t *testing.T) {
+	strs := []string{
+		"#document",
+		"HTML",
+		"A",
+		"DIV",
+		"href",
+		"/one",
+		"/two",
+		"/three?a=1&b=2",
+		"https://example.com/",
+	}
+	snap := &proto.DOMSnapshotCaptureSnapshotResult{
+		Documents: []*proto.DOMSnapshotDocumentSnapshot{{
+			DocumentURL: 8,
+			Nodes: &proto.DOMSnapshotNodeTreeSnapshot{
+				ParentIndex:   []int{-1, 0, 1, 0, 0, 0},
+				NodeType:      []int{9, 1, 1, 1, 1, 1},
+				NodeName:      []proto.DOMSnapshotStringIndex{0, 1, 2, 2, 2, 2},
+				BackendNodeID: []proto.DOMBackendNodeID{0, 10, 11, 12, 13, 14},
+				Attributes: []proto.DOMSnapshotArrayOfStrings{
+					nil,
+					nil,
+					{4, 5},
+					{4, 5},
+					{4, 6},
+					{4, 7},
+				},
+			},
+		}},
+		Strings: strs,
+	}
+
+	got := linkHandles(snap, "3k9x2ab")
+	want := map[string]string{
+		"https://example.com/one":           "g3k9x2ab-b11",
+		"https://example.com/two":           "g3k9x2ab-b13",
+		"https://example.com/three?a=1&b=2": "g3k9x2ab-b14",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("linkHandles() = %v, want %v", got, want)
+	}
+	for href, handle := range want {
+		if got[href] != handle {
+			t.Errorf("linkHandles()[%q] = %q, want %q", href, got[href], handle)
+		}
 	}
 }

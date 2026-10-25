@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"html"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -14,6 +13,7 @@ import (
 	"github.com/go-rod/rod/lib/proto"
 
 	"webmcp/pkg/browsers"
+	"webmcp/pkg/cli/pageops"
 	"webmcp/pkg/mcp/models"
 )
 
@@ -93,7 +93,7 @@ func (t *Page) InputSchema() models.InputSchema {
 			"what": map[string]any{
 				"type":        "string",
 				"enum":        []string{"html", "dom", "text", "css", "js", "links", "screenshot", "meta", "interactives"},
-				"description": "The aspect of the page to extract: html (outerHTML), dom (flattened DOM snapshot), text (visible text), css (style resources), js (script resources), links (anchor hrefs), screenshot (base64 PNG data-URI; full_page captures the whole scrollable page), interactives (dense action map of every visible clickable/typeable element — with stable handles usable as page_act's handle arg; whole-page by design, the selector arg is ignored), meta (title/url/description).",
+				"description": "The aspect of the page to extract: html (outerHTML), dom (flattened DOM snapshot; every element node carries a g<document>-b<backendNodeId> handle usable as page_act's handle arg; the document token makes handles from a previous document stale after navigation), text (visible text), css (style resources), js (script resources), links (anchor hrefs, each with a handle where one matched), screenshot (base64 PNG data-URI; full_page captures the whole scrollable page), interactives (dense action map of every visible clickable/typeable element — with stable handles usable as page_act's handle arg; whole-page by design, the selector arg is ignored), meta (title/url/description).",
 			},
 			"selector": map[string]any{
 				"type":        "string",
@@ -265,340 +265,21 @@ func (t *Page) extractText(ctx context.Context, p *browsers.Page, selector strin
 	return res.Value.Str(), nil
 }
 
-// extractLinks returns the page's anchor links as a JSON array of {text, href},
-// deduplicated by href (first occurrence wins). Non-navigable hrefs
-// (javascript:/mailto:/data:/tel:, empty, exactly "#") and text-less anchors
-// are dropped; remaining hrefs are entity-decoded. Backed by Eval collecting
-// document.querySelectorAll('a[href]').
+// extractLinks returns the page's anchor links as a JSON array of
+// {text, href, handle?} entries, deduplicated by href (first occurrence wins).
+// Backed by the shared pageops.PageLinks implementation so the MCP, CLI and IPC
+// surfaces stay byte-identical.
 func (t *Page) extractLinks(ctx context.Context, p *browsers.Page) (string, error) {
-	p.Lock()
-	defer p.Unlock()
-	if p.Rod == nil {
-		return "", fmt.Errorf("page session is closed")
-	}
-
-	// Text comes from textContent (rendering-independent: captures anchors in
-	// CSS-hidden dropdown panels that innerText reports as ""), normalized to
-	// single spaces, with an accessible-name fallback chain (aria-label →
-	// title → img[alt]) for anchors with no text node. Anchors with no text
-	// and no fallback are dropped right here (no "text":"" on the wire, ever).
-	res, err := p.Rod.Context(ctx).Eval(
-		`() => [...document.querySelectorAll('a[href]')].map(a => {
-  const text = (a.textContent || '').replace(/\s+/g, ' ').trim()
-    || (a.getAttribute('aria-label') || '').trim()
-    || (a.title || '').trim()
-    || ((a.querySelector('img') || {}).alt || '').trim();
-  return { text, href: a.href };
-}).filter(l => l.text !== '')`)
-	if err != nil {
-		return "", fmt.Errorf("evaluate links: %w", err)
-	}
-
-	var links []linkEntry
-	if err := res.Value.Unmarshal(&links); err != nil {
-		return "", fmt.Errorf("decode links: %w", err)
-	}
-
-	// Filter, decode and dedupe in one pass — dedupe AFTER filtering so junk
-	// schemes never occupy the seen map. Drop non-navigable hrefs and any
-	// text-less leftover (the Eval already skips those; this guard keeps the
-	// no-empty-text invariant at the output boundary), unescape entity
-	// references a page may have set literally from JS ("&amp;" — harmless on
-	// already-decoded hrefs), then keep the first occurrence per href.
-	seen := make(map[string]bool, len(links))
-	dedup := make([]linkEntry, 0, len(links))
-	for _, l := range links {
-		l.Href = html.UnescapeString(l.Href)
-		if l.Text == "" || !navigableHref(l.Href) || seen[l.Href] {
-			continue
-		}
-		seen[l.Href] = true
-		dedup = append(dedup, l)
-	}
-
-	// Encode without HTML-safe escaping so "&" renders literally on the links
-	// surface (json.Marshal would emit \u0026); every other extractor keeps
-	// the default escaping.
-	var buf strings.Builder
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(dedup); err != nil {
-		return "", fmt.Errorf("encode links: %w", err)
-	}
-	// json.Encoder appends a trailing newline that json.Marshal did not —
-	// trim it so the output shape is unchanged.
-	return strings.TrimSuffix(buf.String(), "\n"), nil
-}
-
-// navigableHref reports whether an href is one the browser can navigate to:
-// non-empty, not exactly "#", and not a non-navigable pseudo-scheme
-// (javascript:, mailto:, data:, tel: — compared case-insensitively). Relative
-// URLs (already resolved absolute by a.href) and same-page fragment links like
-// "#skip" pass through.
-func navigableHref(href string) bool {
-	if href == "" || href == "#" {
-		return false
-	}
-	switch strings.ToLower(strings.SplitN(href, ":", 2)[0]) {
-	case "javascript", "mailto", "data", "tel":
-		return false
-	}
-	return true
+	return pageops.PageLinks(ctx, p)
 }
 
 // extractDOMSnapshot returns the page's DOM as a compact, LLM-friendly JSON
-// tree. CaptureDOMSnapshot yields a flattened Documents array (index 0 = root
-// document, later indexes = iframe/imported documents) plus a shared Strings
-// table; this helper re-nests each document's parallel-array node tables by
-// ParentIndex and resolves every string index through the table, so the agent
-// reads a real tree (iframes, template contents and flattened shadow DOM
-// included) instead of raw CDP arrays. Backed by p.Rod.CaptureDOMSnapshot().
+// tree in which every element node carries a g<document>-b<backendNodeId> handle.
+// Backed by
+// the shared pageops.PageDOM implementation so the MCP, CLI and IPC surfaces
+// stay byte-identical.
 func (t *Page) extractDOMSnapshot(ctx context.Context, p *browsers.Page) (string, error) {
-	p.Lock()
-	defer p.Unlock()
-
-	if p.Rod == nil {
-		return "", fmt.Errorf("page session is closed")
-	}
-	snap, err := p.Rod.Context(ctx).CaptureDOMSnapshot()
-	if err != nil {
-		return "", fmt.Errorf("capture DOM snapshot: %w", err)
-	}
-
-	docs := buildDOMDocuments(snap)
-	b, err := json.Marshal(docs)
-	if err != nil {
-		return "", fmt.Errorf("encode DOM snapshot: %w", err)
-	}
-	return string(b), nil
-}
-
-// domDocument is the JSON shape of one document in the DOM snapshot output:
-// its context (title, url, frame id) plus the re-nested element tree.
-type domDocument struct {
-	// Title is the document's title.
-	Title string `json:"title"`
-	// URL is the document's URL.
-	URL string `json:"url"`
-	// FrameID is the CDP frame id this document belongs to.
-	FrameID string `json:"frame_id,omitempty"`
-	// Root is the nested tree root (#document).
-	Root *domNode `json:"root"`
-}
-
-// domNode is one node in the re-nested DOM tree.
-type domNode struct {
-	// Tag is the lowercased element name ("div"), or a pseudo-name for
-	// non-elements ("#document", "#text", "#comment").
-	Tag string `json:"tag"`
-	// ID is the element's id attribute, hoisted out of Attrs.
-	ID string `json:"id,omitempty"`
-	// Class is the element's class attribute, whitespace-normalized, hoisted
-	// out of Attrs.
-	Class string `json:"class,omitempty"`
-	// Attrs holds the element's remaining attributes.
-	Attrs map[string]string `json:"attrs,omitempty"`
-	// Text is the node's text: the nodeValue for text nodes, the textarea/
-	// input value or the layout text for elements.
-	Text string `json:"text,omitempty"`
-	// Visible is true when the node has a layout box (absolute bounds), i.e.
-	// it is rendered rather than display:none or detached. Absent when false.
-	Visible bool `json:"visible,omitempty"`
-	// Bounds is the node's absolute position bounding box as reported by CDP
-	// (an array of floats), when the node has one.
-	Bounds []float64 `json:"bounds,omitempty"`
-	// FrameURL is set on frame-owner elements (iframe/frame/object) that CDP
-	// reports as containing another document; the child document itself is
-	// also emitted as its own entry in the Documents array.
-	FrameURL string `json:"frame_url,omitempty"`
-	// Children are the node's element/text/comment children in document order.
-	Children []*domNode `json:"children,omitempty"`
-}
-
-// buildDOMDocuments converts every document in the snapshot into a nested tree
-// and attaches iframe child documents to their frame-owner nodes. Each
-// document is emitted with its title/url/frame id context so no document is
-// lost, and frame owners carry the child document's URL inline.
-func buildDOMDocuments(snap *proto.DOMSnapshotCaptureSnapshotResult) []domDocument {
-	docs := make([]domDocument, len(snap.Documents))
-	nodesByDoc := make([]map[int]*domNode, len(snap.Documents))
-	for i, d := range snap.Documents {
-		root, byIndex := buildDOMTree(snap.Strings, d)
-		nodesByDoc[i] = byIndex
-		docs[i] = domDocument{
-			Title:   str(snap.Strings, d.Title),
-			URL:     str(snap.Strings, d.DocumentURL),
-			FrameID: str(snap.Strings, d.FrameID),
-			Root:    root,
-		}
-	}
-
-	// Second pass: a node whose ContentDocumentIndex rare data points at
-	// another document is a frame owner — annotate it with the child
-	// document's URL so the reader can jump from the iframe to its content.
-	for i, d := range snap.Documents {
-		byIndex := nodesByDoc[i]
-		if byIndex == nil || d.Nodes == nil || d.Nodes.ContentDocumentIndex == nil {
-			continue
-		}
-		for k, nodeIdx := range d.Nodes.ContentDocumentIndex.Index {
-			childIdx := d.Nodes.ContentDocumentIndex.Value[k]
-			if childIdx < 0 || childIdx >= len(docs) || childIdx == i {
-				continue
-			}
-			if node := byIndex[nodeIdx]; node != nil {
-				node.FrameURL = docs[childIdx].URL
-			}
-		}
-	}
-	return docs
-}
-
-// buildDOMTree re-nests one document's flat parallel-array node table into a
-// tree rooted at the node with parent -1, and returns the root plus a flat
-// node-index → *domNode map (used to attach iframe documents afterwards).
-// Whitespace-only text nodes and the inline bodies of <script>/<style>
-// elements are elided to keep the output compact (script/style sources are
-// available via what=js/css instead).
-func buildDOMTree(strs []string, doc *proto.DOMSnapshotDocumentSnapshot) (*domNode, map[int]*domNode) {
-	n := doc.Nodes
-	if n == nil || len(n.ParentIndex) == 0 {
-		return nil, nil
-	}
-
-	layout := layoutIndex(doc.Layout)
-	byIndex := make(map[int]*domNode, len(n.ParentIndex))
-
-	// Pass 1: populate every node from its parallel-array rows.
-	for i := range n.ParentIndex {
-		nd := &domNode{Tag: nodeTag(strs, n, i)}
-		if i < len(n.NodeType) {
-			switch n.NodeType[i] {
-			case 1: // element: hoist id/class, keep other attributes
-				nd.ID, nd.Class, nd.Attrs = nodeAttrs(strs, n.Attributes, i)
-				nd.Text = rareString(strs, n.TextValue, i)
-				if nd.Text == "" {
-					nd.Text = rareString(strs, n.InputValue, i)
-				}
-			case 3: // text: the nodeValue is the text itself
-				nd.Text = str(strs, n.NodeValue[i])
-			}
-		}
-		if li, ok := layout[i]; ok {
-			if li < len(doc.Layout.Bounds) && len(doc.Layout.Bounds[li]) > 0 {
-				nd.Visible = true
-				nd.Bounds = doc.Layout.Bounds[li]
-			}
-			if nd.Text == "" && li < len(doc.Layout.Text) {
-				nd.Text = str(strs, doc.Layout.Text[li])
-			}
-		}
-		byIndex[i] = nd
-	}
-
-	// Pass 2: attach children by ParentIndex, in document order.
-	var root *domNode
-	for i := range n.ParentIndex {
-		nd := byIndex[i]
-		parent := n.ParentIndex[i]
-		if parent < 0 || parent >= len(n.ParentIndex) || parent == i {
-			root = nd
-			continue
-		}
-		// Elide whitespace-only text nodes (pretty-printed markup noise) and
-		// the bodies of script/style elements (sources via what=js/css).
-		if i < len(n.NodeType) && n.NodeType[i] == 3 && strings.TrimSpace(nd.Text) == "" {
-			continue
-		}
-		pn := byIndex[parent]
-		if pn == nil {
-			root = nd
-			continue
-		}
-		if pn.Tag == "script" || pn.Tag == "style" {
-			continue
-		}
-		pn.Children = append(pn.Children, nd)
-	}
-	return root, byIndex
-}
-
-// layoutIndex maps node-tree index → layout-tree entry for O(1) lookups.
-func layoutIndex(layout *proto.DOMSnapshotLayoutTreeSnapshot) map[int]int {
-	if layout == nil {
-		return nil
-	}
-	m := make(map[int]int, len(layout.NodeIndex))
-	for i, node := range layout.NodeIndex {
-		m[node] = i
-	}
-	return m
-}
-
-// nodeTag resolves a node's tag name: the nodeName lowercased for elements
-// ("DIV" → "div"), or the raw pseudo-name for non-elements ("#document",
-// "#text", "#comment").
-func nodeTag(strs []string, n *proto.DOMSnapshotNodeTreeSnapshot, i int) string {
-	if i >= len(n.NodeName) {
-		return ""
-	}
-	name := str(strs, n.NodeName[i])
-	if name == "" || strings.HasPrefix(name, "#") {
-		return name
-	}
-	return strings.ToLower(name)
-}
-
-// nodeAttrs parses the flattened name,value attribute pairs of element node i,
-// hoisting id and class out and returning the remaining attributes. Unnamed or
-// unvalued trailing pairs are ignored.
-func nodeAttrs(strs []string, attrs []proto.DOMSnapshotArrayOfStrings, i int) (id, class string, rest map[string]string) {
-	if i >= len(attrs) {
-		return "", "", nil
-	}
-	pairs := attrs[i]
-	for k := 0; k+1 < len(pairs); k += 2 {
-		name := str(strs, pairs[k])
-		value := str(strs, pairs[k+1])
-		switch name {
-		case "id":
-			id = value
-		case "class":
-			class = strings.Join(strings.Fields(value), " ")
-		case "":
-			// unnamed attribute pair — skip
-		default:
-			if rest == nil {
-				rest = make(map[string]string, 4)
-			}
-			rest[name] = value
-		}
-	}
-	return id, class, rest
-}
-
-// str resolves a string-table index, returning "" for negative or
-// out-of-range indexes (a node may simply have no value).
-func str(strs []string, idx proto.DOMSnapshotStringIndex) string {
-	if idx < 0 || int(idx) >= len(strs) {
-		return ""
-	}
-	return strs[idx]
-}
-
-// rareString returns the string-table value of the rare-data entry for node
-// index i, or "" when the table has no entry for it. Rare data is small, so a
-// linear scan is fine.
-func rareString(strs []string, rd *proto.DOMSnapshotRareStringData, i int) string {
-	if rd == nil {
-		return ""
-	}
-	for k, node := range rd.Index {
-		if node == i {
-			return str(strs, rd.Value[k])
-		}
-	}
-	return ""
+	return pageops.PageDOM(ctx, p)
 }
 
 // extractCSS returns the page's stylesheet resources: a JSON list of
@@ -825,18 +506,6 @@ func (t *Page) extractInteractives(ctx context.Context, p *browsers.Page) (strin
 		return "", fmt.Errorf("encode interactives: %w", err)
 	}
 	return string(b), nil
-}
-
-// linkEntry is one anchor link collected by extractLinks: its text (the
-// anchor's own text or its accessible name) and its absolute href.
-type linkEntry struct {
-	// Text is the anchor's whitespace-normalized text, or its accessible name
-	// when it has no text (fallback chain: aria-label → title → img[alt]).
-	// Never empty — text-less anchors are filtered out.
-	Text string `json:"text"`
-	// Href is the anchor's absolute, entity-decoded URL (resolved against the
-	// document base).
-	Href string `json:"href"`
 }
 
 // pageMeta is the JSON shape returned by extractMeta: the page title and URL

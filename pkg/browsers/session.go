@@ -34,6 +34,9 @@ type Page struct {
 	// and refreshed by touch on every successful Browser.Page lookup. The
 	// manager's background sweeper closes pages idle for longer than its TTL.
 	lastAccess time.Time
+	// docMarkerInstalled reports whether the handle-scope marker script has
+	// been installed on this page (see CaptureSnapshot). Guarded by mu.
+	docMarkerInstalled bool
 
 	// mu serializes access to the underlying rod.Page (rod is not thread-safe).
 	mu sync.Mutex

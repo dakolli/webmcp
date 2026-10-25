@@ -193,11 +193,12 @@ type PageListResult struct {
 }
 
 // PageFetchParams carries the page.fetch parameters. what ∈ html|dom|text|css|
-// js|links|screenshot|meta|interactives; selector scopes html/text (ignored
-// for interactives, which is whole-page by design); target fetches exactly
-// one css/js resource's content instead of the {url,type,size} list; full_page
-// captures the whole scrollable page in a screenshot; max_bytes caps the
-// returned data (default pageops.DefaultPageMaxBytes; screenshots and
+// js|links|screenshot|meta|interactives; dom element nodes and matched links
+// carry a g<document>-b<backendNodeId> handle for page.act; selector scopes html/text
+// (ignored for interactives, which is whole-page by design); target fetches
+// exactly one css/js resource's content instead of the {url,type,size} list;
+// full_page captures the whole scrollable page in a screenshot; max_bytes caps
+// the returned data (default pageops.DefaultPageMaxBytes; screenshots and
 // interactives are never truncated).
 type PageFetchParams struct {
 	// SessionID identifies the live page to fetch from.
@@ -226,11 +227,12 @@ type PageFetchResult struct {
 // PageActParams carries the page.act parameters. action ∈ click|input|type|
 // press_key|click_at|hover_at|drag_and_drop|upload_file|eval|navigate|back|
 // forward|reload|hover|scroll|select|wait|set_viewport|emulate;
-// selector/value/key/button/click_count/x/y/target_x/target_y/target_selector/
-// paths are the per-action payloads; viewport carries the target size for
-// set_viewport and device the preset for emulate; timeout_ms bounds the action
-// (default 30000) and sizes the wait action's "ms" sleep; wait_mode selects
-// what the wait action waits for: load|idle|stable|interactable|ms (default ms).
+// selector/handle/value/key/button/click_count/x/y/target_x/target_y/
+// target_selector/paths are the per-action payloads (handle wins over selector
+// for element actions); viewport carries the target size for set_viewport and
+// device the preset for emulate; timeout_ms bounds the action (default 30000)
+// and sizes the wait action's "ms" sleep; wait_mode selects what the wait
+// action waits for: load|idle|stable|interactable|ms (default ms).
 type PageActParams struct {
 	// SessionID identifies the live page to act on.
 	SessionID string `json:"session_id"`
@@ -241,6 +243,11 @@ type PageActParams struct {
 	Value string `json:"value,omitempty"`
 	// Selector targets an element for element actions.
 	Selector string `json:"selector,omitempty"`
+	// Handle is an element handle from a previous page.fetch
+	// (what=interactives|dom|links), e.g. "g3k9x2ab-b6". It carries the document
+	// that minted it, so a handle from a previous document is rejected as stale.
+	// It wins over Selector when both are set.
+	Handle string `json:"handle,omitempty"`
 	// Key is the key or key combination for press_key (e.g. Enter, Escape, Control+A).
 	Key string `json:"key,omitempty"`
 	// Button selects the mouse button for click/click_at: left (default), right, middle.

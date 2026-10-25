@@ -264,20 +264,20 @@ func parseFetchArgs(args []string, idFlag, whatFlag string) (id, what, url strin
 // override: a positional always wins over its flag counterpart, and the flag
 // is the fallback when the positional grammar leaves the field unfilled.
 type actArgFlags struct {
-	id, action, selector, value, key, button, targetSelector, waitMode, device string
-	x, y, targetX, targetY                                                     float64
-	clickCount, width, height                                                  int
-	paths                                                                      []string
+	id, action, selector, handle, value, key, button, targetSelector, waitMode, device string
+	x, y, targetX, targetY                                                             float64
+	clickCount, width, height                                                          int
+	paths                                                                              []string
 }
 
 // actArgs is the merged result of `page act` parsing: the effective
 // id/action/payload fields after the positionals (which win) are merged over
 // the flag values.
 type actArgs struct {
-	id, action, selector, value, key, button, targetSelector, waitMode, device string
-	x, y, targetX, targetY                                                     float64
-	clickCount, width, height                                                  int
-	paths                                                                      []string
+	id, action, selector, handle, value, key, button, targetSelector, waitMode, device string
+	x, y, targetX, targetY                                                             float64
+	clickCount, width, height                                                          int
+	paths                                                                              []string
 }
 
 // parseActArgs parses `page act` positional args against the flag values and
@@ -432,6 +432,9 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 	}
 	if a.selector == "" {
 		a.selector = f.selector
+	}
+	if a.handle == "" {
+		a.handle = f.handle
 	}
 	if a.value == "" {
 		a.value = f.value

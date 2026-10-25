@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"net/url"
@@ -243,23 +244,56 @@ func PageText(ctx context.Context, p *browsers.Page, selector string) (string, e
 	return res.Value.Str(), nil
 }
 
-// PageLinks returns the page's anchor links as a JSON array of {text, href},
-// deduplicated by href (first occurrence wins). Non-navigable hrefs
+// PageLinks returns the page's anchor links as a JSON array of {text, href,
+// handle}, deduplicated by href (first occurrence wins). Non-navigable hrefs
 // (javascript:/mailto:/data:/tel:, empty, exactly "#") and text-less anchors
 // are dropped; remaining hrefs are entity-decoded — mirrors the MCP
-// extractLinks shape and behavior.
+// extractLinks shape and behavior. Handles come from the same document
+// snapshot as the DOM extractor, so they carry that document's token and are
+// rejected after a navigation.
 func PageLinks(ctx context.Context, p *browsers.Page) (string, error) {
+	links, err := pageAnchorLinks(ctx, p)
+	if err != nil {
+		return "", err
+	}
+
+	snap, token, err := p.CaptureSnapshot(ctx)
+	if err != nil {
+		return "", fmt.Errorf("capture DOM snapshot for link handles: %w", err)
+	}
+	handles := linkHandles(snap, token)
+	for i := range links {
+		links[i].Handle = handles[links[i].Href]
+	}
+
+	// Encode without HTML-safe escaping so "&" renders literally on the links
+	// surface (json.Marshal would emit \u0026); every other extractor keeps
+	// the default escaping.
+	var buf strings.Builder
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(links); err != nil {
+		return "", fmt.Errorf("encode links: %w", err)
+	}
+	// json.Encoder appends a trailing newline that json.Marshal did not —
+	// trim it so the output shape is unchanged.
+	return strings.TrimSuffix(buf.String(), "\n"), nil
+}
+
+// pageAnchorLinks reads the page's anchors under the page lock and returns
+// them filtered, entity-decoded and deduplicated. Text comes from textContent
+// (rendering-independent: captures anchors in CSS-hidden dropdown panels that
+// innerText reports as ""), normalized to single spaces, with an
+// accessible-name fallback chain (aria-label → title → img[alt]) for anchors
+// with no text node. Anchors with no text and no fallback are dropped right
+// here (no "text":"" on the wire, ever).
+func pageAnchorLinks(ctx context.Context, p *browsers.Page) ([]PageLink, error) {
 	p.Lock()
 	defer p.Unlock()
 	if p.Rod == nil {
-		return "", fmt.Errorf("page session is closed")
+		return nil, fmt.Errorf("page session is closed")
 	}
 
-	// Text comes from textContent (rendering-independent: captures anchors in
-	// CSS-hidden dropdown panels that innerText reports as ""), normalized to
-	// single spaces, with an accessible-name fallback chain (aria-label →
-	// title → img[alt]) for anchors with no text node. Anchors with no text
-	// and no fallback are dropped right here (no "text":"" on the wire, ever).
 	res, err := p.Rod.Context(ctx).Eval(
 		`() => [...document.querySelectorAll('a[href]')].map(a => {
   const text = (a.textContent || '').replace(/\s+/g, ' ').trim()
@@ -269,12 +303,12 @@ func PageLinks(ctx context.Context, p *browsers.Page) (string, error) {
   return { text, href: a.href };
 }).filter(l => l.text !== '')`)
 	if err != nil {
-		return "", fmt.Errorf("evaluate links: %w", err)
+		return nil, fmt.Errorf("evaluate links: %w", err)
 	}
 
 	var links []PageLink
 	if err := res.Value.Unmarshal(&links); err != nil {
-		return "", fmt.Errorf("decode links: %w", err)
+		return nil, fmt.Errorf("decode links: %w", err)
 	}
 
 	// Filter, decode and dedupe in one pass — dedupe AFTER filtering so junk
@@ -293,19 +327,7 @@ func PageLinks(ctx context.Context, p *browsers.Page) (string, error) {
 		seen[l.Href] = true
 		dedup = append(dedup, l)
 	}
-
-	// Encode without HTML-safe escaping so "&" renders literally on the links
-	// surface (json.Marshal would emit \u0026); every other extractor keeps
-	// the default escaping.
-	var buf strings.Builder
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(dedup); err != nil {
-		return "", fmt.Errorf("encode links: %w", err)
-	}
-	// json.Encoder appends a trailing newline that json.Marshal did not —
-	// trim it so the output shape is unchanged.
-	return strings.TrimSuffix(buf.String(), "\n"), nil
+	return dedup, nil
 }
 
 // navigableHref reports whether an href is one the browser can navigate to:
@@ -322,6 +344,52 @@ func navigableHref(href string) bool {
 		return false
 	}
 	return true
+}
+
+// linkHandles maps each absolute anchor href in the snapshot to the handle of
+// the first `a[href]` element that carries it, in document order. docToken is
+// the snapshot document's token, stamped onto every minted handle.
+func linkHandles(snap *proto.DOMSnapshotCaptureSnapshotResult, docToken string) map[string]string {
+	handles := make(map[string]string)
+	var walk func(base string, n *domNode)
+	walk = func(base string, n *domNode) {
+		if n == nil {
+			return
+		}
+		if n.Tag == "a" && n.Handle != "" {
+			if href := n.Attrs["href"]; href != "" {
+				if key := absoluteHref(base, href); handles[key] == "" {
+					handles[key] = n.Handle
+				}
+			}
+		}
+		for _, child := range n.Children {
+			walk(base, child)
+		}
+	}
+	for _, doc := range buildDOMDocuments(snap, docToken) {
+		walk(doc.URL, doc.Root)
+	}
+	return handles
+}
+
+// absoluteHref resolves an anchor's raw href attribute against its document
+// URL and entity-decodes it, producing the same absolute string `a.href`
+// yields so snapshot handles can be matched to extracted links.
+func absoluteHref(base, href string) string {
+	href = html.UnescapeString(href)
+	ref, err := url.Parse(href)
+	if err != nil {
+		return href
+	}
+	if base == "" {
+		return ref.String()
+	}
+	b, err := url.Parse(base)
+	if err != nil {
+		return ref.String()
+	}
+	return b.ResolveReference(ref).String()
 }
 
 // PageMeta returns the page's meta info (title, url, meta tags) as a JSON
@@ -544,21 +612,18 @@ type resourceEntry struct {
 // table; this helper re-nests each document's parallel-array node tables by
 // ParentIndex and resolves every string index through the table, so the reader
 // sees a real tree (iframes, template contents and flattened shadow DOM
-// included) instead of raw CDP arrays. Backed by p.Rod.CaptureDOMSnapshot();
-// mirrors the MCP extractDOMSnapshot shape exactly.
+// included) instead of raw CDP arrays. Every element node carries a
+// g<document>-b<backendNodeId> handle usable as page_act's handle argument;
+// the document token scopes it to the document that produced this snapshot.
+// Backed by Page.CaptureSnapshot; mirrors the MCP extractDOMSnapshot shape
+// exactly.
 func PageDOM(ctx context.Context, p *browsers.Page) (string, error) {
-	p.Lock()
-	defer p.Unlock()
-	if p.Rod == nil {
-		return "", fmt.Errorf("page session is closed")
-	}
-
-	snap, err := p.Rod.Context(ctx).CaptureDOMSnapshot()
+	snap, token, err := p.CaptureSnapshot(ctx)
 	if err != nil {
-		return "", fmt.Errorf("capture DOM snapshot: %w", err)
+		return "", err
 	}
 
-	docs := buildDOMDocuments(snap)
+	docs := buildDOMDocuments(snap, token)
 	b, err := json.Marshal(docs)
 	if err != nil {
 		return "", fmt.Errorf("encode DOM snapshot: %w", err)
@@ -594,6 +659,12 @@ type domNode struct {
 	// Text is the node's text: the nodeValue for text nodes, the textarea/
 	// input value or the layout text for elements.
 	Text string `json:"text,omitempty"`
+	// Handle is the element's action handle in the
+	// g<document>-b<backendNodeId> form minted by every snapshot extractor,
+	// usable as page_act's handle argument. The document token scopes it to
+	// the document that produced the snapshot. Set on element nodes only;
+	// absent when CDP reports no backend node id.
+	Handle string `json:"handle,omitempty"`
 	// Visible is true when the node has a layout box (absolute bounds), i.e.
 	// it is rendered rather than display:none or detached. Absent when false.
 	Visible bool `json:"visible,omitempty"`
@@ -612,11 +683,11 @@ type domNode struct {
 // and attaches iframe child documents to their frame-owner nodes. Each
 // document is emitted with its title/url/frame id context so no document is
 // lost, and frame owners carry the child document's URL inline.
-func buildDOMDocuments(snap *proto.DOMSnapshotCaptureSnapshotResult) []domDocument {
+func buildDOMDocuments(snap *proto.DOMSnapshotCaptureSnapshotResult, docToken string) []domDocument {
 	docs := make([]domDocument, len(snap.Documents))
 	nodesByDoc := make([]map[int]*domNode, len(snap.Documents))
 	for i, d := range snap.Documents {
-		root, byIndex := buildDOMTree(snap.Strings, d)
+		root, byIndex := buildDOMTree(snap.Strings, d, docToken)
 		nodesByDoc[i] = byIndex
 		docs[i] = domDocument{
 			Title:   str(snap.Strings, d.Title),
@@ -653,7 +724,11 @@ func buildDOMDocuments(snap *proto.DOMSnapshotCaptureSnapshotResult) []domDocume
 // Whitespace-only text nodes and the inline bodies of <script>/<style>
 // elements are elided to keep the output compact (script/style sources are
 // available via --what js/css instead).
-func buildDOMTree(strs []string, doc *proto.DOMSnapshotDocumentSnapshot) (*domNode, map[int]*domNode) {
+func buildDOMTree(
+	strs []string,
+	doc *proto.DOMSnapshotDocumentSnapshot,
+	docToken string,
+) (*domNode, map[int]*domNode) {
 	n := doc.Nodes
 	if n == nil || len(n.ParentIndex) == 0 {
 		return nil, nil
@@ -672,6 +747,9 @@ func buildDOMTree(strs []string, doc *proto.DOMSnapshotDocumentSnapshot) (*domNo
 				nd.Text = rareString(strs, n.TextValue, i)
 				if nd.Text == "" {
 					nd.Text = rareString(strs, n.InputValue, i)
+				}
+				if i < len(n.BackendNodeID) && n.BackendNodeID[i] > 0 {
+					nd.Handle = browsers.MintHandle(docToken, n.BackendNodeID[i])
 				}
 			case 3: // text: the nodeValue is the text itself
 				nd.Text = str(strs, n.NodeValue[i])
@@ -826,9 +904,117 @@ func parseMouseButton(button string) (proto.InputMouseButton, error) {
 	}
 }
 
-// PageClickOpts clicks the element matched by selector with optional button and click count.
-// button can be "left" (default), "right", or "middle"; clickCount defaults to 1 (2 for double click).
-func PageClickOpts(ctx context.Context, p *browsers.Page, selector string, button string, clickCount int) (string, error) {
+// actTarget resolves an action's element target: a non-empty handle wins over
+// the selector. A handle carries the token of the document that minted it; the
+// element's document marker is read in the same eval as the liveness check, so
+// the scope check costs no extra round trip. A handle from any other document
+// is rejected before it can act on a reused backend node id, while a document
+// without a marker is stamped with the handle's token and treated as current
+// (frames and pre-marker documents must not raise a false stale error).
+// Callers must already hold the page lock; this never locks.
+func actTarget(page *rod.Page, handle, selector string) (*rod.Element, error) {
+	if handle == "" {
+		if selector == "" {
+			return nil, errors.New("either selector or handle is required")
+		}
+		return page.Element(selector)
+	}
+	token, id, err := parseHandle(handle)
+	if err != nil {
+		return nil, err
+	}
+	el, err := page.ElementFromNode(&proto.DOMNode{BackendNodeID: id})
+	if err != nil {
+		return nil, staleResolveError(handle, err)
+	}
+	res, err := el.Eval(
+		`(doc) => { if (!window.`+browsers.DocMarker+`) window.`+browsers.DocMarker+
+			` = doc; return {doc: window.`+browsers.DocMarker+`, live: this.isConnected} }`,
+		token,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("handle %q: check liveness: %w", handle, err)
+	}
+	var state struct {
+		Doc  string `json:"doc"`
+		Live bool   `json:"live"`
+	}
+	if err := res.Value.Unmarshal(&state); err != nil {
+		return nil, fmt.Errorf("handle %q: decode liveness: %w", handle, err)
+	}
+	if state.Doc != token {
+		return nil, staleDocumentError(handle)
+	}
+	if !state.Live {
+		return nil, staleDetachedError(handle)
+	}
+	return el, nil
+}
+
+// staleDocumentError reports a handle minted by a document that has since been
+// replaced (navigation, reload, redirect). Chromium may reuse the backend node
+// id in the newer document, so the handle must never act there.
+func staleDocumentError(handle string) error {
+	return fmt.Errorf("handle %q is stale — minted for a previous document (re-run page_fetch what=interactives to re-mint handles)", handle)
+}
+
+// staleResolveError reports a handle whose backend node no longer resolves.
+func staleResolveError(handle string, err error) error {
+	return fmt.Errorf("handle %q is stale — element no longer in the document (re-run page_fetch what=interactives to re-mint handles): %w", handle, err)
+}
+
+// staleDetachedError reports a handle that resolves to a detached element.
+func staleDetachedError(handle string) error {
+	return fmt.Errorf("handle %q is stale — element detached from the document (re-run page_fetch what=interactives to re-mint handles)", handle)
+}
+
+// parseHandle splits a g<document>-b<backendNodeId> handle minted by
+// page_fetch into its document token and backend node id.
+func parseHandle(handle string) (string, proto.DOMBackendNodeID, error) {
+	invalid := func() (string, proto.DOMBackendNodeID, error) {
+		return "", 0, fmt.Errorf("invalid handle %q (expected g<document>-b<backendNodeId> minted by page_fetch what=interactives|dom|links)", handle)
+	}
+	rest, ok := strings.CutPrefix(handle, "g")
+	if !ok {
+		return invalid()
+	}
+	token, idText, ok := strings.Cut(rest, "-b")
+	if !ok || token == "" {
+		return invalid()
+	}
+	id, err := strconv.ParseInt(idText, 10, 64)
+	if err != nil || id <= 0 {
+		return invalid()
+	}
+	return token, proto.DOMBackendNodeID(id), nil
+}
+
+// actionError adds action and selector context to an actTarget failure; handle
+// errors already carry their complete message.
+func actionError(action, handle, selector string, err error) error {
+	if handle != "" || selector == "" {
+		return err
+	}
+	return fmt.Errorf("%s: element %q: %w", action, selector, err)
+}
+
+// targetFailure adds the resolved target to an element-operation failure.
+func targetFailure(action, handle, selector string, err error) error {
+	if handle != "" {
+		return fmt.Errorf("%s: handle %q: %w", action, handle, err)
+	}
+	return fmt.Errorf("%s: element %q: %w", action, selector, err)
+}
+
+// PageClickOpts clicks the element targeted by handle or selector with
+// optional button and click count.
+func PageClickOpts(
+	ctx context.Context,
+	p *browsers.Page,
+	handle, selector string,
+	button string,
+	clickCount int,
+) (string, error) {
 	p.Lock()
 	defer p.Unlock()
 	if p.Rod == nil {
@@ -843,36 +1029,49 @@ func PageClickOpts(ctx context.Context, p *browsers.Page, selector string, butto
 		clickCount = 1
 	}
 
-	page := p.Rod.Context(ctx)
-
-	el, err := page.Element(selector)
+	el, err := actTarget(p.Rod.Context(ctx), handle, selector)
 	if err != nil {
-		return "", fmt.Errorf("click: element %q: %w", selector, err)
+		return "", actionError("click", handle, selector, err)
 	}
 	if _, err := el.WaitInteractable(); err != nil {
-		return "", fmt.Errorf("click: element %q: %w", selector, err)
+		return "", targetFailure("click", handle, selector, err)
 	}
 	if err := el.Click(btn, clickCount); err != nil {
-		return "", fmt.Errorf("click: element %q: %w", selector, err)
+		return "", targetFailure("click", handle, selector, err)
+	}
+
+	ref := fmt.Sprintf("handle=%q", handle)
+	if handle == "" {
+		ref = fmt.Sprintf("selector=%q", selector)
 	}
 	if (button == "" || button == "left") && clickCount == 1 {
-		return fmt.Sprintf("clicked selector=%q", selector), nil
+		return fmt.Sprintf("clicked %s", ref), nil
 	}
 	btnName := button
 	if btnName == "" {
 		btnName = "left"
 	}
-	return fmt.Sprintf("clicked selector=%q button=%s count=%d", selector, btnName, clickCount), nil
+	return fmt.Sprintf("clicked %s button=%s count=%d", ref, btnName, clickCount), nil
 }
 
-// PageClick clicks the element matched by selector (CSS or XPath) with the left mouse button once.
-func PageClick(ctx context.Context, p *browsers.Page, selector string) (string, error) {
-	return PageClickOpts(ctx, p, selector, "left", 1)
+// PageClick clicks the element targeted by handle or selector with the left
+// mouse button once.
+func PageClick(
+	ctx context.Context,
+	p *browsers.Page,
+	handle, selector string,
+) (string, error) {
+	return PageClickOpts(ctx, p, handle, selector, "left", 1)
 }
 
-// PagePressKey presses a specific key or key combination (e.g., "Enter", "Escape", "Control+a", "Meta+c").
-// If selector is non-empty, it focuses the element matched by selector first.
-func PagePressKey(ctx context.Context, p *browsers.Page, selector, keyStr string) (string, error) {
+// PagePressKey presses a key or key combination (e.g. "Enter", "Escape",
+// "Control+a", "Meta+c"). A non-empty handle or selector focuses that element
+// first.
+func PagePressKey(
+	ctx context.Context,
+	p *browsers.Page,
+	handle, selector, keyStr string,
+) (string, error) {
 	p.Lock()
 	defer p.Unlock()
 	if p.Rod == nil {
@@ -886,12 +1085,15 @@ func PagePressKey(ctx context.Context, p *browsers.Page, selector, keyStr string
 
 	page := p.Rod.Context(ctx)
 
-	if selector != "" {
-		el, err := page.Element(selector)
+	if handle != "" || selector != "" {
+		el, err := actTarget(page, handle, selector)
 		if err != nil {
-			return "", fmt.Errorf("press_key: element %q: %w", selector, err)
+			return "", actionError("press_key", handle, selector, err)
 		}
 		if err := el.Focus(); err != nil {
+			if handle != "" {
+				return "", fmt.Errorf("press_key: focus handle %q: %w", handle, err)
+			}
 			return "", fmt.Errorf("press_key: focus element %q: %w", selector, err)
 		}
 	}
@@ -910,6 +1112,9 @@ func PagePressKey(ctx context.Context, p *browsers.Page, selector, keyStr string
 		return "", fmt.Errorf("press_key %q: %w", keyStr, err)
 	}
 
+	if handle != "" {
+		return fmt.Sprintf("pressed key %q in handle=%q", keyStr, handle), nil
+	}
 	if selector != "" {
 		return fmt.Sprintf("pressed key %q in selector=%q", keyStr, selector), nil
 	}
@@ -1015,8 +1220,14 @@ func PageDragAndDrop(ctx context.Context, p *browsers.Page, fromX, fromY, toX, t
 	return fmt.Sprintf("dragged from (%.1f, %.1f) to (%.1f, %.1f)", fromX, fromY, toX, toY), nil
 }
 
-// PageUploadFile attaches local file paths to a file input element matched by selector.
-func PageUploadFile(ctx context.Context, p *browsers.Page, selector string, paths []string) (string, error) {
+// PageUploadFile attaches local file paths to the file input targeted by
+// handle or selector.
+func PageUploadFile(
+	ctx context.Context,
+	p *browsers.Page,
+	handle, selector string,
+	paths []string,
+) (string, error) {
 	p.Lock()
 	defer p.Unlock()
 	if p.Rod == nil {
@@ -1027,49 +1238,58 @@ func PageUploadFile(ctx context.Context, p *browsers.Page, selector string, path
 		return "", fmt.Errorf("upload_file: no file paths provided")
 	}
 
-	page := p.Rod.Context(ctx)
-	el, err := page.Element(selector)
+	el, err := actTarget(p.Rod.Context(ctx), handle, selector)
 	if err != nil {
-		return "", fmt.Errorf("upload_file: element %q: %w", selector, err)
+		return "", actionError("upload_file", handle, selector, err)
 	}
 	if err := el.SetFiles(paths); err != nil {
-		return "", fmt.Errorf("upload_file: element %q: %w", selector, err)
+		return "", targetFailure("upload_file", handle, selector, err)
+	}
+	if handle != "" {
+		return fmt.Sprintf("uploaded files %v to handle=%q", paths, handle), nil
 	}
 	return fmt.Sprintf("uploaded files %v to selector=%q", paths, selector), nil
 }
 
-// PageInput sets the value of the element matched by selector: it selects all
-// existing text (el.SelectAllText) then types value via rod's Input, so the
-// field ends up exactly value. Returns the same confirmation string as the MCP
-// page_act input.
-func PageInput(ctx context.Context, p *browsers.Page, selector, value string) (string, error) {
+// PageInput sets the value of the element targeted by handle or selector: it
+// selects all existing text (el.SelectAllText) then types value via rod's
+// Input, so the field ends up exactly value.
+func PageInput(
+	ctx context.Context,
+	p *browsers.Page,
+	handle, selector, value string,
+) (string, error) {
 	p.Lock()
 	defer p.Unlock()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}
 
-	page := p.Rod.Context(ctx)
-
-	el, err := page.Element(selector)
+	el, err := actTarget(p.Rod.Context(ctx), handle, selector)
 	if err != nil {
-		return "", fmt.Errorf("input: element %q: %w", selector, err)
+		return "", actionError("input", handle, selector, err)
 	}
 	if err := el.SelectAllText(); err != nil {
-		return "", fmt.Errorf("input: element %q: %w", selector, err)
+		return "", targetFailure("input", handle, selector, err)
 	}
 	if err := el.Input(value); err != nil {
-		return "", fmt.Errorf("input: element %q: %w", selector, err)
+		return "", targetFailure("input", handle, selector, err)
+	}
+	if handle != "" {
+		return fmt.Sprintf("set input handle=%q value=%q", handle, value), nil
 	}
 	return fmt.Sprintf("set input selector=%q value=%q", selector, value), nil
 }
 
-// PageType types keystrokes into the element matched by selector without
-// clearing it — unlike PageInput (the input action selects all text first),
-// type is Focus + InsertText: it focuses the element (scrolling it into view
-// by user gesture) and pastes value at the current caret position. Returns the
-// same confirmation string as the MCP page_act type.
-func PageType(ctx context.Context, p *browsers.Page, selector, value string) (string, error) {
+// PageType types keystrokes into the element targeted by handle or selector
+// without clearing it — unlike PageInput (the input action selects all text
+// first), type is Focus + InsertText: it focuses the element (scrolling it into
+// view by user gesture) and pastes value at the current caret position.
+func PageType(
+	ctx context.Context,
+	p *browsers.Page,
+	handle, selector, value string,
+) (string, error) {
 	p.Lock()
 	defer p.Unlock()
 	if p.Rod == nil {
@@ -1078,37 +1298,44 @@ func PageType(ctx context.Context, p *browsers.Page, selector, value string) (st
 
 	page := p.Rod.Context(ctx)
 
-	el, err := page.Element(selector)
+	el, err := actTarget(page, handle, selector)
 	if err != nil {
-		return "", fmt.Errorf("type: element %q: %w", selector, err)
+		return "", actionError("type", handle, selector, err)
 	}
 	if err := el.Focus(); err != nil {
-		return "", fmt.Errorf("type: element %q: %w", selector, err)
+		return "", targetFailure("type", handle, selector, err)
 	}
 	if err := page.InsertText(value); err != nil {
 		return "", fmt.Errorf("type: %w", err)
 	}
+	if handle != "" {
+		return fmt.Sprintf("typed handle=%q value=%q", handle, value), nil
+	}
 	return fmt.Sprintf("typed selector=%q value=%q", selector, value), nil
 }
 
-// PageHover moves the mouse over the element matched by selector (CSS or
-// XPath), triggering hover-dependent UI. Returns the same confirmation string
-// as the MCP page_act hover.
-func PageHover(ctx context.Context, p *browsers.Page, selector string) (string, error) {
+// PageHover moves the mouse over the element targeted by handle or selector,
+// triggering hover-dependent UI.
+func PageHover(
+	ctx context.Context,
+	p *browsers.Page,
+	handle, selector string,
+) (string, error) {
 	p.Lock()
 	defer p.Unlock()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}
 
-	page := p.Rod.Context(ctx)
-
-	el, err := page.Element(selector)
+	el, err := actTarget(p.Rod.Context(ctx), handle, selector)
 	if err != nil {
-		return "", fmt.Errorf("hover: element %q: %w", selector, err)
+		return "", actionError("hover", handle, selector, err)
 	}
 	if err := el.Hover(); err != nil {
-		return "", fmt.Errorf("hover: element %q: %w", selector, err)
+		return "", targetFailure("hover", handle, selector, err)
+	}
+	if handle != "" {
+		return fmt.Sprintf("hovered handle=%q", handle), nil
 	}
 	return fmt.Sprintf("hovered selector=%q", selector), nil
 }
@@ -1133,26 +1360,30 @@ func PageScroll(ctx context.Context, p *browsers.Page, x, y float64) (string, er
 	return fmt.Sprintf("scrolled to %s", res.Value.JSON("", "  ")), nil
 }
 
-// PageSelect selects an <option> with the given value in the element matched by
-// selector. rod v0.116.2 has no SelectorTypeValue, so the option is matched
-// with a CSS attribute selector [value="..."]. Returns the same confirmation
-// string as the MCP page_act select.
-func PageSelect(ctx context.Context, p *browsers.Page, selector, value string) (string, error) {
+// PageSelect selects an <option> with the given value in the element targeted
+// by handle or selector. rod v0.116.2 has no SelectorTypeValue, so the option
+// is matched with a CSS attribute selector [value="..."].
+func PageSelect(
+	ctx context.Context,
+	p *browsers.Page,
+	handle, selector, value string,
+) (string, error) {
 	p.Lock()
 	defer p.Unlock()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}
 
-	page := p.Rod.Context(ctx)
-
-	el, err := page.Element(selector)
+	el, err := actTarget(p.Rod.Context(ctx), handle, selector)
 	if err != nil {
-		return "", fmt.Errorf("select: element %q: %w", selector, err)
+		return "", actionError("select", handle, selector, err)
 	}
 	opt := `[value="` + value + `"]`
 	if err := el.Select([]string{opt}, true, rod.SelectorTypeCSSSector); err != nil {
-		return "", fmt.Errorf("select: element %q: %w", selector, err)
+		return "", targetFailure("select", handle, selector, err)
+	}
+	if handle != "" {
+		return fmt.Sprintf("selected option value=%q in handle=%q", value, handle), nil
 	}
 	return fmt.Sprintf("selected option value=%q in selector=%q", value, selector), nil
 }
@@ -1287,12 +1518,17 @@ func PageEmulate(ctx context.Context, p *browsers.Page, device string) (string, 
 // PageWait blocks until the page satisfies the requested readiness level, or
 // sleeps for a fixed duration. It supports the readiness modes shared with
 // fetch ("load", "idle", "stable"), an element-level "interactable" mode
-// (requires selector), and the default "ms" mode — a ctx-aware sleep honoring
-// timeout that lets in-flight requests and animations settle before the next
-// action. The "ms" sleep touches no rod state, so it does not take the page
-// lock; every rod-backed mode is fully locked (load/idle/stable delegate to
-// WaitForPage, which owns the lock). Mirrors the MCP page_act wait helper.
-func PageWait(ctx context.Context, p *browsers.Page, mode, selector string, timeout time.Duration) (string, error) {
+// (requires a handle or selector), and the default "ms" mode — a ctx-aware
+// sleep honoring timeout that lets in-flight requests and animations settle
+// before the next action. The "ms" sleep touches no rod state, so it does not
+// take the page lock; every rod-backed mode is fully locked (load/idle/stable
+// delegate to WaitForPage, which owns the lock).
+func PageWait(
+	ctx context.Context,
+	p *browsers.Page,
+	mode, handle, selector string,
+	timeout time.Duration,
+) (string, error) {
 	// Synchronized read (under p.mu, like every other nil guard): the
 	// eviction path can nil p.Rod concurrently, so the check must not run
 	// lock-free. The lock is released before the mode switch — rod-backed
@@ -1327,8 +1563,8 @@ func PageWait(ctx context.Context, p *browsers.Page, mode, selector string, time
 		return fmt.Sprintf("waited for %q", mode), nil
 
 	case "interactable":
-		if selector == "" {
-			return "", fmt.Errorf("wait: interactable mode requires a selector")
+		if handle == "" && selector == "" {
+			return "", fmt.Errorf("wait: interactable mode requires a selector or handle")
 		}
 		p.Lock()
 		defer p.Unlock()
@@ -1337,13 +1573,15 @@ func PageWait(ctx context.Context, p *browsers.Page, mode, selector string, time
 		if p.Rod == nil {
 			return "", fmt.Errorf("page session is closed")
 		}
-		page := p.Rod.Context(ctx)
-		el, err := page.Element(selector)
+		el, err := actTarget(p.Rod.Context(ctx), handle, selector)
 		if err != nil {
-			return "", fmt.Errorf("wait: element %q: %w", selector, err)
+			return "", actionError("wait", handle, selector, err)
 		}
 		if _, err := el.WaitInteractable(); err != nil {
-			return "", fmt.Errorf("wait: element %q: %w", selector, err)
+			return "", targetFailure("wait", handle, selector, err)
+		}
+		if handle != "" {
+			return fmt.Sprintf("element %q is interactable", handle), nil
 		}
 		return fmt.Sprintf("element %q is interactable", selector), nil
 
@@ -1362,6 +1600,10 @@ type PageLink struct {
 	// Href is the anchor's absolute, entity-decoded URL (resolved against the
 	// document base).
 	Href string `json:"href"`
+	// Handle is the handle of the first anchor carrying this href, in the
+	// g<document>-b<backendNodeId> form; omitted when the DOM snapshot has no
+	// match.
+	Handle string `json:"handle,omitempty"`
 }
 
 // PageMetaResult is the JSON shape returned by PageMeta: the page title and URL

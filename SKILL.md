@@ -13,7 +13,8 @@ Drive Chromium via MCP tools using stateful sessions, structured DOM/text extrac
 ## Core Architecture and Mental Model
 
 - **Browser (`browser_id`, e.g., `browser-1`)**: The underlying Chromium/Brave process managed by the server. Created lazily or via `browser_create`, closed with `browser_close`. Auto-detects Brave (`brave-browser` / `brave`) as the default browser when available.
-- **Persistent Profiles & Zero Bloat**: `browser-1` automatically uses the persistent user profile at `~/.config/browser-mcp/profiles/<browser_name>` (e.g. `profiles/brave` or `profiles/default`), persisting cookies, storage, and logins across runs. Calling `browser_create` or `fetch_page` while `browser-1` is active reuses `browser-1` idempotently. Any secondary concurrent browser instance runs in ephemeral mode (`profileDir = ""`), auto-deleting on exit to guarantee zero directory bloat.
+- **Persistent Profiles**: `browser-1` uses the persistent user profile at `~/.config/browser-mcp/profiles/<browser_name>` (e.g. `profiles/brave` or `profiles/default`), persisting cookies, storage, and logins across runs. `browser_create` with **no options** reuses a live `browser-1`; passing any option creates a new `browser-N`.
+- **Sessions expire**: idle pages are closed after 15 minutes, and a crashed Chromium is relaunched under the same `browser_id`. A vanished `session_id` is normal — re-open the URL rather than retrying it.
 - **Session (`session_id`, e.g., `page-1`, `page-2`)**: A distinct browser tab created by `fetch_page`. All read (`page_fetch`) and interaction (`page_act`) operations require a valid `session_id`.
 - **Navigation Continuity**: A session maintains state across navigations, redirects, and history traversal (`back`/`forward`). Reading after a navigation reads the new page.
 - **Resource Management**: Always close sessions with `session_close` and shut down browsers with `browser_close` when workflows conclude.
@@ -26,13 +27,13 @@ Drive Chromium via MCP tools using stateful sessions, structured DOM/text extrac
 
 | Tool | Parameters | Purpose and Returns |
 |---|---|---|
-| `browser_create` | `{ headless?: boolean, stealth?: boolean }` | Launches Chromium instance. Returns `{ browser_id }`. |
+| `browser_create` | `{ bin?: string, profile?: string, headless?: boolean, stealth?: boolean, position?: "left"\|"right"\|"max"\|"normal" }` | Launches a browser instance. Returns `{ browser_id }`. Omit all options to reuse `browser-1`. |
 | `browser_list` | `{}` | Lists all active browsers and their pages. |
 | `browser_close` | `{ browser_id: string }` | Terminates Chromium instance and all open tabs. |
-| `fetch_page` | `{ url: string, wait_for?: "load"\|"stable", timeout_ms?: number, viewport?: { width, height }, device?: string, user_agent?: string }` | Opens URL in a new tab. **NEVER use `wait_for: "idle"`** — the idle network-wait hangs on JS-heavy sites (bot WAFs, trackers, infinite polling) and stalls the call. Prefer `wait_for: "load"` or `"stable"`, or open with the default and follow up with `page_act wait wait_mode=ms`. Accept optional `device` (e.g., `"IPhoneX"`) to apply device emulation prior to page navigation, avoiding post-load layout reflows. Returns `{ session_id, title, url, text_snippet, html_bytes, load_ms }`. |
-| `session_list` | `{}` | Lists all live sessions across browsers: `[{ id, url }]`. |
+| `fetch_page` | `{ url: string, wait_for: "load"\|"idle"\|"stable", timeout_ms?: number, viewport?: { width, height }, device?: string, user_agent?: string }` | Opens URL in a new tab. **Always pass `wait_for`** — an omitted value currently fails with `invalid wait option ""` (the schema's `idle` default is advisory only). **Avoid `wait_for: "idle"`** — the idle network-wait hangs on JS-heavy sites (bot WAFs, trackers, infinite polling) and stalls the call. Prefer `"load"` or `"stable"`. Pass `device` (e.g. `"IPhoneX"`) to apply emulation *before* navigation. Returns `{ session_id, title, url, text_snippet, html_bytes, load_ms }`. |
+| `session_list` | `{}` | Lists live sessions as `[{ id, url }]` (today: the default browser's pages only). |
 | `session_close` | `{ session_id: string }` | Closes tab and invalidates `session_id`. |
-| `page_list` | `{ browser_id: string }` | Lists open pages for a specific browser. |
+| `page_list` | `{ browser_id: string }` | Lists open pages. **`browser_id` is accepted but currently ignored** — it lists the default browser. |
 
 ### 2. Inspection Tool: `page_fetch`
 
@@ -41,7 +42,7 @@ Extracts data from a live session without mutating state.
 ```
 page_fetch {
   session_id: string,
-  what: "meta" | "text" | "links" | "dom" | "html" | "css" | "js" | "screenshot",
+  what: "meta" | "text" | "links" | "dom" | "html" | "css" | "js" | "screenshot" | "interactives",
   selector?: string,     // Scopes "text", "html", or "dom" to a CSS selector
   max_bytes?: number,    // Response payload cap in bytes (default: 50000)
   target?: string,       // Specific URL when what="css"|"js" to fetch file content
@@ -51,11 +52,14 @@ page_fetch {
 
 - `meta`: Returns `{ title, url, meta: [{ name/property, content }] }`. Fastest way to confirm title, URL, and OpenGraph tags.
 - `text`: Visible page text. Use `selector` (e.g., `selector: "main"` or `selector: "article"`) to avoid nav/footer noise.
-- `links`: Array of `[{ text, href }]`. The navigation map of the page.
-- `dom`: Compact structured tree of DOM nodes with tags, attributes, visibility, and bounding boxes. Always set `max_bytes` or scope with `selector`.
+- `links`: Array of `[{ text, href, handle? }]`. The navigation map of the page; `handle` is the first anchor carrying that href (usable as `page_act`'s `handle`).
+- `interactives`: **Start here when you intend to act.** `{ interactives: [{ handle, role, text, href, type, x, y, visible }], truncated }` — every visible clickable/typeable element, capped at 200 (the rest are counted in `truncated`). ~2–5 KB, never byte-truncated. Handles look like `g3k9x2ab-b1073741831` and can be passed straight to `page_act`'s `handle` argument (see below); otherwise use the `text`/`role`/`href`/`x`,`y` fields to choose a target and act with a selector or coordinates.
+- `dom`: Compact structured tree of DOM nodes with tags, attributes, visibility, and bounding boxes; covers every document and iframe, including shadow DOM. Node shape: `{ tag, id?, class?, attrs?, text?, handle?, visible?, bounds?, frame_url?, children? }`; every element node carries `handle` (`g<document>-b<backendNodeId>`). Always set `max_bytes` or scope with `selector`.
 - `html`: Outer HTML markup. Use `selector` to avoid context explosion on large pages.
-- `css` / `js`: Lists loaded resource URLs. Re-request with `target: "<url>"` to read raw stylesheet/script contents.
-- `screenshot`: Returns base64 PNG data-URI.
+- `css` / `js`: Lists loaded resource URLs with sizes; `size` is nullable. Re-request with `target: "<url>"` to read raw stylesheet/script contents.
+- `screenshot`: Returns base64 PNG data-URI; `full_page: true` captures the whole scrollable page (MCP gives that a 90s budget).
+- **Truncation**: `dom`, `links`, `meta`, and the css/js list are cut at `max_bytes` and can end mid-JSON. `interactives` and `screenshot` are never truncated.
+
 
 ### 3. Interaction Tool: `page_act`
 
@@ -66,6 +70,7 @@ page_act {
   session_id: string,
   action: "click" | "input" | "type" | "press_key" | "click_at" | "hover_at" | "drag_and_drop" | "upload_file" | "eval" | "navigate" | "back" | "forward" | "reload" | "hover" | "scroll" | "select" | "wait" | "set_viewport" | "emulate",
   selector?: string,     // CSS selector targeting element (click, input, type, press_key, upload_file, hover, select, wait interactable)
+  handle?: string,       // Element handle from page_fetch (g<document>-b<backendNodeId>); wins over selector when both are set
   value?: string,        // Payload for input/type, JS function for eval, URL for navigate, option value for select
   key?: string,          // Key or key combo for action="press_key" (e.g., "Enter", "Escape", "Tab", "Control+a", "Meta+c", "Shift+Tab")
   button?: "left" | "right" | "middle", // Mouse button for click, click_at, drag_and_drop (default: "left")
@@ -81,6 +86,12 @@ page_act {
 }
 ```
 
+**Stable handles.** `page_fetch` mints a `handle` of the form `g<document>-b<backendNodeId>` (e.g. `g3k9x2ab-b1073741831`) on every element in `interactives`, on every element node in `dom`, and on matched `links` entries. Pass it as `handle` to `click`, `input`, `type`, `press_key`, `hover`, `select`, `wait` (`wait_mode: "interactable"`), or `upload_file`; a handle wins over `selector` when both are set. A handle lives only while its document does: navigation, reload, or a redirect makes every earlier handle fail with `handle "g…-bN" is stale — … (re-run page_fetch what=interactives to re-mint handles)`, and removing or re-rendering the element does the same. A malformed value fails with `invalid handle "x123" (expected g<document>-b<backendNodeId> minted by page_fetch what=interactives|dom|links)`.
+
+```json
+{ "tool": "page_act", "arguments": { "session_id": "page-1", "action": "click", "handle": "g3k9x2ab-b6" } }
+```
+
 ---
 
 ## Standard Interaction Patterns
@@ -89,7 +100,7 @@ page_act {
 
 Never fetch unscoped raw HTML on modern web pages (many pages exceed 2MB). Use this 3-step sequence:
 
-1. **Open Page** (never `wait_for: "idle"` — it hangs on JS-heavy/WAF pages; use `"load"`/`"stable"` or omit and wait explicitly):
+1. **Open Page** (always pass `wait_for` — omitting it fails; never use `"idle"` — it hangs on JS-heavy/WAF pages):
    ```json
    { "tool": "fetch_page", "arguments": { "url": "https://example.com", "wait_for": "stable", "timeout_ms": 15000 } }
    ```
@@ -102,6 +113,11 @@ Never fetch unscoped raw HTML on modern web pages (many pages exceed 2MB). Use t
    ```json
    { "tool": "page_fetch", "arguments": { "session_id": "page-1", "what": "text", "selector": "main" } }
    ```
+4. **Before acting, read the action map** — cheaper and more reliable than guessing selectors:
+   ```json
+   { "tool": "page_fetch", "arguments": { "session_id": "page-1", "what": "interactives" } }
+   ```
+   Then act with the element's text as a selector (`a:has-text("Sign in")` is not supported — use a real CSS selector derived from the map) or with `x`/`y` via `click_at`.
 
 ### 2. Form Input, Key Presses, and File Uploads
 
@@ -197,6 +213,8 @@ Test mobile rendering or bypass desktop-specific layouts:
 | `element "<selector>": context deadline exceeded` | Element not in DOM, hidden behind overlay, or dynamically rendered. | Verify presence with `page_fetch { what: "dom", selector: "..." }` or query via `eval`. |
 | `SyntaxError: Unexpected token` in `eval` | `value` was not wrapped in an arrow function `() => ...` or had escaping issues. | Format `value` as `() => { return ...; }`. |
 | `Argument should belong to the same JavaScript world` | DOM element re-rendered by SPA framework or resides inside a cross-origin iframe. | Re-query the selector or interact via `eval` in document context. |
+| `invalid handle "x123" (expected g<document>-b<backendNodeId> …)` | The `handle` argument is malformed or minted by an older build. | Re-run `page_fetch what=interactives` (or `dom`/`links`) and pass the `handle` verbatim (`g` + document token + `-b` + digits). |
+| `handle "g…-bN" is stale — minted for a previous document / element no longer in the document / detached …` | The page navigated, reloaded, redirected, or the element was removed after the handle was minted. | Re-run `page_fetch what=interactives` (or `dom`/`links`) on the current document and use a fresh handle. |
 | Navigation redirect stall (e.g. tracking links) | Intermediate redirect URL timed out during wait. | Extract target URL using `links` or `eval`, then `navigate` directly to destination domain. |
 | `session "X" no longer exists: the browser process died` | Chromium crash (memory exhaustion or CDP socket close). | Re-open session with `fetch_page`. The manager automatically respawns Chromium. |
 

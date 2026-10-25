@@ -46,7 +46,8 @@ func (t *Act) Description() string {
 		"click_at / hover_at (coordinate-based mouse actions), drag_and_drop (mouse drag), " +
 		"upload_file (set files on <input type='file'>), eval (run JS — the primary escape hatch), " +
 		"navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, or emulate. " +
-		"Pass session_id plus action=... and any required parameters."
+		"Pass session_id plus action=... and any required parameters; element actions take a selector " +
+		"or a stable handle from page_fetch (handle wins when both are given)."
 }
 
 // InputSchema returns the JSON Schema for page_act's arguments.
@@ -71,6 +72,10 @@ func (t *Act) InputSchema() models.InputSchema {
 			"selector": map[string]any{
 				"type":        "string",
 				"description": "CSS selector or XPath identifying target element (click/input/type/press_key/hover/select/upload_file/drag_and_drop source).",
+			},
+			"handle": map[string]any{
+				"type":        "string",
+				"description": "Element handle from a previous page_fetch (what=interactives|dom|links), e.g. g3k9x2ab-b6. It carries the document that minted it: a handle from a previous document (after navigation, reload or redirect) is rejected as stale. Alternative to selector; when both given, handle wins.",
 			},
 			"value": map[string]any{
 				"type":        "string",
@@ -148,6 +153,7 @@ type actArgs struct {
 	SessionID      browsers.PageID    `json:"session_id"`
 	Action         string             `json:"action"`
 	Selector       string             `json:"selector"`
+	Handle         string             `json:"handle"`
 	Value          string             `json:"value"`
 	Key            string             `json:"key"`
 	Button         string             `json:"button"`
@@ -210,17 +216,17 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 	var out string
 	switch a.Action {
 	case "click":
-		out, err = pageops.PageClickOpts(ctx, p, a.Selector, a.Button, a.ClickCount)
+		out, err = pageops.PageClickOpts(ctx, p, a.Handle, a.Selector, a.Button, a.ClickCount)
 	case "input":
-		out, err = pageops.PageInput(ctx, p, a.Selector, a.Value)
+		out, err = pageops.PageInput(ctx, p, a.Handle, a.Selector, a.Value)
 	case "type":
-		out, err = pageops.PageType(ctx, p, a.Selector, a.Value)
+		out, err = pageops.PageType(ctx, p, a.Handle, a.Selector, a.Value)
 	case "press_key":
 		keyStr := a.Key
 		if keyStr == "" {
 			keyStr = a.Value
 		}
-		out, err = pageops.PagePressKey(ctx, p, a.Selector, keyStr)
+		out, err = pageops.PagePressKey(ctx, p, a.Handle, a.Selector, keyStr)
 	case "click_at":
 		out, err = pageops.PageClickAt(ctx, p, a.X, a.Y, a.Button, a.ClickCount)
 	case "hover_at":
@@ -232,7 +238,7 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 		if len(paths) == 0 && a.Value != "" {
 			paths = []string{a.Value}
 		}
-		out, err = pageops.PageUploadFile(ctx, p, a.Selector, paths)
+		out, err = pageops.PageUploadFile(ctx, p, a.Handle, a.Selector, paths)
 	case "eval":
 		out, err = pageops.PageEval(ctx, p, a.Value)
 	case "navigate":
@@ -244,17 +250,17 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 	case "reload":
 		out, err = pageops.PageReload(ctx, p)
 	case "hover":
-		out, err = pageops.PageHover(ctx, p, a.Selector)
+		out, err = pageops.PageHover(ctx, p, a.Handle, a.Selector)
 	case "scroll":
 		out, err = pageops.PageScroll(ctx, p, a.X, a.Y)
 	case "select":
-		out, err = pageops.PageSelect(ctx, p, a.Selector, a.Value)
+		out, err = pageops.PageSelect(ctx, p, a.Handle, a.Selector, a.Value)
 	case "wait":
 		d := timeout
 		if a.TimeoutMS > 0 {
 			d = time.Duration(a.TimeoutMS) * time.Millisecond
 		}
-		out, err = pageops.PageWait(ctx, p, a.WaitMode, a.Selector, d)
+		out, err = pageops.PageWait(ctx, p, a.WaitMode, a.Handle, a.Selector, d)
 	case "set_viewport":
 		out, err = pageops.PageSetViewport(ctx, p, a.Viewport.Width, a.Viewport.Height)
 	case "emulate":
