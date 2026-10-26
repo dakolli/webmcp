@@ -6,9 +6,9 @@ Read the tool reference first. Use these files when tool calling itself fails.
 | :--- | :--- | :--- |
 | `browser_create` | [browser_create_example.md](browser_create_example.md) | tested |
 | `browser_list` | [browser_list_example.md](browser_list_example.md) | tested |
-| `browser_close` | [browser_close_example.md](browser_close_example.md) | draft, re-test pending |
+| `browser_close` | [browser_close_example.md](browser_close_example.md) | tested |
 | `fetch_page` | [fetch_page_example.md](fetch_page_example.md) | tested |
-| `page_list` | [page_list_example.md](page_list_example.md) | draft, re-test pending |
+| `page_list` | [page_list_example.md](page_list_example.md) | tested |
 | `session_list` | [session_list_example.md](session_list_example.md) | tested |
 | `session_close` | [session_close_example.md](session_close_example.md) | tested |
 | `page_fetch` | [page_fetch_example.md](page_fetch_example.md) | tested |

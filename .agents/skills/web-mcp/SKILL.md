@@ -31,9 +31,9 @@ Do not invent parameters. The Go source in `pkg/mcp/tools/` is the schema source
 | :--- | :--- | :--- | :--- |
 | `browser_create` | [browser_create.md](references/tools/browser_create.md) | [browser_create_example.md](references/examples/browser_create_example.md) | tested |
 | `browser_list` | [browser_list.md](references/tools/browser_list.md) | [browser_list_example.md](references/examples/browser_list_example.md) | tested |
-| `browser_close` | [browser_close.md](references/tools/browser_close.md) | [browser_close_example.md](references/examples/browser_close_example.md) | draft, re-test pending |
+| `browser_close` | [browser_close.md](references/tools/browser_close.md) | [browser_close_example.md](references/examples/browser_close_example.md) | tested |
 | `fetch_page` | [fetch_page.md](references/tools/fetch_page.md) | [fetch_page_example.md](references/examples/fetch_page_example.md) | tested |
-| `page_list` | [page_list.md](references/tools/page_list.md) | [page_list_example.md](references/examples/page_list_example.md) | draft, re-test pending |
+| `page_list` | [page_list.md](references/tools/page_list.md) | [page_list_example.md](references/examples/page_list_example.md) | tested |
 | `session_list` | [session_list.md](references/tools/session_list.md) | [session_list_example.md](references/examples/session_list_example.md) | tested |
 | `session_close` | [session_close.md](references/tools/session_close.md) | [session_close_example.md](references/examples/session_close_example.md) | tested |
 | `page_fetch` | [page_fetch.md](references/tools/page_fetch.md) | [page_fetch_example.md](references/examples/page_fetch_example.md) | tested |
@@ -43,10 +43,10 @@ Do not invent parameters. The Go source in `pkg/mcp/tools/` is the schema source
 
 1. Call `browser_list` before you use a `browser_id`. Confirm the id and its `profile_dir`.
 2. Pass `persist:false` for an isolated secondary browser. If your client does not show `persist`, reconnect it before you create a browser.
-3. Never close `browser-1` unless the user asks for a full reset. Never call `browser_close` with an empty `browser_id` in a shared session.
+3. Never close `browser-1` unless the user asks for a full reset. Never call `browser_close` with an empty `browser_id` in a shared session. A misspelled `browser` key is ignored and becomes an empty id. Use the exact key `browser_id`.
 4. Use one browser per task. Page ids collide across browsers, and `page_fetch` and `page_act` resolve an id across live browsers.
 5. `session_close` is not browser-scoped. It closes the tab in the default browser. For a tab in a secondary browser, use `browser_close` with your own id.
-6. `session_list` reports the default browser only. Use `page_list` with a `browser_id` for any other browser.
+6. `session_list` reports the default browser only. Use `page_list` with a required `browser_id` for any other browser. `page_list` shows the creation URL, not the live URL. Use `page_fetch` with `what:"meta"` for the live URL.
 7. An unknown `browser_id` can create a new browser. A typo spends a full Chromium process. Verify the id first.
 8. `fetch_page` creates a new session on every call. Close sessions you no longer need.
 9. `page_fetch` network and console capture is cumulative from page creation. Call `page_act` `clear_logs` before the step you want to observe.
@@ -55,6 +55,7 @@ Do not invent parameters. The Go source in `pkg/mcp/tools/` is the schema source
 12. `page_act` `drag_and_drop` uses mouse events. It does not fire native HTML5 drag events. Use `eval` for HTML5 drag handlers.
 13. `page_act` `wait` defaults to `wait_mode:"ms"`. If you omit `timeout_ms`, it sleeps for 30 seconds.
 14. Prefer `article` over `text` for prose pages. Prefer `interactives` or `a11y` before you act.
+15. `browser_close` is not idempotent. A second close returns a not-found error. Check `browser_list` first.
 
 ## Known live-server limits
 
@@ -85,5 +86,6 @@ Use only the id you created. Do not close `browser-1`.
 
 - Wave A complete: `browser_create`, `browser_list`, `fetch_page`, `session_close`.
 - Wave B complete: `session_list`, `page_fetch`, `page_act`.
-- Wave C pending: re-test the `browser_close` and `page_list` drafts.
+- Wave C complete: `browser_close` and `page_list` re-tested.
+- All 9 tools have a tested reference and example.
 - Extension tickets: blocked until their tool tickets land.
