@@ -8,11 +8,13 @@ The payload rides inside the result envelope, so the full reply is `{"ok":true,"
 
 ## Inputs
 
-The live schema is `code://pkg/mcp/tools/page.go#L90`. The aspect registry is `code://pkg/mcp/tools/aspects.go#L67`.
+The live schema is `code://pkg/mcp/tools/page.go#L90`. The aspect registry is `code://pkg/mcp/tools/aspects.go#L67`. A session held outside the declared owner is refused as `not_found`.
 
 | Name | Type | Required | Default | Meaning |
 | :--- | :--- | :--- | :--- | :--- |
 | `session_id` | string | yes | — | Tab to read, for example `page-1`. Comes from `fetch_page`. |
+| `browser_id` | string | no | — | Optional. Resolve the session inside this browser only, for example `browser-2`. Omit it when exactly one live browser holds the id. |
+| `owner` | string | no | — | Optional. Restrict the lookup to browsers with this owner label, 1 to 64 characters of `A-Z`, `a-z`, `0-9`, `.`, `_`, `-`. |
 | `what` | string | yes | — | Aspect name. See the list below. |
 | `selector` | string | no | — | CSS selector. Only `html` and `text` use it. |
 | `max_bytes` | integer | no | `50000` | Output cap. A value of `0` or less means `50000`, not unbounded. |
@@ -20,7 +22,7 @@ The live schema is `code://pkg/mcp/tools/page.go#L90`. The aspect registry is `c
 | `full_page` | boolean | no | `false` | Capture the whole scrollable page. Only `screenshot` uses it. |
 | `include_values` | boolean | no | `false` | With `what=storage`, return real cookie and storage values instead of `<redacted>`. `true` exposes live session tokens. |
 
-The live `what` enum has 19 values, in registration order: `html`, `dom`, `text`, `css`, `js`, `links`, `screenshot`, `meta`, `interactives`, `a11y`, `network`, `body`, `console`, `article`, `marks`, `security`, `sinks`, `storage`, `har`. The tool has no `timeout_ms` input, every call has a fixed 30 second bound, and a full-page screenshot gets its own 90 second budget.
+The live `what` enum has 20 values, in registration order: `html`, `text`, `links`, `meta`, `dom`, `css`, `js`, `screenshot`, `interactives`, `a11y`, `network`, `console`, `body`, `article`, `marks`, `security`, `storage`, `sinks`, `postmessage`, `har`. The tool has no `timeout_ms` input, every call has a fixed 30 second bound, and a full-page screenshot gets its own 90 second budget.
 
 ## Returns
 
@@ -45,6 +47,7 @@ The live `what` enum has 19 values, in registration order: `html`, `dom`, `text`
 | `marks` | One text block `{marks,viewport_width,viewport_height,truncated}`, then one PNG image block. | no | **no** |
 | `security` | JSON `{url,checks:[{id,status,evidence,detail}],count,truncated}`. | no | **no** |
 | `sinks` | JSON `{installed,hits:[{source,sink,context,value,value_cut?,stack?,selector?,ts}],dropped,truncated}`. | no | **no** |
+| `postmessage` | JSON `{installed, messages:[{origin, source_kind, data, data_type, ts, stack}], dropped, truncated, frames:[{url, probed}]}`. | no | **no** |
 | `storage` | JSON `{cookies,local_storage,session_storage,indexed_db,caches}`, each with a `*_truncated` counter. | no | **no** |
 | `har` | JSON `{log:{version,creator,pages,entries,comment?,truncated?}}`. Tested: 2026-10-26. | no | **no** |
 
@@ -74,8 +77,7 @@ Image blocks are on by default. A client opts out at `initialize` with `capabili
 - **`interactives`** holds `handle`, `role`, `text`, `href`, `type`, `x`, `y`, `width`, `height`, `visible`. `visible: true` means the node has a layout box, not that it is in the viewport.
 - **`a11y`** holds `handle`, `depth`, `role`, `name`, `value`, `states`, plus `count` and `truncated`. Names and values are clipped at 200 runes. Root frame only.
 - **`network`** entries hold `method`, `url`, `type`, `status`, `mime`, `bytes`, `ms`, `failed`, `error`, `seq`, `req_headers`, `resp_headers`. Each header map keeps at most 32 headers per direction at 512 bytes per value under a 4 KB name+value budget, and a cut set adds `req_headers_truncated` or `resp_headers_truncated`. No bodies. **`console`** entries hold `level`, `text`, `source`, `line`, `seq`.
-- **`body`** adds `body` for UTF-8 text or `base64` plus `content_type` for binary, both exclusive. `bytes` is the pre-cap payload size. `truncated` marks the 256 KB cut.
-- **`marks`** items hold `index`, `role`, `text`, `x`, `y`, `width`, `height`. Coordinates are viewport CSS pixels and can be negative, and the top-left `x`/`y` feed `page_act` `click_at` directly. The `screenshot` field appears only for a text-only client.
+- **`body`** adds `body` for UTF-8 text or `base64` plus `content_type` for binary, both exclusive, with `bytes` as the pre-cap size and `truncated` on the 256 KB cut. **`marks`** items hold `index`, `role`, `text`, `x`, `y`, `width`, `height` in viewport CSS pixels that can be negative, and the top-left `x`/`y` feed `page_act` `click_at` directly. The `screenshot` field appears only for a text-only client.
 
 ## Behavior and limits
 
@@ -85,9 +87,7 @@ Every handle has the form `g<document>-b<backendNodeId>`, for example `gy1g0vstq
 
 ### Caps
 
-- `interactives`: 200 entries, about 32 KB at full cap on a link-dense docs page. `a11y`: 400 nodes. `truncated` counts the rest, for example `335` and `299` on the live Wikipedia page.
-- `network` and `console`: 200-entry ring per page. One call emits the newest 100. `dropped` counts true ring loss, `truncated` counts buffered entries above the emit cap.
-- `article`: 40000 runes in `text`, reported by a boolean `truncated`. `marks`: 60 boxes, with `truncated` for the rest. Only nodes inside the viewport are boxed.
+- Caps: `interactives` 200 entries, `a11y` 400 nodes, `article` 40000 runes, `marks` 60 viewport boxes, and `network`/`console` 200-entry rings that emit the newest 100. A `truncated` count reports the rest, and `dropped` counts true ring loss.
 
 ### Network and console capture
 
@@ -127,8 +127,6 @@ Evidence names at most 10 offending values, then `(+N more)`. The script, form, 
 
 ### Sinks tracer with what=sinks
 
-**Tested live on 2026-10-26 against `https://www.postgresql.org/`.**
-
 `sinks` reads a source-to-sink tracer. Arm it first with `page_act action=sinks_install`. The arm step is opt-in and changes page behavior because it wraps page setters and constructors. Keep it off for normal page use.
 
 The payload is `{installed, hits:[{source, sink, context, value, value_cut?, stack?, selector?, ts}], dropped, truncated}`. `installed` is true when the tracer is live in the current document. `hits` holds the newest 100 records, oldest first, and is `[]` and never null on an unarmed page. `dropped` counts hits evicted by the 200-hit ring. `truncated` counts buffered hits older than the emitted 100. `max_bytes` does not apply.
@@ -138,6 +136,12 @@ The payload is `{installed, hits:[{source, sink, context, value, value_cut?, sta
 An unarmed page returns `{"installed":false,"hits":[],"dropped":0,"truncated":0}` with no error. A read is not a state change.
 
 The ring is per document. A full navigation starts a fresh ring, because the arm step re-injects the script before the new document's own scripts, so `installed` stays true. The new document's own scripts can write hits at once, so a post-navigation read can be non-empty. A client-side route change keeps the same ring and appends to it. Clear with `page_act action=sinks_clear`, which returns `{"cleared":N}`.
+
+### postMessage recorder with what=postmessage
+
+`postmessage` reads the `message` event ring. Arm it with `page_act action=postmessage_install`. The payload is `{installed, messages:[{origin, source_kind, data, data_type, ts, stack}], dropped, truncated, frames:[{url, probed}]}`. `messages` is `[]` and never null. `source_kind` is `window`, `frame`, `worker`, or `unknown`. `data_type` is `string`, `json`, `object`, or `other`. `stack` keeps 5 receive-side frames and is omitted when empty.
+
+The ring holds 100 messages per window. One read emits the newest 100 across the root window and every iframe, oldest first. `dropped` counts ring eviction. `truncated` counts buffered messages above the emit cap. `data` clips at 500 runes. `frames` lists each window the read reached, up to 20, and `probed` reports whether the recorder was armed there. There is no per-frame ring and no count per frame: `messages` is one merged list and `frames` lists probed URLs only, so a frame-targeted send cannot be attributed to a specific frame element from the payload alone. An unarmed page returns `{"installed":false,"messages":[],"dropped":0,"truncated":0,"frames":[{"url":"…","probed":false}]}` with no error. `target=clear` empties every ring and returns `{"cleared":N}`. `max_bytes` does not apply.
 
 ### Storage snapshot with what=storage
 
@@ -160,7 +164,7 @@ With `--bind 0.0.0.0`, the server prints `http://[::]:<port>`. Put a reachable h
 | `html`, `text`, `css`, `js` | Cut on a rune boundary. A note is appended. | No. A `css`/`js` list is cut inside its JSON. | Text note |
 | `dom`, `links` | Array root becomes an envelope object. | Yes | `truncated: true`, `omitted` |
 | `meta` | Object keeps its fields, its first array field shrinks. | Yes | `truncated: true`, `omitted` |
-| `screenshot`, `interactives`, `a11y`, `network`, `body`, `console`, `article`, `marks`, `security`, `sinks`, `storage`, `har` | Not cut. | Yes | Shape's own `truncated` or `count` |
+| `screenshot`, `interactives`, `a11y`, `network`, `body`, `console`, `article`, `marks`, `security`, `sinks`, `postmessage`, `storage`, `har` | Not cut. | Yes | Shape's own `truncated` or `count` |
 
 The text note is exact: `… (truncated at max_bytes=600 bytes; raise max_bytes — dom/links/meta do not use selector)`. The array envelope is `{"items":[...],"max_bytes":N,"omitted":N,"truncated":true}`.
 
@@ -201,7 +205,7 @@ Recovery: re-read `what=network` for the current `seq` values, then read the bod
 
 - 2026-10-25 — `meta`, `text` with selector, `css` with `target`, `interactives`, `network`, `body`, `network` header redaction, and the unknown-`what` failure. Commit `819ba12`.
 - 2026-10-26 — `security` on `https://go.dev/` returned `count: 20`, `truncated: 0`. Failure envelopes for `unknown what` and a no-match selector were recorded live. The no-match selector returned `element_not_found`.
-- 2026-10-26 — `sinks` on `https://www.postgresql.org/`: `sinks_install` returned `{"installed":true}`, the arm survived a full navigation, `sinks_clear` returned `{"cleared":N}`, and 250 hits reported `hits:100`, `dropped:50`, `truncated:100`.
+- 2026-10-26 — `sinks` on `https://www.postgresql.org/`: `sinks_install` returned `{"installed":true}`, the arm survived a full navigation, `sinks_clear` returned `{"cleared":N}`, and 250 hits reported `hits:100`, `dropped:50`, `truncated:100`. A `postmessage` read on https://www.python.org/ returned the message list, `frames:[{url,probed}]`, and `target=clear` returned `{"cleared":N}`.
 
 ## When not to use it
 
@@ -209,11 +213,6 @@ Do not use `page_fetch` to open a page. Use `fetch_page`. Do not use it to click
 
 ## Related tools
 
-- `fetch_page` — opens the session that `page_fetch` reads. It returns `session_id`.
-- `page_act` — clicks, types, presses keys, evaluates JS, navigates, calls `clear_logs`, and replays `network` entries.
-- `page_list` — lists the pages of one browser.
-- `session_list` — lists every live session across browsers.
-- `session_close` — closes one page.
-- `browser_list` — lists browsers and their pages.
+- `fetch_page` opens the session. `page_act` acts on it. `page_list`, `session_list`, `session_close`, and `browser_list` manage pages and browsers.
 
 For copyable calls with expected output, see the example file at `.agents/skills/web-mcp/references/examples/page_fetch_example.md`.

@@ -62,10 +62,10 @@ Install or refresh this skill with `browser skill <harness|path|.>`. With no arg
 ## Cross-cutting rules
 
 1. Call `browser_list` before you use a `browser_id`. Confirm the id and its `profile_dir`.
-2. If your client does not show `persist` or `owner`, reconnect it before you create a browser. Reconnect it when a cached `page_fetch` `what` enum lacks `har`, `sinks`, or `storage`, because the live enum has 19 values.
+2. If your client does not show `persist` or `owner`, reconnect it before you create a browser. Reconnect it when a cached `page_fetch` `what` enum lacks `har`, `postmessage`, `sinks`, or `storage`, because the live enum has 20 values. A cached client schema can also omit the new `browser_id` and `owner` inputs, so reconnect the client after a server build.
 3. Never close `browser-1` unless the user asks for a full reset. Never call `browser_close` with an empty `browser_id` in a shared session. A misspelled `browser` key is ignored and becomes an empty id. Use the exact key `browser_id`.
-4. Use one browser per agent and task. Page ids collide across browsers, and `page_fetch` and `page_act` resolve an id across live browsers.
-5. `session_close` resolves the page through the browser that owns it and returns `session page-N closed (browser browser-N)`. Page ids still collide across browsers, so pass the exact id.
+4. Use one browser per agent and task. Page ids are unique per browser, so two owners can both hold `page-1`. With one live browser a bare id resolves. With two or more live browsers a bare id returns `invalid_args`, and the message names every browser and owner.
+5. `page_fetch`, `page_act`, and `session_close` take optional `browser_id` and `owner`. A session held outside the declared owner returns `not_found`, names the holder, and returns no content. Pass `browser_id` to cross on purpose.
 6. `session_list` reads every live browser and identity. Use `page_list` with a required `browser_id` for one browser. Both report the live URL and title, refreshed after navigation and redirects.
 7. An unknown `browser_id` can create a new browser. A typo spends a full Chromium process. Verify the id first.
 8. `fetch_page` creates a new session on every call. Close sessions you no longer need.
@@ -76,6 +76,8 @@ Install or refresh this skill with `browser skill <harness|path|.>`. With no arg
 13. `page_act` `wait` defaults to `wait_mode:"ms"`. If you omit `timeout_ms`, it sleeps for 30 seconds.
 14. Prefer `article` over `text` for prose pages. Prefer `interactives` or `a11y` before you act.
 15. `browser_close` is not idempotent. A second close returns a not-found error. Check `browser_list` first.
+16. `page_act` `inject_canary` proves sink reachability. Run `sinks_install` first or it returns the guard error. It injects a `wm-canary-<8 hex>` value into `query`, `hash`, `postmessage`, and `name`, capped at 20 frames, and returns the `hits` whose value contains the canary.
+17. `page_act` `postmessage_install` arms a `message` recorder on every reachable window and returns `{"installed":true}`. Read it with `page_fetch` `what=postmessage`. Send with `post_message`, which takes `value`, `target_selector` (`top` or a CSS frame selector), and `origin` (default `*`). Clear with `postmessage_clear` or `target=clear`. The ring holds 100 messages per window and clips `data` at 500 runes. The read merges every window into one `messages` list, each entry carries `source_kind` (`window`, `frame`, `worker`, or `unknown`) as the only frame hint, and `frames` lists probed URLs only, with no per-frame ring or count, so a frame-targeted send cannot be attributed to a specific frame element from the payload alone.
 
 ## Incognito identities
 
@@ -120,7 +122,7 @@ Each tool reference states only its own payload and its failure types, and links
 
 ## Known live-server limits
 
-- `page_fetch` large aspects bypass `max_bytes`: `interactives`, `a11y`, `network`, `console`, `article`, `marks`, `screenshot`, `sinks`, `storage`, and `har`. The client can cut the response.
+- `page_fetch` large aspects bypass `max_bytes`: `interactives`, `a11y`, `network`, `console`, `article`, `marks`, `screenshot`, `sinks`, `postmessage`, `storage`, and `har`. The client can cut the response.
 - `page_fetch` `dom` truncation can return an empty `items` array for one huge document. A larger `max_bytes` does not always help.
 - `page_fetch` `css` and `js` lists are cut as plain text. A cut list is not valid JSON.
 - `fetch_page` `browser_id` is not checked. It can launch a new browser with a literal unknown id.
@@ -154,4 +156,5 @@ Keep these shapes in the rotation, with a new host each time:
 - All 9 tools have a tested reference and an example.
 - The result envelope is documented once here and referenced from every tool page.
 - Lifecycle, proxy, scope, headers, `what=body`, `what=security` and `page_act replay` are documented.
-- `sinks` is on the tool surface: `sinks_install` → `what=sinks` → `sinks_clear`. `canary` stays engine-only.
+- `sinks` is on the tool surface: `sinks_install` → `what=sinks` → `sinks_clear`. `inject_canary` is on the tool surface: `sinks_install` → `inject_canary` → `hits`.
+- `postmessage` is on the tool surface: `postmessage_install` → `what=postmessage` → `post_message` → `postmessage_clear`.

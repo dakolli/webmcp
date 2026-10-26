@@ -108,19 +108,20 @@ The second `target` is the seq of this run's `news.css` request. Success rides `
 
 Replay re-reads the request and carries the page's cookies for the target host, and it never writes to the page. Pass `method` to override the method, `headers` to replace captured headers, or `value` to replace the request body.
 
-## 8. Arm the sink tracer
+## 8. Arm the sink tracer and inject a canary
 
-Open a page with a hash, then install, inject the hash into `innerHTML`, read, and clear:
+Open `https://www.sqlite.org/index.html` as `page-7`, install, inject the hash, read the hits, then clear:
 
 ```json
-{"tool":"fetch_page","arguments":{"url":"https://www.iana.org/help/example-domains#wm-canary-160","browser_id":"browser-10","wait_for":"idle"}}
+{"tool":"fetch_page","arguments":{"url":"https://www.sqlite.org/index.html","browser_id":"browser-10","wait_for":"idle"}}
 {"tool":"page_act","arguments":{"session_id":"page-7","action":"sinks_install"}}
-{"tool":"page_act","arguments":{"session_id":"page-7","action":"eval","value":"() => { const d=document.createElement('div'); d.innerHTML=location.hash; document.body.appendChild(d); return d.textContent }"}}
+{"tool":"page_act","arguments":{"session_id":"page-7","action":"inject_canary","targets":["hash"]}}
+{"tool":"page_act","arguments":{"session_id":"page-7","action":"eval","value":"() => { const d=document.createElement('div'); d.id='probe'; d.innerHTML=location.hash; document.body.appendChild(d); return d.textContent }"}}
 {"tool":"page_fetch","arguments":{"session_id":"page-7","what":"sinks"}}
 {"tool":"page_act","arguments":{"session_id":"page-7","action":"sinks_clear"}}
 ```
 
-Expect `{"installed":true}`, then one hit with `sink:"innerHTML"` and `context:"html"`, then `{"cleared":1}`. A second `sinks_install` is a no-op.
+Expect `{"installed":true}`, then `{"canary":"wm-canary-…","injected":[{"target":"hash","where":"https://www.sqlite.org/index.html"}],"hits":[],"installed":true}`. The static page has no hash sink, so `hits:[]` is a clean result. The control eval makes a real finding: `{"source":"location.hash","sink":"innerHTML","context":"html","selector":"div#probe","value":"#wm-canary-…","stack":[…]}`. `selector` and `stack` are omitted when empty. Without `sinks_install` the call fails with `page_act: inject_canary needs the sink tracer — run action "sinks_install" first`. Then `{"cleared":1}` and a second `sinks_install` is a no-op.
 
 ## 9. Failure examples
 
