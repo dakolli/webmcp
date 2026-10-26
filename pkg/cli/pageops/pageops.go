@@ -746,6 +746,9 @@ var aspectEntries = []aspectEntry{
 	{name: "storage", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, q AspectQuery) (string, error) {
 		return PageStorage(ctx, p, q.IncludeValues)
 	}},
+	{name: "sinks", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
+		return PageSinks(ctx, p)
+	}},
 }
 
 // unknownAspectError is the one unknown-what error every surface emits; it names
