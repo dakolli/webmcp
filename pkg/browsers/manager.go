@@ -1009,10 +1009,11 @@ func (m *Manager) Browsers() map[BrowserID]*Browser {
 }
 
 // Sessions returns a read-only snapshot of every live page across every live
-// browser and identity, sorted by page id. A non-empty identity narrows the
-// result to that identity and fails with every live name when it matches none.
-// It never launches, creates, or probes a browser: listing cannot start a
-// Chromium process.
+// browser and identity, sorted by page id. Each entry reports the tab's live URL
+// and title, falling back to the stored URL with Stale set when the tab is busy
+// or unreadable. A non-empty identity narrows the result to that identity and
+// fails with every live name when it matches none. It never launches, creates,
+// or probes a browser: listing cannot start a Chromium process.
 func (m *Manager) Sessions(identity string) ([]PageInfo, error) {
 	live := m.Browsers()
 	pages := make([]PageInfo, 0, len(live))

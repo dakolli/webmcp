@@ -468,9 +468,9 @@ func (t *BrowserClose) Execute(ctx context.Context, args json.RawMessage) (strin
 // Ensure BrowserClose satisfies the Tool interface at compile time.
 var _ Tool = (*BrowserClose)(nil)
 
-// PageList implements the "page_list" tool: it lists every open page (id, url)
-// of the manager's single Browser as a JSON array, mirroring session_list but
-// scoped to a browser_id.
+// PageList implements the "page_list" tool: it lists every open page of the
+// manager's single Browser as a JSON array, mirroring session_list but scoped
+// to a browser_id.
 type PageList struct {
 	// mgr is the shared browsers.Manager owning the single Browser.
 	mgr *browsers.Manager
@@ -489,10 +489,15 @@ func (t *PageList) Name() string {
 
 // Description returns a customer/LLM-facing description of page_list.
 func (t *PageList) Description() string {
-	return "Lists all open pages (id, url) of the given browser as a JSON " +
-		"array. Use it to see which sessions/tabs are still open inside the " +
-		"browser before closing them with session_close. An unknown browser_id " +
-		"returns a not-found error listing the running ids. " +
+	return "Lists every live page of the given browser as a JSON array. Each " +
+		"entry is {id, url, context, title?, stale?}: url and title are read " +
+		"from the live tab, so they follow navigations and redirects; context " +
+		"is the incognito identity ('default' for the browser's own cookie " +
+		"jar); stale marks an entry whose tab was busy or unreadable, in which " +
+		"case url is the last known value. Use it to see which sessions/tabs " +
+		"are still open inside the browser before closing them with " +
+		"session_close. An unknown browser_id returns a not-found error listing " +
+		"the running ids. " +
 		"Example: { \"browser_id\": \"browser-1\" }." + resultEnvelopeDoc
 }
 

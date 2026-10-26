@@ -32,6 +32,9 @@ type Page struct {
 	// Rod is the live go-rod page handle for this tab. Only valid while the
 	// page is open. Guarded by the operation lock.
 	Rod *rod.Page
+	// info reads the tab's live URL and title. It is a field so tests can stub
+	// the CDP round trip; nil reads through rod's Page.Info.
+	info func(context.Context) (url, title string, err error)
 	// lastAccessNano is the UnixNano time this page was last used: set at
 	// creation (NewPage) and refreshed by touch on every successful
 	// Browser.Page lookup. Atomic so listings and the sweeper never take the
@@ -153,11 +156,67 @@ func (p *Page) Close(ctx context.Context) error {
 type PageInfo struct {
 	// ID uniquely identifies the page.
 	ID PageID `json:"id"`
-	// URL is the URL the page was created with.
+	// URL is the tab's live URL when it could be read, else the URL the page
+	// was created with (see Stale).
 	URL string `json:"url"`
 	// Context is the incognito identity the page lives in ("default" for the
 	// parent browser); identities share one Chromium process but not cookies.
 	Context string `json:"context"`
+	// Title is the live document title, empty when it could not be read.
+	Title string `json:"title,omitempty"`
+	// Stale marks an entry whose URL and title could not be read from the live
+	// tab (busy page, dead target, or read timeout); URL then holds the last
+	// known value. Absent means the entry was read live.
+	Stale bool `json:"stale,omitempty"`
+}
+
+// listingInfoBudget bounds all live URL/title reads of one listing. A listing
+// must never wait on the page operation lock, and a dead CDP connection must
+// fall back to the stored URL instead of stalling the whole listing.
+const listingInfoBudget = time.Second
+
+// snapshot returns this page's listing row tagged with its owning identity. It
+// refreshes URL and title from the live tab, and never waits on the page
+// operation lock: a busy or unreadable page is reported from the stored URL
+// with Stale set. The caller bounds the read with ctx.
+func (p *Page) snapshot(ctx context.Context, identity string) PageInfo {
+	info := PageInfo{
+		ID:      p.ID,
+		URL:     p.URL,
+		Context: identity,
+	}
+	unlock, ok := p.TryLock()
+	if !ok {
+		info.Stale = true
+		return info
+	}
+	defer unlock()
+
+	url, title, err := p.readInfo(ctx)
+	if err != nil {
+		info.Stale = true
+		return info
+	}
+	if url != "" {
+		info.URL = url
+	}
+	info.Title = title
+	return info
+}
+
+// readInfo reads the tab's live URL and title through the stubbable seam.
+func (p *Page) readInfo(ctx context.Context) (string, string, error) {
+	if p.info != nil {
+		return p.info(ctx)
+	}
+	if p.Rod == nil {
+		return "", "", fmt.Errorf("browsers: page %q has no live tab", p.ID)
+	}
+	live, err := p.Rod.Context(ctx).Info()
+	if err != nil {
+		return "", "", err
+	}
+	return live.URL, live.Title, nil
 }
 
 // Viewport is a page viewport size in CSS pixels. It is the engine's MCP-free

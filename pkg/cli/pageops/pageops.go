@@ -56,6 +56,28 @@ const defaultPageOpTimeout = 30 * time.Second
 // whole call budget.
 const inputAckTimeout = 2 * time.Second
 
+// resolveSelector resolves one CSS selector without rod's unbounded retry: a
+// selector that matches nothing returns the typed *rod.ElementNotFoundError
+// immediately instead of burning the whole call budget and surfacing as a
+// timeout. A selector that matches resolves as before, and a malformed selector
+// returns its eval error unchanged. Callers must already hold the page lock;
+// this never locks.
+func resolveSelector(page *rod.Page, selector string) (*rod.Element, error) {
+	return page.Sleeper(rod.NotFoundSleeper).Element(selector)
+}
+
+// resolveError maps a selector-resolution failure to the shared not-found
+// sentence when nothing matched, so the result envelope classifies it as
+// element_not_found. Any other failure (malformed selector, eval error) passes
+// through unchanged and keeps its own type.
+func resolveError(selector string, err error) error {
+	var missing *rod.ElementNotFoundError
+	if errors.As(err, &missing) {
+		return fmt.Errorf("no element matched selector %q: %w", selector, err)
+	}
+	return err
+}
+
 // beginPage gives ctx a deadline when it has none, then acquires the page
 // operation lock. The returned release func cancels the derived context and
 // releases the lock; callers defer it immediately. A page already held by
@@ -271,9 +293,9 @@ func PageHTML(ctx context.Context, p *browsers.Page, selector string) (string, e
 		return html, nil
 	}
 
-	el, err := p.Rod.Context(ctx).Element(selector) // CSS; retries until found
+	el, err := resolveSelector(p.Rod.Context(ctx), selector)
 	if err != nil {
-		return "", fmt.Errorf("no element matched selector %q: %w", selector, err)
+		return "", resolveError(selector, err)
 	}
 	html, err := el.HTML()
 	if err != nil {
@@ -314,7 +336,7 @@ func PageText(ctx context.Context, p *browsers.Page, selector string) (string, e
 	// whole-document Eval always yields a string. Nil() must be checked before
 	// Str(), because gson Str() renders a null as "<nil>".
 	if res.Value.Nil() {
-		return "", fmt.Errorf("no element matched selector %q", selector)
+		return "", resolveError(selector, &rod.ElementNotFoundError{})
 	}
 	return res.Value.Str(), nil
 }
@@ -1440,7 +1462,7 @@ func actTarget(page *rod.Page, handle, selector string) (*rod.Element, error) {
 		if selector == "" {
 			return nil, errors.New("either selector or handle is required")
 		}
-		return page.Element(selector)
+		return resolveSelector(page, selector)
 	}
 	token, id, err := parseHandle(handle)
 	if err != nil {
@@ -1857,7 +1879,7 @@ func PageDragAndDrop(ctx context.Context, p *browsers.Page, fromX, fromY, toX, t
 	page := p.Rod.Context(ctx)
 
 	if selector != "" {
-		el, err := page.Element(selector)
+		el, err := resolveSelector(page, selector)
 		if err != nil {
 			return "", fmt.Errorf("drag_and_drop: source element %q: %w", selector, err)
 		}
@@ -1870,7 +1892,7 @@ func PageDragAndDrop(ctx context.Context, p *browsers.Page, fromX, fromY, toX, t
 	}
 
 	if targetSelector != "" {
-		el, err := page.Element(targetSelector)
+		el, err := resolveSelector(page, targetSelector)
 		if err != nil {
 			return "", fmt.Errorf("drag_and_drop: target element %q: %w", targetSelector, err)
 		}

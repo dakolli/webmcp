@@ -89,8 +89,9 @@ func (t *SessionClose) Execute(ctx context.Context, args json.RawMessage) (strin
 }
 
 // SessionList implements the "session_list" tool: it lists every live browser
-// page (id, url, context) of every live browser and identity as a JSON array so
-// the agent can see what tabs are still open across its session lifecycle.
+// page (id, live url, title and context) of every live browser and identity as
+// a JSON array so the agent can see what tabs are still open across its
+// session lifecycle.
 type SessionList struct {
 	// mgr is the shared browsers.Manager owning the live browsers, their
 	// identities and their live pages (sessions).
@@ -110,14 +111,17 @@ func (t *SessionList) Name() string {
 
 // Description returns a customer/LLM-facing description of session_list.
 func (t *SessionList) Description() string {
-	return "Lists every live browser session (id, url, context) across every " +
-		"live browser and identity as a JSON array, where context is the " +
-		"incognito identity ('default' for the browser's own cookie jar). Use " +
-		"it to see which fetch_page sessions are still open before closing them " +
-		"with session_close. Pass identity to list one identity only; an " +
-		"unknown identity reports the live names and creates nothing. It never " +
-		"launches a browser: with none running it returns an empty array. " +
-		"Example: {}." + resultEnvelopeDoc
+	return "Lists every live browser session across every live browser and " +
+		"identity as a JSON array. Each entry is {id, url, context, title?, " +
+		"stale?}: url and title are read from the live tab, so they follow " +
+		"navigations and redirects; context is the incognito identity " +
+		"('default' for the browser's own cookie jar); stale marks an entry " +
+		"whose tab was busy or unreadable, in which case url is the last known " +
+		"value. Use it to see which fetch_page sessions are still open before " +
+		"closing them with session_close. Pass identity to list one identity " +
+		"only; an unknown identity reports the live names and creates nothing. " +
+		"It never launches a browser: with none running it returns an empty " +
+		"array. Example: {}." + resultEnvelopeDoc
 }
 
 // InputSchema returns the JSON Schema for session_list's arguments: an optional

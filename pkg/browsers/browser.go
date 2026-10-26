@@ -1052,11 +1052,17 @@ func (b *Browser) Focus(ctx context.Context, state WindowState) error {
 	}
 }
 
-// Pages returns a read-only snapshot of the Browser's live pages (id, url and
-// owning identity), safe to marshal and iterate; it never exposes the live
-// *rod.Page handles. A root browser includes the pages of every identity.
+// Pages returns a read-only snapshot of the Browser's live pages (id, live url,
+// title and owning identity), safe to marshal and iterate; it never exposes the
+// live *rod.Page handles. URL and title are read from each live tab within one
+// shared budget, so they follow navigations and redirects; a busy or unreadable
+// tab falls back to the stored URL with Stale set instead of waiting on a page
+// operation. A root browser includes the pages of every identity.
 func (b *Browser) Pages() []PageInfo {
-	infos := b.pageInfos()
+	ctx, cancel := context.WithTimeout(context.Background(), listingInfoBudget)
+	defer cancel()
+
+	infos := b.pageInfos(ctx)
 
 	b.mu.Lock()
 	identities := make([]*Browser, 0, len(b.identities))
@@ -1066,7 +1072,7 @@ func (b *Browser) Pages() []PageInfo {
 	b.mu.Unlock()
 
 	for _, child := range identities {
-		infos = append(infos, child.pageInfos()...)
+		infos = append(infos, child.pageInfos(ctx)...)
 	}
 	sort.Slice(infos, func(i, j int) bool { return infos[i].ID < infos[j].ID })
 	return infos
@@ -1086,13 +1092,20 @@ func (b *Browser) pageOwners() []*Browser {
 }
 
 // pageInfos snapshots this browser's own pages, tagged with its identity name.
-func (b *Browser) pageInfos() []PageInfo {
+// It copies the page pointers under b.mu and reads each tab outside the browser
+// lock, so the live URL/title round trip never blocks browser operations.
+func (b *Browser) pageInfos(ctx context.Context) []PageInfo {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	infos := make([]PageInfo, 0, len(b.pages))
-	identity := b.IdentityName()
+	pages := make([]*Page, 0, len(b.pages))
 	for _, p := range b.pages {
-		infos = append(infos, PageInfo{ID: p.ID, URL: p.URL, Context: identity})
+		pages = append(pages, p)
+	}
+	identity := b.IdentityName()
+	b.mu.Unlock()
+
+	infos := make([]PageInfo, 0, len(pages))
+	for _, p := range pages {
+		infos = append(infos, p.snapshot(ctx, identity))
 	}
 	return infos
 }

@@ -11,6 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/proto"
 
 	"webmcp/pkg/browsers"
@@ -208,6 +209,26 @@ func TestActTarget(t *testing.T) {
 	}
 	if got := actionError("click", "g3k9x2ab-b6", "#x", resolveErr).Error(); got != resolveErr.Error() {
 		t.Errorf("handle actionError re-wrapped: %q", got)
+	}
+}
+
+// TestResolveError pins the selector-resolution classification rule: an
+// unmatched selector carries the typed element-not-found error, while a
+// malformed selector keeps its own error.
+func TestResolveError(t *testing.T) {
+	notFound := resolveError("#missing", &rod.ElementNotFoundError{})
+	var missing *rod.ElementNotFoundError
+	if !errors.As(notFound, &missing) {
+		t.Fatalf("resolveError(not found) = %v, want *rod.ElementNotFoundError", notFound)
+	}
+	want := `no element matched selector "#missing": cannot find element`
+	if notFound.Error() != want {
+		t.Fatalf("resolveError(not found) = %q, want %q", notFound, want)
+	}
+
+	evalErr := errors.New("eval js error: SyntaxError: invalid selector")
+	if got := resolveError("#bad[", evalErr); got != evalErr {
+		t.Fatalf("resolveError(eval error) = %v, want the original error", got)
 	}
 }
 

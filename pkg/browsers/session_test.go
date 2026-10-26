@@ -2,6 +2,8 @@ package browsers
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -165,4 +167,141 @@ func TestBrowserCloseDoesNotWaitOnBusyPage(t *testing.T) {
 		}
 	}
 	p.Unlock()
+}
+
+// TestPagesReportsLiveURLAndTitle pins that a listing follows navigation: it
+// reports the tab's current URL and title, not the URL captured at creation.
+func TestPagesReportsLiveURLAndTitle(t *testing.T) {
+	b := NewBrowser("browser-1", context.Background(), false, false, "", "")
+	p := &Page{
+		ID:  "page-1",
+		URL: "https://app.test/old",
+		info: func(context.Context) (string, string, error) {
+			return "https://app.test/new", "Orders", nil
+		},
+	}
+	b.pages[p.ID] = p
+
+	pages := b.Pages()
+	if len(pages) != 1 {
+		t.Fatalf("Pages() = %d entries, want 1", len(pages))
+	}
+	got := pages[0]
+	if got.URL != "https://app.test/new" || got.Title != "Orders" {
+		t.Fatalf("Pages()[0] = %+v, want the live url and title", got)
+	}
+	if got.Stale {
+		t.Fatal("Pages()[0].Stale = true, want a live read")
+	}
+}
+
+// TestPagesBusyPageFallsBackStale pins the no-block contract: a page held by an
+// in-flight operation is reported from its stored URL with Stale set, and the
+// listing returns immediately without attempting the read.
+func TestPagesBusyPageFallsBackStale(t *testing.T) {
+	b := NewBrowser("browser-1", context.Background(), false, false, "", "")
+	read := false
+	p := &Page{
+		ID:  "page-1",
+		URL: "https://app.test/last-view",
+		info: func(context.Context) (string, string, error) {
+			read = true
+			return "https://app.test/live", "Live", nil
+		},
+	}
+	b.pages[p.ID] = p
+	p.Lock()
+	defer p.Unlock()
+
+	done := make(chan []PageInfo, 1)
+	go func() { done <- b.Pages() }()
+
+	select {
+	case pages := <-done:
+		if len(pages) != 1 {
+			t.Fatalf("Pages() = %d entries, want 1", len(pages))
+		}
+		if !pages[0].Stale {
+			t.Fatalf("Pages()[0] = %+v, want Stale on a busy page", pages[0])
+		}
+		if pages[0].URL != "https://app.test/last-view" {
+			t.Fatalf("Pages()[0].URL = %q, want the stored URL", pages[0].URL)
+		}
+		if read {
+			t.Fatal("Pages() read a busy page")
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("Pages() blocked on a busy page")
+	}
+}
+
+// TestPagesUnreadablePageFallsBackStale pins that a dead target reports the
+// stored URL with Stale set instead of failing the whole listing.
+func TestPagesUnreadablePageFallsBackStale(t *testing.T) {
+	b := NewBrowser("browser-1", context.Background(), false, false, "", "")
+	p := &Page{
+		ID:  "page-1",
+		URL: "https://app.test/last-view",
+		info: func(context.Context) (string, string, error) {
+			return "", "", errors.New("target closed")
+		},
+	}
+	b.pages[p.ID] = p
+
+	pages := b.Pages()
+	if len(pages) != 1 || !pages[0].Stale {
+		t.Fatalf("Pages() = %+v, want one Stale entry", pages)
+	}
+	if pages[0].URL != "https://app.test/last-view" {
+		t.Fatalf("Pages()[0].URL = %q, want the stored URL", pages[0].URL)
+	}
+}
+
+// TestPagesBoundsLiveRead pins the read budget: a read that never answers is
+// abandoned at listingInfoTimeout and reported stale, so one wedged tab cannot
+// stall the listing.
+func TestPagesBoundsLiveRead(t *testing.T) {
+	b := NewBrowser("browser-1", context.Background(), false, false, "", "")
+	p := &Page{
+		ID:  "page-1",
+		URL: "https://app.test/last-view",
+		info: func(ctx context.Context) (string, string, error) {
+			<-ctx.Done()
+			return "", "", ctx.Err()
+		},
+	}
+	b.pages[p.ID] = p
+
+	start := time.Now()
+	pages := b.Pages()
+	if elapsed := time.Since(start); elapsed > 2*listingInfoBudget {
+		t.Fatalf("Pages() took %s, want it bounded near %s", elapsed, listingInfoBudget)
+	}
+	if len(pages) != 1 || !pages[0].Stale {
+		t.Fatalf("Pages() = %+v, want one Stale entry", pages)
+	}
+}
+
+// TestPageInfoPayloadShape pins the listing payload keys the tool descriptions
+// promise: id, url and context always; title and the stale marker when known.
+func TestPageInfoPayloadShape(t *testing.T) {
+	data, err := json.Marshal(PageInfo{
+		ID:      "page-1",
+		URL:     "https://app.test/new",
+		Context: "default",
+		Title:   "Orders",
+		Stale:   true,
+	})
+	if err != nil {
+		t.Fatalf("marshal PageInfo: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal PageInfo: %v", err)
+	}
+	for _, key := range []string{"id", "url", "context", "title", "stale"} {
+		if _, ok := got[key]; !ok {
+			t.Errorf("PageInfo payload missing key %q: %s", key, data)
+		}
+	}
 }
