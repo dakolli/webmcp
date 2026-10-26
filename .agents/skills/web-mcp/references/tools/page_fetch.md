@@ -19,7 +19,7 @@ The live schema is `code://pkg/mcp/tools/page.go#L90`. The aspect registry is `c
 | `target` | string | no | — | Resource URL for `css`/`js`. For `body`: a `seq` number or a substring of the request URL, newest match wins. |
 | `full_page` | boolean | no | `false` | Capture the whole scrollable page. Only `screenshot` uses it. |
 
-The live `what` enum has 16 values, in registration order: `html`, `dom`, `text`, `css`, `js`, `links`, `screenshot`, `meta`, `interactives`, `a11y`, `network`, `body`, `console`, `article`, `marks`, `security`. The tool has no `timeout_ms` input, every call has a fixed 30 second bound, and a full-page screenshot gets its own 90 second budget.
+The live `what` enum has 16 values, in registration order: `html`, `dom`, `text`, `css`, `js`, `links`, `screenshot`, `meta`, `interactives`, `a11y`, `network`, `body`, `console`, `article`, `marks`, `security`. A 17th value, `sinks`, is specified by WEB-157 to WEB-159 but is not registered in the built server yet, so treat it as draft. The tool has no `timeout_ms` input, every call has a fixed 30 second bound, and a full-page screenshot gets its own 90 second budget.
 
 ## Returns
 
@@ -43,46 +43,29 @@ The live `what` enum has 16 values, in registration order: `html`, `dom`, `text`
 | `article` | JSON `{title,byline?,excerpt?,text,words,truncated,url}`. | no | **no** |
 | `marks` | One text block `{marks,viewport_width,viewport_height,truncated}`, then one PNG image block. | no | **no** |
 | `security` | JSON `{url,checks:[{id,status,evidence,detail}],count,truncated}`. | no | **no** |
+| `sinks` | JSON `{installed,hits:[{source,sink,context,value,value_cut?,stack?,selector?,ts}],dropped,truncated}`. Draft. | no | **no** |
 
 `dom`, `meta`, and `links` keep their JSON parseable when cut. `css` and `js` do not. Read the truncation matrix below.
 
 ### Image results
 
-`screenshot` and `marks` return two content blocks in `result.content`. The first block is text. It holds the standard envelope inside `data`. The second block is the image. It sits beside the text block, never inside `data`. The `screenshot` text block holds these fields:
-
-| Field | Type | Meaning |
-| :--- | :--- | :--- |
-| `mime_type` | string | Always `image/png`. |
-| `bytes` | integer | PNG size in bytes before base64. |
-| `full_page` | boolean | The `full_page` input you sent. |
-| `width` | integer | Pixel width. Present only when the PNG header decodes. |
-| `height` | integer | Pixel height. Present only when the PNG header decodes. |
-
-A live text block looks like this:
+`screenshot` and `marks` return two content blocks in `result.content`. The first is text and holds the standard envelope inside `data`. The second is the image, beside the text block and never inside `data`. The `screenshot` text block holds `mime_type` (`image/png`), `bytes`, `full_page`, and `width`/`height` only when the PNG header decodes. A live text block looks like this:
 
 ```json
 {"ok":true,"data":{"mime_type":"image/png","bytes":91543,"full_page":false,"width":1280,"height":800}}
 ```
 
-The image block is a sibling of that text block. It is not wrapped by `ok` or `data`:
+The image block is a sibling, not wrapped by `ok` or `data`:
 
 ```json
 {"type":"image","data":"<base64 PNG>","mimeType":"image/png"}
 ```
 
-The `marks` text block holds the old object minus the `screenshot` field. Its fields are `marks`, `viewport_width`, `viewport_height`, and `truncated`. The annotated PNG is the image block. The mark `x` and `y` values still feed `page_act` `click_at`.
+The `marks` text block holds `marks`, `viewport_width`, `viewport_height`, and `truncated`. Its annotated PNG is the image block. Mark `x` and `y` values feed `page_act` `click_at`.
 
 ### Text-only clients
 
-Image blocks are on by default. MCP defines no standard image capability. A client opts out at `initialize`. It sends `capabilities.imageContent:false`, or `capabilities.experimental.imageContent:false`. The server then sends one text block.
-
-For `screenshot`, `data` becomes the data URI string:
-
-```json
-{"ok":true,"data":"data:image/png;base64,<payload>"}
-```
-
-For `marks`, `data.screenshot` holds that data URI string. The other mark fields are unchanged. Bytes are sent once in every mode. The opt-out is read per SSE session.
+Image blocks are on by default. A client opts out at `initialize` with `capabilities.imageContent:false` or `capabilities.experimental.imageContent:false`, and then gets one text block. For `screenshot`, `data` is the data URI string `{"ok":true,"data":"data:image/png;base64,<payload>"}`. For `marks`, `data.screenshot` holds that data URI and other fields are unchanged. The opt-out is read per SSE session.
 
 ### Tree, list, and report shapes
 
@@ -144,6 +127,20 @@ The report holds `url`, `checks`, `count`, and `truncated`. Each check holds `id
 
 Evidence names at most 10 offending values, then `(+N more)`. The script, form, password, and cookie lists are each cut at 200 entries and every omission is reported in `truncated`. Live run on 2026-10-26 against `https://go.dev/`: `count: 20` (6 cookie checks, 2 `csp_unsafe_*`, 14 header/content/cors checks), `truncated: 0`.
 
+### Sinks tracer with what=sinks
+
+**Draft — the surface is not in the built server yet. Every value below follows the WEB-157 to WEB-159 spec. Do not claim a live test for it.**
+
+`sinks` reads a source-to-sink tracer. Arm it first with `page_act action=sinks_install`. The arm step is opt-in and changes page behavior because it wraps page setters and constructors. Keep it off for normal page use.
+
+The payload is `{installed, hits:[{source, sink, context, value, value_cut?, stack?, selector?, ts}], dropped, truncated}`. `installed` is true when the tracer is live in the current document. `hits` holds the newest 100 records, oldest first, and is `[]` and never null on an unarmed page. `dropped` counts hits evicted by the 200-hit ring. `truncated` counts buffered hits older than the emitted 100. `max_bytes` does not apply.
+
+`source` names the tagged read, for example `location.hash`, `message`, `localStorage.getItem`, or `unknown`. `sink` names the instrumented API, for example `innerHTML`, `eval`, `setAttribute:href`, or `location.assign`. `context` is `html`, `attr`, `url`, or `js`. `stack` keeps 5 frames. `selector` is a short CSS path to the node that received the value. `ts` is Unix milliseconds. `value` and each stack or selector string clip at 200 runes, and `value_cut` marks a clipped value. `stack` and `selector` are omitted when empty.
+
+An unarmed page returns `{"installed":false,"hits":[],"dropped":0,"truncated":0}` with no error. A read is not a state change.
+
+The ring is per document. A full navigation starts a fresh ring, because the arm step re-injects the script before the new document's own scripts, so `installed` stays true and `hits` is empty. A client-side route change keeps the same ring and appends to it. Clear with `page_act action=sinks_clear`, which returns `{"cleared":N}`.
+
 ### Screenshots and timeouts
 
 `screenshot` returns PNG only, as an image block plus a metadata text block. There is no format input. `full_page: false` captures the visible viewport. `full_page: true` captures the whole scrollable page on a 90 second budget that is independent of the 30 second bound, and a very tall page can still time out. Large images are not cut by `max_bytes` — a 400x300 full-page capture produced over 87 KB of base64. Prefer a small viewport for `marks`.
@@ -155,7 +152,7 @@ Evidence names at most 10 offending values, then `(+N more)`. The script, form, 
 | `html`, `text`, `css`, `js` | Cut on a rune boundary. A note is appended. | No. A `css`/`js` list is cut inside its JSON. | Text note |
 | `dom`, `links` | Array root becomes an envelope object. | Yes | `truncated: true`, `omitted` |
 | `meta` | Object keeps its fields, its first array field shrinks. | Yes | `truncated: true`, `omitted` |
-| `screenshot`, `interactives`, `a11y`, `network`, `body`, `console`, `article`, `marks`, `security` | Not cut. | Yes | Shape's own `truncated` or `count` |
+| `screenshot`, `interactives`, `a11y`, `network`, `body`, `console`, `article`, `marks`, `security`, `sinks` | Not cut. | Yes | Shape's own `truncated` or `count` |
 
 The text note is exact: `… (truncated at max_bytes=600 bytes; raise max_bytes — dom/links/meta do not use selector)`. The array envelope is `{"items":[...],"max_bytes":N,"omitted":N,"truncated":true}`.
 
@@ -163,25 +160,25 @@ The text note is exact: `… (truncated at max_bytes=600 bytes; raise max_bytes 
 
 ## Failure modes and recovery
 
-Every error rides the envelope: `{"ok":false,"error":{"type":…,"message":…,"hint":…}}`. Read `message` first. The prefix `page_fetch: ` opens the message. This tool produces the types `invalid_args`, `page_closed`, `timeout`, `nav_failed`, and `unknown` (`code://pkg/mcp/tools/envelope.go#L67-L130`). Two full envelopes below were recorded live on 2026-10-26.
+Every error rides the envelope: `{"ok":false,"error":{"type":…,"message":…,"hint":…}}`. Read `message` first. The prefix `page_fetch: ` opens the message. This tool produces the types `invalid_args`, `element_not_found`, `page_closed`, `timeout`, `nav_failed`, and `unknown` (`code://pkg/mcp/tools/envelope.go#L67-L130`). Two full envelopes below were recorded live on 2026-10-26.
 
 **Unknown session.** Type `page_closed`. Message `page_fetch: session "page-999" not found`. Recovery: re-read `session_list` or `page_list`, because the idle sweep removes pages.
 
-**Unknown `what`.** Type `invalid_args`. Live envelope, tested on 2026-10-26:
+**Unknown `what`.** Type `invalid_args`. Live envelope, tested on 2026-10-26 with `sinks` as the probe before this draft aspect existed:
 
 ```json
 {"ok":false,"error":{"type":"invalid_args","message":"page_fetch: unknown what=\"sinks\" (must be one of html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, body, console, article, marks, security)","hint":"fix the arguments per the tool InputSchema (required fields, enum values)"}}
 ```
 
-Recovery: send one listed value. `sinks` and `canary` are not on the tool surface.
+Recovery: send one listed value. `sinks` is draft and `canary` is not on the tool surface.
 
-**No selector match on `text`.** Type `unknown` with no `hint` field. Live envelope, tested on 2026-10-26:
+**No selector match on `text`.** Type `element_not_found`. Live envelope, tested on 2026-10-26:
 
 ```json
-{"ok":false,"error":{"type":"unknown","message":"page_fetch: no element matched selector \"#does-not-exist-xyz\""}}
+{"ok":false,"error":{"type":"element_not_found","message":"page_fetch: no element matched selector \"#does-not-exist-xyz\": cannot find element"}}
 ```
 
-Recovery: check the selector with `interactives` or `a11y` first. Classification as `unknown` rather than `element_not_found` is live drift worth a code fix.
+Recovery: check the selector with `interactives` or `a11y` first.
 
 **Unknown `target` on `css`/`js`.** Type `unknown`. Message: `page_fetch: resource "…" not found in the page's resource tree: {-32000 No resource with given URL found }`. Recovery: list `css` or `js` first, then copy a `url` value exactly.
 
@@ -201,7 +198,8 @@ Recovery: re-read `what=network` for the current `seq` values, then read the bod
 ## Tested calls
 
 - 2026-10-25 — `meta`, `text` with selector, `css` with `target`, `interactives`, `network`, `body`, `network` header redaction, and the unknown-`what` failure. Commit `819ba12`.
-- 2026-10-26 — `security` on `https://go.dev/` returned `count: 20`, `truncated: 0`. Failure envelopes for `unknown what` and a no-match selector recorded live.
+- 2026-10-26 — `security` on `https://go.dev/` returned `count: 20`, `truncated: 0`. Failure envelopes for `unknown what` and a no-match selector were recorded live. The no-match selector returned `element_not_found`.
+- Draft `sinks` has no live test. Its values come from the WEB-157 to WEB-159 spec.
 
 ## When not to use it
 

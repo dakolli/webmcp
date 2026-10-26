@@ -1,4 +1,4 @@
-> Tool: `page_list` · Server: web-mcp · Surface: MCP · Tested: 2026-10-25
+> Tool: `page_list` · Server: web-mcp · Surface: MCP · Tested: 2026-10-26
 
 # page_list example
 
@@ -51,7 +51,7 @@ Expected `data` payloads, one per call, in order:
 ```
 
 The full payloads also hold a `text_snippet` field. `fetch_page` reports the final URL.
-`page_list` reports the raw creation URL.
+`page_list` reports the live URL and title.
 
 ## 4. List the two pages
 
@@ -60,7 +60,7 @@ The full payloads also hold a `text_snippet` field. `fetch_page` reports the fin
 ```
 
 ```json
-{"ok":true,"data":[{"id":"page-1","url":"https://react.dev/learn","context":"default"},{"id":"page-2","url":"https://news.ycombinator.com/news","context":"default"}]}
+{"ok":true,"data":[{"id":"page-1","url":"https://react.dev/learn","title":"Quick Start – React","context":"default"},{"id":"page-2","url":"https://news.ycombinator.com/news","title":"Hacker News","context":"default"}]}
 ```
 
 Read `id` from `data`. Use it with `page_fetch` and `page_act`.

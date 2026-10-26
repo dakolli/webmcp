@@ -2,11 +2,7 @@
 
 # page_act example
 
-Use this file only when tool calling for `page_act` fails. The tool description is
-primary. Every result rides the envelope: `{"ok":true,"data":<payload>}` on success,
-`{"ok":false,"error":{"type":…,"message":…,"hint":…}}` on failure. One success and one
-failure appear below in full envelope form. Reference:
-`.agents/skills/web-mcp/references/tools/page_act.md`.
+Use this file only when tool calling for `page_act` fails. The tool description is primary, and every result rides the envelope with the payload at `data`. One success and one failure appear in full envelope form. Reference: `.agents/skills/web-mcp/references/tools/page_act.md`.
 
 ## 1. Create and confirm your browser
 
@@ -14,8 +10,7 @@ failure appear below in full envelope form. Reference:
 {"tool":"browser_create","arguments":{"headless":true,"stealth":true,"profile":"skill-page-act-example"}}
 ```
 
-Expect `{"browser_id":"browser-10"}` in `data`. A bare create call used the shared default
-profile and failed with a SingletonLock error. Use only your id. Never close an empty id.
+Expect `{"browser_id":"browser-10"}` in `data`. A bare create call used the shared default profile and failed with a SingletonLock error. Use only your id and never close an empty id.
 
 ## 2. Form input, type, verify, and submit
 
@@ -34,10 +29,7 @@ Expect `{"session_id":"page-1","title":"httpbin.org/forms/post","html_bytes":140
 {"tool":"page_act","arguments":{"session_id":"page-1","action":"wait","wait_mode":"load","timeout_ms":1000}}
 ```
 
-Expect `set input … value="Ada Lovelace"`, `set input … value="555-0100"`,
-`typed … value=" EXT"`, `{"name":"Ada Lovelace","tel":"555-0100 EXT"}`, then the delta
-carries the redirect inside one `data` string, then `waited for "load"`. `input`
-replaces, `type` appends at the caret.
+Expect `set input … value="Ada Lovelace"`, `set input … value="555-0100"`, `typed … value=" EXT"`, `{"name":"Ada Lovelace","tel":"555-0100 EXT"}`, then the redirect delta inside one `data` string, then `waited for "load"`. `input` replaces, `type` appends at the caret.
 
 ## 3. select and upload_file
 
@@ -49,9 +41,7 @@ use its `session_id` (`page-2` in this run):
 {"tool":"page_act","arguments":{"session_id":"page-2","action":"upload_file","selector":"input[type=\"file\"]","paths":["/tmp/opencode/example.txt"]}}
 ```
 
-Expect `selected option value="2" in selector="select[name=\"my-select\"]"` and
-`uploaded files [/tmp/opencode/example.txt] to selector="input[type=\"file\"]"`. `select`
-matches the option `value`, not its text.
+Expect `selected option value="2" in selector="select[name=\"my-select\"]"` and `uploaded files [/tmp/opencode/example.txt] to selector="input[type=\"file\"]"`. `select` matches the option `value`, not its text.
 
 ## 4. Clicks, hover, coordinates, scroll, and keys
 
@@ -99,10 +89,7 @@ Open the W3Schools drag page as `page-4`, then drag the range slider:
 {"tool":"page_act","arguments":{"session_id":"page-4","action":"drag_and_drop","selector":"#img1","target_x":170,"target_y":533}}
 ```
 
-Expect `dragged from (97.0, 532.2) to (170.0, 533.0)`. This is a mouse drag and it moved a
-live range slider from `5` to `9`. Native HTML5 drag-and-drop does not fire: on
-`w3schools.com/html/html5_draganddrop.asp` the drop listener stayed `0`. Use `eval` to
-dispatch `dragstart` and `drop` on HTML5 pages.
+Expect `dragged from (97.0, 532.2) to (170.0, 533.0)`. This is a mouse drag and it moved a live range slider from `5` to `9`. Native HTML5 drag-and-drop does not fire: on `w3schools.com/html/html5_draganddrop.asp` the drop listener stayed `0`, so use `eval` to dispatch `dragstart` and `drop` on HTML5 pages.
 
 ## 7. Replay a captured request
 
@@ -119,11 +106,23 @@ The second `target` is the seq of this run's `news.css` request. Success rides `
 {"ok":true,"data":{"status":200,"headers":{"Content-Type":["text/css; charset=utf-8"],"Server":["nginx"],"Vary":["Accept-Encoding"]},"body":"body  { font-family:Verdana, Geneva, sans-serif; … }","bytes":7418,"ms":63,"request":{"method":"GET","url":"https://news.ycombinator.com/news.css?EieZrD3Ae1qf3cIQQaRb","headers":{"Accept-Language":"en","Referer":"https://news.ycombinator.com/","User-Agent":"Mozilla/5.0 …"}}}}
 ```
 
-Replay re-reads the request and carries the page's cookies for the target host. It never
-writes to the page. Pass `method` to override the method, `headers` to replace captured
-headers, or `value` to replace the request body.
+Replay re-reads the request and carries the page's cookies for the target host, and it never writes to the page. Pass `method` to override the method, `headers` to replace captured headers, or `value` to replace the request body.
 
-## 8. Failure examples
+## 8. Arm the sink tracer (draft, not in the built server)
+
+Open a page with a hash, then install, inject the hash into `innerHTML`, read, and clear:
+
+```json
+{"tool":"fetch_page","arguments":{"url":"https://www.iana.org/help/example-domains#wm-canary-160","browser_id":"browser-10","wait_for":"idle"}}
+{"tool":"page_act","arguments":{"session_id":"page-7","action":"sinks_install"}}
+{"tool":"page_act","arguments":{"session_id":"page-7","action":"eval","value":"() => { const d=document.createElement('div'); d.innerHTML=location.hash; document.body.appendChild(d); return d.textContent }"}}
+{"tool":"page_fetch","arguments":{"session_id":"page-7","what":"sinks"}}
+{"tool":"page_act","arguments":{"session_id":"page-7","action":"sinks_clear"}}
+```
+
+Expect `{"installed":true}`, then one hit with `sink:"innerHTML"` and `context:"html"`, then `{"cleared":1}`. A second `sinks_install` is a no-op.
+
+## 9. Failure examples
 
 An ambiguous replay URL substring anchors the failure path (tested live on 2026-10-26):
 
@@ -141,19 +140,14 @@ An ambiguous replay URL substring anchors the failure path (tested live on 2026-
 {"tool":"page_act","arguments":{"session_id":"page-2","action":"eval","value":"() => {"}}
 ```
 
-Expect `page_act: click requires selector (or a handle from page_fetch
-what=interactives)`, `page_act: press_key: unknown key name "Banana"`, and
-`page_act: evaluate js: eval js error: SyntaxError: Unexpected token ')' <nil>`. Stale
-handles return the `page_act: handle "…" is stale — …` message. Re-read `interactives`.
+Expect `page_act: click requires selector (or a handle from page_fetch what=interactives)`, `page_act: press_key: unknown key name "Banana"`, and `page_act: evaluate js: eval js error: SyntaxError: Unexpected token ')' <nil>`. Stale handles return the `page_act: handle "…" is stale — …` message, so re-read `interactives`.
 
-Do not send an unknown `select` value. A live `"value":"nope"` returned
-`MCP error -32001: Request timed out` and wedged the whole server.
+Do not send an unknown `select` value. A live `"value":"nope"` returned `MCP error -32001: Request timed out` and wedged the whole server.
 
-## 9. Clean up
+## 10. Clean up
 
 ```json
 {"tool":"browser_close","arguments":{"browser_id":"browser-10"}}
 ```
 
-Expect the browser to disappear from `browser_list`. Close only your own id. Never close
-an empty id.
+Expect the browser to disappear from `browser_list`. Close only your own id and never close an empty id.

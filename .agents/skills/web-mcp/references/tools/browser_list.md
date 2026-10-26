@@ -1,4 +1,4 @@
-> Tool: `browser_list` · Server: web-mcp · Surface: MCP · Tested: 2026-10-25
+> Tool: `browser_list` · Server: web-mcp · Surface: MCP · Tested: 2026-10-26
 
 # browser_list
 
@@ -68,12 +68,15 @@ The `data` payload for an unscoped browser and a browser scoped to one host:
 
 `persist` and `ephemeral` are opposites. An ephemeral `profile_dir` always sits under `.ephemeral/`.
 
-Each `pages` entry has two fields:
+Each `pages` entry has these fields:
 
 | Field | Type | Meaning |
 | :--- | :--- | :--- |
 | `id` | string | The session id, for example `page-1`. |
-| `url` | string | The URL that created the page. It is not the current URL after navigation. |
+| `url` | string | The live URL of the tab, updated after navigation and redirects. |
+| `title` | string | The live document title. Omitted when empty. |
+| `context` | string | The incognito identity that owns the page. |
+| `stale` | boolean | Present when the live URL and title could not be read. `url` then holds the last known value. |
 
 ## Behavior and limits
 
@@ -83,7 +86,7 @@ Each `pages` entry has two fields:
 - One call decides what to close. `idle_for` at or past `ttl` means the sweeper closes that browser soon and deletes an ephemeral profile. `owner` not yours means do not close it. `pages` empty and idle means a safe close candidate. `pages` non-empty means live work may be in flight, so check with the owner first.
 - `profile_dir` is absolute. A named persistent browser reports `<profiles-dir>/<name>`. An ephemeral browser reports a unique `<profiles-dir>/.ephemeral/<label>-<random>` path.
 - `bin` is omitted when the server uses the default binary. Do not depend on its presence.
-- The page `url` is the creation URL. A page that navigates keeps the old value, so it can lag behind the live tab. Use `page_fetch` with `what: "meta"` for the current URL and title.
+- The page `url` and `title` are live and refresh after navigation.
 - A page id is unique inside one browser only. Two live browsers can both report `page-1`. Keep the `browser_id` with every page id.
 - `idle_for` resets when a tool uses the browser. A browser idle longer than its `ttl` is closed by the sweeper and disappears from the next listing. An ephemeral profile is deleted on that sweep. A persistent profile is kept.
 - `ttl` is 30 minutes by default. `browser_ttl` in ~/.config/browser-mcp/config.json overrides it. `"0"` disables browser sweeping and reports `0s`.
@@ -120,7 +123,7 @@ Create the browsers, then read the state. Creation and the full cleanup sequence
 
 ## When not to use it
 
-Do not use `browser_list` to read the current URL or title. Use `page_fetch` with `what: "meta"`.
+Do not use `browser_list` to read meta tags. Use `page_fetch` with `what: "meta"`.
 
 Do not use it to read page content. Use `page_fetch`.
 

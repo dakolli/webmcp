@@ -1,13 +1,13 @@
-> Tool: `page_list` · Server: web-mcp · Surface: MCP · Tested: 2026-10-25
+> Tool: `page_list` · Server: web-mcp · Surface: MCP · Tested: 2026-10-26
 
 # page_list
 
-List the open pages of one browser. Return the id, creation URL, and context of each page.
+List the open pages of one browser. Return the id, live URL, title, and context of each page.
 
 ## What it does
 
 `page_list` reads the live page map of one browser. Its `data` payload is a JSON array.
-Each entry holds an `id`, `url`, and `context`.
+Each entry holds an `id`, `url`, and `context`, plus `title` and `stale` when present.
 
 Use it to audit tabs before you close them. Use it to recover a page id after a lost
 tool result. Use it to confirm that `fetch_page` created a page.
@@ -44,10 +44,12 @@ On success `data` is an array of page objects. Live result for a two-page browse
 | Field | Type | Meaning |
 | :--- | :--- | :--- |
 | `id` | string | The session id. Use it with `page_fetch`, `page_act`, and `session_close`. |
-| `url` | string | The URL that `fetch_page` received at creation. This is not the current URL after navigation. |
+| `url` | string | The live URL of the tab, updated after navigation and redirects. |
+| `title` | string | The live document title. Omitted when empty. |
+| `stale` | boolean | Present when the live URL and title could not be read. `url` then holds the last known value. |
 | `context` | string | The incognito identity that owns the page. `default` is the browser's own cookie jar. |
 
-The source type is `PageInfo` at `code://pkg/browsers/session.go#L153-L161`. The browser
+The source type is `PageInfo` at `code://pkg/browsers/session.go#L156-L171`. The browser
 sorts the array by `id` as text at `code://pkg/browsers/browser.go#L1058-L1073`.
 
 - An empty browser returns `{"ok":true,"data":[]}`. Live test: `page_list` on a browser
@@ -59,14 +61,15 @@ sorts the array by `id` as text at `code://pkg/browsers/browser.go#L1058-L1073`.
 ## Behavior and limits
 
 - The result is a live snapshot. The tool holds the browser lock while it copies the page map.
-- The `url` field goes stale after navigation. Live test: `page-1` opened `https://example.com` and then navigated to `https://example.org/`. `page_list` still returned `https://example.com`. `page_fetch` with `what: "meta"` returned `https://example.org/`. Use `meta` for the current URL and title.
+- The `url` and `title` fields come from the live tab at call time. They refresh after navigation and redirects. Live test: `page-1` opened `https://example.com` and then navigated to `https://example.org/`. `page_list` returned `https://example.org/` with its new title.
+- A busy or dead tab reports `stale: true` and the last known URL. The tool never waits on the page operation lock.
 - Page ids are per-browser counters. Two browsers can each have a `page-1`. Always keep the `browser_id` with the page id.
 - The 15 minute idle sweep removes pages. A closed page disappears from the next result.
 - The tool never launches Chromium. It calls `Manager.Browser`, not `Manager.Open`. Source: `code://pkg/browsers/manager.go#L946-L985`.
 - Test run: `page_list` with `browser-999` returned the unknown envelope below. It created no browser.
 - A dead Chromium is removed on the probe. The call then returns an `unknown` envelope whose message is `page_list: browsers: browser <id> died`.
 - The tool has no side effects on pages. It does not navigate, reload, or focus.
-- There is no title, status, timestamp, or `browser_id` field in an entry. `context` names
+- There is no status, timestamp, or `browser_id` field in an entry. `context` names
   the identity that owns the page.
 
 ## Failure modes and recovery
@@ -134,8 +137,8 @@ the filter rule.
 `page_list` never launches a browser. It reports the browser you name. It is the safe
 choice when several browsers are live.
 
-Both tools return the same page objects under `data`. Both emit `id`, `url`, and `context`.
-Neither emits a title or a timestamp, although the `session_list` description names both.
+Both tools return the same page objects under `data`. Both emit `id`, `url`, and `context`,
+plus `title` and `stale` when present. Neither emits a timestamp.
 
 ## When to use it
 
@@ -146,7 +149,7 @@ Use `browser_list` to discover browsers. It returns `browser_id`, `bin`, `profil
 and a nested `pages` array for every live browser.
 
 Do not use `page_list` to read page content. Use `page_fetch`.
-Do not use `page_list` to get the current URL or title. Use `page_fetch` with `what: "meta"`.
+Do not use `page_list` for meta tags. Use `page_fetch` with `what: "meta"`.
 Do not use `page_list` when you do not know the browser id. Use `browser_list` first.
 
 ## Related tools
@@ -154,7 +157,7 @@ Do not use `page_list` when you do not know the browser id. Use `browser_list` f
 - `browser_create` — creates a browser and returns the `browser_id` that `page_list` needs.
 - `browser_list` — lists all live browsers with their pages. Use it to find the right `browser_id`.
 - `fetch_page` — opens a new page in a browser. The page then appears in `page_list`.
-- `page_fetch` — reads one page. Use `what: "meta"` for the current URL and title.
+- `page_fetch` — reads one page. Use `what: "meta"` for the meta tags.
 - `session_close` — closes one page. Confirm the browser first.
 - `session_list` — lists pages across every live browser and identity. It never launches one.
 

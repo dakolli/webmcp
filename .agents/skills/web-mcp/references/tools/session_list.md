@@ -1,14 +1,15 @@
-> Tool: `session_list` · Server: web-mcp · Surface: MCP · Tested: 2026-10-25
+> Tool: `session_list` · Server: web-mcp · Surface: MCP · Tested: 2026-10-26
 
 # session_list
 
 List every live session across every live browser and identity. Return a JSON array of page
-ids, URLs, and contexts.
+ids, live URLs, titles, and contexts.
 
 ## What it does
 
 `session_list` reads the live page maps of every live browser and identity. It returns them
-under `data`. Each entry holds a page `id`, `url`, and `context`.
+under `data`. Each entry holds a page `id`, `url`, and `context`, plus `title` and `stale` when
+present.
 
 A session is one browser tab. The id is the address that `page_fetch`, `page_act`, and
 `session_close` use. A session stays live across navigations, redirects, and tool calls.
@@ -42,18 +43,20 @@ Cross-cutting rules.
 On success `data` is an array of page objects. Live result:
 
 ```json
-{"ok":true,"data":[{"id":"page-1","url":"https://example.org","context":"attacker"},{"id":"page-1","url":"https://news.ycombinator.com/news","context":"attacker"},{"id":"page-2","url":"https://www.iana.org/help/example-domains","context":"victim"},{"id":"page-2","url":"https://news.ycombinator.com/news?p=2","context":"victim"},{"id":"page-3","url":"https://developer.mozilla.org/en-US/docs/Web/API/Window/localStorage","context":"default"}]}
+{"ok":true,"data":[{"id":"page-1","url":"https://example.org","title":"Example Domain","context":"attacker"},{"id":"page-1","url":"https://news.ycombinator.com/news","title":"Hacker News","context":"attacker"},{"id":"page-2","url":"https://www.iana.org/help/example-domains","title":"Example Domains","context":"victim"},{"id":"page-2","url":"https://news.ycombinator.com/news?p=2","title":"Hacker News","context":"victim"},{"id":"page-3","url":"https://developer.mozilla.org/en-US/docs/Web/API/Window/localStorage","title":"Window: localStorage property - Web APIs | MDN","context":"default"}]}
 ```
 
 | Field | Type | Meaning |
 | :--- | :--- | :--- |
 | `id` | string | The session id. Use it with `page_fetch`, `page_act`, and `session_close`. |
-| `url` | string | The URL that `fetch_page` received when it created the page. It is not the current URL. |
+| `url` | string | The live URL of the tab, updated after navigation and redirects. |
+| `title` | string | The live document title. Omitted when empty. |
+| `stale` | boolean | Present when the live URL and title could not be read. `url` then holds the last known value. |
 | `context` | string | The incognito identity that owns the page. `default` is the browser's own cookie jar. |
 
-The code emits three fields: `id`, `url`, and `context`. It emits no title and no timestamp.
-Source: `code://pkg/browsers/session.go#L153-L161`. The tool description still names title
-and timestamps, and the code omits them.
+The code emits `id`, `url`, `context`, and optional `title` and `stale`. It emits no timestamp.
+Source: `code://pkg/browsers/session.go#L156-L171`. `title` is omitted when the live title is
+empty, and `stale` when the tab was read live.
 
 The server sorts entries by `id` as text. A browser with more than nine pages lists
 `page-10` before `page-2`. Two browsers can both hold a `page-1`, so ids can repeat.
@@ -71,8 +74,8 @@ An empty array means no live browser holds a page.
   never created (`code://pkg/browsers/manager.go#L1029-L1032`).
 - **Read only on pages.** The tool does not navigate, reload, focus, or close. It copies
   the page map under the browser lock.
-- **The URL is stale after navigation.** The `url` field is the creation URL, not the live
-  address. Use `page_fetch` with `what: "meta"` for the current URL and title.
+- **The URL and title are live.** Both refresh after navigation and redirects. A busy or
+  dead tab reports `stale: true` with the last known URL.
 - **Ids are unique inside one browser only.** Every browser numbers its tabs from
   `page-1`. Two live browsers can both hold a `page-1`. Keep the browser id with the
   session id.
@@ -133,7 +136,7 @@ Do not use it to list browsers. Use `browser_list`.
 Do not use it to prove that your own tabs are alive. It includes every live browser, so
 another agent's pages appear too. Create a browser first, then use `page_list`.
 
-Do not use it to get the current URL or title. Use `page_fetch` with `what: "meta"`.
+Do not use it to read meta tags. Use `page_fetch` with `what: "meta"`.
 Do not use it to read page content. Use `page_fetch`.
 Do not call it in a loop to watch for changes. Each call is a snapshot and nothing launches.
 

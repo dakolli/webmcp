@@ -8,8 +8,8 @@ Interact with a live page that `fetch_page` opened.
 
 `page_act` performs one action in an open session. The `session_id` picks the tab, the
 `action` field picks the operation. Actions cover clicking, typing, keys, mouse
-coordinates, drag, upload, JavaScript, navigation, waiting, emulation, log clearing, and
-replaying a captured network request.
+coordinates, drag, upload, JavaScript, navigation, waiting, emulation, log clearing,
+replaying a captured network request, and draft sink control.
 
 The confirmation rides the result envelope: the full reply is
 `{"ok":true,"data":<payload>}`. See `SKILL.md` for the envelope rules and the
@@ -24,7 +24,7 @@ required. Actions ignore fields they do not use.
 | Name | Type | Required by | Default | Meaning |
 | :--- | :--- | :--- | :--- | :--- |
 | `session_id` | string | always | — | Tab from `fetch_page`, for example `page-3`. |
-| `action` | string | always | — | One of the 21 actions below. |
+| `action` | string | always | — | One of the actions below. `sinks_install` and `sinks_clear` are draft. |
 | `selector` | string | `click`, `input`, `type`, `hover`, `select`, `upload_file` | — | CSS selector or XPath. Optional for `press_key` and the drag source. |
 | `handle` | string | alternative to `selector` | — | Handle from `page_fetch` `what=interactives\|dom\|links`. Wins over `selector`. |
 | `value` | string | `eval`, `navigate`, `input`, `type`, `select`, `replay` | — | Payload text, JavaScript source, URL, or option value. For `replay` it replaces the request body and is sent only when the field is present. |
@@ -71,6 +71,8 @@ it touches the page. For `upload_file`, pass `paths` (a single `value` path also
 | `set_viewport` | `viewport` | Applies a manual width and height override. | `set viewport to 800x600` | No. |
 | `emulate` | `device` | Applies a device preset, or clears it. | `emulated device: IPhoneX` | No. |
 | `clear_logs` | — | Empties the network and console rings. | `{"network":132,"console":1}` | No. |
+| `sinks_install` | — | Arms the source-to-sink tracer. Draft. Idempotent. | `{"installed":true}` | No. |
+| `sinks_clear` | — | Empties the tracer ring and resets `dropped`. Draft. | `{"cleared":N}` | No. |
 | `replay` | `target` | Resends one captured network entry. See below. | Compact JSON result. | No. |
 
 A non-positive `click_count` becomes `1`. An unknown `button` is rejected before the
@@ -79,13 +81,9 @@ explicit `0` is valid.
 
 ## Returns
 
-The confirmation and the state delta arrive as one JSON string inside `data`. Tested live
-on 2026-10-26: a form submit returned
-
-```json
-{"ok":true,"data":"clicked selector=\"form button\"\n→ url=https://httpbin.org/post title=\"httpbin.org/post\""}
-```
-
+The confirmation and the state delta arrive as one JSON string inside `data`. A live form
+submit on 2026-10-26 returned
+`{"ok":true,"data":"clicked selector=\"form button\"\n→ url=https://httpbin.org/post title=\"httpbin.org/post\""}`.
 The delta starts on a new line inside the same string and lists only changed fields.
 `navigate` never appends one. `back` and `forward` do. `eval`, `clear_logs`, and `replay`
 return compact JSON in `data` instead of prose. A DOM node from `eval` comes back as `{}`.
@@ -97,33 +95,32 @@ a navigation.
 ### Handles
 
 A handle has the form `g<document>-b<backendNodeId>`, for example `gcq7sm3ng-b165`. Get
-handles from `page_fetch` with `what=interactives`, `dom`, or `links`.
-
-A handle wins over `selector`. A live `input` with a text-field handle and a password-field
-selector wrote to the text field, and the password field stayed empty. The `g` token names
-the document that minted the handle. Any navigation, reload, redirect, or document
-replacement changes that token, and the old handle then fails as stale. A stale handle
-never acts on a reused backend node id. Re-read `interactives` after every navigation.
+handles from `page_fetch` with `what=interactives`, `dom`, or `links`. A handle wins over
+`selector`. A live `input` with a text-field handle and a password-field selector wrote to
+the text field, and the password field stayed empty. The `g` token names the document that
+minted the handle. Any navigation, reload, redirect, or document replacement changes that
+token, and the old handle then fails as stale. A stale handle never acts on a reused
+backend node id. Re-read `interactives` after every navigation.
 
 ### Element actions
 
 `input` replaces the field contents: it selects all text first, then types `value`. `type`
-does not clear. It focuses the element, then inserts at the caret. A live `input` of
+does not clear, it focuses the element and inserts at the caret. A live `input` of
 `555-0100` then a `type` of `" EXT"` produced `555-0100 EXT`. Some controls reject
 synthetic text — a live `input` on `<input type="time">` left the value empty, so use
 `eval` to set those values. `click` and `wait` `interactable` check interactability, and
-`input` and `type` do not. A hidden element can still receive text.
+`input` and `type` do not, so a hidden element can still receive text.
 
 ### Keyboard combos
 
-Join modifiers and the main key with `+`, so `Control+A`. Modifiers are
-`Control`/`Ctrl`, `Alt`/`Option`, `Shift`, and `Meta`/`Cmd`/`Command`/`Super`/`Windows`/`Win`.
-Main keys include `Enter`/`Return`, `Escape`/`Esc`, `Tab`, `Backspace`, `Delete`/`Del`,
-`Space`, `Home`, `End`, `PageUp`, `PageDown`, `Insert`, the arrows, `CapsLock`,
-`PrintScreen`, `ScrollLock`, `Pause`, `NumLock`, `F1` to `F12`, single letters, digits,
-and common punctuation. Names are case-insensitive, the last token is the main key, and
-`press_key` focuses the element when you pass `selector` or `handle`. A live `Enter` in the
-httpbin name field submitted the form.
+Join modifiers and the main key with `+`, so `Control+A`. Modifiers are `Control`/`Ctrl`,
+`Alt`/`Option`, `Shift`, and `Meta`/`Cmd`/`Command`/`Super`/`Windows`/`Win`. Main keys
+include `Enter`/`Return`, `Escape`/`Esc`, `Tab`, `Backspace`, `Delete`/`Del`, `Space`,
+`Home`, `End`, `PageUp`, `PageDown`, `Insert`, the arrows, `CapsLock`, `PrintScreen`,
+`ScrollLock`, `Pause`, `NumLock`, `F1` to `F12`, single letters, digits, and common
+punctuation. Names are case-insensitive, the last token is the main key, and `press_key`
+focuses the element when you pass `selector` or `handle`. A live `Enter` in the httpbin
+name field submitted the form.
 
 ### Drag and drop
 
@@ -139,23 +136,27 @@ The source takes a `selector` (element center) or `x`/`y`, the target takes `tar
 | `stable` | The DOM stops mutating for 500 ms. | Can stall on animations. |
 | `interactable` | The target is visible and enabled. | Needs `selector` or `handle`. |
 
-`timeout_ms` defaults to `30000` and bounds the whole call. For `ms` mode the server adds a
-5 second margin to the call deadline. If you omit `timeout_ms`, an `ms` wait sleeps 30
-seconds, so always set `timeout_ms` for `ms` mode.
+`timeout_ms` defaults to `30000` and bounds the whole call. For `ms` mode the server adds a 5 second margin. If you omit `timeout_ms`, an `ms` wait sleeps 30 seconds, so always set it.
 
 ### Emulation and viewport
 
-`set_viewport` applies a manual override with DPR 1, and both values must be positive.
-`emulate` applies a go-rod preset with user agent, metrics, and touch, and a later
-`emulate` wins over an earlier `set_viewport`. Live result: `1024x768` then `IPadPro` gave
-`1024x1366` at DPR 2. `emulate` with `clear` resets the preset and drops a manual override.
-Apply emulation before you rely on layout, because a metrics change can reflow the page.
+`set_viewport` applies a manual override with DPR 1, and both values must be positive. `emulate` applies a go-rod preset with user agent, metrics, and touch, and a later `emulate` wins over an earlier `set_viewport`. Live result: `1024x768` then `IPadPro` gave `1024x1366` at DPR 2. `emulate` with `clear` resets the preset and drops a manual override. Apply emulation before layout work, because a metrics change can reflow the page.
 
 ### Logs
 
 Network and console capture is cumulative from page creation. `clear_logs` empties both
 rings, resets `dropped`, and returns the cleared counts. The `seq` counter does not reset.
 The recipe is `clear_logs`, then one action, then `page_fetch` `network` or `console`.
+
+### Sinks tracer
+
+**Draft — not in the built server yet. Every value below follows the WEB-157 to WEB-159 spec.**
+
+`sinks_install` arms the source-to-sink tracer on the page and returns `{"installed":true}`. A second call is a no-op. The arm step is opt-in because instrumentation wraps page setters and constructors and changes page behavior. The script survives a full navigation and re-arms before the new document's own scripts, but the hit ring is per document, so a navigation starts a fresh ring. A client-side route change keeps the ring.
+
+`sinks_clear` empties the ring and resets `dropped`. It returns `{"cleared":N}` and returns `{"cleared":0}` on an unarmed page. Both actions take only `session_id` and `action`. The unknown-action message gains both names after registration.
+
+Recipe: 1. `sinks_install`. 2. Navigate or click. 3. `page_fetch what=sinks`. 4. `sinks_clear`. Read the payload, caps, and unarmed shape in [page_fetch.md](page_fetch.md).
 
 ### Replay with what=network as the source
 
@@ -164,8 +165,7 @@ The recipe is `clear_logs`, then one action, then `page_fetch` `network` or `con
 - `target` picks the entry: a `seq` number or a unique substring of the request URL. An ambiguous substring is refused with every candidate listed as `seq=N METHOD url`.
 - `method` overrides the captured method when given. `headers` replaces captured headers per name, others keep theirs. Framing headers (`Host`, `Cookie`, `Connection`, `Accept-Encoding`, `Content-Length`, and kin) are never copied because the client owns them and the cookie jar owns `Cookie`.
 - `value` replaces the request body, but it is sent only when the `value` field itself is present. Without it the captured body is fetched from the browser, and a body the browser no longer retains reports `body_uncaptured: true` instead of being sent empty. `GET` and `HEAD` never send a body.
-- Each URL, redirects included, is checked against the browser's scope allowlist before any request runs (`code://pkg/mcp/tools/act.go#L352-L354`, `code://pkg/mcp/tools/act.go#L283`).
-- Up to 5 redirects are followed and reported in `chain`. A 301, 302, or 303 switches the next hop to `GET` and drops the body.
+- Each URL, redirects included, is checked against the browser's scope allowlist before any request runs (`code://pkg/mcp/tools/act.go#L352-L354`, `code://pkg/mcp/tools/act.go#L283`). Up to 5 redirects are followed and reported in `chain`, and a 301, 302, or 303 switches the next hop to `GET` and drops the body.
 
 The result is compact JSON inside `data` (`code://pkg/browsers/replay.go#L86-L110`), tested live on 2026-10-26 (body shortened):
 
@@ -183,7 +183,7 @@ and older session ids then fail. Keep one browser per task and confirm the page 
 
 ## Failure modes and recovery
 
-Every error rides the envelope: `{"ok":false,"error":{"type":…,"message":…,"hint":…}}`. Read `message` first. The prefix `page_act: ` opens the message, and the table shows the message content. This tool can produce every type (`code://pkg/mcp/tools/envelope.go#L194-L227`). One full failure envelope, tested live on 2026-10-26 against an ambiguous replay target:
+An absent selector for `click`, `input`, `hover` or `select` fails immediately with type `element_not_found` and names the selector. It does not consume `timeout_ms`. Every error rides the envelope: `{"ok":false,"error":{"type":…,"message":…,"hint":…}}`. Read `message` first. The prefix `page_act: ` opens the message, and the table shows the message content. This tool can produce every type (`code://pkg/mcp/tools/envelope.go#L194-L227`). One live failure envelope, tested on 2026-10-26 against an ambiguous replay target:
 
 ```json
 {"ok":false,"error":{"type":"unknown","message":"page_act: replay: target \"news.ycombinator.com/news\" matches 2 network entries — pass a seq or a longer URL substring: seq=1 GET https://news.ycombinator.com/news; seq=2 GET https://news.ycombinator.com/news.css?EieZrD3Ae1qf3cIQQaRb"}}
@@ -226,15 +226,14 @@ content, use `page_fetch`. Do not use `select` with an unverified value — read
 list with `eval` first. Do not use `drag_and_drop` for native HTML5 drag-and-drop. Do not
 use `eval` to return a DOM node, it returns `{}`. Do not omit `timeout_ms` on an `ms`
 wait. Do not use `replay` instead of `navigate`: a replay sends a fresh HTTP request
-outside the browser and cannot set cookies, storage, or page state.
+outside the browser and cannot set cookies, storage, or page state. Do not arm `sinks` for
+normal browsing, because instrumentation changes page behavior.
 
 ## Tested calls
 
-- 2026-10-25 — form input, type, press_key with delta, select, upload, clicks (element
-  and coordinates), hover, scroll, keyboard combo, drag with a live slider, navigate,
-  back/forward/reload, eval, clear_logs, viewport, emulate, and the miss-path errors.
-- 2026-10-26 — replay failure envelope for an ambiguous target on
-  `https://news.ycombinator.com/news`, and submit-click click + state delta in `data`.
+- 2026-10-25 — input, type, press_key, select, upload, clicks, hover, scroll, keyboard combo, drag, navigate, back/forward/reload, eval, clear_logs, viewport, emulate, and miss-path errors.
+- 2026-10-26 — replay ambiguity failure on `https://news.ycombinator.com/news`, and submit-click with a state delta in `data`.
+- Draft `sinks_install` and `sinks_clear` have no live test. Their values come from the WEB-157 to WEB-159 spec.
 
 ## Related tools
 

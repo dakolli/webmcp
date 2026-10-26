@@ -16,6 +16,10 @@ This file is the single entry. It carries the cross-cutting rules. Tool detail l
 
 Do not invent parameters. The Go source in `pkg/mcp/tools/` is the schema source of truth.
 
+## Install
+
+Install or refresh this skill with `browser skill <harness|path|.>`. With no argument it prints the presets and writes nothing. `AGENTS.md` is never installed.
+
 ## Before you call
 
 - Create one browser per agent. Pass a unique `owner` label such as `"owner": "research-a"`. The label joins the create key, so the same owner and options reuse one browser.
@@ -62,7 +66,7 @@ Do not invent parameters. The Go source in `pkg/mcp/tools/` is the schema source
 3. Never close `browser-1` unless the user asks for a full reset. Never call `browser_close` with an empty `browser_id` in a shared session. A misspelled `browser` key is ignored and becomes an empty id. Use the exact key `browser_id`.
 4. Use one browser per agent and task. Page ids collide across browsers, and `page_fetch` and `page_act` resolve an id across live browsers.
 5. `session_close` is not browser-scoped. It closes the tab in the default browser. For a tab in a secondary browser, use `browser_close` with your own id.
-6. `session_list` reads every live browser and identity. Use `page_list` with a required `browser_id` for one browser. Both show the creation URL, not the live URL. Use `page_fetch` with `what:"meta"` for the live URL.
+6. `session_list` reads every live browser and identity. Use `page_list` with a required `browser_id` for one browser. Both report the live URL and title, refreshed after navigation and redirects.
 7. An unknown `browser_id` can create a new browser. A typo spends a full Chromium process. Verify the id first.
 8. `fetch_page` creates a new session on every call. Close sessions you no longer need.
 9. `page_fetch` network and console capture is cumulative from page creation. Call `page_act` `clear_logs` before the step you want to observe.
