@@ -98,7 +98,8 @@ func (t *Page) Description() string {
 		"scrollable page in a screenshot (default: visible viewport; full-page " +
 		"captures of tall/heavy pages get an extended internal budget of ~90s " +
 		"and may still time out on extreme pages), and max_bytes to cap the " +
-		"response size. Each aspect is capped at a fixed 30s per-call timeout " +
+		"response size. A selector that matches nothing returns element_not_found naming the " +
+		"selector. Each aspect is capped at a fixed 30s per-call timeout " +
 		"(full-page screenshots ~90s); timeout_ms is not supported on this tool. " +
 		"Example: { \"session_id\": \"page-1\", \"what\": \"dom\", \"max_bytes\": 8000 }." +
 		resultEnvelopeDoc

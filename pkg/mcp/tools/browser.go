@@ -286,7 +286,7 @@ func (t *BrowserList) Description() string {
 		"owner, bin, profile_dir, persist, ephemeral, created_at, idle_for (how long the " +
 		"browser has been unused), ttl (when idle cleanup closes it), scope (the navigation " +
 		"allowlist: \"open\" when unrestricted), scope_strict (whether an empty allowlist " +
-		"denies all navigation) and pages (id, url). " +
+		"denies all navigation) and pages, each {id, url, title?, context?, stale?}. " +
 		"Returns [] when none are running. Use it to see what you own and what to close; " +
 		"idle browsers expire automatically. Example: {}." + resultEnvelopeDoc
 }

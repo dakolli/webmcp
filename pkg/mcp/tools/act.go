@@ -53,7 +53,9 @@ func (t *Act) Description() string {
 		"redirects, and returns {status,headers,body,bytes,truncated,ms,request,chain} with " +
 		"sensitive response headers redacted). " +
 		"Pass session_id plus action=... and any required parameters; element actions take a selector " +
-		"or a stable handle from page_fetch (handle wins when both are given). Logs are cumulative " +
+		"or a stable handle from page_fetch (handle wins when both are given). A selector that " +
+		"matches nothing returns error.type=element_not_found and does not wait for timeout_ms. " +
+		"Logs are cumulative " +
 		"from page creation, so call clear_logs right before the step whose traffic/logs you want to " +
 		"observe, then read page_fetch what=network|console and filter client-side." +
 		resultEnvelopeDoc
