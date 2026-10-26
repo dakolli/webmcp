@@ -1,114 +1,97 @@
 # session_list — worked example
 
-A complete live sequence on an isolated browser, 2026-10-25. Read the tool description first. Use this file when a call fails.
+Live sequence, 2026-10-25. Read the tool description first. Use this file when a call
+fails.
 
 Reference: `.agents/skills/web-mcp/references/tools/session_list.md`.
 
-## Step 1 — create an isolated browser
+Every result is one envelope. The payload lives in `data`. The rule with the failure
+branch is in `SKILL.md` under Cross-cutting rules.
+
+## 1. List before you create anything
 
 ```json
-{ "name": "browser_create", "arguments": { "headless": true, "profile": "skill-session-list-98", "stealth": true } }
+{"tool":"session_list","arguments":{}}
 ```
-
-Expected `{"browser_id":"browser-19"}`. The number varies. Do not send `"persist": "false"` as a string. The handler wants a JSON boolean, and a string fails with:
-
-```
-MCP error -32603: browser_create: invalid arguments: json: cannot unmarshal string into Go struct field browserCreateArgs.persist of type bool
-```
-
-## Step 2 — list before you open anything
 
 ```json
-{ "name": "session_list", "arguments": {} }
+{"ok":true,"data":[{"id":"page-1","url":"https://news.ycombinator.com/news"}]}
 ```
 
-Expected live result: `[]`. The array is empty because `browser-1` had no pages.
+This run had no `browser-1`. The manager resolved an unowned default browser created by
+another client and returned its pages. Several unowned candidates resolve in an
+unspecified order. Use `page_list` when the answer must be exact.
 
-## Step 3 — open two pages in your browser
+## 2. Create a browser you own
 
 ```json
-{ "name": "fetch_page", "arguments": { "browser_id": "browser-19", "url": "https://en.wikipedia.org/wiki/Web_browser", "wait_for": "idle" } }
-{ "name": "fetch_page", "arguments": { "browser_id": "browser-19", "url": "https://httpbin.org/forms/post", "wait_for": "idle" } }
+{"tool":"browser_create","arguments":{"headless":true,"stealth":true,"persist":false}}
 ```
-
-Expected ids: `page-1` for the article and `page-2` for the form.
-
-## Step 4 — list again
 
 ```json
-{ "name": "session_list", "arguments": {} }
+{"ok":true,"data":{"browser_id":"browser-4","owner":"unowned","persist":false,"ttl":"30m0s","scope":"open","scope_strict":false,"reused":false}}
 ```
 
-Expected live result:
+Record the `browser_id` inside `data`. The number varies.
+
+## 3. Open one page in it
 
 ```json
-[]
+{"tool":"fetch_page","arguments":{"browser_id":"browser-4","url":"https://react.dev/learn","wait_for":"stable","timeout_ms":30000}}
 ```
-
-Two tabs are live and the result is empty. This is the scope limit. The tool reads `browser-1` only. Your tabs live in `browser-19`.
-
-## Step 5 — read your own browser instead
 
 ```json
-{ "name": "page_list", "arguments": { "browser_id": "browser-19" } }
+{"ok":true,"data":{"session_id":"page-1","title":"Quick Start – React","url":"https://react.dev/learn","text_snippet":"React\nv19.3\nSearch\nCtrl\nK\n…","html_bytes":285239,"load_ms":2760}}
 ```
 
-Expected live result:
+## 4. session_list is not guaranteed to show your page
+
+Another unowned browser can win the resolution. The exact answer for your browser is:
 
 ```json
-[
-  {
-    "id": "page-1",
-    "url": "https://en.wikipedia.org/wiki/Web_browser"
-  },
-  {
-    "id": "page-2",
-    "url": "https://httpbin.org/forms/post"
-  }
-]
+{"tool":"page_list","arguments":{"browser_id":"browser-4"}}
 ```
-
-This is the array shape that `session_list` returns, scoped to one browser.
-
-## Step 6 — close your browser
 
 ```json
-{ "name": "browser_close", "arguments": { "browser_id": "browser-19" } }
+{"ok":true,"data":[{"id":"page-1","url":"https://react.dev/learn"}]}
 ```
 
-Expected: `browser browser-19 closed`. Then call `session_list` again:
+## 5. Failure: unknown id
+
+`session_list` takes no arguments, so it has no argument failure. The failure you will
+meet through its siblings is an unknown id. Live result through `page_list`:
 
 ```json
-{ "name": "session_list", "arguments": {} }
+{"tool":"page_list","arguments":{"browser_id":"browser-999"}}
 ```
-
-Expected live result: `[]`. Nothing changes, because nothing was ever listed. `browser_list` no longer shows `browser-19`.
-
-## Step 7 — the non-empty result
-
-A page in `browser-1` produces this shape:
 
 ```json
-[
-  {
-    "id": "page-1",
-    "url": "https://example.com"
-  }
-]
+{"ok":false,"error":{"type":"unknown","message":"page_list: browser \"browser-999\" not found (running: browser-3 (owner: unowned), browser-4 (owner: unowned)): unknown browser"}}
 ```
 
-This test did not write into `browser-1`. The shape comes from the source. It holds `id` and `url` only. Do not expect a title or a timestamp.
+Recovery: call `browser_list` and copy a live id from `data`.
 
-## Step 8 — find stale sessions
+## 6. Clean up
 
-1. Call `session_list` for `browser-1`.
-2. Call `browser_list` for every browser id.
-3. Call `page_list` for each of those ids.
-4. Confirm a suspect id with `page_fetch`.
-5. Close only a tab that you created.
+```json
+{"tool":"browser_close","arguments":{"browser_id":"browser-4"}}
+```
 
-A closed tab fails at once. The live run used id `none`:
+```json
+{"ok":true,"data":"browser browser-4 closed"}
+```
+
+`browser_list` no longer shows `browser-4`. Do not close `browser-1`.
+
+## 7. Find stale sessions
+
+1. Call `browser_list` for every live browser id.
+2. Call `page_list` for each of those ids.
+3. Mark every id in your transcript that appears in none of the results as stale.
+4. Confirm a suspect id with `page_fetch`. Both stale messages are typed `page_closed`:
 
 ```
 page_fetch: session "page-2" not found
 ```
+
+5. Close only a tab that you created.

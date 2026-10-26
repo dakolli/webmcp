@@ -1,49 +1,31 @@
-> Tool: `page_fetch` · Server: web-mcp · Surface: MCP · Tested: 2026-10-25
+> Tool: `page_fetch` · Server: web-mcp · Surface: MCP · Tested: 2026-10-26
 
 # page_fetch
 
-Read one aspect of a live page that `fetch_page` opened.
+Read one aspect of a live page that `fetch_page` opened. It does not navigate, click, or type. The `session_id` picks the tab, `what` picks the aspect.
 
-## What it does
-
-`page_fetch` reads one view of an open session. It does not navigate, click, or type. The
-`session_id` from `fetch_page` picks the tab. `what` picks the aspect.
-
-The tool returns one text content block. Most aspects return JSON as text. `html`, `text`,
-`css`, `js`, and `screenshot` return raw strings with no JSON wrapper. The tool description
-and input schema win. Use this file as a fallback.
+The payload rides inside the result envelope, so the full reply is `{"ok":true,"data":<payload>}`. See `SKILL.md` for the envelope rules and the `{"ok":false,"error":…}` shape. The payload is one JSON object or array. `html`, `text`, `css`, `js`, and `screenshot` arrive as JSON strings inside `data` with no further wrapper.
 
 ## Inputs
 
-The schema is `code://pkg/mcp/tools/page.go#L90`. The aspect table is
-`code://pkg/mcp/tools/aspects.go#L67`.
+The live schema is `code://pkg/mcp/tools/page.go#L90`. The aspect registry is `code://pkg/mcp/tools/aspects.go#L67`.
 
 | Name | Type | Required | Default | Meaning |
 | :--- | :--- | :--- | :--- | :--- |
 | `session_id` | string | yes | — | Tab to read, for example `page-1`. Comes from `fetch_page`. |
-| `what` | string | yes | — | Aspect name. See the enum below. |
+| `what` | string | yes | — | Aspect name. See the list below. |
 | `selector` | string | no | — | CSS selector. Only `html` and `text` use it. |
 | `max_bytes` | integer | no | `50000` | Output cap. A value of `0` or less means `50000`, not unbounded. |
-| `target` | string | no | — | Resource URL. Only `css` and `js` use it. |
+| `target` | string | no | — | Resource URL for `css`/`js`. For `body`: a `seq` number or a substring of the request URL, newest match wins. |
 | `full_page` | boolean | no | `false` | Capture the whole scrollable page. Only `screenshot` uses it. |
 
-The live `what` enum has 14 values: `html`, `dom`, `text`, `css`, `js`, `links`,
-`screenshot`, `meta`, `interactives`, `a11y`, `network`, `console`, `article`, `marks`.
-
-**Drift.** The worktree `pkg/mcp/tools/aspects.go` also registers `body`. The running server
-does not accept it. The live enum has 14 values. The `body` registration is uncommitted.
-This reference documents the live server.
-
-The tool has no `timeout_ms` input. Do not send one. Every call has a fixed 30 second bound.
-A full-page screenshot gets its own 90 second budget.
+The live `what` enum has 16 values, in registration order: `html`, `dom`, `text`, `css`, `js`, `links`, `screenshot`, `meta`, `interactives`, `a11y`, `network`, `body`, `console`, `article`, `marks`, `security`. The tool has no `timeout_ms` input, every call has a fixed 30 second bound, and a full-page screenshot gets its own 90 second budget.
 
 ## Returns
 
-There is no `ok` field and no outer envelope. The content is the value itself.
-
 ### Aspect return shapes
 
-| `what` | Returns | Uses `selector` | Capped by `max_bytes` |
+| `what` | Payload at `data` | Uses `selector` | Capped by `max_bytes` |
 | :--- | :--- | :--- | :--- |
 | `html` | `outerHTML` string, full page or matched element. | yes | yes, text cut |
 | `dom` | JSON array of document trees. | no | yes, JSON envelope |
@@ -56,82 +38,77 @@ There is no `ok` field and no outer envelope. The content is the value itself.
 | `interactives` | JSON `{interactives:[...],truncated}`. | no | **no** |
 | `a11y` | JSON `{nodes:[...],count,truncated}`. | no | **no** |
 | `network` | JSON `{entries,count,dropped,truncated}`. | no | **no** |
+| `body` | JSON `{seq,method,url,status,content_type,bytes,truncated}` plus `body` or `base64`. | no | **no** |
 | `console` | JSON `{entries,count,dropped,truncated}`. | no | **no** |
 | `article` | JSON `{title,byline?,excerpt?,text,words,truncated,url}`. | no | **no** |
 | `marks` | JSON `{marks,screenshot,viewport_width,viewport_height,truncated}`. | no | **no** |
+| `security` | JSON `{url,checks:[{id,status,evidence,detail}],count,truncated}`. | no | **no** |
 
-`dom`, `meta`, and `links` keep their JSON parseable when cut. `css` and `js` do not. They
-are cut as plain text. Read the truncation matrix below.
+`dom`, `meta`, and `links` keep their JSON parseable when cut. `css` and `js` do not. Read the truncation matrix below.
 
-### Tree and list shapes
+### Tree, list, and report shapes
 
-- **`dom`** returns one entry per document with `title`, `url`, `frame_id`, and `root`. A
-  node has `tag`, `id`, `class`, `attrs`, `text`, `handle`, `visible`, `bounds`, `frame_url`,
-  and `children`. A node without `handle` is structural. Live output showed a bare
-  `{"tag":"html"}` child next to the real `html` element. Read nodes by `handle`.
-- **`links`** is deduplicated by `href`, first wins. It drops `javascript:`, `mailto:`,
-  `data:`, `tel:`, empty hrefs, exactly `#`, and anchors with no text. `text` falls back to
-  `aria-label`, `title`, then `img[alt]`.
-- **`meta`** holds `title`, `url`, and a `meta` array. Each tag has any of `name`,
-  `property`, `http-equiv`, `content`, and `charset`. An empty meta tag still appears.
-- **`css`** lists stylesheets. Inline `<style>` blocks appear as `inline-style[1]`,
-  `inline-style[2]`, with `type: "inline-style"`. `size` can be `null`. The list ends with a
-  hint line that names `what=css&target=<url>`. **`js`** lists scripts the same way with
-  `type: "Script"`.
-- **`interactives`** holds `handle`, `role`, `text`, `href`, `type`, `x`, `y`, `visible`.
-  `visible: true` means the node has a layout box, not that it is in the viewport. A live
-  example.com link at `y` 739 was visible in a 400x300 viewport.
-- **`a11y`** holds `handle`, `depth`, `role`, `name`, `value`, `states`, plus `count` and
-  `truncated`. Names and values are clipped at 200 runes. Root frame only.
-- **`network`** entries hold `method`, `url`, `type`, `status`, `mime`, `bytes`, `ms`,
-  `failed`, `error`, `seq`. **`console`** entries hold `level`, `text`, `source`, `line`,
-  `seq`.
-- **`marks`** items hold `index`, `role`, `text`, `x`, `y`, `width`, `height`. Coordinates
-  are viewport CSS pixels and can be negative.
+- **`dom`** returns one entry per document with `title`, `url`, `frame_id`, and `root`. A node has `tag`, `id`, `class`, `attrs`, `text`, `handle`, `visible`, `bounds`, `frame_url`, and `children`. A node without `handle` is structural.
+- **`links`** is deduplicated by `href`, first wins. It drops `javascript:`, `mailto:`, `data:`, `tel:`, empty hrefs, exactly `#`, and anchors with no text. `text` falls back to `aria-label`, `title`, then `img[alt]`.
+- **`meta`** holds `title`, `url`, and a `meta` array with any of `name`, `property`, `http-equiv`, `content`, `charset`. **`css`** and **`js`** list resources, with inline `<style>`/`<script>` blocks appearing as `inline-style[1]`. Both lists end with a hint naming `what=<css|js>&target=<url>`.
+- **`interactives`** holds `handle`, `role`, `text`, `href`, `type`, `x`, `y`, `visible`. `visible: true` means the node has a layout box, not that it is in the viewport.
+- **`a11y`** holds `handle`, `depth`, `role`, `name`, `value`, `states`, plus `count` and `truncated`. Names and values are clipped at 200 runes. Root frame only.
+- **`network`** entries hold `method`, `url`, `type`, `status`, `mime`, `bytes`, `ms`, `failed`, `error`, `seq`, `req_headers`, `resp_headers`. Each header map keeps at most 32 headers per direction at 512 bytes per value under a 4 KB name+value budget, and a cut set adds `req_headers_truncated` or `resp_headers_truncated`. No bodies. **`console`** entries hold `level`, `text`, `source`, `line`, `seq`.
+- **`body`** adds `body` for UTF-8 text or `base64` plus `content_type` for binary, both exclusive. `bytes` is the pre-cap payload size. `truncated` marks the 256 KB cut.
+- **`marks`** items hold `index`, `role`, `text`, `x`, `y`, `width`, `height`. Coordinates are viewport CSS pixels and can be negative.
 
 ## Behavior and limits
 
 ### Handles and staleness
 
-Every handle has the form `g<document>-b<backendNodeId>`, for example `gy1g0vstq-b162`.
-Pass a handle to `page_act` with the `handle` input. The `g` token identifies the document
-that produced it. Any navigation, reload, or redirect changes the token. The old handle
-then fails as stale. Re-read the aspect after navigation.
+Every handle has the form `g<document>-b<backendNodeId>`, for example `gy1g0vstq-b162`. Pass a handle to `page_act` with the `handle` input. Any navigation, reload, or redirect changes the document token, so the old handle fails as stale. Re-read the aspect after navigating.
 
 ### Caps
 
-- `interactives`: 200 entries. `truncated` counts the rest. Live Wikipedia result had
-  `truncated: 335`.
+- `interactives`: 200 entries, `truncated` counts the rest. Live Wikipedia result had `truncated: 335`.
 - `a11y`: 400 nodes. Live Wikipedia result had `count: 400` and `truncated: 299`.
-- `network` and `console`: 200-entry ring per page. One call emits the newest 100.
-  `dropped` counts true ring loss. `truncated` counts buffered entries above the emit cap.
-- `article`: 40000 runes in `text`, reported by a boolean `truncated`. `marks`: 60 boxes,
-  with `truncated` for the rest. Only nodes inside the viewport are boxed.
+- `network` and `console`: 200-entry ring per page. One call emits the newest 100. `dropped` counts true ring loss, `truncated` counts buffered entries above the emit cap.
+- `article`: 40000 runes in `text`, reported by a boolean `truncated`. `marks`: 60 boxes, with `truncated` for the rest. Only nodes inside the viewport are boxed.
 
 ### Network and console capture
 
-Capture starts before the first document loads. Both rings are cumulative from page
-creation. `clear_logs` empties both rings and resets `dropped`. It returns the cleared
-counts, for example `{"network":39,"console":0}`.
+Capture starts before the first document loads. Both rings are cumulative from page creation. `clear_logs` (a `page_act` action) empties both rings and resets `dropped`, for example `{"network":39,"console":0}`. The `seq` counter does not reset. The recipe is `clear_logs`, then one action, then read.
 
-The `seq` counter does not reset. A live clear on react.dev then one click returned one
-entry with `seq: 40`. Compare `seq` with the value seen before the clear to prove
-attribution. The simpler recipe is `clear_logs`, then one action, then read `network` and
-`console`. A closed page still answers from its buffers. That last point comes from the
-source and was not run live.
+#### Header redaction
+
+`Cookie`, `Set-Cookie`, `Authorization`, and `X-CSRF-Token` values show `<redacted>` by default. The name match is case-insensitive (`code://pkg/browsers/redact.go#L24`). The engine switch `Page.CaptureSecrets(true)` keeps the values of entries captured after the switch, and entries already captured are not rewritten (`code://pkg/browsers/observe.go#L400`). No surface exposes the switch today.
+
+#### Response bodies with what=body
+
+`body` fetches one observed response on demand. Read `network` first, then call with `target` set to the entry's `seq` or a substring of its `url`. The payload is capped at 256 KB and flagged with `truncated: true`, `max_bytes` does not apply, and the browser evicts response bodies quickly, so read right after the request. Live evidence from commit `819ba12`: a form POST to `https://httpbin.org/post` returned a 1143 byte `application/json` body.
+
+#### Security audit with what=security
+
+`security` returns one passive audit. It never reloads or probes the site. It reads observed response headers from the network ring, the cookie jar for the current URL, and one DOM evaluation. Source: `code://pkg/cli/pageops/security.go#L124-L167`.
+
+The report holds `url`, `checks`, `count`, and `truncated`. Each check holds `id`, `status` — `ok`, `warn`, `fail`, or `info` — evidence, and detail. Check ids and the status you get when the protection is missing (`code://pkg/cli/pageops/security.go#L223-L601`):
+
+| `id` | Meaning and status when the protection is missing |
+| :--- | :--- |
+| `headers` | `info` only: the document response left the ring and every header check reads absent, or the captured header set was cut at 32 headers / 4 KB. |
+| `csp` | `warn` when no `Content-Security-Policy` header and no `<meta http-equiv>` policy exists. A meta-only policy is a warning too. |
+| `csp_unsafe_inline`, `csp_unsafe_eval` | `warn` when the policy allows the directive. Present only when any policy was found. |
+| `hsts` | `fail` with no header or on plain http, `warn` when a value sets `max-age=0`. |
+| `x_frame_options` | `warn` when absent. A CSP `frame-ancestors` directive satisfies it. |
+| `x_content_type_options` | `warn` unless the header is exactly `nosniff`. |
+| `referrer_policy`, `permissions_policy`, `coop` | `info` when absent (no failure status exists), `ok` when set. |
+| `cookie:<name>` | One check per cookie, `warn` when `HttpOnly`, `Secure`, or `SameSite` is missing. Becomes `cookies`, `ok`, when no cookies exist. |
+| `mixed_content` | `warn` for an http:// subresource observed on an https page, `info` on plain-http pages. |
+| `sri` | `warn` for cross-origin `<script src>` without an `integrity` attribute. |
+| `form_target` | `warn` for http form actions and GET forms with password fields. |
+| `password_autocomplete` | `warn` for password fields lacking `current-password` or `new-password`. |
+| `cors` | `warn` for an observed response pairing `Access-Control-Allow-Origin: *` with credentials, `info` before any response is observed. |
+
+Evidence names at most 10 offending values, then `(+N more)`. The script, form, password, and cookie lists are each cut at 200 entries and every omission is reported in `truncated`. Live run on 2026-10-26 against `https://go.dev/`: `count: 20` (6 cookie checks, 2 `csp_unsafe_*`, 14 header/content/cors checks), `truncated: 0`.
 
 ### Screenshots and timeouts
 
-`screenshot` returns PNG only, as `data:image/png;base64,...`. There is no format input.
-`full_page: false` captures the visible viewport. `full_page: true` captures the whole
-scrollable page on a 90 second budget that is independent of the 30 second bound. A very
-tall page can still time out.
-
-Large images are not cut by `max_bytes`. A 400x300 full-page capture produced over 87 KB
-of base64, and some clients drop such a block. Prefer a small viewport for `marks`.
-
-Every other aspect is bounded at 30 seconds. There is no way to raise the bound on this
-tool. Use `page_act` with `wait` before the read if the page is still loading.
+`screenshot` returns PNG only, as `data:image/png;base64,...`. There is no format input. `full_page: false` captures the visible viewport. `full_page: true` captures the whole scrollable page on a 90 second budget that is independent of the 30 second bound, and a very tall page can still time out. Large images are not cut by `max_bytes` — a 400x300 full-page capture produced over 87 KB of base64. Prefer a small viewport for `marks`.
 
 ## Truncation matrix
 
@@ -140,80 +117,65 @@ tool. Use `page_act` with `wait` before the read if the page is still loading.
 | `html`, `text`, `css`, `js` | Cut on a rune boundary. A note is appended. | No. A `css`/`js` list is cut inside its JSON. | Text note |
 | `dom`, `links` | Array root becomes an envelope object. | Yes | `truncated: true`, `omitted` |
 | `meta` | Object keeps its fields, its first array field shrinks. | Yes | `truncated: true`, `omitted` |
-| `screenshot`, `interactives`, `a11y`, `network`, `console`, `article`, `marks` | Not cut. | Yes | Shape's own `truncated` or `count` |
+| `screenshot`, `interactives`, `a11y`, `network`, `body`, `console`, `article`, `marks`, `security` | Not cut. | Yes | Shape's own `truncated` or `count` |
 
-The text note is exact:
+The text note is exact: `… (truncated at max_bytes=600 bytes; raise max_bytes — dom/links/meta do not use selector)`. The array envelope is `{"items":[...],"max_bytes":N,"omitted":N,"truncated":true}`.
 
-```
-… (truncated at max_bytes=600 bytes; raise max_bytes — dom/links/meta do not use selector)
-```
-
-The array envelope is `{"items":[...],"max_bytes":N,"omitted":N,"truncated":true}`.
-The object envelope adds `truncated` and `max_bytes` and keeps `title` and `url`.
-
-**`dom` is nearly all-or-nothing.** The envelope cuts whole documents, not nodes. The
-Wikipedia document exceeded 400000 bytes. At `max_bytes: 50000` the live result was
-`{"items":[],"max_bytes":50000,"omitted":1,"truncated":true}`. Use `article`, `text`, or
-`html` with a `selector` for large pages. Do not raise `max_bytes` to megabytes.
+**`dom` is nearly all-or-nothing.** The envelope cuts whole documents, not nodes. The Wikipedia document exceeded 400000 bytes. At `max_bytes: 50000` the live result was `{"items":[],"max_bytes":50000,"omitted":1,"truncated":true}`. Use `article`, `text`, or `html` with a `selector` for large pages, never a megabyte `max_bytes`.
 
 ## Failure modes and recovery
 
-The server prefixes tool errors with `MCP error -32603: `. The strings below omit that
-prefix.
+Every error rides the envelope: `{"ok":false,"error":{"type":…,"message":…,"hint":…}}`. Read `message` first. The prefix `page_fetch: ` opens the message. This tool produces the types `invalid_args`, `page_closed`, `timeout`, `nav_failed`, and `unknown` (`code://pkg/mcp/tools/envelope.go#L67-L130`). Two full envelopes below were recorded live on 2026-10-26.
 
-**Unknown session.** Live: `page_fetch: session "page-999" not found`.
-Recovery: re-read `session_list` or `page_list`. A 15 minute idle sweep removes pages.
+**Unknown session.** Type `page_closed`. Message `page_fetch: session "page-999" not found`. Recovery: re-read `session_list` or `page_list`, because the idle sweep removes pages.
 
-**Unknown `what`.** Live:
-`page_fetch: unknown what="tablez" (must be one of html, dom, text, css, js, links,
-screenshot, meta, interactives, a11y, network, console, article, marks)`.
-Recovery: send one listed value. `body` is rejected by the live server.
+**Unknown `what`.** Type `invalid_args`. Live envelope, tested on 2026-10-26:
 
-**No selector match on `text`.** Live:
-`page_fetch: no element matched selector "#does-not-exist-xyz"`.
-Recovery: check the selector with `interactives` or `a11y` first.
+```json
+{"ok":false,"error":{"type":"invalid_args","message":"page_fetch: unknown what=\"sinks\" (must be one of html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, body, console, article, marks, security)","hint":"fix the arguments per the tool InputSchema (required fields, enum values)"}}
+```
 
-**Bad selector on `html`.** Live:
-`page_fetch: no element matched selector "##": eval js error: SyntaxError: Failed to
-execute 'querySelector' on 'Document': '##' is not a valid selector.`
-Recovery: send a valid CSS selector. Prefer `#id` or a tag over complex expressions.
+Recovery: send one listed value. `sinks` and `canary` are not on the tool surface.
 
-**Unknown `target`.** Live:
-`page_fetch: resource "https://en.wikipedia.org/does-not-exist.css" not found in the
-page's resource tree: {-32000 No resource with given URL found }`.
-Recovery: list `css` or `js` first, then copy a `url` value exactly.
+**No selector match on `text`.** Type `unknown` with no `hint` field. Live envelope, tested on 2026-10-26:
 
-**Session and its browser are gone.** Live:
-`page_fetch: browsers: launch browser browser-1: browsers: launch chromium: [launcher]
-Failed to get the debug url: Opening in existing browser session.`
-The manager fell back to the default browser and its profile was locked. Recovery: open a
-new session with `fetch_page`, then read it.
+```json
+{"ok":false,"error":{"type":"unknown","message":"page_fetch: no element matched selector \"#does-not-exist-xyz\""}}
+```
 
-**Missing required input.** From the source: `page_fetch: missing required argument
-"session_id"` or `..."what"`. Send both fields.
+Recovery: check the selector with `interactives` or `a11y` first. Classification as `unknown` rather than `element_not_found` is live drift worth a code fix.
 
-**Bad JSON shape.** From the source: `page_fetch: invalid arguments: json: cannot
-unmarshal ...`. Send one JSON object with the documented keys.
+**Unknown `target` on `css`/`js`.** Type `unknown`. Message: `page_fetch: resource "…" not found in the page's resource tree: {-32000 No resource with given URL found }`. Recovery: list `css` or `js` first, then copy a `url` value exactly.
 
-## When not to use
+**`body` with no matching entry or an unusable body.** From the source (`code://pkg/cli/pageops/pageops.go#L527`, `code://pkg/browsers/observe.go#L417`), runtime values as `%` templates:
 
-Do not use `page_fetch` to open a page. Use `fetch_page`. Do not use it to click, type,
-scroll, or navigate. Use `page_act`.
+```
+body: no network entry matches target %q (read what=network first; target is a seq number or a substring of the request URL, newest match wins)
+network body: seq %d (%s %s) failed before a response arrived (%s)
+network body: seq %d (%s %s) body is no longer available — the browser keeps response bodies only briefly (evicted, streamed, or served from cache); re-issue the request and read the body immediately: %w
+network body: seq %d (%s %s) has an empty body (status %d, mime %q) — the response carried no payload
+```
 
-Do not use `dom` for prose on a large page. Use `article` or `text`. Do not use
-`screenshot` for text. It costs bytes and returns no structure.
+Recovery: re-read `what=network` for the current `seq` values, then read the body at once.
 
-Do not use `interactives` to test whether an element is on screen. Use `marks` for
-viewport boxes. Do not expect `selector` to scope `dom`, `meta`, or `links`. They ignore it.
+**Missing required input.** Type `invalid_args`. Messages `page_fetch: missing required argument "session_id"` and `..."what"`. Send both fields.
+
+## Tested calls
+
+- 2026-10-25 — `meta`, `text` with selector, `css` with `target`, `interactives`, `network`, `body`, `network` header redaction, and the unknown-`what` failure. Commit `819ba12`.
+- 2026-10-26 — `security` on `https://go.dev/` returned `count: 20`, `truncated: 0`. Failure envelopes for `unknown what` and a no-match selector recorded live.
+
+## When not to use it
+
+Do not use `page_fetch` to open a page. Use `fetch_page`. Do not use it to click, type, scroll, or navigate. Use `page_act`. Do not use `dom` for prose on a large page. Use `article` or `text`. Do not use `interactives` to test whether an element is on screen — use `marks` for viewport boxes. Do not expect `selector` to scope `dom`, `meta`, `links`, or `security`. They ignore it. `security` is a passive audit of what the browser already holds, not an exploit scanner.
 
 ## Related tools
 
 - `fetch_page` — opens the session that `page_fetch` reads. It returns `session_id`.
-- `page_act` — clicks, types, presses keys, evaluates JS, navigates, and calls `clear_logs`.
+- `page_act` — clicks, types, presses keys, evaluates JS, navigates, calls `clear_logs`, and replays `network` entries.
 - `page_list` — lists the pages of one browser.
 - `session_list` — lists every live session across browsers.
 - `session_close` — closes one page.
 - `browser_list` — lists browsers and their pages.
 
-For copyable calls with expected output, see the example file at
-`.agents/skills/web-mcp/references/examples/page_fetch_example.md`.
+For copyable calls with expected output, see the example file at `.agents/skills/web-mcp/references/examples/page_fetch_example.md`.

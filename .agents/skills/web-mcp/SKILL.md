@@ -1,11 +1,12 @@
 ---
 name: web-mcp
-description: Drive a live, stateful Chromium browser over the web-mcp MCP server. Use for real browsing, page inspection (DOM, accessibility, network, console, article, marks), form filling, and UI testing. The MCP tool description is primary. This skill is the fallback for exact shapes, limits, and errors.
+description: Drive a live, stateful Chromium browser over the web-mcp MCP server. Use for real browsing, page inspection (DOM, accessibility, network, console, article, marks), form filling, and UI testing. The MCP tool description is primary. This skill carries the exact shapes, limits, and errors.
 ---
 
 # web-mcp — MCP browser skill
 
-This skill supports the 9 `web-mcp` MCP tools. It does not replace the tool descriptions.
+This skill covers the 9 `web-mcp` MCP tools. It does not replace the tool descriptions.
+This file is the single entry. It carries the cross-cutting rules. Tool detail lives in the references.
 
 ## Read order
 
@@ -15,13 +16,26 @@ This skill supports the 9 `web-mcp` MCP tools. It does not replace the tool desc
 
 Do not invent parameters. The Go source in `pkg/mcp/tools/` is the schema source of truth.
 
+## Before you call
+
+- Create one browser per agent. Pass a unique `owner` label such as `"owner": "research-a"`. The label joins the create key, so the same owner and options reuse one browser.
+- Browsers are ephemeral by default. Pass `persist:true` with a `profile` name only when logins must survive a restart.
+- Close your own browser with `browser_close` when the task ends. Never close another agent's browser.
+
+## Prefer a headless browser
+
+- Create browsers with `"headless": true`. Most reads and actions do not need a window.
+- Go headful only when a site blocks automation in headless mode, or when the task needs a real display for a visual check, window placement, or an OS dialog.
+
 ## Mental model
 
 - **Browser** (`browser_id`, for example `browser-1`). One Chromium process and one profile.
 - **Session** (`session_id`, for example `page-1`). One live tab inside a browser.
-- `browser-1` uses the persistent profile at `~/.config/browser-mcp/profiles/default`.
-- A secondary browser is ephemeral when you pass `persist:false`. Its profile is removed on close.
+- `browser-1` is the first id minted. It is not a shared singleton.
+- The ephemeral profile lives under `~/.config/browser-mcp/profiles/.ephemeral/` and is removed on close.
+- A persistent profile needs `persist:true` and a `profile` name.
 - A bare `profile` name resolves under the config dir. A relative path with a separator is rejected.
+- A browser idle for 30 minutes closes automatically. Set `browser_ttl` in `~/.config/browser-mcp/config.json` to change it. `browser_list` shows `idle_for` and `ttl`.
 - Idle sessions expire after 15 minutes. A dead Chromium is relaunched under the same `browser_id`.
 - Page ids are unique inside one browser only. Two live browsers can both have `page-1`.
 
@@ -42,9 +56,9 @@ Do not invent parameters. The Go source in `pkg/mcp/tools/` is the schema source
 ## Cross-cutting rules
 
 1. Call `browser_list` before you use a `browser_id`. Confirm the id and its `profile_dir`.
-2. Pass `persist:false` for an isolated secondary browser. If your client does not show `persist`, reconnect it before you create a browser.
+2. If your client does not show `persist` or `owner`, reconnect it before you create a browser.
 3. Never close `browser-1` unless the user asks for a full reset. Never call `browser_close` with an empty `browser_id` in a shared session. A misspelled `browser` key is ignored and becomes an empty id. Use the exact key `browser_id`.
-4. Use one browser per task. Page ids collide across browsers, and `page_fetch` and `page_act` resolve an id across live browsers.
+4. Use one browser per agent and task. Page ids collide across browsers, and `page_fetch` and `page_act` resolve an id across live browsers.
 5. `session_close` is not browser-scoped. It closes the tab in the default browser. For a tab in a secondary browser, use `browser_close` with your own id.
 6. `session_list` reports the default browser only. Use `page_list` with a required `browser_id` for any other browser. `page_list` shows the creation URL, not the live URL. Use `page_fetch` with `what:"meta"` for the live URL.
 7. An unknown `browser_id` can create a new browser. A typo spends a full Chromium process. Verify the id first.
@@ -56,6 +70,26 @@ Do not invent parameters. The Go source in `pkg/mcp/tools/` is the schema source
 13. `page_act` `wait` defaults to `wait_mode:"ms"`. If you omit `timeout_ms`, it sleeps for 30 seconds.
 14. Prefer `article` over `text` for prose pages. Prefer `interactives` or `a11y` before you act.
 15. `browser_close` is not idempotent. A second close returns a not-found error. Check `browser_list` first.
+
+## Result envelope
+
+Every tool returns one JSON envelope. Success puts the payload inside `data`:
+
+```json
+{"ok":true,"data":[]}
+```
+
+`data` is the JSON object or array shown in each tool reference. Prose results, such as the `browser_close` replies, become a JSON string inside `data`, for example `{"ok":true,"data":"browser browser-2 closed"}`.
+
+Failure puts the error branch inside `error`:
+
+```json
+{"ok":false,"error":{"type":"unknown","message":"browser_close: browser \"browser-2\" not found (running: browser-1 (owner: unowned)): unknown browser"}}
+```
+
+Branch on `error.type`. The values are `invalid_args`, `element_not_found`, `not_interactable`, `anti_bot`, `page_closed`, `timeout`, `nav_failed`, and `unknown`. `message` is the human sentence, prefixed with the tool name. `hint` is a one-line fix and is omitted when the type has none, such as `unknown`.
+
+Each tool reference states only its own payload and its failure types, and links here. This section is the only full description of the envelope. Shapes come from `code://pkg/mcp/tools/envelope.go#L43-L56`.
 
 ## Known live-server limits
 
@@ -78,14 +112,19 @@ Use only the id you created. Do not close `browser-1`.
 
 ## Test pages
 
-- `https://en.wikipedia.org/wiki/Web_browser` — large DOM, the 200-interactive cap, many links, one search input.
-- `https://httpbin.org/forms/post` — full form, POST round trip, file input.
-- `https://react.dev/learn` — SPA, client-side routes, React handlers, theme toggle.
+Never reuse one site. No site is the default. Pick a different real site for each run, and rotate across news, documentation, shops, SPAs and government portals.
+
+When a call fails, repeat it once on a second unrelated site before you report a defect. A quirk of one site is not a code bug.
+
+Keep these shapes in the rotation, with a new host each time:
+
+- a large page with hundreds of interactive elements
+- a form that posts and returns a body
+- an SPA with client-side routes and framework handlers
 
 ## Maintainer status
 
-- Wave A complete: `browser_create`, `browser_list`, `fetch_page`, `session_close`.
-- Wave B complete: `session_list`, `page_fetch`, `page_act`.
-- Wave C complete: `browser_close` and `page_list` re-tested.
-- All 9 tools have a tested reference and example.
-- Extension tickets: blocked until their tool tickets land.
+- All 9 tools have a tested reference and an example.
+- The result envelope is documented once here and referenced from every tool page.
+- Lifecycle, proxy, scope, headers, `what=body`, `what=security` and `page_act replay` are documented.
+- Open extension work: `sinks` and `canary` are engine-only and not on the tool surface yet.

@@ -2,9 +2,11 @@
 
 # page_list example
 
-Use this file only when tool calling for `page_list` fails. The tool description is primary.
+Use this file only when tool calling for `page_list` fails. The tool description is
+primary. Your ids can differ.
 
-This sequence creates a browser you own, lists an empty page set, opens two pages, lists them, tests two failures, and cleans up. The live test used `browser-4`. Your id can differ.
+This sequence creates a browser you own, lists an empty page set, opens two pages, lists
+them, tests two failures, and cleans up. The live test used `browser-4`.
 
 ## 1. Create a browser you own
 
@@ -12,13 +14,12 @@ This sequence creates a browser you own, lists an empty page set, opens two page
 {"tool":"browser_create","arguments":{"headless":true,"stealth":true,"persist":false}}
 ```
 
-Expected output:
-
 ```json
-{"browser_id":"browser-4"}
+{"ok":true,"data":{"browser_id":"browser-4","owner":"unowned","persist":false,"ttl":"30m0s","scope":"open","scope_strict":false,"reused":false}}
 ```
 
-`persist:false` gives an ephemeral profile. The manager deletes it on close. Record the exact id. Use it below.
+`persist:false` gives an ephemeral profile. The manager deletes it on close. Record the
+`browser_id` inside `data`. Use it below.
 
 ## 2. List an empty browser
 
@@ -26,10 +27,8 @@ Expected output:
 {"tool":"page_list","arguments":{"browser_id":"browser-4"}}
 ```
 
-Expected output:
-
-```
-[]
+```json
+{"ok":true,"data":[]}
 ```
 
 No page opened. No browser launched.
@@ -37,21 +36,22 @@ No page opened. No browser launched.
 ## 3. Open two pages
 
 ```json
-{"tool":"fetch_page","arguments":{"browser_id":"browser-4","url":"https://example.com","wait_for":"load"}}
+{"tool":"fetch_page","arguments":{"browser_id":"browser-4","url":"https://react.dev/learn","wait_for":"stable","timeout_ms":30000}}
 ```
 
 ```json
-{"tool":"fetch_page","arguments":{"browser_id":"browser-4","url":"https://httpbin.org/forms/post","wait_for":"load"}}
+{"tool":"fetch_page","arguments":{"browser_id":"browser-4","url":"https://news.ycombinator.com/news","wait_for":"load"}}
 ```
 
-Expected output, one line per call, in order:
+Expected `data` payloads, one per call, in order:
 
 ```json
-{"session_id":"page-1","title":"Example Domain","url":"https://example.com/","html_bytes":2358,"load_ms":497}
-{"session_id":"page-2","title":"httpbin.org/forms/post","url":"https://httpbin.org/forms/post","html_bytes":1404,"load_ms":383}
+{"session_id":"page-1","title":"Quick Start – React","url":"https://react.dev/learn","html_bytes":285239,"load_ms":2760}
+{"session_id":"page-2","title":"Hacker News","url":"https://news.ycombinator.com/news","html_bytes":34861,"load_ms":571}
 ```
 
-The full results also hold a `text_snippet` field. `fetch_page` reports the final URL with a trailing slash. `page_list` reports the raw creation URL.
+The full payloads also hold a `text_snippet` field. `fetch_page` reports the final URL.
+`page_list` reports the raw creation URL.
 
 ## 4. List the two pages
 
@@ -59,22 +59,11 @@ The full results also hold a `text_snippet` field. `fetch_page` reports the fina
 {"tool":"page_list","arguments":{"browser_id":"browser-4"}}
 ```
 
-Expected output:
-
 ```json
-[
-  {
-    "id": "page-1",
-    "url": "https://example.com"
-  },
-  {
-    "id": "page-2",
-    "url": "https://httpbin.org/forms/post"
-  }
-]
+{"ok":true,"data":[{"id":"page-1","url":"https://react.dev/learn"},{"id":"page-2","url":"https://news.ycombinator.com/news"}]}
 ```
 
-Read `id` from this result. Use it with `page_fetch` and `page_act`.
+Read `id` from `data`. Use it with `page_fetch` and `page_act`.
 
 ## 5. Failure: use an unknown id
 
@@ -82,13 +71,12 @@ Read `id` from this result. Use it with `page_fetch` and `page_act`.
 {"tool":"page_list","arguments":{"browser_id":"browser-999"}}
 ```
 
-Expected error:
-
-```
-MCP error -32603: page_list: browser "browser-999" not found (running: browser-1, browser-4): unknown browser
+```json
+{"ok":false,"error":{"type":"unknown","message":"page_list: browser \"browser-999\" not found (running: browser-3 (owner: unowned), browser-4 (owner: unowned)): unknown browser"}}
 ```
 
-Do not retry `browser-999`. Recovery: call `browser_list` and copy a live `browser_id` from its result.
+The running list shows the live ids of that moment. Yours will differ. Do not retry
+`browser-999`. Recovery: call `browser_list` and copy a live `browser_id` from `data`.
 
 ## 6. Failure: omit `browser_id`
 
@@ -96,10 +84,8 @@ Do not retry `browser-999`. Recovery: call `browser_list` and copy a live `brows
 {"tool":"page_list","arguments":{}}
 ```
 
-Expected error:
-
-```
-MCP error -32603: page_list: missing required argument "browser_id"
+```json
+{"ok":false,"error":{"type":"invalid_args","message":"page_list: missing required argument \"browser_id\"","hint":"fix the arguments per the tool InputSchema (required fields, enum values)"}}
 ```
 
 Recovery: send the object with the `browser_id` key. Do not rely on a default browser.
@@ -112,9 +98,11 @@ Close only your browser. Its pages close with it. Do not call `session_close`.
 {"tool":"browser_close","arguments":{"browser_id":"browser-4"}}
 ```
 
-Expected output:
+```json
+{"ok":true,"data":"browser browser-4 closed"}
+```
 
-```
-browser browser-4 closed
-```
 Never send `{}` or an empty `browser_id` to `browser_close`.
+
+See [page_list.md](../tools/page_list.md) for the full input table, return shape, and
+error strings.

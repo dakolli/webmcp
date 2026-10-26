@@ -2,154 +2,174 @@
 
 # browser_create
 
-Launch a Chromium browser or reuse the live default browser. Return the `browser_id` that every page tool needs.
+Create a live Chromium browser or reuse the one your owner already holds. Return the `browser_id` that every page tool needs.
 
 ## What it does
 
-`browser_create` starts one Chromium process and registers it under a `browser_id`. The id looks like `browser-1` or `browser-7`.
+`browser_create` starts one Chromium process and registers it under a `browser_id` such as `browser-2`. It opens no page. Use `fetch_page` to open one.
 
-A call with zero arguments reuses the live default browser. It returns `browser-1` when that browser is alive.
+The call is idempotent per owner. A second call with the same owner and the same launch options returns the live browser with `reused:true`. A different owner, or any changed option, gets a separate browser. The proxy, headers and scope are fixed at creation and never change afterwards.
 
-A call with at least one argument creates a new browser. It mints a new id. It does not replace `browser-1`.
-
-The call returns after Chromium is up. It does not open a page. Use `fetch_page` to open a page.
+Browsers are ephemeral by default on the MCP surface. With no `persist`, the profile lives under `~/.config/browser-mcp/profiles/.ephemeral/` and is deleted when the browser closes. That fresh profile is the isolation mechanism: a scoped or header-identity browser is not a second identity in the same profile, it is a whole new profile.
 
 ## Inputs
 
-All inputs are optional. The schema declares no required field. The source is `code://pkg/mcp/tools/browser.go#L53`.
+All inputs are optional. The schema declares no required field. Source: `code://pkg/mcp/tools/browser.go#L82-L150`.
 
 | Name | Type | Required | Default | Meaning |
 | :--- | :--- | :--- | :--- | :--- |
-| `bin` | string | no | empty | Browser executable path or command, for example `brave-browser`. Empty probes `brave-browser`, `brave`, `google-chrome`, `chrome`, then `chromium`. |
-| `profile` | string | no | empty | Bare profile name or absolute directory. A bare name resolves under `~/.config/browser-mcp/profiles/<name>` when persistent, or under `profiles/.ephemeral/` when ephemeral. A relative path with a separator is rejected. |
-| `persist` | boolean | no | `false` | Keep the profile after close. `false` gives secondary browsers an ephemeral profile that is deleted on close. `browser-1` with no explicit profile stays persistent. |
+| `bin` | string | no | empty | Browser executable path or command, for example `brave-browser`. Empty probes the default browsers in order. |
+| `profile` | string | no | empty | Bare profile name or absolute directory. A bare name resolves under `~/.config/browser-mcp/profiles/<name>` when persistent, or under `profiles/.ephemeral/` when ephemeral. A relative path with a separator is rejected. An absolute path is always persistent. |
+| `persist` | boolean | no | `false` | Keep the profile after close. `true` with a `profile` name keeps that named profile. On the MCP surface even `browser-1` is ephemeral unless you pass `persist:true`. |
 | `headless` | boolean | no | server setting | Run without a window. The manager default is headful. |
 | `stealth` | boolean | no | server setting | Apply go-rod/stealth to every page in the new browser. The manager default is on. |
 | `position` | string | no | empty | Headful window preset: `left`, `right`, `max`, or `normal`. |
+| `proxy` | string | no | empty | Local proxy for intercept tools, for example `127.0.0.1:8080`. Accepts `host:port` or `scheme://host:port`. Credentials belong in `~/.config/browser-mcp/proxy.json`, never in this argument. |
+| `proxy_bypass` | string | no | empty | Comma-separated hosts that skip the proxy, for example `localhost,*.internal`. Passed to Chromium as `--proxy-bypass-list`. |
+| `ignore_certs` | boolean | no | `false` | Accept invalid TLS certificates via `--ignore-certificate-errors`. Independent of `proxy`: set it explicitly. |
+| `headers` | object of name to string | no | empty | Request headers sent with every request of every page in this browser, first navigation and subresources included. Use it for an identity header, for example `{"X-Bug-Bounty":"your-handle"}`. |
+| `scope` | array of strings | no | empty (no limit) | Navigation allowlist. A bare host covers its subdomains. `*.example.com`, `host:port` and `*` are accepted. Omit for no limit. |
+| `scope_strict` | boolean | no | `false` | Opt-in strict mode. When `true` with an empty `scope`, every navigation is refused. |
+| `owner` | string | no | session identity, else `unowned` | Owner label of 1 to 64 characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, and `-`. It joins the create key. |
 
-Passing any input creates a new browser, even when the value equals the default. `{"headless":false}` and `{"stealth":true}` both create a new id.
+String-encoded arguments are accepted: the registry rewrites `"scope":"[\"wikipedia.org\"]"` into the array and `"true"` into the boolean before the call runs. Source: `code://pkg/mcp/tools/registry.go#L189-L264`.
 
 ## Returns
 
-The tool returns one line of compact JSON. It has one field.
+The payload below rides inside the result envelope, so the full reply is `{"ok":true,"data":<payload>}`. See `SKILL.md` for the envelope and for the `{"ok":false,"error":…}` shape.
+
+One line of compact JSON with seven fields. Source: `code://pkg/mcp/tools/browser.go#L238-L261`.
 
 ```json
-{"browser_id":"browser-5"}
+{"ok":true,"data":{"browser_id":"browser-4","owner":"unowned","persist":false,"ttl":"30m0s","scope":"open","scope_strict":false,"reused":false}}
 ```
 
-| Field | Type | Meaning |
-| :--- | :--- | :--- |
-| `browser_id` | string | The live browser id. Use it with `fetch_page`, `browser_list`, `page_list`, and `browser_close`. |
-
-Test run: `{"headless":true,"profile":"skill-create-93-eph","stealth":true}` returned `{"browser_id":"browser-5"}`.
-
-Errors are MCP errors with the prefix `MCP error -32603: `. The failure section lists the tested messages.
+| Field | Meaning |
+| :--- | :--- |
+| `browser_id` | The live browser id. Use it with `fetch_page`, `browser_list`, and `browser_close`. |
+| `owner` | The explicit `owner`, the SSE session label, or `unowned`. |
+| `persist` | `true` when the profile survives close. |
+| `ttl` | The effective idle TTL as a Go duration, for example `30m0s`. `0s` disables browser sweeping. |
+| `scope` | `open` when unrestricted, `strict` when an empty allowlist denies all, else the patterns joined by `", "`. |
+| `scope_strict` | Whether an empty allowlist denies every navigation. |
+| `reused` | `true` when a live browser matched the owner and launch options. |
 
 ## Behavior and limits
 
-**Reuse needs zero arguments.** The tool reuses only the default browser. It checks that `browser-1` is alive. If `browser-1` is dead or absent, the call mints the next free id and does not use `browser-1`.
+**The create key is owner plus every launch option, including headers and scope.** The key holds `owner`, `bin`, `profile`, `persist`, `headless`, `stealth`, `position`, `proxy`, `proxy_bypass`, `ignore_certs`, `headers`, `scope`, and `scope_strict`. A different owner plus a different scope is therefore a different browser. Scope and header identity is canonical: allowlist order, duplicates and blank entries are ignored, and headers compare as sorted `name=value`. Source: `code://pkg/browsers/manager.go#L447-L482`.
 
-**You cannot reattach by id.** `browser_create` has no `browser_id` input. A second call with options always creates another Chromium process.
+**Owner joins the key but does not authorize.** `browser_close` works by id and never checks the owner. Source: `code://pkg/browsers/manager.go#L128-L140`.
 
-**Ids are not reused.** Each create or failed launch consumes the next number. Test run: a failed launch used `browser-2`, and a later success returned `browser-4`.
+**Proxy.** The value is validated before Chromium starts, so a bad `proxy` never launches a process. Credentials are never accepted in the argument: they come only from `~/.config/browser-mcp/proxy.json` (mode 0600), keyed by lowercase `host:port`. A loopback proxy (`localhost` or a loopback IP) with no `proxy.json` entry arms no auth handler, so a local intercept proxy works without credentials and pays no interception cost. A remote proxy may demand credentials, and a page under it fails until `proxy.json` has the entry. Source: `code://pkg/browsers/proxyauth.go#L20-L70` and `code://pkg/browsers/proxyauth.go#L110-L112`.
 
-**Profiles separate state.** A persistent profile keeps cookies and logins across restarts. An ephemeral profile starts clean and is removed when the browser closes. An absolute path is always persistent.
+**`ignore_certs`.** Legitimate with an intercept proxy whose MITM CA signs the pages you fetch: the proxy re-signs TLS, Chromium refuses it, and `ignore_certs:true` accepts the local CA. Turn it on only for that setup. Source: `code://pkg/browsers/browser.go#L332-L334`.
 
-**Persist default follows the server.** The schema default is `false`. The `browser serve mcp` daemon builds its manager with persistence on. Test run: a browser created without `persist` reported a path under `profiles/`, not `profiles/.ephemeral/`, so the engine treated it as persistent. Pass `persist:false` to request an ephemeral profile.
+**`headers` ride every request.** They are installed at page creation, before any navigation, and stay for the life of each page. Verified live: the network capture shows an `X-Doc-Test` header on the document and on every subresource. Source: `code://pkg/browsers/browser.go#L486-L489`.
 
-**The default profile is a trap.** A new browser with options and no `profile` can resolve the same directory as the server's default browser. The launch then fails with a `SingletonLock` error. Pass a distinct `profile` name for every new browser.
+**Scope matching.** A bare host also covers its subdomains, so `wikipedia.org` admits `en.wikipedia.org`. `*.example.com` means the same as the bare host. `host:port` pins the port, with the scheme default (`80` for http, `443` for https) applied otherwise. `*` allows all. Entries are lowercased and trimmed. A relative navigation (no host) is always allowed. Source: `code://pkg/browsers/policy.go#L96-L121`.
 
-**`browser_list` shows the real path.** It returns `profile_dir` as an absolute path. Test run: `browser-5` reported `/home/<user>/.config/browser-mcp/profiles/skill-create-93-eph`.
+**Scope enforcement is navigation-only.** `fetch_page` checks before the tab is created, and `page_act navigate` checks before it moves. Subresources and redirects are never checked, so a redirect can still land on an out-of-scope host. Source: `code://pkg/browsers/browser.go#L455-L459`.
 
-**Position is headful only.** In headless mode the value is accepted and ignored. Test run: `left`, `right`, `max`, and `normal` all created a headless browser with no error and no window.
-
-**Position mapping in headful mode.** `left` and the empty value place the window at `0,0` with size `1280x1400`. `right` places it at `1280,0` with size `1280x1400`. `max` starts the window maximized. `normal` falls through to the `left` case.
-
-**Stealth is per page.** A `true` value makes every page in the new browser run the go-rod/stealth patches. It does not change existing pages.
-
-**Cost.** Each browser is a full Chromium process. Keep the live count small. The 15-minute TTL closes idle pages, not browsers.
-
-**No page is opened.** The new browser has an empty page list. `browser_list` shows `"pages": []`.
+**Idle TTL is 30 minutes**, overridable by `browser_ttl` in `~/.config/browser-mcp/config.json`. One live browser per profile directory: a second create on the same directory fails before Chromium starts.
 
 ## Failure modes and recovery
 
-The MCP server prefixes tool errors with `MCP error -32603: `. The strings below show the message after that prefix. Ids and paths differ on your host.
+Every error rides the envelope: `{"ok":false,"error":{"type":…,"message":…,"hint":…}}`. Read `message` first. The tool prefixes it with `browser_create: `.
 
-**Profile already in use.** Another live browser holds the same profile directory.
-
-```
-browser_create: browsers: launch browser browser-2: browsers: launch chromium: profile "…/profiles/default" appears to be in use by another running browser — pass a distinct profile name: [launcher] Failed to get the debug url: … SingletonLock: File exists (17)
-```
-
-Test run: a call with `{"headless":true,"stealth":true}` and no `profile` hit this error while `browser-1` held the default profile.
-
-Recovery: add a unique `profile` name. Set `persist:false` with that name to use an ephemeral directory.
-
-**Unknown or missing binary.**
+**Out of scope navigation.** Tested live against a browser created with `scope:["wikipedia.org"]`.
 
 ```
-browser_create: browsers: launch browser browser-11: browsers: launch chromium: fork/exec /nonexistent/definitely-not-a-browser-93: no such file or directory
+web-mcp: host "example.net" is outside the scope allowlist (allowed: wikipedia.org; scope=wikipedia.org, scope_strict=false) — add it with browser_create scope=["example.net"]
 ```
 
-Test run: the bad `bin` value returned this exact message.
-
-Recovery: omit `bin` to use discovery, or pass a path that exists and is executable.
-
-**Relative profile path.**
+Strict mode with no scope refuses everything:
 
 ```
-browser_create: browsers: resolve profile for browser-12: config: profile "./leak" is a relative path; pass an absolute path or a bare name (resolved under browser-mcp/profiles)
+web-mcp: host "example.com" is outside the scope allowlist (allowed: none; scope=strict, scope_strict=true) — add it with browser_create scope=["example.com"]
 ```
 
-Test run: `{"profile":"./leak"}` returned this error before launch.
+Recovery: scope is immutable per browser, so create a new browser with the extended allowlist. Source: `code://pkg/browsers/policy.go#L140-L154`.
 
-Recovery: use a bare name such as `audit`, or an absolute path.
-
-**`persist` arrives as a string.** A host that caches an older tool schema may send the boolean as text.
+**Invalid proxy.** Tested live. The argument is rejected before launch, never mid-navigation.
 
 ```
-browser_create: invalid arguments: json: cannot unmarshal string into Go struct field browserCreateArgs.persist of type bool
+browsers: invalid proxy "http://user:pass@127.0.0.1:8080": credentials are not accepted here; put them in <config-dir>/proxy.json and chmod 600 it
+browsers: invalid proxy "127.0.0.1:99999": port "99999" must be a number between 1 and 65535
+browsers: invalid proxy "127.0.0.1": missing port; pass host:port
 ```
 
-Test run: `{"persist":false}` returned this error while the host schema lacked the `persist` property.
+A proxy with credentials in the URL is refused with the first message. Source: `code://pkg/browsers/proxyauth.go#L20-L70`.
 
-Recovery: reconnect the MCP client so it reloads the tool schema. Until then, omit `persist` and pass a unique `profile` name.
-
-**Bad argument shape.**
+**Profile already in use.** Tested live with `profile: "audit"` held by `browser-2` owned by `client-a`.
 
 ```
-browser_create: invalid arguments: json: cannot unmarshal ...
+profile "…/audit" is already in use by browser-2 (owned by client-a) — close it with browser_close {browser_id: "browser-2"} or pick a different profile name
 ```
 
-Recovery: send one JSON object with the documented keys.
+Recovery: close the holder, or pick a different `profile`.
 
-**Manager shut down.** The server is stopping.
+**Invalid owner.** Source message, not run live.
 
 ```
-browser_create: browsers: manager has been shut down
+browser_create: owner "bad/name" is invalid — use 1 to 64 characters from A-Z, a-z, 0-9, '.', '_' and '-' only
 ```
 
-This path was not run live. The message comes from the source. Recovery: start a new `browser serve mcp` process.
+**Bad argument shape.** The error names the field, the wanted type and the value it received, then shows one corrected call. A client that sends `"true"` as text is corrected automatically. Source: `code://pkg/mcp/tools/registry.go`.
+
+## Tested calls
+
+Verified 2026-10-25 on the live server. The unscoped call ran over MCP. The scoped, strict and proxy calls ran through the CLI against the same shared manager, so the engine path and every error string above are live.
+
+```json
+{"tool":"browser_create","arguments":{"headless":true,"stealth":true}}
+```
+
+Payload: `{"browser_id":"browser-4","owner":"unowned","persist":false,"ttl":"30m0s","scope":"open","scope_strict":false,"reused":false}`.
+
+```json
+{"tool":"browser_create","arguments":{"owner":"doc-web128","headless":true,"stealth":true,"scope":["wikipedia.org"],"headers":{"X-Doc-Test":"web-128"}}}
+```
+
+Payload: `scope:"wikipedia.org", scope_strict:false, reused:false`. A fetch to another host failed with the scoped refusal above. A fetch to a page under the allowed domain succeeded, proving the subdomain inherits. `{"owner":"doc-strict","headless":true,"scope_strict":true}` returned `scope:"strict", scope_strict:true` and refused a navigation.
 
 ## When not to use it
 
-Do not call `browser_create` to open a page. Call `fetch_page`. It uses the default browser and creates the tab.
+Do not call `browser_create` to open a page. Call `fetch_page` with a `browser_id`.
 
-Do not create a browser for every task. Reuse the live default unless you need a separate profile or process.
+Do not repeat the same owner and options per call. That reuses one browser automatically.
 
-Do not use it to inspect state. Use `browser_list`.
+Do not use `owner` as authentication. It is a label, not a permission check.
 
-Do not omit `profile` on a second browser while the default browser is live. The launch fails on the profile lock.
+Do not pass credentials in `proxy`. They belong in `proxy.json` only.
 
-Do not use it to close a browser. Use `browser_close`.
+Do not use `scope` as a security boundary. Redirects and subresources bypass it. It bounds navigation cost, not trust.
+
+Do not omit `profile` on a second browser that needs the same persistent directory as a live one. The create fails on the profile lock.
 
 ## Related tools
 
-- `browser_list` — lists live browsers, their absolute `profile_dir`, and their pages.
-- `browser_close` — closes one browser and its pages. Pass the id you got here.
+- `browser_list` — lists live browsers with `owner`, `persist`, `ephemeral`, `idle_for`, `ttl`, `scope`, and `scope_strict`. An unscoped browser shows `"scope":"open"`.
+- `browser_close` — closes one browser. `purge:true` also deletes its profile.
 - `fetch_page` — opens a page in a browser and returns a `session_id`.
-- `page_list` — lists the pages of one browser.
-- `session_list` — lists all live sessions without a `browser_id`.
-- `session_close` — closes one page.
+- `page_list` / `session_list` / `session_close` — pages inside a browser.
 
 See [browser_create_example.md](../examples/browser_create_example.md) for copyable call sequences with expected output.
+
+## Maintainer anchors
+
+- Owner validation: `code://pkg/mcp/tools/browser.go#L17-L33`
+- Tool description: `code://pkg/mcp/tools/browser.go#L55-L78`
+- Input schema: `code://pkg/mcp/tools/browser.go#L82-L150`
+- Execute path: `code://pkg/mcp/tools/browser.go#L170-L234`
+- Result shape: `code://pkg/mcp/tools/browser.go#L238-L261`
+- Create key: `code://pkg/browsers/manager.go#L447-L482`
+- Create and reuse: `code://pkg/browsers/manager.go#L540-L582`
+- Profile collision: `code://pkg/browsers/manager.go#L865-L878`
+- Launcher proxy and cert flags: `code://pkg/browsers/browser.go#L311-L334`
+- Proxy parse and credential key: `code://pkg/browsers/proxyauth.go#L20-L70`
+- Loopback check: `code://pkg/browsers/proxyauth.go#L83-L93`
+- Proxy auth arming: `code://pkg/browsers/proxyauth.go#L110-L112`
+- proxy.json load and mode 0600: `code://pkg/config/proxy.go#L40-L73`
+- Scope matching: `code://pkg/browsers/policy.go#L96-L121`
+- Scope refusal: `code://pkg/browsers/policy.go#L140-L154`
+- Headers install: `code://pkg/browsers/policy.go#L219-L242`

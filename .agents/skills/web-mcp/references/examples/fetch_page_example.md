@@ -8,111 +8,74 @@ primary. Your ids and byte counts can differ.
 ## 1. Create a browser you own
 
 ```json
-{"tool":"browser_create","arguments":{"profile":"skill-fetch-96","headless":true,"stealth":true}}
+{"tool":"browser_create","arguments":{"headless":true,"stealth":true,"persist":false}}
 ```
 
 ```json
-{"browser_id":"browser-16"}
+{"ok":true,"data":{"browser_id":"browser-4","owner":"unowned","persist":false,"ttl":"30m0s","scope":"open","scope_strict":false,"reused":false}}
 ```
 
-Record the id. Use it in every later call. Add `"persist":false` when your client accepts it.
+Record the `browser_id` inside `data`. Use it in every later call. `serve mcp` starts no
+browser, so this call can take launch time.
 
-## 2. Fetch with each wait mode
+## 2. Fetch one page
 
 ```json
-{"tool":"fetch_page","arguments":{"url":"https://en.wikipedia.org/wiki/Web_browser","wait_for":"load","browser_id":"browser-16","timeout_ms":60000}}
-```
-
-```json
-{"session_id":"page-1","title":"Web browser - Wikipedia","url":"https://en.wikipedia.org/wiki/Web_browser","text_snippet":"Jump to content\nMain menu\nSearch\n…","html_bytes":597043,"load_ms":1185}
-```
-
-Repeat with `"wait_for":"idle"` and `"wait_for":"stable"`. Live test: `idle` returned in
-1534 ms, `stable` returned in 1479 ms. Each call returned a new `session_id`.
-
-## 3. Fetch a client-rendered page
-
-```json
-{"tool":"fetch_page","arguments":{"url":"https://react.dev/learn","wait_for":"stable","browser_id":"browser-16","timeout_ms":8000}}
-```
-
-Output (abridged): `{"session_id":"page-4","title":"Quick Start – React","url":"https://react.dev/learn","html_bytes":285239,"load_ms":2570}`.
-
-## 4. Apply a viewport
-
-```json
-{"tool":"fetch_page","arguments":{"url":"https://example.com","wait_for":"load","browser_id":"browser-16","viewport":{"width":800,"height":600}}}
-```
-
-Confirm the viewport. The `eval` value must be a function expression.
-
-```json
-{"tool":"page_act","arguments":{"session_id":"page-5","action":"eval","value":"() => JSON.stringify({w:innerWidth,h:innerHeight,dpr:devicePixelRatio})"}}
-```
-
-Output: `"{\"w\":800,\"h\":600,\"dpr\":1}"`.
-
-## 5. Device beats viewport, and UA beats both
-
-```json
-{"tool":"fetch_page","arguments":{"url":"https://example.com","wait_for":"load","browser_id":"browser-16","device":"IPadPro","viewport":{"width":400,"height":400}}}
-```
-
-The eval returns `1024x1366` at DPR 2. The device won.
-
-```json
-{"tool":"fetch_page","arguments":{"url":"https://example.com","wait_for":"load","browser_id":"browser-16","user_agent":"webmcp-skill-test/1.0"}}
-```
-
-`page_act` `eval` of `() => navigator.userAgent` returns `"webmcp-skill-test/1.0"`. A fetch
-with `"device":"IPhoneX"` gives `375x812` at DPR 3. Call `page_list` to confirm the pages.
-
-## 6. Errors you can expect
-
-```json
-{"tool":"fetch_page","arguments":{"url":"not-a-url","browser_id":"browser-16"}}
-```
-
-```text
-MCP error -32603: fetch_page: browsers: navigate: {-32000 Cannot navigate to invalid URL }
+{"tool":"fetch_page","arguments":{"url":"https://react.dev/learn","wait_for":"stable","browser_id":"browser-4","timeout_ms":30000}}
 ```
 
 ```json
-{"tool":"fetch_page","arguments":{"url":"ftp://example.com/file","browser_id":"browser-16"}}
+{"ok":true,"data":{"session_id":"page-1","title":"Quick Start – React","url":"https://react.dev/learn","text_snippet":"React\nv19.3\nSearch\nCtrl\nK\n…","html_bytes":285239,"load_ms":2760}}
 ```
 
-```text
-MCP error -32603: fetch_page: browsers: navigate: navigation failed: net::ERR_ABORTED
+Read `session_id` from `data`. The full `text_snippet` runs 500 characters.
+
+## 3. Failure: bad wait mode
+
+```json
+{"tool":"fetch_page","arguments":{"url":"https://react.dev/learn","wait_for":"bogus","browser_id":"browser-4"}}
 ```
 
 ```json
-{"tool":"fetch_page","arguments":{"url":"https://en.wikipedia.org/wiki/Web_browser","wait_for":"stable","browser_id":"browser-16","timeout_ms":1200}}
+{"ok":false,"error":{"type":"invalid_args","message":"fetch_page: invalid wait_for \"bogus\" (must be one of load, idle, stable)","hint":"fix the arguments per the tool InputSchema (required fields, enum values)"}}
 ```
 
-```text
-MCP error -32603: fetch_page: context deadline exceeded (session page-10 closed)
-```
+The failure happened at validation, before any browser work. No session was created.
 
-The tab number depends on your session count. The timeout closes the tab. Do not reuse that id.
-
-## 8. Clean up
-
-Close the browser you created. This also closes every page in it.
+## 4. Failure: unreachable host
 
 ```json
-{"tool":"browser_close","arguments":{"browser_id":"browser-16"}}
+{"tool":"fetch_page","arguments":{"url":"https://this-host-does-not-exist-96.invalid/","browser_id":"browser-4"}}
 ```
 
-Output: `browser browser-16 closed`. Then run `browser_list` and confirm the id is absent.
-Do not close `browser-1`. Never send `{}` or an empty `browser_id` to `browser_close`.
+```json
+{"ok":false,"error":{"type":"nav_failed","message":"fetch_page: browsers: navigate: navigation failed: net::ERR_NAME_NOT_RESOLVED","hint":"the page navigation failed — verify the URL is reachable, retry, or re-fetch the page"}}
+```
 
-This build's `session_close` resolves pages on the default browser. It cannot close a page
-in your own browser. It returned `session_close: browsers: page "page-9" not found` for a
-live page. Close your browser instead.
+## 5. Failure: timeout closes the tab
 
-## Schema fallback
+The message text is from a live run with `timeout_ms: 1200`. The envelope wrapping is the
+rule in [fetch_page.md](../tools/fetch_page.md).
 
-Send one JSON object with only the documented keys. Confirm `browser_id` with
-`browser_list` first, because an unknown id creates a browser.
+```json
+{"ok":false,"error":{"type":"timeout","message":"fetch_page: context deadline exceeded (session page-10 closed)","hint":"the call exceeded its timeout (default 30s) — retry with a higher timeout_ms, narrow the selector, or the page is wedged"}}
+```
 
-See [fetch_page.md](../tools/fetch_page.md) for the full input table, return shape, and error strings.
+The tab number depends on your session count. The timeout closes the tab. Do not reuse
+that id.
+
+## 6. Clean up
+
+```json
+{"tool":"browser_close","arguments":{"browser_id":"browser-4"}}
+```
+
+```json
+{"ok":true,"data":"browser browser-4 closed"}
+```
+
+Then run `browser_list` and confirm the id is absent from `data`. Do not close
+`browser-1`. Never send `{}` or an empty `browser_id` to `browser_close`.
+
+See [fetch_page.md](../tools/fetch_page.md) for the full input table, return shape, and
+error types.

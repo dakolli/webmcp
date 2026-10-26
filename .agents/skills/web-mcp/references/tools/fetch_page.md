@@ -15,9 +15,13 @@ The call reuses a live browser. It applies stealth, viewport, device, and User-A
 settings **before** navigation. The loaded page sees those settings. You do not need to
 navigate again.
 
+`serve mcp` starts no browser. If no browser can be resolved for you, `fetch_page`
+launches one and the first call pays the launch time. Call `browser_create` first when
+you want to control the launch options.
+
 ## Inputs
 
-`url` is the only required input. The source is `code://pkg/mcp/tools/fetch.go#L49`.
+`url` is the only required input. Schema source: `code://pkg/mcp/tools/fetch.go#L55-L102`.
 
 | Name | Type | Required | Default | Meaning |
 | :--- | :--- | :--- | :--- | :--- |
@@ -29,16 +33,17 @@ navigate again.
 | `device` | string | no | none | go-rod preset name or Title, case-insensitive. Examples: `IPhoneX`, `iphone x`, `IPadPro`. `clear` resets emulation. |
 | `user_agent` | string | no | browser default | User-Agent override for this page, applied before navigation. |
 
-**Precedence.** `device` beats `viewport`. Live test: `IPadPro` plus `viewport`
-`400x400` gave a `1024x1366` viewport at DPR 2. A `user_agent` wins over a device preset's
-UA when you pass both. That rule comes from the source and was not run live.
-
-The schema has no `persist` input, and this MCP client omits it. A lone `profile` name on
-`browser_create` therefore yields a persistent profile. See the example's isolation note.
+**Precedence.** `device` beats `viewport`. Live test: `IPadPro` plus `viewport` `400x400`
+gave a `1024x1366` viewport at DPR 2. A `user_agent` wins over a device preset's UA when
+you pass both. That rule comes from the source and was not run live.
 
 ## Returns
 
-The tool returns one line of compact JSON. It has no wrapper and no `ok` field.
+Every result is one envelope. The payload lives in `data`. The envelope rule with the
+failure branch and the full error-type list is in [SKILL.md](../../SKILL.md) under
+Cross-cutting rules.
+
+On success `data` is one page summary object:
 
 | Field | Type | Meaning |
 | :--- | :--- | :--- |
@@ -47,16 +52,16 @@ The tool returns one line of compact JSON. It has no wrapper and no `ok` field.
 | `url` | string | Final URL after redirects. |
 | `text_snippet` | string | First 500 characters of `document.body.innerText`. |
 | `html_bytes` | integer | Byte length of the full outer HTML. |
-| `load_ms` | integer | Time from call start through the wait and the summary reads. It includes browser launch or relaunch. |
+| `load_ms` | integer | Time from call start through the wait and the summary reads. It includes a forced launch. |
 
 Live result:
 
 ```json
-{"session_id":"page-1","title":"Web browser - Wikipedia","url":"https://en.wikipedia.org/wiki/Web_browser","text_snippet":"Jump to content\nMain menu\nSearch\n…","html_bytes":597043,"load_ms":1185}
+{"ok":true,"data":{"session_id":"page-1","title":"Quick Start – React","url":"https://react.dev/learn","text_snippet":"React\nv19.3\nSearch\nCtrl\nK\n…","html_bytes":285239,"load_ms":2760}}
 ```
 
 The snippet is cut at 500 characters. `html_bytes` can change between fetches because
-scripts inject content. Live test: 597043, 614822, and 614807 bytes on one page.
+scripts inject content.
 
 ## Behavior and limits
 
@@ -72,19 +77,15 @@ scripts inject content. Live test: 597043, 614822, and 614807 bytes on one page.
 Use `stable` for client-rendered pages such as `react.dev`. Each mode can stall. The
 timeout ends the stall.
 
-**Live timings.** Wikipedia with a 60 s cap: `load` 1185 ms, `idle` 1534 ms, `stable`
-1479 ms. `react.dev/learn` with `stable` and an 8 s cap: 2570 ms. `example.com` with the
-default `idle`: 687 ms.
-
 **Timeout covers everything.** The bound starts before the browser lookup. It includes a
-cold Chromium download. A short timeout on a first run fails before any page loads.
+cold Chromium download and a launch that no live browser can serve.
 
-**A wait timeout closes the tab.** The error names the closed session:
+**A wait timeout closes the tab.** The envelope names the closed session in `message`:
 `fetch_page: context deadline exceeded (session page-10 closed)`. Do not reuse that id.
 
 **Lifecycle.** The engine sweeps idle pages after 15 minutes. A later `page_fetch` with an
-expired id returns a not-found error. If Chromium dies, the next call relaunches it under
-the same `browser_id`. Old session ids then fail with a "browser was restarted" error.
+expired id returns a `page_closed` envelope. A relaunch after a Chromium death makes old
+session ids fail with a "browser was restarted" error, also typed `page_closed`.
 
 **`browser_id` is not checked.** Live test: `{"browser_id":"browser-999"}` did not fail.
 It launched a browser with the literal id `browser-999` and an ephemeral profile. A typo
@@ -100,81 +101,80 @@ close sessions you no longer need.
 
 ## Failure modes and recovery
 
-The server prefixes tool errors with `MCP error -32603: `. The strings below show the
-message after that prefix.
+Every failure is one envelope:
 
-**Invalid URL.** Live test: `"not-a-url"`.
-`fetch_page: browsers: navigate: {-32000 Cannot navigate to invalid URL }`
-
-**DNS failure.** Live test: `https://this-host-does-not-exist-96.invalid/`.
-`fetch_page: browsers: navigate: navigation failed: net::ERR_NAME_NOT_RESOLVED`
-
-Recovery for both: send an absolute URL with a resolvable host.
-
-**Non-http scheme.** The schema says http or https. `file://` loaded in the live test with
-no error, so the code does not enforce the scheme. Do not rely on that. FTP failed with
-`fetch_page: browsers: navigate: navigation failed: net::ERR_ABORTED` on
-`ftp://example.com/file`. Recovery: serve the content over http or https.
-
-**Timeout before the page loads.** Live test with `timeout_ms: 1` created no session:
-`fetch_page: browsers: apply stealth: context deadline exceeded`. Recovery: raise
-`timeout_ms` and retry. Allow more time on a cold start.
-
-**Timeout during the wait.** The tab is closed for you. Live test: a 1200 ms cap on
-Wikipedia with `stable`.
-
-```
-fetch_page: context deadline exceeded (session page-10 closed)
+```json
+{"ok":false,"error":{"type":<type>,"message":"fetch_page: …","hint":"<one-line fix>"}}
 ```
 
-Recovery: retry with a larger cap or a cheaper wait mode.
+The message starts with `fetch_page: `. Types seen by this tool: `invalid_args`,
+`nav_failed`, `timeout`, `page_closed`, `anti_bot`, and `unknown`.
 
-**Close also failed.** Rare. This format comes from the source and was not run live. The message appends the close error:
-`fetch_page: context deadline exceeded (session page-7 closed, but close reported: …)`.
-The session is already evicted. Do not call `session_close` for it.
+**Invalid `wait_for`.** Live result:
 
-**Unknown device.** Live test with `device:"Nokia3310"`:
-`fetch_page: unknown device "Nokia3310" (see go-rod lib/devices presets, e.g. IPhoneX, IPadPro, LaptopWithHiDPIScreen)`.
-Recovery: use a real preset name or `clear`.
+```json
+{"ok":false,"error":{"type":"invalid_args","message":"fetch_page: invalid wait_for \"bogus\" (must be one of load, idle, stable)","hint":"fix the arguments per the tool InputSchema (required fields, enum values)"}}
+```
 
-**Bad viewport.** Live test with `height:0`: `fetch_page: viewport width and height must be positive`.
-Recovery: send positive integers.
+**DNS failure.** Live result for `https://this-host-does-not-exist-96.invalid/`:
 
-**Negative timeout.** Live test with `timeout_ms:-5`: `fetch_page: timeout_ms must be >= 0`.
-Recovery: omit the field or send a non-negative value.
+```json
+{"ok":false,"error":{"type":"nav_failed","message":"fetch_page: browsers: navigate: navigation failed: net::ERR_NAME_NOT_RESOLVED","hint":"the page navigation failed — verify the URL is reachable, retry, or re-fetch the page"}}
+```
 
-**Missing url or bad enum.** The client schema usually blocks these before the server. The
-server strings are `fetch_page: missing required argument "url"` and
-`fetch_page: invalid wait_for "<value>" (must be one of load, idle, stable)`.
+**Invalid URL string.** Live result for `"not-a-url"`:
 
-**Bad JSON shape.** `fetch_page: invalid arguments: json: cannot unmarshal …`. Recovery:
-send one JSON object with the documented keys.
+```json
+{"ok":false,"error":{"type":"unknown","message":"fetch_page: browsers: navigate: {-32000 Cannot navigate to invalid URL }"}}
+```
 
-**Server stopping.** `fetch_page: browsers: manager has been shut down`. Recovery: start a
-new `browser serve mcp` process.
+Recovery for all three: send an absolute http or https URL with a resolvable host, or fix the enum value. The `unknown` type carries no hint.
+
+**Non-http scheme.** `file://` loaded with no error, so the code does not enforce the
+schema scheme. Do not rely on that. FTP failed with a `nav_failed` envelope whose message
+ends `net::ERR_ABORTED`. Serve the content over http or https.
+
+**Timeout before the page loads.** Live test with `timeout_ms: 1` created no session.
+Typed `timeout`, message `fetch_page: browsers: apply stealth: context deadline exceeded`.
+
+**Timeout during the wait.** The tab is closed for you. Typed `timeout`, message
+`fetch_page: context deadline exceeded (session page-10 closed)`. Recovery: retry with a
+larger cap or a cheaper wait mode.
+
+**Close also failed.** Rare. The message appends the close error and the session is
+already evicted: `fetch_page: context deadline exceeded (session page-7 closed, but close
+reported: …)`. Do not call `session_close` for it.
+
+**Unknown device.** Typed `invalid_args`. Live message: `fetch_page: unknown device
+"Nokia3310" (see go-rod lib/devices presets, e.g. IPhoneX, IPadPro, LaptopWithHiDPIScreen)`.
+
+**Bad arguments.** Typed `invalid_args`. Exact messages: `fetch_page: viewport width and
+height must be positive`, `fetch_page: timeout_ms must be >= 0`, `fetch_page: missing
+required argument "url"`, and `fetch_page: invalid arguments: json: cannot unmarshal …`.
+
+**Bot challenge.** A challenge page or a denied navigation is typed `anti_bot`. The hint
+says: retry after a wait, toggle stealth via `browser_create`, or hand off to a human.
+
+**Server stopping.** Typed `unknown`, message `fetch_page: browsers: manager has been
+shut down`. Recovery: start a new `browser serve mcp` process.
 
 ## When not to use
 
-Do not use `fetch_page` to re-read an open page. Use `page_fetch` with the `session_id`.
-
-Do not use it to click, type, or scroll. Use `page_act`.
-
+Do not re-read an open page with it. Use `page_fetch` with the `session_id`.
+Do not click, type, or scroll with it. Use `page_act`.
 Do not pass a guessed `browser_id`. An unknown id creates a browser.
-
-Do not use it as a stateless HTTP client for static pages. Every call pays a tab and a full navigation.
-
-Do not use it to close a tab. Use `session_close` for the default browser, or `browser_close` for a browser that you own.
+Do not use it as a stateless HTTP client. Every call pays a tab and a full navigation.
+Do not close a tab with it. Use `session_close` or `browser_close`.
 
 ## Related tools
 
 - `page_fetch` — read html, dom, text, links, meta, and other aspects of the session.
 - `page_act` — click, type, press keys, evaluate JS, and navigate inside the session.
 - `page_list` — list the pages of one browser. Confirm your new page here.
-- `session_list` — list every live session across browsers.
+- `session_list` — list the live sessions the manager resolves for you.
 - `session_close` — close one page.
 - `browser_create` — create an isolated browser with its own profile.
 - `browser_list` — list live browsers, their absolute `profile_dir`, and their pages.
 - `browser_close` — close one browser and every page in it.
 
-See [fetch_page_example.md](../examples/fetch_page_example.md) for copyable call sequences with expected
-output.
+See [fetch_page_example.md](../examples/fetch_page_example.md) for copyable call sequences with expected output.

@@ -2,106 +2,117 @@
 
 # browser_create example
 
-Use this file only when tool calling for `browser_create` fails. The tool description is primary. The full contract is in [browser_create.md](../tools/browser_create.md).
+Use this file when tool calling for `browser_create` fails. The tool description is primary. The full contract is in [browser_create.md](../tools/browser_create.md).
 
-This sequence reuses the default browser, creates one isolated browser, confirms it, tests common failures, and closes it. Ids and paths differ on your host.
+Every result rides the envelope: `{"ok":true,"data":<shown payload>}`. Errors ride `{"ok":false,"error":{"type":…,"message":…,"hint":…}}`. Only the payload is shown below.
 
-## 1. Reuse the live default browser
+This sequence creates a persistent browser and an ephemeral browser under two owners, reuses one, tests a profile collision, creates a scoped browser with an identity header, creates a local-proxy browser, then closes with exact ids. Run it on an isolated server. Ids and paths differ on your host.
 
-```json
-{"tool":"browser_create","arguments":{}}
-```
-
-Expected output:
+## 1. Create a persistent browser
 
 ```json
-{"browser_id":"browser-1"}
+{"tool":"browser_create","arguments":{"owner":"client-a","profile":"audit","persist":true,"headless":true,"stealth":true}}
 ```
 
-Zero arguments reuses `browser-1` only while it is alive. If it is dead, the call returns a new id. Do not assume `browser-1` after a restart.
-
-## 2. Create an isolated browser
+Expected payload:
 
 ```json
-{"tool":"browser_create","arguments":{"profile":"skill-create-93","headless":true,"stealth":true}}
+{"browser_id":"browser-2","owner":"client-a","persist":true,"ttl":"30m0s","scope":"open","scope_strict":false,"reused":false}
 ```
 
-Expected output:
+Record the id. The profile resolves under `<profiles-dir>/audit`.
+
+## 2. Repeat the same call
 
 ```json
-{"browser_id":"browser-5"}
+{"tool":"browser_create","arguments":{"owner":"client-a","profile":"audit","persist":true,"headless":true,"stealth":true}}
 ```
 
-The id can differ. Record it. Every option creates a new browser. Add `"persist":false` to delete the profile on close when your host exposes that field.
-
-## 3. Confirm the new browser
+Expected payload:
 
 ```json
-{"tool":"browser_list","arguments":{}}
+{"browser_id":"browser-2","owner":"client-a","persist":true,"ttl":"30m0s","scope":"open","scope_strict":false,"reused":true}
 ```
 
-Expected output, trimmed to your browser:
+The same owner and the same options reuse the live browser.
+
+## 3. Collide on the same profile as another owner
 
 ```json
-[
-  {
-    "browser_id": "browser-5",
-    "profile_dir": "/home/<user>/.config/browser-mcp/profiles/skill-create-93",
-    "pages": []
-  }
-]
+{"tool":"browser_create","arguments":{"owner":"client-b","profile":"audit","persist":true,"headless":true,"stealth":true}}
 ```
 
-The `profile_dir` is absolute. `pages` is empty because `browser_create` opens no page.
+Expected error. The envelope carries the message, and the tool prefixes it with `browser_create: `.
 
-## 4. Failure: reuse the default profile
+```
+profile "…/audit" is already in use by browser-2 (owned by client-a) — close it with browser_close {browser_id: "browser-2"} or pick a different profile name
+```
+
+Recovery: pick a different `profile`, or create an ephemeral browser with no `profile`.
+
+## 4. Create an ephemeral browser for another owner
 
 ```json
-{"tool":"browser_create","arguments":{"headless":true,"stealth":true}}
+{"tool":"browser_create","arguments":{"owner":"client-b","headless":true,"stealth":true,"persist":false}}
 ```
 
-Expected error while `browser-1` is live:
-
-```
-MCP error -32603: browser_create: browsers: launch browser browser-2: browsers: launch chromium: profile "…/profiles/default" appears to be in use by another running browser — pass a distinct profile name: … SingletonLock: File exists (17)
-```
-
-Recovery: pass a unique `profile` name.
-
-## 5. Failure: bad binary
+Expected payload:
 
 ```json
-{"tool":"browser_create","arguments":{"bin":"/nonexistent/definitely-not-a-browser-93","profile":"skill-create-93-bin","headless":true}}
+{"browser_id":"browser-3","owner":"client-b","persist":false,"ttl":"30m0s","scope":"open","scope_strict":false,"reused":false}
 ```
 
-Expected error:
+The profile sits under `<profiles-dir>/.ephemeral/browser-3-<random>` and is deleted on close.
 
-```
-MCP error -32603: browser_create: browsers: launch browser browser-11: browsers: launch chromium: fork/exec /nonexistent/definitely-not-a-browser-93: no such file or directory
-```
-
-## 6. Failure: relative profile path
+## 5. Create a scoped browser with an identity header
 
 ```json
-{"tool":"browser_create","arguments":{"profile":"./leak","headless":true}}
+{"tool":"browser_create","arguments":{"owner":"doc-web128","headless":true,"stealth":true,"scope":["wikipedia.org"],"headers":{"X-Bug-Bounty":"your-handle"}}}
 ```
 
-Expected error:
+Expected payload:
+
+```json
+{"browser_id":"browser-4","owner":"doc-web128","persist":false,"ttl":"30m0s","scope":"wikipedia.org","scope_strict":false,"reused":false}
+```
+
+Verified live on 2026-10-25 with `scope:["wikipedia.org"]` and a test header:
+
+- A fetch to a page under the allowed domain succeeded. The bare host covers its subdomains.
+- A fetch to any other host failed with the scoped refusal in the reference.
+- The network capture showed the identity header on the document request and on every subresource request.
+- Repeating the same call with `scope` sent as the string `"[\"wikipedia.org\"]"` is accepted. The registry rewrites it into the array.
+
+## 6. Create a local-proxy browser with ignore_certs
+
+```json
+{"tool":"browser_create","arguments":{"owner":"doc-proxy","headless":true,"proxy":"127.0.0.1:8080","ignore_certs":true}}
+```
+
+Expected payload:
+
+```json
+{"browser_id":"browser-5","owner":"doc-proxy","persist":false,"ttl":"30m0s","scope":"open","scope_strict":false,"reused":false}
+```
+
+This pairs the browser with a local intercept proxy on port 8080 and accepts its MITM CA. Verified live on 2026-10-25 for the failure paths, all rejected before Chromium starts:
 
 ```
-MCP error -32603: browser_create: browsers: resolve profile for browser-12: config: profile "./leak" is a relative path; pass an absolute path or a bare name (resolved under browser-mcp/profiles)
+browsers: invalid proxy "http://user:pass@127.0.0.1:8080": credentials are not accepted here; put them in <config-dir>/proxy.json and chmod 600 it
+browsers: invalid proxy "127.0.0.1:99999": port "99999" must be a number between 1 and 65535
+browsers: invalid proxy "127.0.0.1": missing port; pass host:port
 ```
 
-## 7. Close your browser
+A loopback proxy with no entry in `~/.config/browser-mcp/proxy.json` launches with no auth handler. A page through a dead proxy then fails with `net::ERR_PROXY_CONNECTION_FAILED`.
+
+Credentials never go in the call. See the reference for the `proxy.json` contract.
+
+## 7. Close every browser you created
 
 ```json
 {"tool":"browser_close","arguments":{"browser_id":"browser-5"}}
 ```
 
-Expected output:
+Repeat for browser-4, browser-3, and browser-2. Expected message per call: `browser browser-5 closed`.
 
-```
-browser browser-5 closed
-```
-
-Close only the ids you created. Never send `{}` or an empty `browser_id` in a shared session.
+Always close the browser you created with its exact id. Never send `{}` or an empty `browser_id` in a shared session.
