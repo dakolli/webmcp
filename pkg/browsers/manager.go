@@ -29,6 +29,33 @@ type BrowserID string
 // ErrUnknownBrowser reports that a browser id does not match a live browser.
 var ErrUnknownBrowser = errors.New("unknown browser")
 
+// PageLookupKind classifies why a page id did not resolve for the caller.
+type PageLookupKind string
+
+const (
+	// PageLookupForeign means the id exists only outside the declared owner.
+	PageLookupForeign PageLookupKind = "foreign"
+	// PageLookupAmbiguous means the page id cannot be pinned to one browser.
+	PageLookupAmbiguous PageLookupKind = "ambiguous"
+	// PageLookupMissing means no live browser holds the id.
+	PageLookupMissing PageLookupKind = "missing"
+)
+
+// PageLookupError reports a page id that the qualifier-aware lookup refused.
+// Message is the exact human sentence; Kind is the machine branch the surfaces
+// map to a result-envelope error type.
+type PageLookupError struct {
+	// ID is the page id that failed to resolve.
+	ID PageID
+	// Kind classifies the refusal.
+	Kind PageLookupKind
+	// Message is the human sentence returned to the caller.
+	Message string
+}
+
+// Error returns the human sentence for the lookup failure.
+func (e *PageLookupError) Error() string { return e.Message }
+
 // defaultTTL is the per-page idle timeout applied by NewManager when no
 // WithTTL option is given. Pages that go unused for longer than the TTL are
 // closed by the manager's background sweeper.
@@ -1245,36 +1272,184 @@ func profileDirWithinProfiles(dir string) (string, error) {
 	return abs, nil
 }
 
-// Page resolves the live page with the given PageID across all active browsers.
-func (m *Manager) Page(ctx context.Context, id PageID) (*Page, error) {
-	m.mu.Lock()
-	browsers := make([]*Browser, 0, len(m.browsers))
-	for _, b := range m.browsers {
-		browsers = append(browsers, b)
-	}
-	m.mu.Unlock()
-
-	if len(browsers) == 0 {
-		b, err := m.Open(ctx)
-		if err != nil {
+// Page resolves the live page with the given PageID inside the declared browser
+// or owner. browserID pins the lookup to one browser; owner restricts it to
+// browsers carrying that owner; when neither is given the id resolves only if
+// exactly one browser is live. A page held outside the declaration is never
+// returned. A cold manager keeps the historical lazy-open behavior for the
+// unqualified single-browser path.
+func (m *Manager) Page(
+	ctx context.Context,
+	id PageID,
+	browserID BrowserID,
+	owner string,
+) (*Page, error) {
+	if browserID == "" && owner == "" && len(m.Browsers()) == 0 {
+		if _, err := m.Open(ctx); err != nil {
 			return nil, err
 		}
-		browsers = append(browsers, b)
 	}
+	b, err := m.resolvePage(id, browserID, owner)
+	if err != nil {
+		return nil, err
+	}
+	return b.Page(ctx, id)
+}
 
-	for _, b := range browsers {
-		if p, err := b.Page(ctx, id); err == nil {
-			return p, nil
-		}
+// resolvePage resolves id inside the declared browser or owner. The order is an
+// explicit browser_id, then an explicit owner, then the only live browser. Two
+// or more live browsers without a qualifier are ambiguous and refused; an id
+// held outside the declared owner is reported as not found with the holding
+// browsers named and no page content.
+func (m *Manager) resolvePage(
+	id PageID,
+	browserID BrowserID,
+	owner string,
+) (*Browser, error) {
+	if browserID != "" {
+		return m.resolvePageIn(id, browserID)
 	}
 
 	m.mu.Lock()
+	live := make([]*Browser, 0, len(m.browsers))
+	for _, b := range m.browsers {
+		live = append(live, b)
+	}
 	relaunched := m.relaunched
 	m.mu.Unlock()
-	if relaunched {
-		return nil, fmt.Errorf("session %q no longer exists: browser was restarted; call fetch_page to re-open URLs", id)
+
+	sort.Slice(live, func(i, j int) bool { return live[i].id < live[j].id })
+
+	if owner != "" {
+		holders := make([]*Browser, 0, 2)
+		foreign := make([]*Browser, 0, 2)
+		for _, b := range live {
+			if _, _, ok := b.lookupPage(id); !ok {
+				continue
+			}
+			if b.Owner() == owner {
+				holders = append(holders, b)
+				continue
+			}
+			foreign = append(foreign, b)
+		}
+		switch len(holders) {
+		case 1:
+			return holders[0], nil
+		case 0:
+			if len(foreign) > 0 {
+				return nil, foreignSessionError(id, owner, foreign)
+			}
+			return nil, m.pageLookupError(id, relaunched)
+		default:
+			return nil, ambiguousSessionError(id, holders)
+		}
 	}
-	return nil, fmt.Errorf("session %q not found", id)
+
+	if len(live) >= 2 {
+		return nil, &PageLookupError{
+			ID:   id,
+			Kind: PageLookupAmbiguous,
+			Message: fmt.Sprintf(
+				"session %q needs a browser — %d browsers are live: %s; pass browser_id or owner",
+				id,
+				len(live),
+				browserOwners(live),
+			),
+		}
+	}
+	if len(live) == 1 {
+		if _, _, ok := live[0].lookupPage(id); !ok {
+			return nil, m.pageLookupError(id, relaunched)
+		}
+		return live[0], nil
+	}
+	return nil, m.pageLookupError(id, relaunched)
+}
+
+// resolvePageIn resolves id inside the explicitly named browser, crossing the
+// owner declaration on purpose. An unknown browser or page is refused.
+func (m *Manager) resolvePageIn(id PageID, browserID BrowserID) (*Browser, error) {
+	m.mu.Lock()
+	target := m.browsers[browserID]
+	running := m.runningIDsLocked()
+	m.mu.Unlock()
+
+	if target == nil {
+		return nil, fmt.Errorf(
+			"browser %q not found (running: %s): %w",
+			browserID,
+			running,
+			ErrUnknownBrowser,
+		)
+	}
+	if _, _, ok := target.lookupPage(id); !ok {
+		return nil, &PageLookupError{
+			ID:   id,
+			Kind: PageLookupMissing,
+			Message: fmt.Sprintf(
+				"session %q not found in browser %s (live: %s)",
+				id,
+				browserID,
+				pageIDsOrNone(m.livePageIDs()),
+			),
+		}
+	}
+	return target, nil
+}
+
+// pageLookupError renders the not-found error for a session id, naming every
+// live page id and explaining a pre-restart id.
+func (m *Manager) pageLookupError(id PageID, relaunched bool) error {
+	live := pageIDsOrNone(m.livePageIDs())
+	message := fmt.Sprintf("session %q not found (live: %s)", id, live)
+	if relaunched {
+		message = fmt.Sprintf(
+			"session %q no longer exists: browser was restarted; call fetch_page to re-open URLs (live: %s)",
+			id,
+			live,
+		)
+	}
+	return &PageLookupError{ID: id, Kind: PageLookupMissing, Message: message}
+}
+
+// foreignSessionError reports that id exists only outside the declared owner,
+// naming the holding browsers and owners without returning any page content.
+func foreignSessionError(id PageID, owner string, holders []*Browser) error {
+	return &PageLookupError{
+		ID:   id,
+		Kind: PageLookupForeign,
+		Message: fmt.Sprintf(
+			"session %q is not in owner %s — held by %s; pass browser_id to reach it on purpose",
+			id,
+			owner,
+			browserOwners(holders),
+		),
+	}
+}
+
+// ambiguousSessionError reports that id cannot be pinned to one browser,
+// naming each holder and owner so the caller can narrow it.
+func ambiguousSessionError(id PageID, holders []*Browser) error {
+	return &PageLookupError{
+		ID:   id,
+		Kind: PageLookupAmbiguous,
+		Message: fmt.Sprintf(
+			"session %q needs a browser — %d browsers hold it: %s; pass browser_id",
+			id,
+			len(holders),
+			browserOwners(holders),
+		),
+	}
+}
+
+// browserOwners renders "browser-N (owner X)" entries for a lookup message.
+func browserOwners(list []*Browser) string {
+	listed := make([]string, len(list))
+	for i, b := range list {
+		listed[i] = fmt.Sprintf("%s (owner %s)", b.id, b.OwnerLabel())
+	}
+	return strings.Join(listed, ", ")
 }
 
 // PageClose reports how Manager.ClosePage carried out a close.
@@ -1287,74 +1462,40 @@ type PageClose struct {
 	Evicted bool
 }
 
-// ClosePage closes the live page id through the browser that owns it, without
-// probing the tab. It resolves the id in the browsers this caller may address —
-// the ones created under the caller's owner key or by the caller's own surface
-// identity (see SessionOwnerFrom), plus the shared unowned pool unless the
-// caller chose an explicit owner. The resolved page is then closed only through
-// the browser that holds it, so it never falls back to a default or guessed
-// browser and never touches another owner's browser. An unknown id fails naming
-// every live page id.
-func (m *Manager) ClosePage(ctx context.Context, id PageID) (PageClose, error) {
-	owner := OwnerFrom(ctx)
-	session := SessionOwnerFrom(ctx)
-	allowUnowned := !HasExplicitOwner(ctx)
-
-	m.mu.Lock()
-	candidates := make([]*Browser, 0, len(m.browsers))
-	for _, b := range m.browsers {
-		if browserOwnedBy(b, owner) || browserOwnedBy(b, session) ||
-			(allowUnowned && b.Owner() == UnownedOwner) {
-			candidates = append(candidates, b)
-		}
+// ClosePage closes the live page id through the browser that holds it, without
+// probing the tab. It resolves the id with the same qualifier-aware lookup as
+// Page, so it never falls back to a default or guessed browser and never
+// touches a page outside the declared browser or owner. An unknown id fails
+// naming every live page id.
+func (m *Manager) ClosePage(
+	ctx context.Context,
+	id PageID,
+	browserID BrowserID,
+	owner string,
+) (PageClose, error) {
+	b, err := m.resolvePage(id, browserID, owner)
+	if err != nil {
+		return PageClose{}, err
 	}
-	relaunched := m.relaunched
-	m.mu.Unlock()
-
-	sort.Slice(candidates, func(i, j int) bool {
-		a, b := candidates[i].id, candidates[j].id
-		if (a == DefaultBrowserID) != (b == DefaultBrowserID) {
-			return a == DefaultBrowserID
-		}
-		return a < b
-	})
-
-	for _, b := range candidates {
-		pageOwner, _, ok := b.lookupPage(id)
-		if !ok {
-			continue
-		}
-		released, err := pageOwner.closePage(ctx, id)
-		if err != nil {
-			return PageClose{Browser: pageOwner.id}, err
-		}
-		return PageClose{Browser: pageOwner.id, Evicted: !released}, nil
-	}
-
-	live := m.livePageIDs()
-	if relaunched {
-		return PageClose{}, fmt.Errorf(
-			"session %q no longer exists: browser was restarted; call fetch_page to re-open URLs (live: %s)",
-			id,
-			pageIDsOrNone(live),
-		)
-	}
-	return PageClose{}, fmt.Errorf("session %q not found (live: %s)", id, pageIDsOrNone(live))
+	return m.closeResolvedPage(ctx, b, id)
 }
 
-// browserOwnedBy reports whether owner addresses b: either through the owner
-// key used for reuse, or through the surface identity that created it. The
-// second key matters because an explicit owner label replaces the owner key at
-// creation (WEB-166); an empty sessionOwner falls back to the owner key.
-func browserOwnedBy(b *Browser, owner string) bool {
-	if b.Owner() == owner {
-		return true
+// closeResolvedPage closes id through the browser resolved for it.
+func (m *Manager) closeResolvedPage(ctx context.Context, b *Browser, id PageID) (PageClose, error) {
+	pageOwner, _, ok := b.lookupPage(id)
+	if !ok {
+		return PageClose{}, fmt.Errorf(
+			"session %q not found (live: %s)",
+			id,
+			pageIDsOrNone(m.livePageIDs()),
+		)
 	}
-	session := b.sessionOwner
-	if session == "" {
-		session = b.Owner()
+
+	released, err := pageOwner.closePage(ctx, id)
+	if err != nil {
+		return PageClose{Browser: pageOwner.id}, err
 	}
-	return session == owner
+	return PageClose{Browser: pageOwner.id, Evicted: !released}, nil
 }
 
 // livePageIDs returns every page id registered in a live browser or identity,

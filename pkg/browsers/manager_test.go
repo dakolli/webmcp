@@ -613,7 +613,7 @@ func TestManagerClosePageUsesOwningBrowser(t *testing.T) {
 	m.browsers[first.id] = first
 	m.browsers[second.id] = second
 
-	closed, err := m.ClosePage(context.Background(), p.ID)
+	closed, err := m.ClosePage(context.Background(), p.ID, "browser-2", "")
 	if err != nil {
 		t.Fatalf("ClosePage(%q): %v", p.ID, err)
 	}
@@ -679,7 +679,7 @@ func TestManagerClosePageClosesListedPageWithHangingInfo(t *testing.T) {
 	}
 
 	ctx := WithOwnerKey(context.Background(), "sse-session-1")
-	closed, err := m.ClosePage(ctx, listed[0].ID)
+	closed, err := m.ClosePage(ctx, listed[0].ID, "", "")
 	if err != nil {
 		t.Fatalf("ClosePage(%q) from the listing: %v", listed[0].ID, err)
 	}
@@ -708,7 +708,7 @@ func TestManagerClosePageEvictsStuckPage(t *testing.T) {
 	defer p.Unlock()
 
 	start := time.Now()
-	closed, err := m.ClosePage(context.Background(), p.ID)
+	closed, err := m.ClosePage(context.Background(), p.ID, "", "")
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("ClosePage(%q) on a stuck page: %v", p.ID, err)
@@ -736,7 +736,7 @@ func TestManagerClosePageUnknownNamesLivePages(t *testing.T) {
 	b.pages["page-2"] = &Page{ID: "page-2"}
 	m.browsers[b.id] = b
 
-	_, err := m.ClosePage(context.Background(), "page-99")
+	_, err := m.ClosePage(context.Background(), "page-99", "", "")
 	if err == nil {
 		t.Fatal("ClosePage(page-99) succeeded, want the live ids named")
 	}
@@ -750,26 +750,154 @@ func TestManagerClosePageUnknownNamesLivePages(t *testing.T) {
 	}
 }
 
-// TestManagerClosePageNeverTouchesAnotherOwner pins ownership: a page id that
-// belongs to another client's browser is refused, never closed.
+// TestManagerClosePageNeverTouchesAnotherOwner pins declarative isolation: a
+// page id that belongs to another owner's browser is refused, never closed.
 func TestManagerClosePageNeverTouchesAnotherOwner(t *testing.T) {
 	m := NewManager(WithTTL(0), WithBrowserTTL(0))
 	mine := NewBrowser(DefaultBrowserID, m.baseCtx, false, false, "", "")
 	mine.owner = "agent-a"
-	mine.sessionOwner = "agent-a"
 	theirs := NewBrowser("browser-2", m.baseCtx, false, false, "", "")
 	theirs.owner = "agent-b"
-	theirs.sessionOwner = "session-b"
 	p := &Page{ID: "page-2"}
 	theirs.pages[p.ID] = p
 	m.browsers[mine.id] = mine
 	m.browsers[theirs.id] = theirs
 
-	ctx := WithOwnerKey(context.Background(), "agent-a")
-	if _, err := m.ClosePage(ctx, p.ID); err == nil {
-		t.Fatal("ClosePage closed a page in another client's browser")
+	if _, err := m.ClosePage(context.Background(), p.ID, "", "agent-a"); err == nil {
+		t.Fatal("ClosePage closed a page in another owner's browser")
 	}
 	if _, ok := theirs.pages[p.ID]; !ok {
-		t.Fatal("ClosePage removed another client's page")
+		t.Fatal("ClosePage removed another owner's page")
+	}
+}
+
+// newOwnerPair builds two live browsers owned by task-a and task-b. browser-1
+// holds page-1; browser-2 holds a colliding page-1 plus page-2, which only
+// task-b owns.
+func newOwnerPair(t *testing.T) (m *Manager, alice, bob *Browser) {
+	t.Helper()
+	m = NewManager(WithTTL(0), WithBrowserTTL(0))
+	alice = NewBrowser(DefaultBrowserID, m.baseCtx, false, false, "", "")
+	alice.owner = "task-a"
+	alice.ownerLabel = "task-a"
+	alice.pages["page-1"] = &Page{ID: "page-1", URL: "https://app.test/alice"}
+	bob = NewBrowser("browser-2", m.baseCtx, false, false, "", "")
+	bob.owner = "task-b"
+	bob.ownerLabel = "task-b"
+	bob.pages["page-1"] = &Page{ID: "page-1", URL: "https://app.test/bob"}
+	bob.pages["page-2"] = &Page{ID: "page-2", URL: "https://app.test/bob-only"}
+	m.browsers[alice.id] = alice
+	m.browsers[bob.id] = bob
+	return m, alice, bob
+}
+
+// TestResolvePageOwnerIsolation pins the declarative qualifier rules: an owner
+// sees only its own pages, a foreign id is not found with the holder named and
+// no content, and a browser_id crosses owners on purpose.
+func TestResolvePageOwnerIsolation(t *testing.T) {
+	t.Run("page inside the declared owner resolves", func(t *testing.T) {
+		m, alice, _ := newOwnerPair(t)
+		got, err := m.resolvePage("page-1", "", "task-a")
+		if err != nil {
+			t.Fatalf("resolvePage(page-1, owner task-a): %v", err)
+		}
+		if got != alice {
+			t.Fatalf("resolvePage(page-1, owner task-a) = %s, want %s", got.id, alice.id)
+		}
+	})
+
+	t.Run("unique foreign id is not found and names the holder", func(t *testing.T) {
+		m, _, bob := newOwnerPair(t)
+		_, err := m.resolvePage("page-2", "", "task-a")
+		if err == nil {
+			t.Fatal("resolvePage(page-2, owner task-a) returned a page, want not found")
+		}
+		want := `session "page-2" is not in owner task-a — held by browser-2 (owner task-b); pass browser_id to reach it on purpose`
+		if err.Error() != want {
+			t.Fatalf("resolvePage error = %q, want %q", err, want)
+		}
+		var lookup *PageLookupError
+		if !errors.As(err, &lookup) || lookup.Kind != PageLookupForeign {
+			t.Fatalf("resolvePage error kind = %v, want PageLookupForeign", err)
+		}
+		if strings.Contains(err.Error(), "https://") {
+			t.Fatalf("not-found error leaked page content: %q", err)
+		}
+		if _, _, ok := bob.lookupPage("page-2"); !ok {
+			t.Fatal("foreign lookup removed bob's page")
+		}
+	})
+
+	t.Run("browser_id alone crosses owners", func(t *testing.T) {
+		m, _, bob := newOwnerPair(t)
+		got, err := m.resolvePage("page-2", "browser-2", "")
+		if err != nil {
+			t.Fatalf("resolvePage(page-2, browser-2): %v", err)
+		}
+		if got != bob {
+			t.Fatalf("resolvePage(page-2, browser-2) = %s, want %s", got.id, bob.id)
+		}
+	})
+
+	t.Run("unknown owner reports the live browsers", func(t *testing.T) {
+		m, _, _ := newOwnerPair(t)
+		_, err := m.resolvePage("page-1", "", "task-z")
+		var lookup *PageLookupError
+		if !errors.As(err, &lookup) || lookup.Kind != PageLookupForeign {
+			t.Fatalf("resolvePage(page-1, owner task-z) = %v, want PageLookupForeign", err)
+		}
+		for _, want := range []string{"browser-1 (owner task-a)", "browser-2 (owner task-b)"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("error = %q, want it to name %q", err, want)
+			}
+		}
+	})
+
+	t.Run("an unqualified caller is not a wildcard", func(t *testing.T) {
+		m, _, bob := newOwnerPair(t)
+		_, err := m.resolvePage("page-2", "", "")
+		var lookup *PageLookupError
+		if !errors.As(err, &lookup) || lookup.Kind != PageLookupAmbiguous {
+			t.Fatalf("resolvePage(page-2) = %v, want PageLookupAmbiguous", err)
+		}
+		if _, _, ok := bob.lookupPage("page-2"); !ok {
+			t.Fatal("an unqualified lookup removed bob's page")
+		}
+	})
+}
+
+// TestResolvePageRequiresABrowserWithTwoOwners pins the ambiguity refusal: two
+// live browsers and no qualifier name both browsers and demand a choice.
+func TestResolvePageRequiresABrowserWithTwoOwners(t *testing.T) {
+	m, _, _ := newOwnerPair(t)
+	_, err := m.Page(context.Background(), "page-3", "", "")
+	if err == nil {
+		t.Fatal("Page(page-3) with two live browsers returned a page, want refusal")
+	}
+	want := `session "page-3" needs a browser — 2 browsers are live: browser-1 (owner task-a), browser-2 (owner task-b); pass browser_id or owner`
+	if err.Error() != want {
+		t.Fatalf("Page(page-3) error = %q, want %q", err, want)
+	}
+	var lookup *PageLookupError
+	if !errors.As(err, &lookup) || lookup.Kind != PageLookupAmbiguous {
+		t.Fatalf("Page(page-3) error kind = %v, want PageLookupAmbiguous", err)
+	}
+
+	if _, err := m.ClosePage(context.Background(), "page-3", "", ""); err == nil {
+		t.Fatal("ClosePage(page-3) with two live browsers succeeded, want refusal")
+	}
+}
+
+// TestResolvePageSingleBrowser pins that the historic single-browser path needs
+// no qualifier.
+func TestResolvePageSingleBrowser(t *testing.T) {
+	m, alice, _ := newOwnerPair(t)
+	delete(m.browsers, "browser-2")
+	got, err := m.resolvePage("page-1", "", "")
+	if err != nil {
+		t.Fatalf("resolvePage(page-1) with one browser: %v", err)
+	}
+	if got != alice {
+		t.Fatalf("resolvePage(page-1) = %s, want %s", got.id, alice.id)
 	}
 }

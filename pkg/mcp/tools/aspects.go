@@ -114,6 +114,9 @@ func init() {
 	registerAspect("sinks", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
 		return pageops.PageSinks(ctx, p)
 	}, truncationNone)
+	registerAspect("postmessage", func(ctx context.Context, p *browsers.Page, a pageFetchArgs) (string, error) {
+		return pageops.PagePostMessage(ctx, p, a.Target)
+	}, truncationNone)
 	registerAspect("storage", func(ctx context.Context, p *browsers.Page, a pageFetchArgs) (string, error) {
 		return pageops.PageStorage(ctx, p, a.IncludeValues)
 	}, truncationNone)

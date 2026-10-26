@@ -71,7 +71,13 @@ func TestClientCallBadParams(t *testing.T) {
 			name:    "page.fetch unknown what",
 			method:  MethodPageFetch,
 			params:  PageFetchParams{SessionID: "page-1", What: "bogus"},
-			wantMsg: `page.fetch: unknown what="bogus" (must be one of html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, marks, security, storage, sinks, har)`,
+			wantMsg: `page.fetch: unknown what="bogus" (must be one of html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, marks, security, storage, sinks, postmessage, har)`,
+		},
+		{
+			name:    "page.act post_message missing value",
+			method:  MethodPageAct,
+			params:  PageActParams{SessionID: "page-1", Action: "post_message"},
+			wantMsg: `page.act: post_message requires a payload (e.g. 'page act last post_message '{"t":"wm"}''`,
 		},
 	}
 	for _, tt := range tests {

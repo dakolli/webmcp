@@ -72,7 +72,7 @@ func TestOpenTargetBrowserUnknownID(t *testing.T) {
 		t.Errorf("openTargetBrowser(browser-99) error = %q, want %q", err.Error(), want)
 	}
 
-	_, err = browserPages(context.Background(), mgr, nil, "browser-99", "page list")
+	_, err = browserPages(context.Background(), mgr, nil, "browser-99", "", "page list")
 	if err == nil {
 		t.Fatal("browserPages(browser-99) = nil error, want unknown-browser error")
 	}

@@ -13,8 +13,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/spf13/cobra"
-
 	"webmcp/pkg/browsers"
 	"webmcp/pkg/cli/ipc"
 )
@@ -25,7 +23,7 @@ import (
 var whatVocab = map[string]bool{
 	"html": true, "text": true, "links": true, "meta": true,
 	"dom": true, "css": true, "js": true, "screenshot": true,
-	"interactives": true, "sinks": true,
+	"interactives": true, "sinks": true, "postmessage": true,
 }
 
 // actionVocab is the page-act action vocabulary shared by `page act` parsing
@@ -38,6 +36,8 @@ var actionVocab = map[string]bool{
 	"forward": true, "reload": true, "hover": true, "scroll": true,
 	"select": true, "wait": true, "set_viewport": true, "emulate": true,
 	"clear_logs": true, "sinks_install": true, "sinks_clear": true,
+	"inject_canary": true, "postmessage_install": true,
+	"postmessage_clear": true, "post_message": true,
 }
 
 // actPayloadSpecs maps each page act action to its positional payload slots,
@@ -48,48 +48,51 @@ var actionVocab = map[string]bool{
 // all, so --value is rejected for it as well. Each slot fills the same-named
 // field of actArgs (see parseActArgs).
 var actPayloadSpecs = map[string][]string{
-	"click":         {"selector"},
-	"hover":         {"selector"},
-	"select":        {"selector", "value"},
-	"input":         {"selector", "text"},
-	"navigate":      {"url"},
-	"eval":          {"js"},
-	"scroll":        {"x", "y"},
-	"wait":          {"mode"},
-	"set_viewport":  {"w", "h"},
-	"emulate":       {"device"},
-	"back":          {},
-	"forward":       {},
-	"reload":        {},
-	"type":          {"selector", "text"},
-	"press_key":     {"key"},
-	"click_at":      {"x", "y"},
-	"hover_at":      {"x", "y"},
-	"drag_and_drop": {"from_x", "from_y", "to_x", "to_y"},
-	"upload_file":   {"selector", "path"},
-	"clear_logs":    {},
-	"sinks_install": {},
-	"sinks_clear":   {},
+	"click":               {"selector"},
+	"hover":               {"selector"},
+	"select":              {"selector", "value"},
+	"input":               {"selector", "text"},
+	"navigate":            {"url"},
+	"eval":                {"js"},
+	"scroll":              {"x", "y"},
+	"wait":                {"mode"},
+	"set_viewport":        {"w", "h"},
+	"emulate":             {"device"},
+	"back":                {},
+	"forward":             {},
+	"reload":              {},
+	"type":                {"selector", "text"},
+	"press_key":           {"key"},
+	"click_at":            {"x", "y"},
+	"hover_at":            {"x", "y"},
+	"drag_and_drop":       {"from_x", "from_y", "to_x", "to_y"},
+	"upload_file":         {"selector", "path"},
+	"clear_logs":          {},
+	"sinks_install":       {},
+	"sinks_clear":         {},
+	"inject_canary":       {"value"},
+	"postmessage_install": {},
+	"postmessage_clear":   {},
+	"post_message":        {"value"},
 }
 
 // resolvePageID resolves a user-supplied page id (possibly empty) to a live
 // page id, for the command labeled by label ("page fetch", "page act",
-// "page close"). browserID pins the candidate pages to one browser; empty means
-// the CLI's default browser selection. It gathers the open pages client-side —
-// over IPC via browser.list (which, like `page list`, never lazily launches a
-// browser; a "no browser open" answer means zero pages), else via mgr.Browser()
-// (also a non-blocking read that never launches) — and applies the pure
-// resolution rules of resolvePageIDFromPages. The returned id is the canonical
-// engine id ("page-N"): the caller passes it straight to
-// pageFetchViaIPC/pageActViaIPC/pageCloseViaIPC or mgr.Page.
+// "page close"). browserID pins the candidate pages to one browser and wins
+// over owner; owner narrows the candidates to browsers carrying that owner;
+// with neither, exactly one live browser must exist. It gathers the open pages
+// client-side — over IPC via browser.list (which, like `page list`, never
+// lazily launches a browser; a "no browser open" answer means zero pages), else
+// via the manager's non-blocking Browser read (which never launches) — and
+// applies the pure resolution rules of resolvePageIDFromPages. The returned id
+// is the canonical engine id ("page-N").
 func resolvePageID(
 	ctx context.Context,
-	cmd *cobra.Command,
 	mgr *browsers.Manager,
 	cl *ipc.Client,
-	browserID, raw, label string,
+	browserID, owner, raw, label string,
 ) (string, error) {
-	pages, err := browserPages(ctx, mgr, cl, browserID, label)
+	pages, err := browserPages(ctx, mgr, cl, browserID, owner, label)
 	if err != nil {
 		return "", err
 	}
@@ -97,47 +100,147 @@ func resolvePageID(
 }
 
 // browserPages returns the open pages a page command may resolve against: the
-// explicitly pinned browser (which must already be live), or the CLI's default
-// browser selection when browserID is empty. It never launches a browser.
+// explicitly pinned browser (which must already be live), the browsers carrying
+// owner, or the only live browser when neither qualifier is given. It never
+// launches a browser.
 func browserPages(
 	ctx context.Context,
 	mgr *browsers.Manager,
 	cl *ipc.Client,
-	browserID, label string,
+	browserID, owner, label string,
 ) ([]browsers.PageInfo, error) {
-	if browserID == "" {
-		if cl != nil {
-			res, err := browserSnapshotViaIPC(ctx, cl, label)
-			if err != nil {
-				return nil, err
-			}
-			return res.Pages, nil
-		}
-		if b, err := mgr.Browser(""); err == nil {
-			return b.Pages(), nil
-		}
-		return nil, nil
+	entries, err := browserEntries(ctx, mgr, cl, label)
+	if err != nil {
+		return nil, err
 	}
 
-	if cl != nil {
-		res, err := browserSnapshotViaIPC(ctx, cl, label)
-		if err != nil {
-			return nil, err
-		}
-		entry, err := selectBrowserEntry(res.Browsers, browserID, label)
+	if browserID != "" {
+		entry, err := selectBrowserEntry(entries, browserID, label)
 		if err != nil {
 			return nil, err
 		}
 		return entry.Pages, nil
 	}
-	b, err := mgr.Browser(browsers.BrowserID(browserID))
-	if err != nil {
-		if errors.Is(err, browsers.ErrUnknownBrowser) {
-			return nil, unknownBrowserErr(label, browserID, managerBrowserIDs(mgr))
+
+	if owner != "" {
+		matching := make([]ipc.BrowserEntry, 0, len(entries))
+		for _, entry := range entries {
+			if entry.Owner == owner {
+				matching = append(matching, entry)
+			}
 		}
-		return nil, fmt.Errorf("%s: %w", label, err)
+		if len(matching) == 0 {
+			return nil, ownerNotFoundErr(label, owner, entries)
+		}
+		return pagesOf(matching, label)
 	}
-	return b.Pages(), nil
+
+	switch len(entries) {
+	case 0:
+		return nil, nil
+	case 1:
+		return entries[0].Pages, nil
+	default:
+		return nil, ambiguousBrowserErr(label, entries)
+	}
+}
+
+// browserEntries reads the live browsers from the serve process when one is
+// reachable, else from the in-process manager. It never launches a browser.
+func browserEntries(
+	ctx context.Context,
+	mgr *browsers.Manager,
+	cl *ipc.Client,
+	label string,
+) ([]ipc.BrowserEntry, error) {
+	if cl != nil {
+		res, err := browserSnapshotViaIPC(ctx, cl, label)
+		if err != nil {
+			return nil, err
+		}
+		return sortedEntries(res.Browsers), nil
+	}
+
+	active := mgr.Browsers()
+	entries := make([]ipc.BrowserEntry, 0, len(active))
+	for id, b := range active {
+		info := b.Info()
+		entries = append(entries, ipc.BrowserEntry{
+			BrowserID: string(id),
+			Owner:     info.Owner,
+			Pages:     b.Pages(),
+		})
+	}
+	return sortedEntries(entries), nil
+}
+
+// sortedEntries orders browser entries by id for stable error messages.
+func sortedEntries(entries []ipc.BrowserEntry) []ipc.BrowserEntry {
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].BrowserID < entries[j].BrowserID
+	})
+	return entries
+}
+
+// pagesOf flattens the pages of matching browsers and refuses a page id held by
+// two of them, so duplicate page-N ids never resolve to an arbitrary browser.
+func pagesOf(entries []ipc.BrowserEntry, label string) ([]browsers.PageInfo, error) {
+	pages := make([]browsers.PageInfo, 0)
+	holders := make(map[browsers.PageID]string)
+	for _, entry := range entries {
+		for _, p := range entry.Pages {
+			if holder, ok := holders[p.ID]; ok && holder != entry.BrowserID {
+				return nil, fmt.Errorf(
+					"%s: session %q is held by both %s and %s — pass --browser to choose one",
+					label,
+					p.ID,
+					holder,
+					entry.BrowserID,
+				)
+			}
+			holders[p.ID] = entry.BrowserID
+			pages = append(pages, p)
+		}
+	}
+	return pages, nil
+}
+
+// ambiguousBrowserErr refuses a bare page id when several browsers are live,
+// naming each browser and owner so the caller can qualify the request.
+func ambiguousBrowserErr(label string, entries []ipc.BrowserEntry) error {
+	return fmt.Errorf(
+		"%s: a page id needs a browser — %d browsers are live: %s; pass --browser or --owner",
+		label,
+		len(entries),
+		browserEntriesDisplay(entries),
+	)
+}
+
+// ownerNotFoundErr reports that no live browser carries the declared owner.
+func ownerNotFoundErr(label, owner string, entries []ipc.BrowserEntry) error {
+	if len(entries) == 0 {
+		return fmt.Errorf(
+			"%s: no browser has owner %q — no browsers are live; create one with 'browser create --owner %s'",
+			label,
+			owner,
+			owner,
+		)
+	}
+	return fmt.Errorf(
+		"%s: no browser has owner %q — live: %s; pass a live --owner or --browser",
+		label,
+		owner,
+		browserEntriesDisplay(entries),
+	)
+}
+
+// browserEntriesDisplay renders "browser-N (owner X)" entries for a message.
+func browserEntriesDisplay(entries []ipc.BrowserEntry) string {
+	listed := make([]string, len(entries))
+	for i, entry := range entries {
+		listed[i] = fmt.Sprintf("%s (owner %s)", entry.BrowserID, entry.Owner)
+	}
+	return strings.Join(listed, ", ")
 }
 
 // browserSnapshotViaIPC reads the daemon's live-browser snapshot, treating its
@@ -366,20 +469,22 @@ func parseFetchArgs(args []string, idFlag, whatFlag string) (id, what, url strin
 // override: a positional always wins over its flag counterpart, and the flag
 // is the fallback when the positional grammar leaves the field unfilled.
 type actArgFlags struct {
-	id, action, selector, handle, value, key, button, targetSelector, waitMode, device string
-	x, y, targetX, targetY                                                             float64
-	clickCount, width, height                                                          int
-	paths                                                                              []string
+	id, action, selector, handle, value, key, button, targetSelector, origin, waitMode, device string
+	x, y, targetX, targetY                                                                     float64
+	clickCount, width, height                                                                  int
+	paths                                                                                      []string
+	targets                                                                                    []string
 }
 
 // actArgs is the merged result of `page act` parsing: the effective
 // id/action/payload fields after the positionals (which win) are merged over
 // the flag values.
 type actArgs struct {
-	id, action, selector, handle, value, key, button, targetSelector, waitMode, device string
-	x, y, targetX, targetY                                                             float64
-	clickCount, width, height                                                          int
-	paths                                                                              []string
+	id, action, selector, handle, value, key, button, targetSelector, origin, waitMode, device string
+	x, y, targetX, targetY                                                                     float64
+	clickCount, width, height                                                                  int
+	paths                                                                                      []string
+	targets                                                                                    []string
 }
 
 // parseActArgs parses `page act` positional args against the flag values and
@@ -523,6 +628,14 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 		if len(payload) >= 1 {
 			a.device = payload[0]
 		}
+	case "inject_canary":
+		if len(payload) >= 1 {
+			a.value = payload[0]
+		}
+	case "post_message":
+		if len(payload) >= 1 {
+			a.value = payload[0]
+		}
 	}
 
 	// Merge the flags in: positionals win; flags are the fallback.
@@ -553,8 +666,14 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 	if a.targetSelector == "" {
 		a.targetSelector = f.targetSelector
 	}
+	if a.origin == "" {
+		a.origin = f.origin
+	}
 	if len(a.paths) == 0 {
 		a.paths = f.paths
+	}
+	if len(a.targets) == 0 {
+		a.targets = f.targets
 	}
 	if a.waitMode == "" {
 		a.waitMode = f.waitMode

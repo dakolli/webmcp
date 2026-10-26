@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/go-rod/rod"
+
+	"webmcp/pkg/browsers"
 )
 
 func TestOkResultEmbedsJSONPayload(t *testing.T) {
@@ -105,6 +107,38 @@ func TestClassifyError(t *testing.T) {
 		{
 			name: "invalid args type error",
 			err:  errors.New(`browser_create: "ignore_certs" must be a boolean (true or false), but the request sent the string "yes".`),
+			want: errInvalidArgs,
+		},
+		{
+			name: "foreign session is not found",
+			err: fmt.Errorf("page_fetch: %w", &browsers.PageLookupError{
+				Kind:    browsers.PageLookupForeign,
+				Message: `session "page-2" not found for owner a — held by browser-2 (owner b)`,
+			}),
+			want: errNotFound,
+		},
+		{
+			name: "missing session is not found",
+			err: fmt.Errorf("page_fetch: %w", &browsers.PageLookupError{
+				Kind:    browsers.PageLookupMissing,
+				Message: `session "page-9" not found (live: page-1)`,
+			}),
+			want: errNotFound,
+		},
+		{
+			name: "typed missing beats the restart marker",
+			err: fmt.Errorf("page_fetch: %w", &browsers.PageLookupError{
+				Kind:    browsers.PageLookupMissing,
+				Message: `session "page-1" no longer exists: browser was restarted; call fetch_page to re-open URLs`,
+			}),
+			want: errNotFound,
+		},
+		{
+			name: "ambiguous session is invalid args",
+			err: fmt.Errorf("page_fetch: %w", &browsers.PageLookupError{
+				Kind:    browsers.PageLookupAmbiguous,
+				Message: `session "page-3" needs a browser — 2 browsers are live: browser-1 (owner a), browser-2 (owner b)`,
+			}),
 			want: errInvalidArgs,
 		},
 		{
@@ -237,6 +271,66 @@ func TestClassifyErrorPrecedence(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got, _ := classifyError(tt.err, challengeState{}); got != tt.want {
 				t.Fatalf("classifyError() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSessionLookupEnvelopes pins the two resolver payloads: a foreign id is
+// not_found and an id held by two browsers is invalid_args, each with its own
+// hint and never page_closed.
+func TestSessionLookupEnvelopes(t *testing.T) {
+	tests := []struct {
+		name     string
+		kind     browsers.PageLookupKind
+		msg      string
+		wantType string
+		wantHint string
+	}{
+		{
+			name:     "foreign",
+			kind:     browsers.PageLookupForeign,
+			msg:      `session "page-2" is not in owner task-a — held by browser-2 (owner task-b); pass browser_id to reach it on purpose`,
+			wantType: errNotFound,
+			wantHint: "the session is not in that browser or owner — call session_list for the live ids, or pass the matching browser_id or owner",
+		},
+		{
+			name:     "missing",
+			kind:     browsers.PageLookupMissing,
+			msg:      `session "page-9" not found (live: page-1)`,
+			wantType: errNotFound,
+			wantHint: "the session is not in that browser or owner — call session_list for the live ids, or pass the matching browser_id or owner",
+		},
+		{
+			name:     "ambiguous",
+			kind:     browsers.PageLookupAmbiguous,
+			msg:      `session "page-3" needs a browser — 2 browsers are live: browser-1 (owner task-a), browser-2 (owner task-b); pass browser_id or owner`,
+			wantType: errInvalidArgs,
+			wantHint: "this session id needs a browser — pass browser_id or owner to choose the browser that holds it",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := failResult(fmt.Errorf("page_fetch: %w", &browsers.PageLookupError{
+				Kind:    tc.kind,
+				Message: tc.msg,
+			}))
+			if err != nil {
+				t.Fatalf("failResult() error = %v", err)
+			}
+			t.Logf("payload: %s", out)
+			env := mustEnvelope(t, out)
+			if env.Error == nil {
+				t.Fatal("envelope has no error branch")
+			}
+			if env.Error.Type != tc.wantType {
+				t.Fatalf("type = %q, want %q", env.Error.Type, tc.wantType)
+			}
+			if env.Error.Hint != tc.wantHint {
+				t.Fatalf("hint = %q, want %q", env.Error.Hint, tc.wantHint)
+			}
+			if want := "page_fetch: " + tc.msg; env.Error.Message != want {
+				t.Fatalf("message = %q, want %q", env.Error.Message, want)
 			}
 		})
 	}

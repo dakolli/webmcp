@@ -39,7 +39,7 @@ const (
 	MethodPageList = "page.list"
 	// MethodPageFetch extracts any aspect in the shared pageops registry from a live page.
 	MethodPageFetch = "page.fetch"
-	// MethodPageAct performs an action on a live page (click/input/hover/scroll/select/eval/navigate/back/forward/reload/wait/set_viewport/emulate/clear_logs/sinks_install/sinks_clear).
+	// MethodPageAct performs an action on a live page (click/input/hover/scroll/select/eval/navigate/back/forward/reload/wait/set_viewport/emulate/clear_logs/sinks_install/sinks_clear/inject_canary/postmessage_install/postmessage_clear/post_message).
 	MethodPageAct = "page.act"
 	// MethodPageClose closes an open page.
 	MethodPageClose = "page.close"
@@ -278,10 +278,16 @@ type PageListResult struct {
 // capture is cumulative from page creation, so clear with page.act clear_logs
 // before the step under observation. what=sinks returns the source-to-sink
 // tracer ring {installed,hits,dropped,truncated}; arming it is the separate
-// page.act sinks_install action.
+// page.act sinks_install action. what=postmessage returns the postMessage
+// recorder ring {installed,messages,dropped,truncated,frames}; arming it is the
+// separate page.act postmessage_install action and target=clear empties it.
 type PageFetchParams struct {
 	// SessionID identifies the live page to fetch from.
 	SessionID string `json:"session_id"`
+	// BrowserID optionally resolves the session inside that browser only.
+	BrowserID string `json:"browser_id,omitempty"`
+	// Owner optionally restricts the lookup to browsers with that owner.
+	Owner string `json:"owner,omitempty"`
 	// What is the aspect to extract; see pageops.ValidateAspect for the values.
 	What string `json:"what"`
 	// Selector optionally scopes html/text extraction to a CSS match.
@@ -308,19 +314,30 @@ type PageFetchResult struct {
 // PageActParams carries the page.act parameters. action ∈ click|input|type|
 // press_key|click_at|hover_at|drag_and_drop|upload_file|eval|navigate|back|
 // forward|reload|hover|scroll|select|wait|set_viewport|emulate|clear_logs|
-// sinks_install|sinks_clear; selector/handle/value/key/button/click_count/x/y/
-// target_x/target_y/target_selector/paths are the per-action payloads (handle
-// wins over selector for element actions); viewport carries the target size for
-// set_viewport and device the preset for emulate; timeout_ms bounds the action
-// (default 30000) and sizes the wait action's "ms" sleep; wait_mode selects what
-// the wait action waits for: load|idle|stable|interactable|ms (default ms).
-// clear_logs, sinks_install and sinks_clear take no payload: clear_logs empties
-// both log buffers and returns the cleared counts; sinks_install arms the
-// source-to-sink tracer and returns {"installed":true}; sinks_clear empties its
-// ring and returns {"cleared":N}.
+// sinks_install|sinks_clear|inject_canary|postmessage_install|postmessage_clear|
+// post_message; selector/handle/value/key/button/click_count/x/y/
+// target_x/target_y/target_selector/origin/paths/targets are the per-action
+// payloads (handle wins over selector for element actions); viewport carries the
+// target size for set_viewport and device the preset for emulate; timeout_ms
+// bounds the action (default 30000) and sizes the wait action's "ms" sleep;
+// wait_mode selects what the wait action waits for: load|idle|stable|interactable|ms
+// (default ms). clear_logs, sinks_install, sinks_clear, postmessage_install and
+// postmessage_clear take no required payload: clear_logs empties both log
+// buffers and returns the cleared counts; sinks_install arms the source-to-sink
+// tracer and returns {"installed":true}; sinks_clear empties its ring and
+// returns {"cleared":N}; inject_canary takes optional value (custom canary) and
+// targets and returns the canary report; postmessage_install arms the
+// postMessage recorder and returns {"installed":true}; postmessage_clear empties
+// its rings and returns {"cleared":N}; post_message takes value (the payload),
+// optional target_selector ("top" or an iframe CSS selector) and origin (target
+// origin, default "*") and returns {origin,target}.
 type PageActParams struct {
 	// SessionID identifies the live page to act on.
 	SessionID string `json:"session_id"`
+	// BrowserID optionally resolves the session inside that browser only.
+	BrowserID string `json:"browser_id,omitempty"`
+	// Owner optionally restricts the lookup to browsers with that owner.
+	Owner string `json:"owner,omitempty"`
 	// Action is the action to perform (including clear_logs, sinks_install and
 	// sinks_clear, which take no payload; they return {"network":N,"console":M},
 	// {"installed":true} and {"cleared":N} respectively).
@@ -349,10 +366,17 @@ type PageActParams struct {
 	TargetX float64 `json:"target_x,omitempty"`
 	// TargetY is the target vertical coordinate for drag_and_drop.
 	TargetY float64 `json:"target_y,omitempty"`
-	// TargetSelector is the target element selector for drag_and_drop.
+	// TargetSelector is the target element selector for drag_and_drop, or the
+	// destination frame for post_message: "top" (or empty) sends to
+	// window.top, a CSS selector naming an iframe sends to its contentWindow.
 	TargetSelector string `json:"target_selector,omitempty"`
+	// Origin is the target origin for post_message (default "*").
+	Origin string `json:"origin,omitempty"`
 	// Paths is the list of local file paths for upload_file.
 	Paths []string `json:"paths,omitempty"`
+	// Targets is the list of canary injection points for inject_canary:
+	// query, hash, postmessage, name (empty means all four).
+	Targets []string `json:"targets,omitempty"`
 	// TimeoutMS bounds the action in milliseconds (0 → server default 30000);
 	// the wait action's "ms" mode sleeps for this long.
 	TimeoutMS int `json:"timeout_ms,omitempty"`
@@ -377,9 +401,10 @@ type PageActResult struct {
 type PageCloseParams struct {
 	// SessionID identifies the page to close.
 	SessionID string `json:"session_id"`
-	// BrowserID names the browser that owns the page; empty resolves the
-	// page across every live browser.
+	// BrowserID optionally resolves the session inside that browser only.
 	BrowserID string `json:"browser_id,omitempty"`
+	// Owner optionally restricts the lookup to browsers with that owner.
+	Owner string `json:"owner,omitempty"`
 }
 
 // PageCloseResult is the result of page.close.

@@ -28,7 +28,8 @@ var actActionNames = []string{
 	"drag_and_drop", "upload_file", "eval", "navigate",
 	"back", "forward", "reload", "hover", "scroll", "select",
 	"wait", "set_viewport", "emulate", "clear_logs",
-	"sinks_install", "sinks_clear", "replay",
+	"sinks_install", "sinks_clear", "replay", "inject_canary",
+	"postmessage_install", "postmessage_clear", "post_message",
 }
 
 // actActionList renders actActionNames for an error message.
@@ -73,8 +74,28 @@ func (t *Act) Description() string {
 		"replay (resends one captured network entry through a Go HTTP client — bypasses CORS, " +
 		"carries the page's cookies for the target host without writing any back, follows up to 5 " +
 		"redirects, and returns {status,headers,body,bytes,truncated,ms,request,chain} with " +
-		"sensitive response headers redacted). " +
-		"Pass session_id plus action=... and any required parameters; element actions take a selector " +
+		"sensitive response headers redacted), or " +
+		"inject_canary (proves sink reachability: injects a unique wm-canary-<8 hex> value into " +
+		"query, hash, postmessage and name — the default set, or pass targets to narrow it — and " +
+		"returns {canary, injected:[{target, where}], hits:[{sink, context, selector, value, stack}], " +
+		"installed}. query reloads the page, hash does not, postmessage posts a wm-probe message to " +
+		"every frame, name writes window.name. Work is capped at 20 frames and each frame is reported " +
+		"with its URL in injected.where. Requires sinks_install first), " +
+		"postmessage_install (arm the postMessage recorder: one capture-phase listener per window and " +
+		"iframe, without wrapping addEventListener, so a page listener keeps its identity; no " +
+		"parameters; returns {\"installed\":true}; read the ring with page_fetch what=postmessage), " +
+		"postmessage_clear (empty every recorder ring; no parameters; returns {\"cleared\":N}), or " +
+		"post_message (deliver value to window.top, window.self or window.parent when " +
+		"target_selector is \"top\", \"self\", \"parent\" or omitted, or to the contentWindow of " +
+		"the <iframe>/<frame> matched by any other target_selector; a selector that is not a frame " +
+		"returns an error instead of falling back to top; origin is the target origin, default " +
+		"\"*\"; it arms the recorder first so the delivery can be read back, and returns " +
+		"{origin,target}. A value that is a complete JSON object or array is delivered as that " +
+		"structure, anything else as a string). " +
+		"Pass session_id plus action=... and any required parameters. When more than " +
+		"one browser is live, pass browser_id or owner to declare which browser holds " +
+		"the session; with one live browser both may be omitted, and a session held " +
+		"outside the declared owner is refused as not_found. Element actions take a selector " +
 		"or a stable handle from page_fetch (handle wins when both are given). A selector that " +
 		"matches nothing returns error.type=element_not_found and does not wait for timeout_ms. " +
 		"Logs are cumulative " +
@@ -92,10 +113,18 @@ func (t *Act) InputSchema() models.InputSchema {
 				"type":        "string",
 				"description": "The session_id returned by fetch_page for the page to act on.",
 			},
+			"browser_id": map[string]any{
+				"type":        "string",
+				"description": "Optional browser_id to resolve the session inside that browser only (e.g. 'browser-2'). Use it when more than one browser is live; with exactly one live browser it may be omitted.",
+			},
+			"owner": map[string]any{
+				"type":        "string",
+				"description": "Optional owner label (1-64 chars: A-Z, a-z, 0-9, '.', '_', '-') restricting the lookup to browsers with that owner. A session held by another owner is not_found, never acted on.",
+			},
 			"action": map[string]any{
 				"type":        "string",
 				"enum":        append([]string(nil), actActionNames...),
-				"description": "The interaction to perform: click (selector), input (set field text), type (keystrokes), press_key (key/combo e.g. Enter, Escape, Control+A), click_at/hover_at ({x, y} coordinates), drag_and_drop (from {x,y}/selector to {target_x,target_y}/target_selector), upload_file (set file input paths), eval (run JS), navigate (URL), back/forward/reload, hover (selector), scroll (x/y), select (option value), wait (readiness mode), set_viewport (W x H), emulate (device preset), clear_logs (empty both log buffers; no parameters; returns {\"network\":N,\"console\":M} cleared counts), sinks_install (arm the source-to-sink tracer; no parameters; returns {\"installed\":true}; capture is opt-in, changes page behavior, survives client-side route changes and full navigations while its per-document ring resets on a full navigation; read it with page_fetch what=sinks, which is read-only and never arms capture), sinks_clear (empty the tracer ring; no parameters; returns {\"cleared\":N}), replay (resend one captured network entry; needs target, optionally method, headers and value; returns {status,headers,body,bytes,truncated,ms,request,chain}). Logs are cumulative from page creation — filter client-side or clear_logs right before the step under observation.",
+				"description": "The interaction to perform: click (selector), input (set field text), type (keystrokes), press_key (key/combo e.g. Enter, Escape, Control+A), click_at/hover_at ({x, y} coordinates), drag_and_drop (from {x,y}/selector to {target_x,target_y}/target_selector), upload_file (set file input paths), eval (run JS), navigate (URL), back/forward/reload, hover (selector), scroll (x/y), select (option value), wait (readiness mode), set_viewport (W x H), emulate (device preset), clear_logs (empty both log buffers; no parameters; returns {\"network\":N,\"console\":M} cleared counts), sinks_install (arm the source-to-sink tracer; no parameters; returns {\"installed\":true}; capture is opt-in, changes page behavior, survives client-side route changes and full navigations while its per-document ring resets on a full navigation; read it with page_fetch what=sinks, which is read-only and never arms capture), sinks_clear (empty the tracer ring; no parameters; returns {\"cleared\":N}), replay (resend one captured network entry; needs target, optionally method, headers and value; returns {status,headers,body,bytes,truncated,ms,request,chain}), inject_canary (inject a canary into query/hash/postmessage/name — default all four, narrow with targets — and return {canary, injected:[{target, where}], hits:[{sink, context, selector, value, stack}], installed}; requires sinks_install first; query reloads, hash does not; capped at 20 frames), postmessage_install (arm the postMessage recorder: one capture-phase listener per window and iframe without wrapping addEventListener, so page listeners keep their identity; no parameters; returns {\"installed\":true}; read it with page_fetch what=postmessage), postmessage_clear (empty every recorder ring; no parameters; returns {\"cleared\":N}), post_message (deliver value to window.top/self/parent when target_selector is \"top\", \"self\", \"parent\" or omitted, or to the contentWindow of the <iframe>/<frame> matched by any other target_selector; a selector that is not a frame errors instead of falling back to top; origin is the target origin, default \"*\"; arms the recorder first and returns {origin,target}). Logs are cumulative from page creation — filter client-side or clear_logs right before the step under observation.",
 			},
 			"selector": map[string]any{
 				"type":        "string",
@@ -107,7 +136,14 @@ func (t *Act) InputSchema() models.InputSchema {
 			},
 			"value": map[string]any{
 				"type":        "string",
-				"description": "Payload value for input/type (text), press_key (key combo fallback), eval (JS source), navigate (URL), select (option value), or upload_file (single path fallback). For replay it replaces the request body; omit it to send no body.",
+				"description": "Payload value for input/type (text), press_key (key combo fallback), eval (JS source), navigate (URL), select (option value), or upload_file (single path fallback). For replay it replaces the request body; omit it to send no body. For inject_canary it is the custom canary value; omit it to mint wm-canary-<8 hex>.",
+			},
+			"targets": map[string]any{
+				"type":  "array",
+				"items": map[string]any{"type": "string", "enum": []string{"query", "hash", "postmessage", "name"}},
+				"description": "Injection points for inject_canary (default all four): query (append wmcanary and reload), " +
+					"hash (set location.hash and dispatch hashchange, no reload), postmessage (post a wm-probe message " +
+					"carrying the canary to every frame), or name (write window.name). Each entry may also be a comma-separated list.",
 			},
 			"key": map[string]any{
 				"type":        "string",
@@ -141,8 +177,18 @@ func (t *Act) InputSchema() models.InputSchema {
 				"description": "Target vertical coordinate in pixels for drag_and_drop action.",
 			},
 			"target_selector": map[string]any{
+				"type": "string",
+				"description": "Target element selector for drag_and_drop, or the destination frame for post_message: " +
+					"\"top\", \"self\" and \"parent\" are keywords for window.top/self/parent, and any other " +
+					"value is a CSS selector for an <iframe> or <frame> whose contentWindow alone receives " +
+					"the message. A selector that matches an element that is not a frame, or a frame " +
+					"without a contentWindow, returns an error instead of falling back to top. Example: " +
+					"{ \"action\": \"post_message\", \"value\": \"{\\\"t\\\":\\\"wm\\\"}\", \"target_selector\": \"iframe#widget\" }.",
+			},
+			"origin": map[string]any{
 				"type":        "string",
-				"description": "Target element selector for drag_and_drop action.",
+				"default":     "*",
+				"description": "Target origin for post_message (default \"*\"). Pass the receiver's origin, e.g. https://widget.example, to keep the browser from delivering the message to an unexpected document.",
 			},
 			"target": map[string]any{
 				"type": "string",
@@ -194,6 +240,8 @@ func (t *Act) InputSchema() models.InputSchema {
 // actArgs is the strict decoding target for page_act arguments.
 type actArgs struct {
 	SessionID      browsers.PageID    `json:"session_id"`
+	BrowserID      string             `json:"browser_id"`
+	Owner          string             `json:"owner"`
 	Action         string             `json:"action"`
 	Selector       string             `json:"selector"`
 	Handle         string             `json:"handle"`
@@ -206,7 +254,9 @@ type actArgs struct {
 	TargetX        float64            `json:"target_x"`
 	TargetY        float64            `json:"target_y"`
 	TargetSelector string             `json:"target_selector"`
+	Origin         string             `json:"origin"`
 	Target         string             `json:"target"`
+	Targets        []string           `json:"targets"`
 	Method         string             `json:"method"`
 	Headers        map[string]string  `json:"headers"`
 	Paths          []string           `json:"paths"`
@@ -239,6 +289,10 @@ func (a *actArgs) validate(provided map[string]json.RawMessage) error {
 	case "navigate":
 		if a.Value == "" {
 			return fmt.Errorf("navigate requires value (the target URL)")
+		}
+	case "post_message":
+		if _, ok := provided["value"]; !ok {
+			return fmt.Errorf("post_message requires value (the message payload, e.g. {\"t\":\"wm\"})")
 		}
 	case "replay":
 		if a.Target == "" {
@@ -294,7 +348,7 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	p, err := t.mgr.Page(ctx, a.SessionID)
+	p, err := t.mgr.Page(ctx, a.SessionID, browsers.BrowserID(a.BrowserID), a.Owner)
 	if err != nil {
 		return failResult(fmt.Errorf("page_act: %w", err))
 	}
@@ -376,6 +430,14 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 				return t.mgr.CheckPageScope(a.SessionID, rawURL)
 			},
 		})
+	case "inject_canary":
+		out, err = pageops.PageCanaryInject(ctx, p, a.Targets, a.Value)
+	case "postmessage_install":
+		out, err = pageops.PagePostMessageInstall(ctx, p)
+	case "postmessage_clear":
+		out, err = pageops.PagePostMessageClear(ctx, p)
+	case "post_message":
+		out, err = pageops.PagePostMessageSend(ctx, p, a.Value, a.TargetSelector, a.Origin)
 	default:
 		return failResult(fmt.Errorf("page_act: unknown action=%q (must be one of %s)", a.Action, actActionList()))
 	}

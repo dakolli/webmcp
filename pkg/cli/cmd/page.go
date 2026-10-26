@@ -44,8 +44,8 @@ resolve only against that browser and an unknown id fails with the live ids.
 
 Subcommands:
   list   List the browser's open pages (id, url)
-  fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, console, body, article, marks, security, storage, sinks, har); a URL opens a new page first
-  act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear)
+  fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, console, body, article, marks, security, storage, sinks, postmessage, har); a URL opens a new page first
+  act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, inject_canary)
   close  Close an open page
 
 Run a subcommand with --help for its flags and examples.`,
@@ -96,9 +96,21 @@ which sessions are still alive before acting on or closing them.`,
 			}
 			printServeHint(cmd)
 
-			pages, err := browserPages(ctx, mgr, nil, browserID, "page list")
+			entries, err := browserEntries(ctx, mgr, nil, "page list")
 			if err != nil {
 				return err
+			}
+			var pages []browsers.PageInfo
+			if browserID == "" {
+				for _, entry := range entries {
+					pages = append(pages, entry.Pages...)
+				}
+			} else {
+				entry, err := selectBrowserEntry(entries, browserID, "page list")
+				if err != nil {
+					return err
+				}
+				pages = entry.Pages
 			}
 			reportBrowserTarget(cmd, browserID)
 			if len(pages) == 0 {
@@ -119,6 +131,8 @@ which sessions are still alive before acting on or closing them.`,
 func newPageFetchCmd(mgr *browsers.Manager) *cobra.Command {
 	var (
 		id            string
+		browserID     string
+		owner         string
 		what          string
 		url           string
 		selector      string
@@ -133,7 +147,7 @@ func newPageFetchCmd(mgr *browsers.Manager) *cobra.Command {
 		Short: "Extract an aspect of a live page",
 		Long: `Extracts an aspect of a live page (html, text, links, meta, dom, css,
 js, screenshot, interactives, a11y, network, console, body, article, marks,
-security, storage, sinks, har) and prints it. The page id is optional when
+security, storage, sinks, postmessage, har) and prints it. The page id is optional when
 only one page is open; 'last' means the most recently opened page; a bare number
 resolves to page-N. A URL in the [id] slot opens a NEW page for it first —
 creating the browser if needed, exactly like 'web-cli fetch <url>' — and then
@@ -146,7 +160,7 @@ dance).
           extract the aspect — mirrors 'web-cli fetch <url>' (wait: idle)
   [what]  the aspect to extract: html, text, links, meta, dom, css, js,
           screenshot, interactives, a11y, network, console, body, article, marks,
-          security, storage, sinks, har (default: text)
+          security, storage, sinks, postmessage, har (default: text)
 
   --id <session>     the page/session id (the positional [id] wins when both
                      are given; never treated as a URL)
@@ -161,14 +175,19 @@ dance).
                      instead of <redacted> (exposes live session tokens)
   --max-bytes <n>    cap output size (default 50000; screenshots,
                      interactives, a11y, network, console, body, article,
-                     marks, security and sinks are never truncated)
+                     marks, security, sinks and postmessage are never truncated)
   --identity <name>  open the URL in an incognito identity inside the target
                      browser (default "default"): a new name is created on
                      first use, and identities keep separate cookies/storage
                      in one Chromium process. Only valid with a URL.
+  --browser <id>     resolve the page inside that browser only; use it when
+                     more than one browser is live. Wins over --owner.
+  --owner <label>    restrict the lookup to browsers with that owner (1-64
+                     chars: A-Z, a-z, 0-9, '.', '_', '-'). A page held by
+                     another owner is refused, never returned.
 
 links, meta, dom, interactives, a11y, network, console, body, article, marks,
-security and sinks print JSON, mirroring the MCP page_fetch shapes. article is the readable prose body as
+security, sinks and postmessage print JSON, mirroring the MCP page_fetch shapes. article is the readable prose body as
 markdown ({title, byline?, excerpt?, text, words, truncated, url}); prefer it
 over text when you want the article rather than the whole page. marks is the
 numbered overlay ({marks:[{index, role, text?, x, y, width, height}], screenshot,
@@ -181,7 +200,12 @@ caches} with a *_truncated counter per section); every value is <redacted>
 unless --include-values is set, which exposes live session tokens. sinks is the
 source-to-sink tracer ring ({installed, hits:[{source, sink, context, value,
 value_cut, stack, selector, ts}], dropped, truncated}); arm it with
-'page act sinks_install' and reset it with 'page act sinks_clear'.
+'page act sinks_install' and reset it with 'page act sinks_clear'. postmessage is
+the postMessage recorder ring ({installed, messages:[{origin, source_kind, data,
+data_type, ts, stack}], dropped, truncated, frames:[{url, probed}]}); arm it with
+'page act postmessage_install', reset it with 'page act postmessage_clear' or
+--target clear, and send a message with 'page act post_message'. Messages are
+aggregated across up to 20 frames and data is clipped at 500 runes.
 Screenshots print a data:image/png;base64,... data-URI. network/console emit
 {entries,count,dropped,truncated} over the newest 100 buffered entries; capture is
 cumulative from page creation, so clear with 'page act clear_logs' right before the
@@ -208,7 +232,17 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 			ctx, cancel := context.WithTimeout(cmdCtx(cmd), defaultCmdTimeout)
 			defer cancel()
 
-			browserID := explicitBrowserID(cmd)
+			if browserID == "" {
+				browserID = explicitBrowserID(cmd)
+			}
+			normalized, err := ipc.NormalizeOwner(owner)
+			if err != nil {
+				return fmt.Errorf("page fetch: %w", err)
+			}
+			owner = normalized
+			if owner != "" {
+				ctx = browsers.WithExplicitOwner(ctx, owner)
+			}
 			id, what, url = parseFetchArgs(args, id, what)
 
 			if url != "" {
@@ -234,7 +268,7 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 				if url != "" {
 					if browserID == "" {
 						var open ipc.BrowserOpenResult
-						if err := cl.Call(ctx, ipc.MethodBrowserOpen, &ipc.BrowserOpenParams{}, &open); err != nil {
+						if err := cl.Call(ctx, ipc.MethodBrowserOpen, &ipc.BrowserOpenParams{Owner: owner}, &open); err != nil {
 							return fmt.Errorf("page fetch: %w", err)
 						}
 					} else if err := requireLiveBrowser(ctx, cl, browserID, "page fetch"); err != nil {
@@ -250,19 +284,18 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 						return fmt.Errorf("page fetch: %w", err)
 					}
 					reportBrowserTarget(cmd, browserID)
-					return pageFetchViaIPC(cmd, ctx, cl, summary.SessionID, what, selector, target, fullPage, maxBytes, includeValues)
+					return pageFetchViaIPC(cmd, ctx, cl, summary.SessionID, browserID, owner, what, selector, target, fullPage, maxBytes, includeValues)
 				}
-				rid, err := resolvePageID(ctx, cmd, mgr, cl, browserID, id, "page fetch")
+				rid, err := resolvePageID(ctx, mgr, cl, browserID, owner, id, "page fetch")
 				if err != nil {
 					return err
 				}
 				reportBrowserTarget(cmd, browserID)
-				return pageFetchViaIPC(cmd, ctx, cl, rid, what, selector, target, fullPage, maxBytes, includeValues)
+				return pageFetchViaIPC(cmd, ctx, cl, rid, browserID, owner, what, selector, target, fullPage, maxBytes, includeValues)
 			}
 			printServeHint(cmd)
 
 			var p *browsers.Page
-			var err error
 			if url != "" {
 				var b *browsers.Browser
 				b, err = openTargetBrowser(ctx, mgr, browserID, "page fetch")
@@ -285,12 +318,17 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 				}
 			} else {
 				var rid string
-				rid, err = resolvePageID(ctx, cmd, mgr, nil, browserID, id, "page fetch")
+				rid, err = resolvePageID(ctx, mgr, nil, browserID, owner, id, "page fetch")
 				if err != nil {
 					return err
 				}
 				reportBrowserTarget(cmd, browserID)
-				p, err = mgr.Page(ctx, browsers.PageID(rid)) // opens the Browser if needed; probes for liveness
+				p, err = mgr.Page(
+					ctx,
+					browsers.PageID(rid),
+					browsers.BrowserID(browserID),
+					owner,
+				)
 				if err != nil {
 					return fmt.Errorf("page fetch: %w", err)
 				}
@@ -312,24 +350,28 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to fetch (optional with one page open; 'last'; or a bare number)")
-	cmd.Flags().StringVar(&what, "what", "", "aspect to extract: html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, marks, security, storage, sinks, har (default text)")
+	cmd.Flags().StringVar(&what, "what", "", "aspect to extract: html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, marks, security, storage, sinks, postmessage, har (default text)")
 	cmd.Flags().StringVar(&selector, "selector", "", "optional CSS selector scoping html/text extraction")
 	cmd.Flags().StringVar(&target, "target", "", "resource URL for one css/js resource, or seq/URL substring selecting one network body (with --what body)")
 	cmd.Flags().BoolVar(&fullPage, "full-page", false, "capture the entire scrollable page instead of the visible viewport (screenshot only)")
 	cmd.Flags().BoolVar(&includeValues, "include-values", false, "with --what storage, print real cookie and localStorage/sessionStorage values instead of <redacted> (exposes live tokens)")
 	cmd.Flags().IntVar(&maxBytes, "max-bytes", pageops.DefaultPageMaxBytes, "maximum output size in bytes (default 50000)")
 	cmd.Flags().StringVar(&identity, "identity", "", "incognito identity for a URL open (default \"default\"); a new name is created on first use, cookies/storage stay separate")
+	cmd.Flags().StringVar(&browserID, "browser", "", "browser_id to resolve the page inside that browser only (use when more than one browser is live)")
+	cmd.Flags().StringVar(&owner, "owner", "", "owner label restricting the lookup to browsers with that owner (1-64 chars: A-Z, a-z, 0-9, '.', '_', '-')")
 	return cmd
 }
 
 // newPageActCmd builds `page act`: it performs an action on a live page —
 // click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file,
 // hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport,
-// emulate, clear_logs, sinks_install and sinks_clear (mirroring the MCP page_act
-// surface).
+// emulate, clear_logs, sinks_install, sinks_clear and inject_canary (mirroring
+// the MCP page_act surface).
 func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 	var (
 		id             string
+		browserID      string
+		owner          string
 		action         string
 		selector       string
 		handle         string
@@ -341,7 +383,9 @@ func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 		targetX        float64
 		targetY        float64
 		targetSelector string
+		origin         string
 		paths          []string
+		targets        []string
 		waitMode       string
 		timeoutMS      int
 		width, height  int
@@ -353,10 +397,15 @@ func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 		Long: `Performs an action on a live page (click, input, type, press_key, click_at,
 hover_at, drag_and_drop, upload_file, hover, scroll, select, eval, navigate, back,
 forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install,
-sinks_clear) and prints the confirmation. The page id
+sinks_clear, inject_canary, postmessage_install, postmessage_clear, post_message)
+and prints the confirmation. The page id
 is optional when only one page is open; 'last' means the most recently opened page;
 a bare number resolves to page-N.
 Positional payloads fill each action's fields — flags remain as fallbacks.
+--browser resolves the page inside that browser only; --owner restricts the
+lookup to browsers with that owner (1-64 chars: A-Z, a-z, 0-9, '.', '_', '-').
+With more than one live browser pass one of them; a page held by another owner
+is refused, never acted on.
 Element actions also accept --handle from page fetch interactives/dom/links/a11y, e.g.
 --handle g3k9x2ab-b6; when both --handle and --selector are given, the handle wins.
 A handle is scoped to the document that minted it: after a navigation, reload or
@@ -383,6 +432,10 @@ redirect it is rejected as stale, so re-fetch before acting.
   clear_logs   (none)
   sinks_install (none)
   sinks_clear  (none)
+  inject_canary [canary]  (optional custom value; targets via --targets)
+  postmessage_install (none)
+  postmessage_clear   (none)
+  post_message  [value]   (target frame via --target-selector, default top; origin via --origin)
   back/forward/reload    (none)
   type         [selector] [text]
 
@@ -391,7 +444,21 @@ Logs are cumulative from page creation: clear right before the step whose traffi
 you want to observe, then run 'page fetch last network|console' and filter client-side.
 sinks_install arms the source-to-sink tracer and prints {"installed":true}; it changes
 page behavior, so capture stays opt-in. sinks_clear empties the tracer ring and prints
-{"cleared":N}; read the hits with 'page fetch <id> sinks'.`,
+{"cleared":N}; read the hits with 'page fetch <id> sinks'. inject_canary injects a
+unique wm-canary-<8 hex> value into query/hash/postmessage/name (all four by
+default; narrow with --targets, repeatable or comma-separated) and prints
+{canary, injected, hits, installed}. It requires 'page act sinks_install' first
+and works across at most 20 frames. postmessage_install arms the postMessage
+recorder: one capture-phase listener per window and iframe, without wrapping
+addEventListener, so page listeners keep their identity; it prints
+{"installed":true}. postmessage_clear empties every recorder ring and prints
+{"cleared":N}; read the log with 'page fetch <id> postmessage', or pass
+--target clear for the same {cleared} envelope. post_message delivers a value to
+window.top (--target-selector top or omitted) or to the contentWindow of the
+iframe named by --target-selector, using --origin as the target origin (default
+"*"), arms the recorder first, and prints {origin,target}. A value that is a
+complete JSON object or array is delivered as that structure; anything else is
+delivered as a string.`,
 		Example: `  web-cli page act click "#submit"                          # click on the single open page
   web-cli page act 12 input "#search" "pizza"               # type into a search box
   web-cli page act 12 press_key "Enter"                     # press Enter key
@@ -400,14 +467,20 @@ page behavior, so capture stays opt-in. sinks_clear empties the tracer ring and 
   web-cli page act last eval '() => document.title'         # run JS on the latest page
   web-cli page act last clear_logs  # reset both buffers, print {network,console} counts
   web-cli page act last sinks_install  # arm the source-to-sink tracer
-  web-cli page act last sinks_clear    # empty the tracer ring, print {cleared}`,
+  web-cli page act last sinks_clear    # empty the tracer ring, print {cleared}
+  web-cli page act last inject_canary  # inject into all four sources, print sink hits
+  web-cli page act last inject_canary --targets hash  # hash only, no reload
+  web-cli page act last postmessage_install  # arm the postMessage recorder
+  web-cli page act last post_message '{"t":"wm"}'  # send to window.top, read with 'page fetch last postmessage'
+  web-cli page act last post_message '{"t":"wm"}' --target-selector "iframe#widget" --origin https://widget.example
+  web-cli page act last postmessage_clear  # empty every recorder ring, print {cleared}`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Positional args win over the --flags; payload counts are
 			// validated here, before any browser work.
 			parsed, err := parseActArgs(args, actArgFlags{
 				id: id, action: action, selector: selector, handle: handle, value: value, key: key,
-				button: button, clickCount: clickCount, targetSelector: targetSelector,
-				paths: paths, waitMode: waitMode, device: device, x: x, y: y,
+				button: button, clickCount: clickCount, targetSelector: targetSelector, origin: origin,
+				paths: paths, targets: targets, waitMode: waitMode, device: device, x: x, y: y,
 				targetX: targetX, targetY: targetY, width: width, height: height,
 			})
 			if err != nil {
@@ -415,7 +488,8 @@ page behavior, so capture stays opt-in. sinks_clear empties the tracer ring and 
 			}
 			id, action, selector, handle = parsed.id, parsed.action, parsed.selector, parsed.handle
 			value, key, button, clickCount = parsed.value, parsed.key, parsed.button, parsed.clickCount
-			targetSelector, paths, waitMode, device = parsed.targetSelector, parsed.paths, parsed.waitMode, parsed.device
+			targetSelector, origin, paths, waitMode, device = parsed.targetSelector, parsed.origin, parsed.paths, parsed.waitMode, parsed.device
+			targets = parsed.targets
 			x, y, targetX, targetY = parsed.x, parsed.y, parsed.targetX, parsed.targetY
 			width, height = parsed.width, parsed.height
 
@@ -431,9 +505,9 @@ page behavior, so capture stays opt-in. sinks_clear empties the tracer ring and 
 			defer cancel()
 
 			switch action {
-			case "click", "input", "type", "press_key", "click_at", "hover_at", "drag_and_drop", "upload_file", "eval", "navigate", "back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport", "emulate", "clear_logs", "sinks_install", "sinks_clear":
+			case "click", "input", "type", "press_key", "click_at", "hover_at", "drag_and_drop", "upload_file", "eval", "navigate", "back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport", "emulate", "clear_logs", "sinks_install", "sinks_clear", "inject_canary", "postmessage_install", "postmessage_clear", "post_message":
 			default:
-				return fmt.Errorf("page act: unknown action=%q (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear)", action)
+				return fmt.Errorf("page act: unknown action=%q (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, inject_canary, postmessage_install, postmessage_clear, post_message)", action)
 			}
 
 			if action == "set_viewport" && (width <= 0 || height <= 0) {
@@ -450,6 +524,9 @@ page behavior, so capture stays opt-in. sinks_clear empties the tracer ring and 
 			if action == "eval" && value == "" {
 				return fmt.Errorf("page act: eval requires a non-empty --value (a JS function, e.g. '() => document.title')")
 			}
+			if action == "post_message" && value == "" {
+				return fmt.Errorf("page act: post_message requires a payload (e.g. 'page act last post_message '{\"t\":\"wm\"}''")
+			}
 			if action == "wait" {
 				if err := pageops.ValidateWait(waitMode); err != nil {
 					return fmt.Errorf("page act: %w", err)
@@ -460,24 +537,39 @@ page behavior, so capture stays opt-in. sinks_clear empties the tracer ring and 
 			if action == "set_viewport" {
 				vp = &browsers.Viewport{Width: width, Height: height}
 			}
-			browserID := explicitBrowserID(cmd)
+			if browserID == "" {
+				browserID = explicitBrowserID(cmd)
+			}
+			normalized, err := ipc.NormalizeOwner(owner)
+			if err != nil {
+				return fmt.Errorf("page act: %w", err)
+			}
+			owner = normalized
+			if owner != "" {
+				ctx = browsers.WithExplicitOwner(ctx, owner)
+			}
 			if cl := dialServe(cmd); cl != nil {
 				defer cl.Close()
-				rid, err := resolvePageID(ctx, cmd, mgr, cl, browserID, id, "page act")
+				rid, err := resolvePageID(ctx, mgr, cl, browserID, owner, id, "page act")
 				if err != nil {
 					return err
 				}
 				reportBrowserTarget(cmd, browserID)
-				return pageActViaIPC(cmd, ctx, cl, rid, action, handle, selector, value, key, button, clickCount, x, y, targetX, targetY, targetSelector, paths, waitMode, timeoutMS, vp, device)
+				return pageActViaIPC(cmd, ctx, cl, rid, browserID, owner, action, handle, selector, value, key, button, clickCount, x, y, targetX, targetY, targetSelector, origin, paths, targets, waitMode, timeoutMS, vp, device)
 			}
 			printServeHint(cmd)
 
-			rid, err := resolvePageID(ctx, cmd, mgr, nil, browserID, id, "page act")
+			rid, err := resolvePageID(ctx, mgr, nil, browserID, owner, id, "page act")
 			if err != nil {
 				return err
 			}
 			reportBrowserTarget(cmd, browserID)
-			p, err := mgr.Page(ctx, browsers.PageID(rid)) // opens the Browser if needed; probes for liveness
+			p, err := mgr.Page(
+				ctx,
+				browsers.PageID(rid),
+				browsers.BrowserID(browserID),
+				owner,
+			)
 			if err != nil {
 				return fmt.Errorf("page act: %w", err)
 			}
@@ -538,6 +630,14 @@ page behavior, so capture stays opt-in. sinks_clear empties the tracer ring and 
 				out, err = pageops.PageSinksInstall(ctx, p)
 			case "sinks_clear":
 				out, err = pageops.PageSinksClear(ctx, p)
+			case "inject_canary":
+				out, err = pageops.PageCanaryInject(ctx, p, targets, value)
+			case "postmessage_install":
+				out, err = pageops.PagePostMessageInstall(ctx, p)
+			case "postmessage_clear":
+				out, err = pageops.PagePostMessageClear(ctx, p)
+			case "post_message":
+				out, err = pageops.PagePostMessageSend(ctx, p, value, targetSelector, origin)
 			}
 			if err != nil {
 				return fmt.Errorf("page act: %w", err)
@@ -551,10 +651,10 @@ page behavior, so capture stays opt-in. sinks_clear empties the tracer ring and 
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to act on (optional with one page open; 'last'; or a bare number)")
-	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear")
+	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, inject_canary, postmessage_install, postmessage_clear, post_message")
 	cmd.Flags().StringVar(&selector, "selector", "", "CSS selector targeting the element (element actions)")
 	cmd.Flags().StringVar(&handle, "handle", "", "element handle from page fetch (g<document>-b<backendNodeId>, scoped to its document); wins over --selector (element actions)")
-	cmd.Flags().StringVar(&value, "value", "", "value for eval (JS function), input (text), type (text), navigate (URL), select (option value)")
+	cmd.Flags().StringVar(&value, "value", "", "value for eval (JS function), input (text), type (text), navigate (URL), select (option value), or inject_canary (custom canary)")
 	cmd.Flags().StringVar(&key, "key", "", "key or key combo for press_key action (e.g. Enter, Escape, Control+A)")
 	cmd.Flags().StringVar(&button, "button", "left", "mouse button for click and click_at: left, right, middle")
 	cmd.Flags().IntVar(&clickCount, "click-count", 1, "click count for click and click_at (1 for single click, 2 for double click)")
@@ -562,28 +662,37 @@ page behavior, so capture stays opt-in. sinks_clear empties the tracer ring and 
 	cmd.Flags().Float64Var(&y, "y", 0, "vertical coordinate in pixels (scroll, click_at, hover_at, drag_and_drop)")
 	cmd.Flags().Float64Var(&targetX, "target-x", 0, "target horizontal coordinate in pixels (drag_and_drop)")
 	cmd.Flags().Float64Var(&targetY, "target-y", 0, "target vertical coordinate in pixels (drag_and_drop)")
-	cmd.Flags().StringVar(&targetSelector, "target-selector", "", "target element selector (drag_and_drop)")
+	cmd.Flags().StringVar(&targetSelector, "target-selector", "", "target element selector (drag_and_drop), or destination frame for post_message: \"top\" (default) or a CSS selector naming an iframe")
+	cmd.Flags().StringVar(&origin, "origin", "*", "target origin for post_message (default \"*\"); pass the receiver's origin to restrict delivery")
 	cmd.Flags().StringArrayVar(&paths, "path", nil, "file paths for upload_file action")
+	cmd.Flags().StringSliceVar(&targets, "targets", nil, "canary injection points for inject_canary: query, hash, postmessage, name (repeatable or comma-separated; default all four)")
 	cmd.Flags().StringVar(&waitMode, "wait", "ms", "wait mode (wait action): load, idle, stable, interactable (needs --selector or --handle), ms (sleep --timeout-ms; default ms)")
 	cmd.Flags().IntVar(&timeoutMS, "timeout-ms", 30000, "per-action timeout in milliseconds (default 30000)")
+	cmd.Flags().StringVar(&browserID, "browser", "", "browser_id to resolve the page inside that browser only (use when more than one browser is live)")
+	cmd.Flags().StringVar(&owner, "owner", "", "owner label restricting the lookup to browsers with that owner (1-64 chars: A-Z, a-z, 0-9, '.', '_', '-')")
 	cmd.Flags().IntVar(&width, "width", 0, "target viewport width in CSS pixels (set_viewport action)")
 	cmd.Flags().IntVar(&height, "height", 0, "target viewport height in CSS pixels (set_viewport action)")
 	cmd.Flags().StringVar(&device, "device", "", "go-rod device preset to apply (emulate action), e.g. IPhoneX, IPadPro")
 	return cmd
 }
 
-// newPageCloseCmd builds `page close`: it resolves the page with the given id
-// via Manager.Page (surfacing restart-aware errors for pre-restart sessions),
-// then closes it via Manager.Open -> Browser.ClosePage (mirroring SessionClose).
+// newPageCloseCmd builds `page close`: it resolves the page with the same
+// qualifier-aware lookup as page fetch/act, then closes it through the browser
+// that holds it (mirroring the MCP session_close tool).
 func newPageCloseCmd(mgr *browsers.Manager) *cobra.Command {
-	var id string
+	var (
+		id        string
+		browserID string
+		owner     string
+	)
 	cmd := &cobra.Command{
 		Use:   "close [id]",
 		Short: "Close an open page",
 		Long: `Closes the page with the given id, releasing its browser tab. The id is
 optional when only one page is open; 'last' means the most recently opened
-page; a bare number resolves to page-N. The session id becomes invalid
-afterwards.`,
+page; a bare number resolves to page-N. With more than one live browser pass
+--browser or --owner; a page held by another owner is refused, never closed.
+The session id becomes invalid afterwards.`,
 		Example: `  web-cli page close     # close the single open page
   web-cli page close 12  # close page-12
   web-cli page close last`,
@@ -595,35 +704,37 @@ afterwards.`,
 			ctx, cancel := context.WithTimeout(cmdCtx(cmd), defaultCmdTimeout)
 			defer cancel()
 
-			browserID := explicitBrowserID(cmd)
+			if browserID == "" {
+				browserID = explicitBrowserID(cmd)
+			}
+			normalized, err := ipc.NormalizeOwner(owner)
+			if err != nil {
+				return fmt.Errorf("page close: %w", err)
+			}
+			owner = normalized
 			if cl := dialServe(cmd); cl != nil {
 				defer cl.Close()
-				rid, err := resolvePageID(ctx, cmd, mgr, cl, browserID, id, "page close")
+				rid, err := resolvePageID(ctx, mgr, cl, browserID, owner, id, "page close")
 				if err != nil {
 					return err
 				}
 				reportBrowserTarget(cmd, browserID)
-				return pageCloseViaIPC(cmd, ctx, cl, rid, browserID)
+				return pageCloseViaIPC(cmd, ctx, cl, rid, browserID, owner)
 			}
 			printServeHint(cmd)
 
-			rid, err := resolvePageID(ctx, cmd, mgr, nil, browserID, id, "page close")
+			rid, err := resolvePageID(ctx, mgr, nil, browserID, owner, id, "page close")
 			if err != nil {
 				return err
 			}
 			reportBrowserTarget(cmd, browserID)
 
-			b, err := openTargetBrowser(ctx, mgr, browserID, "page close")
-			if err != nil {
-				return err
-			}
-			// Resolve through the manager first so a pre-restart session id
-			// surfaces the explicit "browser was restarted" error (mirrors the
-			// MCP session_close tool).
-			if _, err := mgr.Page(ctx, browsers.PageID(rid)); err != nil {
-				return fmt.Errorf("page close: %w", err)
-			}
-			if err := b.ClosePage(ctx, browsers.PageID(rid)); err != nil {
+			if _, err := mgr.ClosePage(
+				ctx,
+				browsers.PageID(rid),
+				browsers.BrowserID(browserID),
+				owner,
+			); err != nil {
 				return fmt.Errorf("page close: %w", err)
 			}
 			fmt.Printf("session %s closed\n", rid)
@@ -631,6 +742,8 @@ afterwards.`,
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to close (optional with one page open; 'last'; or a bare number)")
+	cmd.Flags().StringVar(&browserID, "browser", "", "browser_id to resolve the page inside that browser only (use when more than one browser is live)")
+	cmd.Flags().StringVar(&owner, "owner", "", "owner label restricting the lookup to browsers with that owner (1-64 chars: A-Z, a-z, 0-9, '.', '_', '-')")
 	return cmd
 }
 
@@ -677,7 +790,7 @@ func pageFetchViaIPC(
 	cmd *cobra.Command,
 	ctx context.Context,
 	cl *ipc.Client,
-	id, what, selector, target string,
+	id, browserID, owner, what, selector, target string,
 	fullPage bool,
 	maxBytes int,
 	includeValues bool,
@@ -688,6 +801,8 @@ func pageFetchViaIPC(
 	var res ipc.PageFetchResult
 	if err := cl.Call(ctx, ipc.MethodPageFetch, &ipc.PageFetchParams{
 		SessionID:     id,
+		BrowserID:     browserID,
+		Owner:         owner,
 		What:          what,
 		Selector:      selector,
 		Target:        target,
@@ -703,18 +818,19 @@ func pageFetchViaIPC(
 
 // pageActViaIPC implements `page act` against a live serve process: it
 // forwards the action (with its handle/selector/value/key/button/click_count/
-// x/y/target_x/target_y/target_selector/paths/timeout/wait/viewport/device
+// x/y/target_x/target_y/target_selector/origin/paths/timeout/wait/viewport/device
 // params) to page.act and prints the confirmation byte-identically to the
 // in-process path.
 func pageActViaIPC(
 	cmd *cobra.Command,
 	ctx context.Context,
 	cl *ipc.Client,
-	id, action, handle, selector, value, key, button string,
+	id, browserID, owner, action, handle, selector, value, key, button string,
 	clickCount int,
 	x, y, targetX, targetY float64,
-	targetSelector string,
+	targetSelector, origin string,
 	paths []string,
+	targets []string,
 	waitMode string,
 	timeoutMS int,
 	vp *browsers.Viewport,
@@ -723,6 +839,8 @@ func pageActViaIPC(
 	var res ipc.PageActResult
 	if err := cl.Call(ctx, ipc.MethodPageAct, &ipc.PageActParams{
 		SessionID:      id,
+		BrowserID:      browserID,
+		Owner:          owner,
 		Action:         action,
 		Selector:       selector,
 		Handle:         handle,
@@ -735,7 +853,9 @@ func pageActViaIPC(
 		TargetX:        targetX,
 		TargetY:        targetY,
 		TargetSelector: targetSelector,
+		Origin:         origin,
 		Paths:          paths,
+		Targets:        targets,
 		TimeoutMS:      timeoutMS,
 		WaitMode:       waitMode,
 		Viewport:       vp,
@@ -754,9 +874,9 @@ func pageCloseViaIPC(
 	cmd *cobra.Command,
 	ctx context.Context,
 	cl *ipc.Client,
-	id, browserID string,
+	id, browserID, owner string,
 ) error {
-	params := &ipc.PageCloseParams{SessionID: id, BrowserID: browserID}
+	params := &ipc.PageCloseParams{SessionID: id, BrowserID: browserID, Owner: owner}
 	if err := cl.Call(ctx, ipc.MethodPageClose, params, nil); err != nil {
 		return fmt.Errorf("page close: %w", err)
 	}

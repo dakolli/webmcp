@@ -17,6 +17,7 @@ import (
 // machine branch signal; the human sentence stays in Error.Message.
 const (
 	errInvalidArgs     = "invalid_args"
+	errNotFound        = "not_found"
 	errElementNotFound = "element_not_found"
 	errNotInteractable = "not_interactable"
 	errAntiBot         = "anti_bot"
@@ -33,7 +34,7 @@ const resultEnvelopeDoc = " Every result is one JSON envelope: " +
 	" on success (data is the JSON object/array to address directly, or a JSON " +
 	"string for prose), or " +
 	`{"ok":false,"error":{"type":<type>,"message":<human sentence>,"hint":<one-line fix>}}` +
-	" on failure. Branch on error.type (invalid_args, element_not_found, " +
+	" on failure. Branch on error.type (invalid_args, not_found, element_not_found, " +
 	"not_interactable, anti_bot, page_closed, timeout, nav_failed, unknown), " +
 	"apply error.hint when present, and read success payloads under data."
 
@@ -124,7 +125,6 @@ var pageClosedMarkers = []string{
 	"page session is closed",
 	"page is closed (nil rod handle)",
 	"browsers: page ",
-	`session "`,
 	"no longer exists",
 	"inspected target navigated or closed",
 	"no target with given id found",
@@ -204,9 +204,16 @@ func classifyError(err error, ch challengeState) (string, string) {
 		notClickable   *rod.NotInteractableError
 		closeCanceled  *rod.PageCloseCanceledError
 		navigation     *rod.NavigationError
+		lookup         *browsers.PageLookupError
 	)
 
 	switch {
+	case errors.As(err, &lookup) && lookup.Kind == browsers.PageLookupAmbiguous:
+		return errInvalidArgs, "this session id needs a browser — pass browser_id or owner to choose the browser that holds it"
+	case errors.As(err, &lookup):
+		return errNotFound, "the session is not in that browser or owner — call session_list for the live ids, or pass the matching browser_id or owner"
+	case errors.Is(err, browsers.ErrUnknownBrowser):
+		return errInvalidArgs, "that browser_id is not live — call browser_list for the running ids and pass one of them"
 	case containsAny(msg, invalidArgsMarkers):
 		return errInvalidArgs, hintFor(errInvalidArgs)
 	case errors.As(err, &missingElement) || containsAny(msg, elementNotFoundMarkers):
@@ -234,6 +241,8 @@ func hintFor(errType string) string {
 	switch errType {
 	case errInvalidArgs:
 		return "fix the arguments per the tool InputSchema (required fields, enum values)"
+	case errNotFound:
+		return "the session is not in that browser or owner, or no longer exists — call session_list for the live ids, then pass the matching browser_id or owner"
 	case errElementNotFound:
 		return "no element matched the selector — read what=dom or what=links and retry with an exact selector"
 	case errNotInteractable:

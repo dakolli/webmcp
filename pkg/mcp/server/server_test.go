@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -120,8 +122,9 @@ func TestProcessRequestPromptsListAndGet(t *testing.T) {
 }
 
 type ownerCaptureTool struct {
-	owner string
-	label string
+	owner   string
+	session string
+	label   string
 }
 
 func (t *ownerCaptureTool) Name() string        { return "capture_owner" }
@@ -133,6 +136,7 @@ func (t *ownerCaptureTool) InputSchema() models.InputSchema {
 
 func (t *ownerCaptureTool) Execute(ctx context.Context, _ json.RawMessage) (string, error) {
 	t.owner = browsers.OwnerFrom(ctx)
+	t.session = browsers.SessionOwnerFrom(ctx)
 	t.label = browsers.OwnerLabelFrom(ctx)
 	return "ok", nil
 }
@@ -330,7 +334,7 @@ func TestNoAuthWarning(t *testing.T) {
 	}
 }
 
-func TestProcessRequestInjectsSSEOwner(t *testing.T) {
+func TestProcessRequestLabelsSSESessionWithoutOwnerToken(t *testing.T) {
 	capture := &ownerCaptureTool{}
 	r := tools.NewEmptyRegistry()
 	r.Register(capture)
@@ -352,8 +356,11 @@ func TestProcessRequestInjectsSSEOwner(t *testing.T) {
 
 	callCaptureTool(t, s, withSSESession(context.Background(), sessionID))
 
-	if capture.owner != sessionID {
-		t.Fatalf("owner = %q, want the SSE session id %q", capture.owner, sessionID)
+	if capture.owner != browsers.UnownedOwner {
+		t.Fatalf("owner = %q, want %q (no transport token)", capture.owner, browsers.UnownedOwner)
+	}
+	if capture.session != browsers.UnownedOwner {
+		t.Fatalf("session owner = %q, want %q (no transport token)", capture.session, browsers.UnownedOwner)
 	}
 	if capture.label != "Claude" {
 		t.Fatalf("label = %q, want the client name Claude", capture.label)
@@ -376,10 +383,55 @@ func TestProcessRequestOwnerFallbacks(t *testing.T) {
 
 	const sessionID = "1700000000000999999"
 	callCaptureTool(t, s, withSSESession(context.Background(), sessionID))
-	if capture.owner != sessionID {
-		t.Fatalf("owner = %q, want the SSE session id", capture.owner)
+	if capture.owner != browsers.UnownedOwner {
+		t.Fatalf("owner = %q, want %q (no transport token)", capture.owner, browsers.UnownedOwner)
+	}
+	if capture.session != browsers.UnownedOwner {
+		t.Fatalf("session owner = %q, want %q (no transport token)", capture.session, browsers.UnownedOwner)
 	}
 	if capture.label != "client-999999" {
 		t.Fatalf("label = %q, want the synthetic client-999999", capture.label)
+	}
+}
+
+// postMessage drives one JSON-RPC request through the real HTTP dispatch entry
+// that the SSE and Streamable HTTP paths share.
+func postMessage(
+	t *testing.T,
+	s *Server,
+	target,
+	body string,
+) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, target, strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
+// TestHandleMessageQuerySessionReachesTool pins that the SSE endpoint query
+// session id reaches the tool as a display label, with no owner token derived
+// from it.
+func TestHandleMessageQuerySessionReachesTool(t *testing.T) {
+	capture := &ownerCaptureTool{}
+	r := tools.NewEmptyRegistry()
+	r.Register(capture)
+	s := &Server{registry: r, labels: map[string]string{}}
+
+	const sessionID = "1700000000000000123"
+	rec := postMessage(
+		t,
+		s,
+		"/message?session_id="+sessionID,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"capture_owner","arguments":{}}}`,
+	)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if capture.session != browsers.UnownedOwner {
+		t.Fatalf("session owner = %q, want %q (no transport token)", capture.session, browsers.UnownedOwner)
+	}
+	if capture.label != "client-000123" {
+		t.Fatalf("label = %q, want client-000123", capture.label)
 	}
 }

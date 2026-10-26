@@ -96,8 +96,26 @@ func (s *stubbedManager) Browsers() map[browsers.BrowserID]*browsers.Browser {
 }
 
 // Page implements manager.
-func (s *stubbedManager) Page(ctx context.Context, id browsers.PageID) (*browsers.Page, error) {
+func (s *stubbedManager) Page(
+	ctx context.Context,
+	id browsers.PageID,
+	_ browsers.BrowserID,
+	_ string,
+) (*browsers.Page, error) {
 	return s.browser.Page(ctx, id)
+}
+
+// ClosePage implements manager.
+func (s *stubbedManager) ClosePage(
+	ctx context.Context,
+	id browsers.PageID,
+	_ browsers.BrowserID,
+	_ string,
+) (browsers.PageClose, error) {
+	if err := s.browser.ClosePage(ctx, id); err != nil {
+		return browsers.PageClose{}, err
+	}
+	return browsers.PageClose{Browser: s.browser.ID()}, nil
 }
 
 // CheckPageScope implements manager: the stub has no allowlist.

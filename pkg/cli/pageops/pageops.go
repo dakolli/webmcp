@@ -750,6 +750,9 @@ var aspectEntries = []aspectEntry{
 	{name: "sinks", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
 		return PageSinks(ctx, p)
 	}},
+	{name: "postmessage", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, q AspectQuery) (string, error) {
+		return PagePostMessage(ctx, p, q.Target)
+	}},
 	{name: "har", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
 		return PageHAR(ctx, p)
 	}},

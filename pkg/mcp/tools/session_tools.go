@@ -32,15 +32,18 @@ func (t *SessionClose) Name() string {
 // Description returns a customer/LLM-facing description of session_close.
 func (t *SessionClose) Description() string {
 	return "Closes a live browser session opened by fetch_page, releasing its " +
-		"browser tab. The session_id is resolved from the live browser registry " +
-		"without probing the tab, then closed through the browser that owns it, " +
-		"without launching a browser. A page an operation still holds is evicted " +
-		"from the session registry after a short bound, and its tab is left to " +
-		"the browser teardown. The session_id becomes invalid afterwards. Use " +
-		"session_list to see which sessions are still open; an unknown id fails " +
-		"and names the live ids. This never launches a browser and never touches " +
-		"a browser that does not own the session. Example: " +
-		"{ \"session_id\": \"page-1\" }." + resultEnvelopeDoc
+		"browser tab. When more than one browser is live, pass browser_id or owner " +
+		"to declare which browser holds the session; with one live browser both may " +
+		"be omitted, and a session held outside the declared owner is refused as " +
+		"not_found with the holding browser named and its content untouched. The id " +
+		"is resolved from the live browser registry without probing the tab, then closed through the " +
+		"browser that owns it, without launching a browser. A page an operation " +
+		"still holds is evicted from the session registry after a short bound, " +
+		"and its tab is left to the browser teardown. The session_id becomes " +
+		"invalid afterwards. Use session_list to see which sessions are still " +
+		"open; an unknown id fails and names the live ids. This never launches a " +
+		"browser and never touches a browser that does not own the session. " +
+		"Example: { \"session_id\": \"page-1\" }." + resultEnvelopeDoc
 }
 
 // InputSchema returns the JSON Schema for session_close's arguments: a required
@@ -53,6 +56,14 @@ func (t *SessionClose) InputSchema() models.InputSchema {
 				"type":        "string",
 				"description": "The session_id returned by fetch_page for the session to close.",
 			},
+			"browser_id": map[string]any{
+				"type":        "string",
+				"description": "Optional browser_id to resolve the session inside that browser only (e.g. 'browser-2'). Use it when more than one browser is live; with exactly one live browser it may be omitted.",
+			},
+			"owner": map[string]any{
+				"type":        "string",
+				"description": "Optional owner label (1-64 chars: A-Z, a-z, 0-9, '.', '_', '-') restricting the lookup to browsers with that owner. A session held by another owner is not_found, never closed.",
+			},
 		},
 		Required: []string{"session_id"},
 	}
@@ -62,6 +73,10 @@ func (t *SessionClose) InputSchema() models.InputSchema {
 type sessionCloseArgs struct {
 	// SessionID identifies the page/session to close (required).
 	SessionID browsers.PageID `json:"session_id"`
+	// BrowserID optionally pins the lookup to one browser.
+	BrowserID string `json:"browser_id"`
+	// Owner optionally restricts the lookup to browsers with that owner.
+	Owner string `json:"owner"`
 }
 
 // Execute parses the session_id and closes the page through the browser that
@@ -76,7 +91,7 @@ func (t *SessionClose) Execute(ctx context.Context, args json.RawMessage) (strin
 	if a.SessionID == "" {
 		return failResult(fmt.Errorf("session_close: missing required argument %q", "session_id"))
 	}
-	closed, err := t.mgr.ClosePage(ctx, a.SessionID)
+	closed, err := t.mgr.ClosePage(ctx, a.SessionID, browsers.BrowserID(a.BrowserID), a.Owner)
 	if err != nil {
 		return failResult(fmt.Errorf("session_close: %w", err))
 	}

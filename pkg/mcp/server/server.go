@@ -347,6 +347,7 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sessionID := r.URL.Query().Get("session_id")
+
 	resp := s.processRequest(withSSESession(r.Context(), sessionID), req)
 	respBytes, err := json.Marshal(resp)
 	if err != nil {
@@ -464,8 +465,8 @@ func (s *Server) imagesEnabled(sessionID string) bool {
 	return enabled
 }
 
-// processRequest runs one JSON-RPC request against the tool registry: it
-// injects the caller's owner identity, handles the MCP handshake (initialize),
+// processRequest runs one JSON-RPC request against the tool registry, handles
+// the MCP handshake (initialize),
 // the tool inventory (tools/list) and tool invocations (tools/call), returning a
 // JSON-RPC response.
 func (s *Server) processRequest(ctx context.Context, req models.JSONRPCRequest) models.JSONRPCResponse {
@@ -475,7 +476,6 @@ func (s *Server) processRequest(ctx context.Context, req models.JSONRPCRequest) 
 	}
 
 	if sessionID := sseSessionFrom(ctx); sessionID != "" {
-		ctx = browsers.WithOwnerKey(ctx, sessionID)
 		ctx = browsers.WithOwnerLabel(ctx, s.clientLabel(sessionID))
 	}
 

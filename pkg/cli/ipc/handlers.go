@@ -50,7 +50,18 @@ type manager interface {
 	PruneProfiles(ctx context.Context) ([]string, error)
 	Browser(id browsers.BrowserID) (*browsers.Browser, error)
 	Browsers() map[browsers.BrowserID]*browsers.Browser
-	Page(ctx context.Context, id browsers.PageID) (*browsers.Page, error)
+	Page(
+		ctx context.Context,
+		id browsers.PageID,
+		browserID browsers.BrowserID,
+		owner string,
+	) (*browsers.Page, error)
+	ClosePage(
+		ctx context.Context,
+		id browsers.PageID,
+		browserID browsers.BrowserID,
+		owner string,
+	) (browsers.PageClose, error)
 	CheckPageScope(id browsers.PageID, rawURL string) error
 }
 
@@ -59,7 +70,8 @@ var _ manager = (*browsers.Manager)(nil)
 
 // handle dispatches a decoded request to its method handler. Unknown methods
 // get a -32601 error naming the method; handlers return (result, nil) on
-// success and (nil, *Error) on JSON-RPC failure.
+// success and (nil, *Error) on JSON-RPC failure. Page requests carry their
+// browser_id and owner as explicit params; there is no transport identity.
 func (s *Server) handle(ctx context.Context, req Request) (any, *Error) {
 	switch req.Method {
 	case MethodPing:
@@ -397,7 +409,12 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 		return nil, &Error{Code: CodeInvalidParams, Message: fmt.Sprintf("page.fetch: %v", err)}
 	}
 
-	page, err := s.mgr.Page(ctx, browsers.PageID(p.SessionID)) // opens the Browser if needed; probes for liveness
+	page, err := s.mgr.Page(
+		ctx,
+		browsers.PageID(p.SessionID),
+		browsers.BrowserID(p.BrowserID),
+		p.Owner,
+	)
 	if err != nil {
 		return nil, serverError(err)
 	}
@@ -423,9 +440,9 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 // handlePageAct implements page.act: it performs the requested action on a
 // live page — click, input, type, press_key, click_at, hover_at, drag_and_drop,
 // upload_file, hover, scroll, select, eval, navigate, back, forward, reload,
-// wait, set_viewport, emulate, clear_logs, sinks_install or sinks_clear —
-// mirroring the CLI page act command. An unknown action is a -32602
-// invalid-params error.
+// wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear or
+// inject_canary — mirroring the CLI page act command. An unknown action is a
+// -32602 invalid-params error.
 func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any, *Error) {
 	p, rpcErr := decodeParams[PageActParams](params)
 	if rpcErr != nil {
@@ -438,17 +455,23 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		return nil, &Error{Code: CodeInvalidParams, Message: `page.act: missing required param "action"`}
 	}
 	switch p.Action {
-	case "click", "input", "type", "press_key", "click_at", "hover_at", "drag_and_drop", "upload_file", "eval", "navigate", "back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport", "emulate", "clear_logs", "sinks_install", "sinks_clear":
+	case "click", "input", "type", "press_key", "click_at", "hover_at", "drag_and_drop", "upload_file", "eval", "navigate", "back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport", "emulate", "clear_logs", "sinks_install", "sinks_clear", "inject_canary", "postmessage_install", "postmessage_clear", "post_message":
 	default:
 		return nil, &Error{
 			Code:    CodeInvalidParams,
-			Message: fmt.Sprintf("page.act: unknown action=%q (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear)", p.Action),
+			Message: fmt.Sprintf("page.act: unknown action=%q (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, inject_canary, postmessage_install, postmessage_clear, post_message)", p.Action),
 		}
 	}
 	if p.Action == "eval" && p.Value == "" {
 		return nil, &Error{
 			Code:    CodeInvalidParams,
 			Message: "page.act: eval requires a non-empty --value (a JS function, e.g. '() => document.title')",
+		}
+	}
+	if p.Action == "post_message" && p.Value == "" {
+		return nil, &Error{
+			Code:    CodeInvalidParams,
+			Message: "page.act: post_message requires a payload (e.g. 'page act last post_message '{\"t\":\"wm\"}''",
 		}
 	}
 	if p.Action == "wait" {
@@ -479,7 +502,12 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		}
 	}
 
-	page, err := s.mgr.Page(ctx, browsers.PageID(p.SessionID)) // opens the Browser if needed; probes for liveness
+	page, err := s.mgr.Page(
+		ctx,
+		browsers.PageID(p.SessionID),
+		browsers.BrowserID(p.BrowserID),
+		p.Owner,
+	)
 	if err != nil {
 		return nil, serverError(err)
 	}
@@ -545,6 +573,14 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		out, err = pageops.PageSinksInstall(ctx, page)
 	case "sinks_clear":
 		out, err = pageops.PageSinksClear(ctx, page)
+	case "inject_canary":
+		out, err = pageops.PageCanaryInject(ctx, page, p.Targets, p.Value)
+	case "postmessage_install":
+		out, err = pageops.PagePostMessageInstall(ctx, page)
+	case "postmessage_clear":
+		out, err = pageops.PagePostMessageClear(ctx, page)
+	case "post_message":
+		out, err = pageops.PagePostMessageSend(ctx, page, p.Value, p.TargetSelector, p.Origin)
 	}
 	if err != nil {
 		return nil, serverError(err)
@@ -556,10 +592,9 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 	return PageActResult{Data: out}, nil
 }
 
-// handlePageClose implements page.close: it resolves the page with the given id
-// via Manager.Page (surfacing restart-aware errors for pre-restart sessions),
-// then closes it through the browser named by browser_id, else the default
-// browser. The session id becomes invalid afterwards.
+// handlePageClose implements page.close: it resolves and closes the page with
+// the same qualifier-aware lookup as page.fetch/page.act (mirrors the MCP
+// session_close tool). The session id becomes invalid afterwards.
 func (s *Server) handlePageClose(ctx context.Context, params json.RawMessage) (any, *Error) {
 	p, rpcErr := decodeParams[PageCloseParams](params)
 	if rpcErr != nil {
@@ -569,17 +604,12 @@ func (s *Server) handlePageClose(ctx context.Context, params json.RawMessage) (a
 		return nil, &Error{Code: CodeInvalidParams, Message: `page.close: missing required param "session_id"`}
 	}
 
-	b, err := s.targetBrowser(ctx, p.BrowserID)
-	if err != nil {
-		return nil, serverError(err)
-	}
-	// Resolve through the manager first so a pre-restart session id surfaces
-	// the explicit "browser was restarted" error (mirrors the MCP
-	// session_close tool).
-	if _, err := s.mgr.Page(ctx, browsers.PageID(p.SessionID)); err != nil {
-		return nil, serverError(err)
-	}
-	if err := b.ClosePage(ctx, browsers.PageID(p.SessionID)); err != nil {
+	if _, err := s.mgr.ClosePage(
+		ctx,
+		browsers.PageID(p.SessionID),
+		browsers.BrowserID(p.BrowserID),
+		p.Owner,
+	); err != nil {
 		return nil, serverError(err)
 	}
 	return PageCloseResult{OK: true}, nil

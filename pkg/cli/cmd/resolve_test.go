@@ -55,6 +55,7 @@ func TestParseFetchArgs(t *testing.T) {
 		{"no args, id flag", nil, "page-1", "", "page-1", "text", ""},
 		{"1 arg aspect is what", []string{"links"}, "", "", "", "links", ""},
 		{"1 arg sinks aspect is what", []string{"sinks"}, "", "", "", "sinks", ""},
+		{"1 arg postmessage aspect is what", []string{"postmessage"}, "", "", "", "postmessage", ""},
 		{"1 arg aspect, what flag loses", []string{"dom"}, "", "html", "", "dom", ""},
 		{"1 arg digits is id", []string{"12"}, "", "", "12", "text", ""},
 		{"1 arg literal id", []string{"page-1"}, "", "", "page-1", "text", ""},
@@ -249,6 +250,42 @@ func TestParseActArgs(t *testing.T) {
 			actArgFlags{},
 			actArgs{action: "clear_logs"},
 		},
+		{
+			"inject_canary defaults",
+			[]string{"12", "inject_canary"},
+			actArgFlags{},
+			actArgs{id: "12", action: "inject_canary"},
+		},
+		{
+			"inject_canary custom value positional and targets flag",
+			[]string{"12", "inject_canary", "wm-canary-deadbeef"},
+			actArgFlags{targets: []string{"hash", "postmessage"}},
+			actArgs{id: "12", action: "inject_canary", value: "wm-canary-deadbeef", targets: []string{"hash", "postmessage"}},
+		},
+		{
+			"action-first inject_canary with targets flag",
+			[]string{"inject_canary"},
+			actArgFlags{id: "page-1", targets: []string{"query"}},
+			actArgs{id: "page-1", action: "inject_canary", targets: []string{"query"}},
+		},
+		{
+			"id + post_message value with target and origin flags",
+			[]string{"12", "post_message", `{"t":"wm"}`},
+			actArgFlags{targetSelector: "iframe#w", origin: "https://w.example"},
+			actArgs{id: "12", action: "post_message", value: `{"t":"wm"}`, targetSelector: "iframe#w", origin: "https://w.example"},
+		},
+		{
+			"action-first postmessage_install",
+			[]string{"postmessage_install"},
+			actArgFlags{},
+			actArgs{action: "postmessage_install"},
+		},
+		{
+			"flag-only postmessage_clear",
+			nil,
+			actArgFlags{id: "page-1", action: "postmessage_clear"},
+			actArgs{id: "page-1", action: "postmessage_clear"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -323,6 +360,42 @@ func TestParseActArgsErrors(t *testing.T) {
 			[]string{"12", "clear_logs"},
 			actArgFlags{value: "x"},
 			`page act: action "clear_logs" takes no payload; got --value "x"`,
+		},
+		{
+			"inject_canary extra payload",
+			[]string{"12", "inject_canary", "one", "two"},
+			actArgFlags{},
+			`page act: action "inject_canary" takes at most 1 positional arg ([value]); got 2`,
+		},
+		{
+			"postmessage_install no payload allowed",
+			[]string{"postmessage_install", "x"},
+			actArgFlags{},
+			`page act: action "postmessage_install" takes no positional args; got 1`,
+		},
+		{
+			"postmessage_clear no payload allowed",
+			[]string{"postmessage_clear", "x"},
+			actArgFlags{},
+			`page act: action "postmessage_clear" takes no positional args; got 1`,
+		},
+		{
+			"postmessage_install refuses --value",
+			[]string{"12", "postmessage_install"},
+			actArgFlags{value: "x"},
+			`page act: action "postmessage_install" takes no payload; got --value "x"`,
+		},
+		{
+			"postmessage_clear refuses --value",
+			[]string{"12", "postmessage_clear"},
+			actArgFlags{value: "x"},
+			`page act: action "postmessage_clear" takes no payload; got --value "x"`,
+		},
+		{
+			"post_message extra payload",
+			[]string{"12", "post_message", "one", "two"},
+			actArgFlags{},
+			`page act: action "post_message" takes at most 1 positional arg ([value]); got 2`,
 		},
 		{
 			"scroll partial payload",

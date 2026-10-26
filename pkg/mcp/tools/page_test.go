@@ -103,6 +103,42 @@ func TestPageFetchSinks(t *testing.T) {
 	}
 }
 
+// TestPageFetchPostMessage pins the postMessage read surface: it is a
+// self-capped aspect present in the enum, and the description carries the
+// opt-in arming, aggregation and clear contract.
+func TestPageFetchPostMessage(t *testing.T) {
+	asp, ok := aspects["postmessage"]
+	if !ok || asp.read == nil {
+		t.Fatal("postmessage aspect is not registered")
+	}
+	if asp.trunc != truncationNone {
+		t.Errorf("postmessage truncation = %v, want truncationNone", asp.trunc)
+	}
+
+	what, ok := (&Page{}).InputSchema().Properties["what"].(map[string]any)
+	if !ok {
+		t.Fatal("what schema property is missing")
+	}
+	enum, _ := what["enum"].([]string)
+	if !slices.Contains(enum, "postmessage") {
+		t.Errorf("what enum = %v, want postmessage included", enum)
+	}
+
+	desc := (&Page{}).Description()
+	for _, want := range []string{"postMessage recorder", "postmessage_install", "postmessage_clear", "target=clear", "frames", "500 runes"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("page_fetch description is missing %q", want)
+		}
+	}
+
+	propDesc, _ := what["description"].(string)
+	for _, want := range []string{"postmessage", "postmessage_install", "target=clear"} {
+		if !strings.Contains(propDesc, want) {
+			t.Errorf("what schema description is missing %q", want)
+		}
+	}
+}
+
 func TestScreenshotCarrier(t *testing.T) {
 	uri, encoded := testPNG(t)
 
@@ -164,5 +200,43 @@ func TestMarksCarrier(t *testing.T) {
 	}
 	if n := strings.Count(out, encoded); n != 1 {
 		t.Errorf("base64 payload occurs %d times in the carrier, want exactly 1", n)
+	}
+}
+
+// TestSessionQualifiersAreOptionalOnPageSurfaces pins the declarative lookup
+// contract on wire surfaces: page_fetch, page_act and session_close each accept
+// an optional browser_id and owner, and neither is ever required.
+func TestSessionQualifiersAreOptionalOnPageSurfaces(t *testing.T) {
+	surfaces := []struct {
+		name   string
+		schema models.InputSchema
+	}{
+		{"page_fetch", (&Page{}).InputSchema()},
+		{"page_act", (&Act{}).InputSchema()},
+		{"session_close", (&SessionClose{}).InputSchema()},
+	}
+	for _, surface := range surfaces {
+		t.Run(surface.name, func(t *testing.T) {
+			for _, key := range []string{"browser_id", "owner"} {
+				if _, ok := surface.schema.Properties[key]; !ok {
+					t.Fatalf("%s schema is missing %q", surface.name, key)
+				}
+			}
+			for _, required := range surface.schema.Required {
+				if required == "browser_id" || required == "owner" {
+					t.Fatalf("%s marks %q required; both must stay optional", surface.name, required)
+				}
+			}
+		})
+	}
+
+	var a actArgs
+	if err := json.Unmarshal([]byte(
+		`{"session_id":"page-1","action":"back","browser_id":"browser-2","owner":"task-b"}`,
+	), &a); err != nil {
+		t.Fatalf("decode page_act qualifiers: %v", err)
+	}
+	if a.BrowserID != "browser-2" || a.Owner != "task-b" {
+		t.Fatalf("page_act qualifiers = %q/%q, want browser-2/task-b", a.BrowserID, a.Owner)
 	}
 }

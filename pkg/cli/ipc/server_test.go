@@ -215,6 +215,11 @@ func TestServerBadParams(t *testing.T) {
 			line: `{"jsonrpc":"2.0","id":1,"method":"page.open","params":{"url":42}}`,
 			want: "url", // encoding/json names the struct field in the decode error
 		},
+		{
+			name: "page.act post_message missing value",
+			line: `{"jsonrpc":"2.0","id":1,"method":"page.act","params":{"session_id":"page-1","action":"post_message"}}`,
+			want: `page.act: post_message requires a payload`,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -261,7 +266,7 @@ func TestServerBadParamsPageFetchUnknownWhat(t *testing.T) {
 	if resp.Error == nil || resp.Error.Code != CodeInvalidParams {
 		t.Fatalf("error = %+v, want code %d (-32602)", resp.Error, CodeInvalidParams)
 	}
-	if want := `page.fetch: unknown what="bogus" (must be one of html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, marks, security, storage, sinks, har)`; resp.Error.Message != want {
+	if want := `page.fetch: unknown what="bogus" (must be one of html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, marks, security, storage, sinks, postmessage, har)`; resp.Error.Message != want {
 		t.Errorf("error message = %q, want %q", resp.Error.Message, want)
 	}
 }
@@ -272,7 +277,7 @@ func TestServerBadParamsPageFetchUnknownWhat(t *testing.T) {
 func TestServerPageFetchAcceptsSharedAspects(t *testing.T) {
 	path := startServer(t, newStubServer())
 
-	for _, what := range []string{"article", "marks", "body", "security", "sinks"} {
+	for _, what := range []string{"article", "marks", "body", "security", "sinks", "postmessage"} {
 		t.Run(what, func(t *testing.T) {
 			conn := dialRaw(t, path)
 			r := bufio.NewReader(conn)

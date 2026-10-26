@@ -49,6 +49,11 @@ type Page struct {
 	// re-injects the script and only a page close disarms it (see InstallSinks).
 	// Guarded by the operation lock.
 	sinkScriptInstalled bool
+	// postMessageScriptInstalled reports whether the postMessage recorder is
+	// armed: the page-level flag outlives any single document, so a navigation
+	// re-injects the script and only a page close disarms it (see
+	// InstallPostMessages). Guarded by the operation lock.
+	postMessageScriptInstalled bool
 	// observer holds the page's network/console capture rings. It is assigned
 	// once in the pre-registration window and never replaced, so read methods
 	// may use it without taking the operation lock. Engine-internal: surfaces
