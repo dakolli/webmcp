@@ -6,7 +6,7 @@ import "testing"
 // registerAspect line: unique names in registration order, a reader for every
 // name, and a schema enum that mirrors the registration order.
 func TestAspectRegistry(t *testing.T) {
-	const wantList = "html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, console, article, marks"
+	const wantList = "html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, body, console, article, marks"
 	if got := validAspects(); got != wantList {
 		t.Errorf("validAspects() = %q, want %q", got, wantList)
 	}

@@ -81,6 +81,44 @@ The MCP server binds all interfaces and has **no authentication** — keep it lo
 - Add `--persist` to keep a named profile and its logins after close.
   The MCP equivalent is `"persist": true` on `browser_create`.
 
+### Proxy & TLS (Burp, Caido, ZAP)
+
+Route the browser through a local intercept proxy with `--proxy` (CLI) or `proxy`
+(`browser_create`). Both accept `host:port` or `scheme://host:port`:
+
+```sh
+browser browser create --proxy http://127.0.0.1:8080 --ignore-certs
+browser fetch https://example.org --wait load    # the request appears in the proxy history
+```
+
+```json
+{ "proxy": "http://127.0.0.1:8080", "ignore_certs": true }
+```
+
+- `--proxy-bypass` / `proxy_bypass` takes a comma-separated host list
+  (`localhost,*.internal`) that skips the proxy.
+- `--ignore-certs` / `ignore_certs` accepts invalid TLS certificates, such as the
+  proxy's MITM CA. It is independent of the proxy: set it explicitly.
+- Chromium receives `--proxy-server=<value>`, `--proxy-bypass-list=<list>` and
+  `--ignore-certificate-errors`. These are process-start flags, so they are per
+  browser: create a new browser to change them.
+- Proxy credentials never go in a flag or tool argument. For a remote proxy, put
+  them in `~/.config/browser-mcp/proxy.json` with mode `0600`, keyed by proxy
+  `host:port`:
+
+```json
+{
+  "proxies": {
+    "proxy.example.com:8080": { "username": "user", "password": "pass" }
+  }
+}
+```
+
+The engine answers Chromium's proxy auth challenge from that file. A proxy that
+demands auth with no matching entry fails with an error naming the file path. A
+local intercept proxy needs no credentials; do not point an agent at a remote
+proxy unless the user asks.
+
 ### 2. Use it from the CLI
 
 ```sh
@@ -117,7 +155,7 @@ browser page close last
 
 | Tool | Purpose |
 | :--- | :--- |
-| `browser_create` | Launch/reuse a browser (`bin`, `profile`, `persist`, `headless`, `stealth`, `position`). |
+| `browser_create` | Launch/reuse a browser (`bin`, `profile`, `persist`, `headless`, `stealth`, `position`, `proxy`, `proxy_bypass`, `ignore_certs`). |
 | `browser_list` | List live browsers and their pages. |
 | `browser_close` | Close one browser, or all when `browser_id` is empty. An unknown id fails with `browser "browser-42" not found (running: browser-1)`. |
 | `fetch_page` | Open a URL in a new session and return `session_id` + summary. `wait_for` defaults to `idle`. |

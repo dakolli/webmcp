@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -36,14 +37,18 @@ func NewFetchCmd(mgr *browsers.Manager) *cobra.Command {
 		Long: "Fetch opens a URL in a new page of the live browser, waits for the page " +
 			"to load, and prints a compact summary (session_id, title, url, text snippet, " +
 			"html byte size, load time). It mirrors the MCP fetch_page tool; the printed " +
-			"session_id can be used with the page command to read or interact with the page.",
+			"session_id can be used with the page command to read or interact with the page. " +
+			"A global --browser-id pins the browser; the id must already be live and is " +
+			"never replaced by a default or by the only open browser.",
 		Example: `  web-cli fetch https://news.ycombinator.com          # open a page; prints session id + summary
   web-cli fetch https://example.com --wait stable     # wait for the DOM to settle first
   web-cli fetch https://example.com --device IPhoneX  # emulate an iPhone X (opt-in)
-  web-cli fetch https://example.com --json            # machine-readable summary`,
+  web-cli fetch https://example.com --json            # machine-readable summary
+  browser --browser-id browser-2 fetch https://example.com  # open on a pinned live browser`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			urlStr := args[0]
+			browserID := explicitBrowserID(cmd)
 			if err := pageops.ValidateURL(urlStr); err != nil {
 				return fmt.Errorf("fetch: %w", err)
 			}
@@ -81,16 +86,17 @@ func NewFetchCmd(mgr *browsers.Manager) *cobra.Command {
 			// the in-process path below, which works exactly as before.
 			if cl := dialServe(cmd); cl != nil {
 				defer cl.Close()
-				return fetchViaIPC(cmd, ctx, cl, urlStr, waitFor, asJSON, vp, device)
+				return fetchViaIPC(cmd, ctx, cl, urlStr, waitFor, asJSON, vp, device, browserID)
 			}
 			printServeHint(cmd)
 
 			start := time.Now() // load timing for the summary
 
-			b, err := mgr.Open(ctx) // lazily launches the single Browser
+			b, err := openTargetBrowser(ctx, mgr, browserID, "fetch")
 			if err != nil {
-				return fmt.Errorf("fetch: %w", err)
+				return err
 			}
+			reportBrowserTarget(cmd, browserID)
 			// NewPage applies the device preset pre-navigation (governs the
 			// load itself); the CLI has no --user-agent flag (MCP-only).
 			p, err := b.NewPage(ctx, urlStr, vp, device, "") // new tab; stealth applied by default
@@ -135,20 +141,39 @@ func NewFetchCmd(mgr *browsers.Manager) *cobra.Command {
 }
 
 // fetchViaIPC implements the fetch command against a live serve process: it
-// opens the browser (idempotent — mirrors Manager.Open's laziness) and the
-// page over IPC, then prints the summary byte-identically to the in-process
-// path (the IPC page.open result IS the pageops.FetchSummary shape). device is
-// threaded through PageOpenParams so the serve process applies the preset
-// pre-navigation (governs the load itself).
-func fetchViaIPC(cmd *cobra.Command, ctx context.Context, cl *ipc.Client, urlStr, waitFor string, asJSON bool, vp *browsers.Viewport, device string) error {
-	var open ipc.BrowserOpenResult
-	if err := cl.Call(ctx, ipc.MethodBrowserOpen, &ipc.BrowserOpenParams{}, &open); err != nil {
-		return fmt.Errorf("fetch: %w", err)
+// validates the pinned browser (when --browser-id is set) or opens the default
+// one, opens the page in that browser, then prints the summary byte-identically
+// to the in-process path (the IPC page.open result IS the
+// pageops.FetchSummary shape). browserID is forwarded so the daemon opens the
+// page on the browser the user pinned; an unknown id fails with the live ids.
+func fetchViaIPC(
+	cmd *cobra.Command,
+	ctx context.Context,
+	cl *ipc.Client,
+	urlStr, waitFor string,
+	asJSON bool,
+	vp *browsers.Viewport,
+	device, browserID string,
+) error {
+	if browserID == "" {
+		var open ipc.BrowserOpenResult
+		if err := cl.Call(ctx, ipc.MethodBrowserOpen, &ipc.BrowserOpenParams{}, &open); err != nil {
+			return fmt.Errorf("fetch: %w", err)
+		}
+	} else if err := requireLiveBrowser(ctx, cl, browserID, "fetch"); err != nil {
+		return err
 	}
 	var summary ipc.PageOpenResult
-	if err := cl.Call(ctx, ipc.MethodPageOpen, &ipc.PageOpenParams{URL: urlStr, Wait: waitFor, Viewport: vp, Device: device}, &summary); err != nil {
+	if err := cl.Call(ctx, ipc.MethodPageOpen, &ipc.PageOpenParams{
+		URL:       urlStr,
+		Wait:      waitFor,
+		Viewport:  vp,
+		Device:    device,
+		BrowserID: browserID,
+	}, &summary); err != nil {
 		return fmt.Errorf("fetch: %w", err)
 	}
+	reportBrowserTarget(cmd, browserID)
 
 	if asJSON {
 		out, err := json.Marshal(summary)
@@ -163,4 +188,29 @@ func fetchViaIPC(cmd *cobra.Command, ctx context.Context, cl *ipc.Client, urlStr
 		summary.SessionID, summary.Title, summary.URL,
 		summary.TextSnippet, summary.HTMLBytes, summary.LoadMs)
 	return nil
+}
+
+// openTargetBrowser returns the browser fetch opens its page in: the pinned
+// browser when --browser-id is set (it must already be live, so an unknown id
+// fails with the live ids), else the lazily opened default browser.
+func openTargetBrowser(
+	ctx context.Context,
+	mgr *browsers.Manager,
+	id, label string,
+) (*browsers.Browser, error) {
+	if id == "" {
+		b, err := mgr.Open(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", label, err)
+		}
+		return b, nil
+	}
+	b, err := mgr.Browser(browsers.BrowserID(id))
+	if err != nil {
+		if errors.Is(err, browsers.ErrUnknownBrowser) {
+			return nil, unknownBrowserErr(label, id, managerBrowserIDs(mgr))
+		}
+		return nil, fmt.Errorf("%s: %w", label, err)
+	}
+	return b, nil
 }

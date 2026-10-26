@@ -76,6 +76,23 @@ func WithStealth(stealth bool) Option {
 	return func(m *Manager) { m.stealth = stealth }
 }
 
+// WithProxy configures the upstream proxy for browsers created without an
+// explicit proxy (host:port or scheme://host:port).
+func WithProxy(proxy string) Option {
+	return func(m *Manager) { m.proxy = proxy }
+}
+
+// WithProxyBypass configures the comma-separated hosts that skip the proxy.
+func WithProxyBypass(bypass string) Option {
+	return func(m *Manager) { m.proxyBypass = bypass }
+}
+
+// WithIgnoreCerts makes Chromium accept invalid TLS certificates, such as an
+// intercept proxy's MITM CA. It is independent of WithProxy.
+func WithIgnoreCerts(ignore bool) Option {
+	return func(m *Manager) { m.ignoreCerts = ignore }
+}
+
 // WithBin configures a custom browser binary executable path (e.g. "/usr/bin/brave-browser",
 // "brave", "google-chrome", or "chrome"). When empty, the launcher defaults to the
 // downloaded Chromium binary.
@@ -96,9 +113,10 @@ func WithProfileName(name string) Option {
 	return func(m *Manager) { m.profileName = name }
 }
 
-// WithPersist controls whether a named or default profile survives browser
-// close. When false, secondary browsers get a unique ephemeral profile that is
-// removed on close; browser-1 with no explicit profile stays persistent.
+// WithPersist controls profile persistence. As a manager option it applies to
+// the default browser only; passed to CreateBrowser it applies to that browser.
+// Unnamed secondary browsers otherwise get a unique ephemeral profile that is
+// removed on close.
 func WithPersist(persist bool) Option {
 	return func(m *Manager) { m.persist = persist }
 }
@@ -164,14 +182,24 @@ type Manager struct {
 	// profileName is the default profile name (or absolute path) resolved through
 	// pkg/config for browsers created without an explicit WithProfileDir.
 	profileName string
-	// persist keeps named/default profiles after close. Ephemeral profiles are
-	// removed when their last owning browser closes.
+	// persist keeps the DEFAULT browser's profile after close. Secondary
+	// browsers start ephemeral unless their own CreateBrowser call opts in:
+	// named and default profiles are shared, so inheriting this flag would
+	// point a second live browser at the directory browser-1 already holds
+	// (WEB-132).
 	persist bool
 	// profileRefs tracks how many live browsers own each profile directory and
 	// whether the directory is ephemeral.
 	profileRefs map[string]*profileRef
 	// position specifies default window placement ("left", "right", "max", "normal").
 	position string
+	// proxy is the default upstream proxy for browsers created without an
+	// explicit proxy (host:port or scheme://host:port).
+	proxy string
+	// proxyBypass is the default comma-separated proxy bypass list.
+	proxyBypass string
+	// ignoreCerts makes Chromium accept invalid TLS certificates by default.
+	ignoreCerts bool
 	// shutdown marks the manager as terminated; Open rejects further calls.
 	shutdown bool
 	// ttl is the per-page idle timeout enforced by the background sweeper
@@ -213,6 +241,7 @@ func NewManager(opts ...Option) *Manager {
 		browsers:      make(map[BrowserID]*Browser),
 		nextBrowserID: 1,
 		stealth:       true,
+		persist:       true,
 		ttl:           defaultTTL,
 		sweepInterval: sweepIntervalForTTL(defaultTTL),
 		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -276,19 +305,27 @@ func (m *Manager) CreateBrowser(ctx context.Context, opts ...Option) (BrowserID,
 		stealth:     m.stealth,
 		binPath:     m.binPath,
 		profileName: m.profileName,
-		persist:     m.persist,
 		position:    m.position,
+		proxy:       m.proxy,
+		proxyBypass: m.proxyBypass,
+		ignoreCerts: m.ignoreCerts,
 	}
 	defaultProfileDir := m.profileDir
+	defaultPersist := m.persist
 	m.mu.Unlock()
 
 	for _, o := range opts {
 		o(tempMgr)
 	}
+	if tempMgr.proxy != "" {
+		if _, _, err := parseProxy(tempMgr.proxy); err != nil {
+			return "", nil, err
+		}
+	}
 
 	persist := tempMgr.persist
 	if tempMgr.profileName == "" && id == DefaultBrowserID {
-		persist = true
+		persist = defaultPersist || persist
 	}
 
 	profileDir := tempMgr.profileDir
@@ -308,6 +345,10 @@ func (m *Manager) CreateBrowser(ctx context.Context, opts ...Option) (BrowserID,
 	m.retainProfile(profileDir, ephemeral)
 
 	b := NewBrowser(id, m.baseCtx, tempMgr.headless, tempMgr.stealth, tempMgr.binPath, profileDir, tempMgr.position)
+	b.proxy = tempMgr.proxy
+	b.proxyBypass = tempMgr.proxyBypass
+	b.ignoreCerts = tempMgr.ignoreCerts
+	b.logger = m.logger
 	b.ephemeral = ephemeral
 	b.profileCleanup = func() { m.releaseProfile(profileDir) }
 	if err := b.Launch(ctx); err != nil {
@@ -370,6 +411,11 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 		profileDir = m.profileDir
 		m.mu.Unlock()
 	}
+	if m.proxy != "" {
+		if _, _, err := parseProxy(m.proxy); err != nil {
+			return nil, err
+		}
+	}
 	if profileDir == "" {
 		resolved, eph, err := config.ResolveProfile("", m.binPath, string(id), id == DefaultBrowserID)
 		if err != nil {
@@ -381,6 +427,10 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 	m.retainProfile(profileDir, ephemeral)
 
 	b := NewBrowser(id, m.baseCtx, m.headless, m.stealth, m.binPath, profileDir)
+	b.proxy = m.proxy
+	b.proxyBypass = m.proxyBypass
+	b.ignoreCerts = m.ignoreCerts
+	b.logger = m.logger
 	b.ephemeral = ephemeral
 	b.profileCleanup = func() { m.releaseProfile(profileDir) }
 	if err := b.Launch(ctx); err != nil {
@@ -728,6 +778,7 @@ func (m *Manager) sweepOnce(ctx context.Context) {
 			}
 
 			closeCtx, cancel := context.WithTimeout(ctx, closePageTimeout)
+			b.stopProxyAuth(handle)
 			err := closeRodPage(closeCtx, handle)
 			cancel()
 			if err != nil {

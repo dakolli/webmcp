@@ -36,7 +36,7 @@ const (
 	MethodPageOpen = "page.open"
 	// MethodPageList lists the Browser's open pages.
 	MethodPageList = "page.list"
-	// MethodPageFetch extracts an aspect of a live page (html/dom/text/css/js/links/screenshot/meta/interactives/a11y/network/console/article/marks).
+	// MethodPageFetch extracts any aspect in the shared pageops registry from a live page.
 	MethodPageFetch = "page.fetch"
 	// MethodPageAct performs an action on a live page (click/input/hover/scroll/select/eval/navigate/back/forward/reload/wait/set_viewport/emulate/clear_logs).
 	MethodPageAct = "page.act"
@@ -117,6 +117,14 @@ type BrowserOpenParams struct {
 	Headless *bool `json:"headless,omitempty"`
 	// Stealth requests go-rod/stealth (accepted for parity only).
 	Stealth *bool `json:"stealth,omitempty"`
+	// Proxy is an upstream proxy for the new browser: host:port or
+	// scheme://host:port. Credentials come only from proxy.json.
+	Proxy string `json:"proxy,omitempty"`
+	// ProxyBypass is the comma-separated list of hosts that skip the proxy.
+	ProxyBypass string `json:"proxy_bypass,omitempty"`
+	// IgnoreCerts makes Chromium accept invalid TLS certificates; it is
+	// independent of Proxy.
+	IgnoreCerts *bool `json:"ignore_certs,omitempty"`
 }
 
 // BrowserOpenResult is the result of browser.open.
@@ -169,6 +177,9 @@ type BrowserFocusResult struct {
 type PageOpenParams struct {
 	// URL is the absolute http(s) URL to open in a new page.
 	URL string `json:"url"`
+	// BrowserID targets an already-live browser; empty keeps the default
+	// browser. page.open never creates the named browser.
+	BrowserID string `json:"browser_id,omitempty"`
 	// Wait is the readiness level before returning: idle (default), load, stable.
 	Wait string `json:"wait,omitempty"`
 	// Viewport optionally overrides the new page's viewport size; nil = plain
@@ -192,30 +203,26 @@ type PageListResult struct {
 	Pages []browsers.PageInfo `json:"pages"`
 }
 
-// PageFetchParams carries the page.fetch parameters. what ∈ html|dom|text|css|
-// js|links|screenshot|meta|interactives|a11y|network|console|article|marks; dom
-// element nodes, matched links and DOM-backed a11y nodes carry a
-// g<document>-b<backendNodeId> handle for page.act; selector scopes html/text
-// (ignored for interactives, a11y, network, console, article and marks, which
-// are whole-page by design); target fetches exactly one css/js resource's
-// content instead of the {url,type,size} list; full_page captures the whole
-// scrollable page in a screenshot; max_bytes caps the returned data (default
-// pageops.DefaultPageMaxBytes; screenshots, interactives, a11y, network,
-// console, article and marks are never truncated — article self-caps at
-// 40000 runes and marks carries a screenshot data-URI). network/console return
+// PageFetchParams carries the page.fetch parameters. what is any aspect in the
+// shared pageops registry (ValidateAspect is the allow-list); dom element nodes,
+// matched links and DOM-backed a11y nodes carry a g<document>-b<backendNodeId>
+// handle for page.act; selector scopes html/text; target fetches exactly one
+// css/js resource's content, or with what=body selects one observed response by
+// seq or URL substring; full_page captures the whole scrollable page in a
+// screenshot; max_bytes caps the returned data (default pageops.DefaultPageMaxBytes),
+// except for the aspects that self-cap. network/console return
 // {entries,count,dropped,truncated} over the newest 100 buffered entries;
 // capture is cumulative from page creation, so clear with page.act clear_logs
 // before the step under observation.
 type PageFetchParams struct {
 	// SessionID identifies the live page to fetch from.
 	SessionID string `json:"session_id"`
-	// What is the aspect to extract: html, dom, text, css, js, links,
-	// screenshot, meta, interactives, a11y, network, console, article, marks.
+	// What is the aspect to extract; see pageops.ValidateAspect for the values.
 	What string `json:"what"`
 	// Selector optionally scopes html/text extraction to a CSS match.
 	Selector string `json:"selector,omitempty"`
-	// Target is a resource URL that, when set, makes what=css|js fetch exactly
-	// that one resource's content instead of listing the page's resources.
+	// Target is a css/js resource URL, or with what=body a seq number or URL
+	// substring selecting one observed response body.
 	Target string `json:"target,omitempty"`
 	// FullPage captures the entire scrollable page instead of the visible
 	// viewport (screenshot only).
@@ -298,6 +305,9 @@ type PageActResult struct {
 type PageCloseParams struct {
 	// SessionID identifies the page to close.
 	SessionID string `json:"session_id"`
+	// BrowserID names the browser that owns the page; empty resolves the
+	// page across every live browser.
+	BrowserID string `json:"browser_id,omitempty"`
 }
 
 // PageCloseResult is the result of page.close.

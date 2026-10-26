@@ -96,6 +96,9 @@ func init() {
 	registerAspect("network", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
 		return pageops.PageNetwork(ctx, p)
 	}, truncationNone)
+	registerAspect("body", func(ctx context.Context, p *browsers.Page, a pageFetchArgs) (string, error) {
+		return pageops.PageBody(ctx, p, a.Target)
+	}, truncationNone)
 	registerAspect("console", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
 		return pageops.PageConsole(ctx, p)
 	}, truncationNone)

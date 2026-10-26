@@ -23,6 +23,29 @@ import (
 // path when multi-browser support lands.
 const singleBrowserID = "browser-1"
 
+// explicitBrowserID returns the --browser-id value only when the user set the
+// flag, so an omitted flag keeps the command's default target instead of
+// silently pinning browser-1.
+func explicitBrowserID(cmd *cobra.Command) string {
+	if !cmd.Flags().Changed("browser-id") {
+		return ""
+	}
+	id, err := cmd.Flags().GetString("browser-id")
+	if err != nil {
+		return ""
+	}
+	return id
+}
+
+// reportBrowserTarget writes the pinned browser id to stderr, leaving stdout
+// byte-stable for scripts and JSON consumers.
+func reportBrowserTarget(cmd *cobra.Command, id string) {
+	if id == "" {
+		return
+	}
+	fmt.Fprintf(cmd.ErrOrStderr(), "browser_id: %s (--browser-id)\n", id)
+}
+
 // NewRootCmd constructs the web-cli root command, wiring it to the shared
 // browsers.Manager and registering the browser / fetch / page commands and the
 // serve tree (serve, serve stop, serve mcp).
@@ -59,7 +82,7 @@ opened page; a bare number resolves to page-N.`,
 	// --browser-id is inherited by every subcommand (mirrors browser_create's
 	// browser_id in the MCP toolset).
 	root.PersistentFlags().String("browser-id", singleBrowserID,
-		"id of the browser to operate on")
+		"id of the browser to operate on (must already be live for fetch/page commands)")
 	// --socket is the path of the long-lived serve process's IPC socket,
 	// consumed by serve itself and by the client-side command forwarding
 	// (WEB-29); it must not be redefined by any subcommand.
@@ -365,8 +388,8 @@ func browserListViaIPC(cmd *cobra.Command, cl *ipc.Client) error {
 // browser process with optional custom binary (--bin), profile (--profile),
 // persistence (--persist), and window position (--position).
 func NewBrowserCreateCmd(mgr *browsers.Manager) *cobra.Command {
-	var bin, profile, position string
-	var persist bool
+	var bin, profile, position, proxy, proxyBypass string
+	var persist, ignoreCerts bool
 	cmd := &cobra.Command{
 		Use:   "create",
 		Short: "Create and launch a new browser instance",
@@ -377,7 +400,16 @@ A bare profile name resolves under ~/.config/browser-mcp/profiles; an absolute
 path is used as given; relative paths are rejected. Secondary browsers default
 to an ephemeral profile that is deleted on close. Pass --persist to keep a named
 profile (and its logins) after close. browser-1 with no explicit profile is
-always persistent.`,
+always persistent.
+
+--proxy sends traffic through an intercept proxy such as Burp, Caido or ZAP:
+accept host:port or scheme://host:port, for example 127.0.0.1:8080 or
+http://127.0.0.1:8080. --proxy-bypass lists comma-separated hosts that skip it.
+--ignore-certs accepts the proxy's MITM certificate and is independent of
+--proxy. Proxy credentials never go on the command line: put them in
+~/.config/browser-mcp/proxy.json (mode 0600), keyed by proxy host:port.`,
+		Example: `  browser browser create --proxy http://127.0.0.1:8080 --ignore-certs
+  browser browser create --proxy 127.0.0.1:8080 --proxy-bypass localhost,*.internal`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx, cancel := context.WithTimeout(cmdCtx(cmd), 30*time.Second)
 			defer cancel()
@@ -385,12 +417,17 @@ always persistent.`,
 			if cl := dialServe(cmd); cl != nil {
 				defer cl.Close()
 				params := map[string]any{
-					"bin":      bin,
-					"profile":  profile,
-					"position": position,
+					"bin":          bin,
+					"profile":      profile,
+					"position":     position,
+					"proxy":        proxy,
+					"proxy_bypass": proxyBypass,
 				}
 				if cmd.Flags().Changed("persist") {
 					params["persist"] = persist
+				}
+				if cmd.Flags().Changed("ignore-certs") {
+					params["ignore_certs"] = ignoreCerts
 				}
 				var res struct {
 					BrowserID string `json:"browser_id"`
@@ -416,6 +453,15 @@ always persistent.`,
 			if position != "" {
 				opts = append(opts, browsers.WithPosition(position))
 			}
+			if proxy != "" {
+				opts = append(opts, browsers.WithProxy(proxy))
+			}
+			if proxyBypass != "" {
+				opts = append(opts, browsers.WithProxyBypass(proxyBypass))
+			}
+			if cmd.Flags().Changed("ignore-certs") {
+				opts = append(opts, browsers.WithIgnoreCerts(ignoreCerts))
+			}
 			id, b, err := mgr.CreateBrowser(ctx, opts...)
 			if err != nil {
 				return fmt.Errorf("browser create: %w", err)
@@ -438,5 +484,8 @@ always persistent.`,
 	cmd.Flags().StringVar(&profile, "profile", "", "profile name resolved under the config dir, or an absolute directory path")
 	cmd.Flags().BoolVar(&persist, "persist", false, "keep the profile (and its logins) after close; secondary browsers are otherwise ephemeral")
 	cmd.Flags().StringVar(&position, "position", "", "window position split screen preset: left, right, max, normal")
+	cmd.Flags().StringVar(&proxy, "proxy", "", "upstream proxy host:port or scheme://host:port (e.g. 127.0.0.1:8080)")
+	cmd.Flags().StringVar(&proxyBypass, "proxy-bypass", "", "comma-separated hosts that skip the proxy (e.g. localhost,*.internal)")
+	cmd.Flags().BoolVar(&ignoreCerts, "ignore-certs", false, "accept invalid TLS certificates (e.g. an intercept proxy's MITM CA); independent of --proxy")
 	return cmd
 }

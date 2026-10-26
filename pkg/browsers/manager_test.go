@@ -89,3 +89,15 @@ func TestBrowserCloseRunsProfileCleanupOnce(t *testing.T) {
 		t.Fatalf("profile cleanup calls = %d, want 1", calls)
 	}
 }
+
+func TestLaunchRefusesUnresolvedProfile(t *testing.T) {
+	b := NewBrowser("browser-2", context.Background(), false, false, "", "")
+
+	err := b.Launch(context.Background())
+	if err == nil {
+		t.Fatal("Launch() succeeded without a resolved profile directory")
+	}
+	if !strings.Contains(err.Error(), "no profile directory resolved") {
+		t.Fatalf("Launch() error = %q, want the missing-profile error", err)
+	}
+}

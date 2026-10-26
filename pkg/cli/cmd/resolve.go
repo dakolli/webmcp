@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -68,42 +69,138 @@ var actPayloadSpecs = map[string][]string{
 
 // resolvePageID resolves a user-supplied page id (possibly empty) to a live
 // page id, for the command labeled by label ("page fetch", "page act",
-// "page close"). It gathers the open pages client-side — over IPC via
-// browser.list (which, like `page list`, never lazily launches the browser; a
-// "no browser open" answer means zero pages), else via mgr.Browser() (also a
-// non-blocking read that never launches; an error means no browser, i.e. zero
-// pages) — and applies the pure resolution rules of resolvePageIDFromPages.
-// The returned id is the canonical engine id ("page-N"): the caller passes it
-// straight to pageFetchViaIPC/pageActViaIPC/pageCloseViaIPC or mgr.Page.
-func resolvePageID(ctx context.Context, cmd *cobra.Command, mgr *browsers.Manager, cl *ipc.Client, raw, label string) (string, error) {
-	var pages []browsers.PageInfo
-	if cl != nil {
-		var res ipc.BrowserListResult
-		if err := cl.Call(ctx, ipc.MethodBrowserList, nil, &res); err != nil {
-			var serverErr *ipc.ServerError
-			if errors.As(err, &serverErr) &&
-				serverErr.Code == ipc.CodeServerError &&
-				strings.Contains(serverErr.Message, "no browser open") {
-				// No browser on the daemon → zero pages; the resolution rules
-				// below produce the friendly "no open pages" answer. Never a
-				// lazy launch: these commands all fail with "no open pages"
-				// when the browser is absent, so launching it here would be
-				// pure waste (mirrors the in-process mgr.Browser read).
-			} else {
-				return "", fmt.Errorf("%s: %w", label, err)
-			}
-		} else {
-			pages = res.Pages
-		}
-	} else {
-		// mgr.Browser never launches the browser: with none open it errors,
-		// which we treat as zero pages (the resolution rules below produce the
-		// friendly "no open pages" answer).
-		if b, err := mgr.Browser(""); err == nil {
-			pages = b.Pages()
-		}
+// "page close"). browserID pins the candidate pages to one browser; empty means
+// the CLI's default browser selection. It gathers the open pages client-side —
+// over IPC via browser.list (which, like `page list`, never lazily launches a
+// browser; a "no browser open" answer means zero pages), else via mgr.Browser()
+// (also a non-blocking read that never launches) — and applies the pure
+// resolution rules of resolvePageIDFromPages. The returned id is the canonical
+// engine id ("page-N"): the caller passes it straight to
+// pageFetchViaIPC/pageActViaIPC/pageCloseViaIPC or mgr.Page.
+func resolvePageID(
+	ctx context.Context,
+	cmd *cobra.Command,
+	mgr *browsers.Manager,
+	cl *ipc.Client,
+	browserID, raw, label string,
+) (string, error) {
+	pages, err := browserPages(ctx, mgr, cl, browserID, label)
+	if err != nil {
+		return "", err
 	}
 	return resolvePageIDFromPages(raw, pages, label)
+}
+
+// browserPages returns the open pages a page command may resolve against: the
+// explicitly pinned browser (which must already be live), or the CLI's default
+// browser selection when browserID is empty. It never launches a browser.
+func browserPages(
+	ctx context.Context,
+	mgr *browsers.Manager,
+	cl *ipc.Client,
+	browserID, label string,
+) ([]browsers.PageInfo, error) {
+	if browserID == "" {
+		if cl != nil {
+			res, err := browserSnapshotViaIPC(ctx, cl, label)
+			if err != nil {
+				return nil, err
+			}
+			return res.Pages, nil
+		}
+		if b, err := mgr.Browser(""); err == nil {
+			return b.Pages(), nil
+		}
+		return nil, nil
+	}
+
+	if cl != nil {
+		res, err := browserSnapshotViaIPC(ctx, cl, label)
+		if err != nil {
+			return nil, err
+		}
+		entry, err := selectBrowserEntry(res.Browsers, browserID, label)
+		if err != nil {
+			return nil, err
+		}
+		return entry.Pages, nil
+	}
+	b, err := mgr.Browser(browsers.BrowserID(browserID))
+	if err != nil {
+		if errors.Is(err, browsers.ErrUnknownBrowser) {
+			return nil, unknownBrowserErr(label, browserID, managerBrowserIDs(mgr))
+		}
+		return nil, fmt.Errorf("%s: %w", label, err)
+	}
+	return b.Pages(), nil
+}
+
+// browserSnapshotViaIPC reads the daemon's live-browser snapshot, treating its
+// own "no browser open" answer as an empty snapshot rather than an error.
+func browserSnapshotViaIPC(ctx context.Context, cl *ipc.Client, label string) (*ipc.BrowserListResult, error) {
+	var res ipc.BrowserListResult
+	if err := cl.Call(ctx, ipc.MethodBrowserList, nil, &res); err != nil {
+		var serverErr *ipc.ServerError
+		if errors.As(err, &serverErr) &&
+			serverErr.Code == ipc.CodeServerError &&
+			strings.Contains(serverErr.Message, "no browser open") {
+			return &ipc.BrowserListResult{}, nil
+		}
+		return nil, fmt.Errorf("%s: %w", label, err)
+	}
+	return &res, nil
+}
+
+// requireLiveBrowser fails unless id names a browser the daemon already has
+// live, reporting the live ids otherwise.
+func requireLiveBrowser(ctx context.Context, cl *ipc.Client, id, label string) error {
+	res, err := browserSnapshotViaIPC(ctx, cl, label)
+	if err != nil {
+		return err
+	}
+	_, err = selectBrowserEntry(res.Browsers, id, label)
+	return err
+}
+
+// selectBrowserEntry returns the live browser entry with the given id, or an
+// error naming the live ids when it is not running.
+func selectBrowserEntry(entries []ipc.BrowserEntry, id, label string) (*ipc.BrowserEntry, error) {
+	for i := range entries {
+		if entries[i].BrowserID == id {
+			return &entries[i], nil
+		}
+	}
+	ids := make([]string, 0, len(entries))
+	for _, e := range entries {
+		ids = append(ids, e.BrowserID)
+	}
+	return nil, unknownBrowserErr(label, id, liveBrowserIDs(ids))
+}
+
+// unknownBrowserErr reports an id that is not live together with the live ids,
+// mirroring the engine's browser-not-found shape.
+func unknownBrowserErr(label, id, running string) error {
+	return fmt.Errorf("%s: browser %q not found (running: %s)", label, id, running)
+}
+
+// managerBrowserIDs renders the in-process manager's live browser ids.
+func managerBrowserIDs(mgr *browsers.Manager) string {
+	active := mgr.Browsers()
+	ids := make([]string, 0, len(active))
+	for id := range active {
+		ids = append(ids, string(id))
+	}
+	return liveBrowserIDs(ids)
+}
+
+// liveBrowserIDs renders a sorted comma-separated id list, or "none" when no
+// browser is running.
+func liveBrowserIDs(ids []string) string {
+	if len(ids) == 0 {
+		return "none"
+	}
+	sort.Strings(ids)
+	return strings.Join(ids, ", ")
 }
 
 // resolvePageIDFromPages applies the page-id resolution rules against a

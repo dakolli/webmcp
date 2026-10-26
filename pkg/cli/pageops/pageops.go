@@ -519,6 +519,156 @@ func PageConsole(_ context.Context, p *browsers.Page) (string, error) {
 	return encodeLogs(entries, dropped, "console")
 }
 
+// PageBody returns the on-demand response body of one observed network entry as
+// a self-capped JSON object ({seq,url,content_type,bytes,truncated,body|base64}).
+// target is either a sequence number or a substring of the request URL, matched
+// against the newest entry. The body itself is fetched from the browser on
+// demand, so no bodies are buffered.
+func PageBody(ctx context.Context, p *browsers.Page, target string) (string, error) {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return "", fmt.Errorf("body requires target=<seq> or target=<url substring>")
+	}
+	entries, _ := p.NetworkEntries()
+	var hit *browsers.NetworkEntry
+	if seq, err := strconv.ParseInt(target, 10, 64); err == nil {
+		for i := range entries {
+			if entries[i].Seq == seq {
+				hit = &entries[i]
+				break
+			}
+		}
+	} else {
+		for i := len(entries) - 1; i >= 0; i-- {
+			if strings.Contains(entries[i].URL, target) {
+				hit = &entries[i]
+				break
+			}
+		}
+	}
+	if hit == nil {
+		return "", fmt.Errorf(
+			"body: no network entry matches target %q (read what=network first; target is a seq number or a substring of the request URL, newest match wins)",
+			target,
+		)
+	}
+	body, err := p.NetworkBody(ctx, hit.Seq)
+	if err != nil {
+		return "", err
+	}
+	b, err := json.Marshal(body)
+	if err != nil {
+		return "", fmt.Errorf("encode network body: %w", err)
+	}
+	return string(b), nil
+}
+
+// aspectEntry is one page aspect: its what name, its reader and whether the
+// reader already caps its own output (bypassing max_bytes truncation).
+type aspectEntry struct {
+	name       string
+	selfCapped bool
+	read       func(ctx context.Context, p *browsers.Page, selector, target string, fullPage bool) (string, error)
+}
+
+// aspectEntries is the single registry of page aspects, in the order error
+// messages list them. The CLI and the daemon resolve every what through it, so a
+// new aspect is one entry here instead of another hardcoded allow-list.
+var aspectEntries = []aspectEntry{
+	{name: "html", read: func(ctx context.Context, p *browsers.Page, selector, _ string, _ bool) (string, error) {
+		return PageHTML(ctx, p, selector)
+	}},
+	{name: "text", read: func(ctx context.Context, p *browsers.Page, selector, _ string, _ bool) (string, error) {
+		return PageText(ctx, p, selector)
+	}},
+	{name: "links", read: func(ctx context.Context, p *browsers.Page, _, _ string, _ bool) (string, error) {
+		return PageLinks(ctx, p)
+	}},
+	{name: "meta", read: func(ctx context.Context, p *browsers.Page, _, _ string, _ bool) (string, error) {
+		return PageMeta(ctx, p)
+	}},
+	{name: "dom", read: func(ctx context.Context, p *browsers.Page, _, _ string, _ bool) (string, error) {
+		return PageDOM(ctx, p)
+	}},
+	{name: "css", read: func(ctx context.Context, p *browsers.Page, _, target string, _ bool) (string, error) {
+		return PageCSS(ctx, p, target)
+	}},
+	{name: "js", read: func(ctx context.Context, p *browsers.Page, _, target string, _ bool) (string, error) {
+		return PageJS(ctx, p, target)
+	}},
+	{name: "screenshot", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _, _ string, fullPage bool) (string, error) {
+		return PageScreenshot(ctx, p, fullPage)
+	}},
+	{name: "interactives", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _, _ string, _ bool) (string, error) {
+		return PageInteractives(ctx, p)
+	}},
+	{name: "a11y", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _, _ string, _ bool) (string, error) {
+		return PageA11y(ctx, p)
+	}},
+	{name: "network", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _, _ string, _ bool) (string, error) {
+		return PageNetwork(ctx, p)
+	}},
+	{name: "console", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _, _ string, _ bool) (string, error) {
+		return PageConsole(ctx, p)
+	}},
+	{name: "body", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _, target string, _ bool) (string, error) {
+		return PageBody(ctx, p, target)
+	}},
+	{name: "article", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _, _ string, _ bool) (string, error) {
+		return PageArticle(ctx, p)
+	}},
+	{name: "marks", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _, _ string, _ bool) (string, error) {
+		return PageMarks(ctx, p)
+	}},
+}
+
+// unknownAspectError is the one unknown-what error every surface emits; it names
+// every supported value from the shared registry.
+func unknownAspectError(what string) error {
+	names := make([]string, len(aspectEntries))
+	for i, a := range aspectEntries {
+		names[i] = a.name
+	}
+	return fmt.Errorf("unknown what=%q (must be one of %s)", what, strings.Join(names, ", "))
+}
+
+// ValidateAspect reports whether what names a supported page aspect. Surfaces
+// call it before touching a page so an unknown value fails fast with the shared
+// error text.
+func ValidateAspect(what string) error {
+	for _, a := range aspectEntries {
+		if a.name == what {
+			return nil
+		}
+	}
+	return unknownAspectError(what)
+}
+
+// PageAspect reads the aspect named what through the shared registry, truncating
+// the output to maxBytes on a rune boundary unless the reader self-caps. An
+// unknown what returns the shared error naming every supported value.
+func PageAspect(
+	ctx context.Context,
+	p *browsers.Page,
+	what,
+	selector,
+	target string,
+	fullPage bool,
+	maxBytes int,
+) (string, error) {
+	for _, a := range aspectEntries {
+		if a.name != what {
+			continue
+		}
+		out, err := a.read(ctx, p, selector, target, fullPage)
+		if err != nil || a.selfCapped {
+			return out, err
+		}
+		return PageTruncate(out, maxBytes), nil
+	}
+	return "", unknownAspectError(what)
+}
+
 // PageClearLogs empties both capture rings, resets their dropped counters and
 // returns the cleared counts as {"network":N,"console":M}. It needs no context:
 // the call touches only the observer's in-memory state.

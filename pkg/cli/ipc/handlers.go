@@ -68,12 +68,15 @@ func (s *Server) handle(ctx context.Context, req Request) (any, *Error) {
 
 func (s *Server) handleBrowserOpen(ctx context.Context, params json.RawMessage) (any, *Error) {
 	var p struct {
-		Bin      string `json:"bin,omitempty"`
-		Profile  string `json:"profile,omitempty"`
-		Position string `json:"position,omitempty"`
-		Headless *bool  `json:"headless,omitempty"`
-		Stealth  *bool  `json:"stealth,omitempty"`
-		Persist  *bool  `json:"persist,omitempty"`
+		Bin         string `json:"bin,omitempty"`
+		Profile     string `json:"profile,omitempty"`
+		Position    string `json:"position,omitempty"`
+		Proxy       string `json:"proxy,omitempty"`
+		ProxyBypass string `json:"proxy_bypass,omitempty"`
+		Headless    *bool  `json:"headless,omitempty"`
+		Stealth     *bool  `json:"stealth,omitempty"`
+		Persist     *bool  `json:"persist,omitempty"`
+		IgnoreCerts *bool  `json:"ignore_certs,omitempty"`
 	}
 	if len(params) > 0 && string(params) != "null" {
 		_ = json.Unmarshal(params, &p)
@@ -91,6 +94,15 @@ func (s *Server) handleBrowserOpen(ctx context.Context, params json.RawMessage) 
 	}
 	if p.Position != "" {
 		opts = append(opts, browsers.WithPosition(p.Position))
+	}
+	if p.Proxy != "" {
+		opts = append(opts, browsers.WithProxy(p.Proxy))
+	}
+	if p.ProxyBypass != "" {
+		opts = append(opts, browsers.WithProxyBypass(p.ProxyBypass))
+	}
+	if p.IgnoreCerts != nil {
+		opts = append(opts, browsers.WithIgnoreCerts(*p.IgnoreCerts))
 	}
 	if p.Headless != nil {
 		opts = append(opts, browsers.WithHeadless(*p.Headless))
@@ -192,10 +204,12 @@ func (s *Server) handleBrowserFocus(ctx context.Context, params json.RawMessage)
 }
 
 // handlePageOpen implements page.open: it validates the URL and wait strategy
-// (-32602 on failure), opens the URL as a new page in the live browser (minting
-// a fresh page-N id that persists for the life of the serve process), waits for
-// the requested readiness level (idle by default) and returns the full
-// fetchSummary shape.
+// (-32602 on failure), opens the URL as a new page in the target browser (the
+// explicit browser_id when given, else the default browser), mints a fresh
+// page-N id that persists for the life of the serve process, waits for the
+// requested readiness level (idle by default) and returns the full
+// fetchSummary shape. An unknown browser_id is a -32000 error naming the live
+// ids; page.open never creates the named browser.
 func (s *Server) handlePageOpen(ctx context.Context, params json.RawMessage) (any, *Error) {
 	p, rpcErr := decodeParams[PageOpenParams](params)
 	if rpcErr != nil {
@@ -229,7 +243,7 @@ func (s *Server) handlePageOpen(ctx context.Context, params json.RawMessage) (an
 	}
 
 	start := time.Now() // load timing for the summary
-	b, err := s.mgr.Open(ctx)
+	b, err := s.targetBrowser(ctx, p.BrowserID)
 	if err != nil {
 		return nil, serverError(err)
 	}
@@ -260,19 +274,13 @@ func (s *Server) handlePageList(ctx context.Context, params json.RawMessage) (an
 	return PageListResult{Pages: b.Pages()}, nil
 }
 
-// handlePageFetch implements page.fetch: it extracts an aspect of a live page —
-// html, text, links, meta (selector scoping html/text), dom (nested DOM JSON),
-// css/js (resource list or one target resource), screenshot (base64 PNG
-// data-URI; full_page captures the whole page), interactives (dense action map
-// of every visible clickable/typeable element with stable handles), a11y
-// (flattened accessibility tree with roles/names/values/state flags and
-// handles), network/console (bounded log envelopes), article (readable body as
-// markdown) or marks (numbered overlay boxes plus the annotated viewport
-// screenshot) — mirroring the CLI page fetch command. Results are truncated to
-// max_bytes (default pageops.DefaultPageMaxBytes) except screenshots,
-// interactives, a11y, network, console, article and marks, which bypass
-// truncation (mirrors the CLI/MCP truncation exception). An unknown extractor
-// is a -32602 invalid-params error.
+// handlePageFetch implements page.fetch: it reads any aspect of a live page
+// through the shared pageops aspect registry — html, text, links, meta, dom,
+// css/js (resource list or one target resource), screenshot, interactives, a11y,
+// network/console (bounded log envelopes), body (one stored response body),
+// article and marks. The registry owns both the accepted what values and the
+// truncation policy, so this handler mirrors the CLI page fetch command without
+// duplicating either. An unknown extractor is a -32602 invalid-params error.
 func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (any, *Error) {
 	p, rpcErr := decodeParams[PageFetchParams](params)
 	if rpcErr != nil {
@@ -281,15 +289,11 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 	if p.SessionID == "" {
 		return nil, &Error{Code: CodeInvalidParams, Message: `page.fetch: missing required param "session_id"`}
 	}
-	switch p.What {
-	case "html", "text", "links", "meta", "dom", "css", "js", "screenshot", "interactives", "a11y", "network", "console", "article", "marks":
-	case "":
+	if p.What == "" {
 		return nil, &Error{Code: CodeInvalidParams, Message: `page.fetch: missing required param "what"`}
-	default:
-		return nil, &Error{
-			Code:    CodeInvalidParams,
-			Message: fmt.Sprintf("page.fetch: unknown what=%q (must be one of html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, article, marks)", p.What),
-		}
+	}
+	if err := pageops.ValidateAspect(p.What); err != nil {
+		return nil, &Error{Code: CodeInvalidParams, Message: fmt.Sprintf("page.fetch: %v", err)}
 	}
 
 	page, err := s.mgr.Page(ctx, browsers.PageID(p.SessionID)) // opens the Browser if needed; probes for liveness
@@ -297,64 +301,15 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 		return nil, serverError(err)
 	}
 
-	var out string
-	switch p.What {
-	case "html":
-		out, err = pageops.PageHTML(ctx, page, p.Selector)
-	case "text":
-		out, err = pageops.PageText(ctx, page, p.Selector)
-	case "links":
-		out, err = pageops.PageLinks(ctx, page)
-	case "meta":
-		out, err = pageops.PageMeta(ctx, page)
-	case "dom":
-		out, err = pageops.PageDOM(ctx, page)
-	case "css":
-		out, err = pageops.PageCSS(ctx, page, p.Target)
-	case "js":
-		out, err = pageops.PageJS(ctx, page, p.Target)
-	case "screenshot":
-		out, err = pageops.PageScreenshot(ctx, page, p.FullPage)
-	case "interactives":
-		out, err = pageops.PageInteractives(ctx, page)
-	case "a11y":
-		out, err = pageops.PageA11y(ctx, page)
-	case "network":
-		out, err = pageops.PageNetwork(ctx, page)
-	case "console":
-		out, err = pageops.PageConsole(ctx, page)
-	case "article":
-		out, err = pageops.PageArticle(ctx, page)
-	case "marks":
-		out, err = pageops.PageMarks(ctx, page)
-	}
-	if err != nil {
-		return nil, serverError(err)
-	}
-
-	// Screenshots bypass truncate: the data-URI is binary-as-text and cutting
-	// it mid-stream would produce an undecodable image. Image size scales with
-	// the viewport (or full-page height), not max_bytes (mirrors the CLI and
-	// MCP truncation exception). Interactives, a11y, network and console bypass
-	// it too: all four are machine-parseable JSON envelopes whose designed
-	// incompleteness signal is their "truncated" field (the MaxInteractives /
-	// MaxA11yNodes / MaxLogEmit cap) plus, for the logs, the "dropped"
-	// ring-overflow counter — not a byte cut. Truncating would emit invalid JSON
-	// plus a misleading "narrow the selector" hint. Article and marks bypass it
-	// for the same reason: article self-caps at browsers.MaxArticleRunes and
-	// reports it through "truncated", while marks carries an annotated
-	// screenshot data-URI that a byte cut would corrupt.
-	if p.What == "screenshot" || p.What == "interactives" || p.What == "a11y" ||
-		p.What == "network" || p.What == "console" || p.What == "article" ||
-		p.What == "marks" {
-		return PageFetchResult{Data: out}, nil
-	}
-
 	maxBytes := p.MaxBytes
 	if maxBytes <= 0 {
 		maxBytes = pageops.DefaultPageMaxBytes
 	}
-	return PageFetchResult{Data: pageops.PageTruncate(out, maxBytes)}, nil
+	out, err := pageops.PageAspect(ctx, page, p.What, p.Selector, p.Target, p.FullPage, maxBytes)
+	if err != nil {
+		return nil, serverError(err)
+	}
+	return PageFetchResult{Data: out}, nil
 }
 
 // handlePageAct implements page.act: it performs the requested action on a
@@ -485,8 +440,8 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 
 // handlePageClose implements page.close: it resolves the page with the given id
 // via Manager.Page (surfacing restart-aware errors for pre-restart sessions),
-// then closes it via Manager.Open -> Browser.ClosePage. The session id becomes
-// invalid afterwards.
+// then closes it through the browser named by browser_id, else the default
+// browser. The session id becomes invalid afterwards.
 func (s *Server) handlePageClose(ctx context.Context, params json.RawMessage) (any, *Error) {
 	p, rpcErr := decodeParams[PageCloseParams](params)
 	if rpcErr != nil {
@@ -496,7 +451,7 @@ func (s *Server) handlePageClose(ctx context.Context, params json.RawMessage) (a
 		return nil, &Error{Code: CodeInvalidParams, Message: `page.close: missing required param "session_id"`}
 	}
 
-	b, err := s.mgr.Open(ctx)
+	b, err := s.targetBrowser(ctx, p.BrowserID)
 	if err != nil {
 		return nil, serverError(err)
 	}
@@ -510,6 +465,15 @@ func (s *Server) handlePageClose(ctx context.Context, params json.RawMessage) (a
 		return nil, serverError(err)
 	}
 	return PageCloseResult{OK: true}, nil
+}
+
+// targetBrowser returns the browser a page method should operate on: the
+// explicitly named live browser when id is set, else the lazily opened default.
+func (s *Server) targetBrowser(ctx context.Context, id string) (*browsers.Browser, error) {
+	if id == "" {
+		return s.mgr.Open(ctx)
+	}
+	return s.mgr.Browser(browsers.BrowserID(id))
 }
 
 // handleServerShutdown implements server.shutdown: it returns {ok: true} and

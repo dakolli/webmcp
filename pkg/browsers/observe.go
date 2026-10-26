@@ -1,6 +1,8 @@
 package browsers
 
 import (
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -23,6 +25,8 @@ const (
 	networkErrorLimit = 200
 	// consoleTextLimit bounds a stored console entry text.
 	consoleTextLimit = 500
+	// networkBodyCap bounds an on-demand response body at 256 KB.
+	networkBodyCap = 256 << 10
 	// ellipsis marks a string cut by cutString.
 	ellipsis = "…"
 )
@@ -39,9 +43,33 @@ type NetworkEntry struct {
 	Failed bool   `json:"failed,omitempty"`
 	Error  string `json:"error,omitempty"`
 	Seq    int64  `json:"seq"`
+	// ReqHeaders holds the request headers, bounded per entry and redacted
+	// unless the page was set to capture secrets.
+	ReqHeaders map[string]string `json:"req_headers,omitempty"`
+	// RespHeaders holds the response headers under the same rules.
+	RespHeaders map[string]string `json:"resp_headers,omitempty"`
+	// ReqHeadersTruncated reports a request header set cut by the entry bound.
+	ReqHeadersTruncated bool `json:"req_headers_truncated,omitempty"`
+	// RespHeadersTruncated reports a response header set cut by the entry bound.
+	RespHeadersTruncated bool `json:"resp_headers_truncated,omitempty"`
 
-	redirectDedupeKey proto.NetworkRequestID
-	requestedAt       proto.MonotonicTime
+	requestID   proto.NetworkRequestID
+	requestedAt proto.MonotonicTime
+}
+
+// NetworkBody is one on-demand response body, fetched from the browser by the
+// entry's sequence number. Body carries UTF-8 text; Base64 carries binary
+// content and is exclusive with Body.
+type NetworkBody struct {
+	Seq         int64  `json:"seq"`
+	Method      string `json:"method,omitempty"`
+	URL         string `json:"url"`
+	Status      int    `json:"status,omitempty"`
+	ContentType string `json:"content_type,omitempty"`
+	Bytes       int64  `json:"bytes"`
+	Truncated   bool   `json:"truncated,omitempty"`
+	Body        string `json:"body,omitempty"`
+	Base64      string `json:"base64,omitempty"`
 }
 
 // ConsoleEntry is one observed console message, exception or log entry.
@@ -101,6 +129,8 @@ type pageObserver struct {
 	con    ringBuffer[ConsoleEntry]
 	netSeq int64
 	conSeq int64
+	// secrets keeps sensitive header values instead of redacting them.
+	secrets bool
 }
 
 // newPageObserver returns an observer whose rings are bounded to the capture caps.
@@ -114,7 +144,7 @@ func newPageObserver() *pageObserver {
 // indexOfRequest returns the ring position currently keyed by id, or -1.
 func (o *pageObserver) indexOfRequest(id proto.NetworkRequestID) int {
 	for i := range o.net.items {
-		if o.net.items[i].redirectDedupeKey == id {
+		if o.net.items[i].requestID == id {
 			return i
 		}
 	}
@@ -122,7 +152,8 @@ func (o *pageObserver) indexOfRequest(id proto.NetworkRequestID) int {
 }
 
 // recordRequest opens an entry for a request, or rewrites the existing entry in
-// place when the same RequestID re-fires on a redirect hop.
+// place when the same RequestID re-fires on a redirect hop. The request headers
+// are captured bounded and redacted unless the page opted into secret capture.
 func (o *pageObserver) recordRequest(e *proto.NetworkRequestWillBeSent) {
 	if e.Request == nil {
 		return
@@ -133,10 +164,13 @@ func (o *pageObserver) recordRequest(e *proto.NetworkRequestWillBeSent) {
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	headers, cut := redactHeaders(e.Request.Headers, o.secrets)
 	if i := o.indexOfRequest(e.RequestID); i >= 0 {
 		entry := &o.net.items[i]
 		entry.Method = e.Request.Method
 		entry.URL = cutString(e.Request.URL, networkURLLimit)
+		entry.ReqHeaders = headers
+		entry.ReqHeadersTruncated = cut
 		if e.Type != "" {
 			entry.Type = string(e.Type)
 		}
@@ -145,17 +179,19 @@ func (o *pageObserver) recordRequest(e *proto.NetworkRequestWillBeSent) {
 	}
 	o.netSeq++
 	o.net.push(NetworkEntry{
-		Method:            e.Request.Method,
-		URL:               cutString(e.Request.URL, networkURLLimit),
-		Type:              string(e.Type),
-		Seq:               o.netSeq,
-		redirectDedupeKey: e.RequestID,
-		requestedAt:       e.Timestamp,
+		Method:              e.Request.Method,
+		URL:                 cutString(e.Request.URL, networkURLLimit),
+		Type:                string(e.Type),
+		Seq:                 o.netSeq,
+		ReqHeaders:          headers,
+		ReqHeadersTruncated: cut,
+		requestID:           e.RequestID,
+		requestedAt:         e.Timestamp,
 	})
 }
 
-// recordResponse joins the response status, MIME type and resource type onto the
-// entry keyed by the request ID.
+// recordResponse joins the response status, MIME type, resource type and
+// redacted response headers onto the entry keyed by the request ID.
 func (o *pageObserver) recordResponse(e *proto.NetworkResponseReceived) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -167,6 +203,7 @@ func (o *pageObserver) recordResponse(e *proto.NetworkResponseReceived) {
 	if e.Response != nil {
 		entry.Status = e.Response.Status
 		entry.MIME = e.Response.MIMEType
+		entry.RespHeaders, entry.RespHeadersTruncated = redactHeaders(e.Response.Headers, o.secrets)
 	}
 	entry.Type = string(e.Type)
 }
@@ -358,6 +395,122 @@ func (p *Page) NetworkEntries() ([]NetworkEntry, int) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.net.take(), int(o.net.dropped)
+}
+
+// CaptureSecrets controls whether headers captured from now on keep the values
+// of Cookie, Set-Cookie, Authorization and X-CSRF-Token. The default replaces
+// them with "<redacted>"; entries already captured are not rewritten.
+func (p *Page) CaptureSecrets(on bool) {
+	o := p.observer
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	o.secrets = on
+	o.mu.Unlock()
+}
+
+// NetworkBody fetches the response body the browser still holds for the entry
+// with the given Seq. The read is on demand, so memory stays bounded; a body
+// the browser has already evicted, streamed or served from cache returns an
+// actionable error rather than an empty string.
+func (p *Page) NetworkBody(ctx context.Context, seq int64) (NetworkBody, error) {
+	o := p.observer
+	if o == nil {
+		return NetworkBody{}, fmt.Errorf("network body: page has no network observer")
+	}
+	o.mu.Lock()
+	var entry NetworkEntry
+	found := false
+	for i := range o.net.items {
+		if o.net.items[i].Seq == seq {
+			entry = o.net.items[i]
+			found = true
+			break
+		}
+	}
+	o.mu.Unlock()
+	if !found {
+		return NetworkBody{}, fmt.Errorf(
+			"network body: no network entry with seq %d (the ring keeps the newest %d; re-read what=network for current seq values)",
+			seq,
+			networkRingCap,
+		)
+	}
+	if entry.Failed {
+		return NetworkBody{}, fmt.Errorf(
+			"network body: seq %d (%s %s) failed before a response arrived (%s)",
+			seq,
+			entry.Method,
+			entry.URL,
+			entry.Error,
+		)
+	}
+	p.Lock()
+	defer p.Unlock()
+	if p.Rod == nil {
+		return NetworkBody{}, fmt.Errorf("network body: page session is closed")
+	}
+	res, err := proto.NetworkGetResponseBody{RequestID: entry.requestID}.Call(p.Rod.Context(ctx))
+	if err != nil {
+		return NetworkBody{}, fmt.Errorf(
+			"network body: seq %d (%s %s) body is no longer available — the browser keeps response bodies only briefly (evicted, streamed, or served from cache); re-issue the request and read the body immediately: %w",
+			seq,
+			entry.Method,
+			entry.URL,
+			err,
+		)
+	}
+	body, err := buildNetworkBody(entry, res)
+	if err != nil {
+		return NetworkBody{}, fmt.Errorf("network body: seq %d (%s %s): %w", seq, entry.Method, entry.URL, err)
+	}
+	if body.Body == "" && body.Base64 == "" {
+		return NetworkBody{}, fmt.Errorf(
+			"network body: seq %d (%s %s) has an empty body (status %d, mime %q) — the response carried no payload",
+			seq,
+			entry.Method,
+			entry.URL,
+			entry.Status,
+			entry.MIME,
+		)
+	}
+	return body, nil
+}
+
+// buildNetworkBody assembles a body result from a CDP body response, capping
+// the payload at 256 KB and switching binary content to base64.
+func buildNetworkBody(entry NetworkEntry, res *proto.NetworkGetResponseBodyResult) (NetworkBody, error) {
+	raw := []byte(res.Body)
+	if res.Base64Encoded {
+		decoded, err := base64.StdEncoding.DecodeString(res.Body)
+		if err != nil {
+			return NetworkBody{}, fmt.Errorf("decode base64 body: %w", err)
+		}
+		raw = decoded
+	}
+	out := NetworkBody{
+		Seq:         entry.Seq,
+		Method:      entry.Method,
+		URL:         entry.URL,
+		Status:      entry.Status,
+		ContentType: entry.MIME,
+		Bytes:       int64(len(raw)),
+	}
+	if len(raw) > networkBodyCap {
+		end := networkBodyCap
+		for end > 0 && !utf8.RuneStart(raw[end]) {
+			end--
+		}
+		raw = raw[:end]
+		out.Truncated = true
+	}
+	if res.Base64Encoded || !utf8.Valid(raw) {
+		out.Base64 = base64.StdEncoding.EncodeToString(raw)
+		return out, nil
+	}
+	out.Body = string(raw)
+	return out, nil
 }
 
 // ConsoleEntries returns a copy of the observed console entries, oldest first,

@@ -45,6 +45,10 @@ func (t *BrowserCreate) Description() string {
 		"Passing any option (headless, profile, bin, …) creates a NEW browser id rather than " +
 		"reusing browser-1, and fails with a Chromium SingletonLock error if another running " +
 		"browser holds the same profile — pass a distinct profile name per browser. " +
+		"Local proxy for intercept tools, for example 127.0.0.1:8080. Do not set a remote proxy " +
+		"unless the user asks. Proxy credentials never go in a tool argument: put them in " +
+		"~/.config/browser-mcp/proxy.json (mode 0600), keyed by proxy host:port. " +
+		"Example: { \"proxy\": \"http://127.0.0.1:8080\", \"ignore_certs\": true }. " +
 		"Example: { \"headless\": true, \"profile\": \"audit\", \"persist\": true }."
 }
 
@@ -79,18 +83,36 @@ func (t *BrowserCreate) InputSchema() models.InputSchema {
 				"enum":        []string{"left", "right", "max", "normal"},
 				"description": "Optional window position split screen preset: 'left' (left screen half), 'right' (right screen half), 'max', 'normal'.",
 			},
+			"proxy": map[string]any{
+				"type": "string",
+				"description": "Local proxy for intercept tools, for example 127.0.0.1:8080. " +
+					"Accepts host:port or scheme://host:port. Credentials are never accepted here; " +
+					"put them in ~/.config/browser-mcp/proxy.json (mode 0600), keyed by proxy host:port.",
+			},
+			"proxy_bypass": map[string]any{
+				"type":        "string",
+				"description": "Comma-separated hosts that skip the proxy, for example 'localhost,*.internal'.",
+			},
+			"ignore_certs": map[string]any{
+				"type": "boolean",
+				"description": "Accept invalid TLS certificates, for example an intercept proxy's MITM CA. " +
+					"Independent of proxy: set it explicitly.",
+			},
 		},
 	}
 }
 
 // browserCreateArgs is the strict decoding target for browser_create arguments.
 type browserCreateArgs struct {
-	Bin      string `json:"bin,omitempty"`
-	Profile  string `json:"profile,omitempty"`
-	Position string `json:"position,omitempty"`
-	Headless *bool  `json:"headless,omitempty"`
-	Stealth  *bool  `json:"stealth,omitempty"`
-	Persist  *bool  `json:"persist,omitempty"`
+	Bin         string `json:"bin,omitempty"`
+	Profile     string `json:"profile,omitempty"`
+	Position    string `json:"position,omitempty"`
+	Proxy       string `json:"proxy,omitempty"`
+	ProxyBypass string `json:"proxy_bypass,omitempty"`
+	Headless    *bool  `json:"headless,omitempty"`
+	Stealth     *bool  `json:"stealth,omitempty"`
+	Persist     *bool  `json:"persist,omitempty"`
+	IgnoreCerts *bool  `json:"ignore_certs,omitempty"`
 }
 
 // Execute parses options and creates a new distinct Browser via Manager.CreateBrowser.
@@ -114,6 +136,15 @@ func (t *BrowserCreate) Execute(ctx context.Context, args json.RawMessage) (stri
 	}
 	if a.Position != "" {
 		opts = append(opts, browsers.WithPosition(a.Position))
+	}
+	if a.Proxy != "" {
+		opts = append(opts, browsers.WithProxy(a.Proxy))
+	}
+	if a.ProxyBypass != "" {
+		opts = append(opts, browsers.WithProxyBypass(a.ProxyBypass))
+	}
+	if a.IgnoreCerts != nil {
+		opts = append(opts, browsers.WithIgnoreCerts(*a.IgnoreCerts))
 	}
 	if a.Headless != nil {
 		opts = append(opts, browsers.WithHeadless(*a.Headless))

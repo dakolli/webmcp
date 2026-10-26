@@ -11,7 +11,35 @@ import (
 	"testing"
 
 	"webmcp/pkg/browsers"
+	"webmcp/pkg/cli/ipc"
 )
+
+// TestSelectBrowserEntry pins the daemon-side selector: the pinned id picks its
+// own entry, and an unknown id fails with the sorted live id list — never with
+// the default browser's pages.
+func TestSelectBrowserEntry(t *testing.T) {
+	entries := []ipc.BrowserEntry{
+		{BrowserID: "browser-2", Pages: []browsers.PageInfo{{ID: "page-2", URL: "https://b.com"}}},
+		{BrowserID: "browser-1", Pages: []browsers.PageInfo{{ID: "page-1", URL: "https://a.com"}}},
+	}
+
+	got, err := selectBrowserEntry(entries, "browser-2", "page list")
+	if err != nil {
+		t.Fatalf("selectBrowserEntry(browser-2) error = %v, want nil", err)
+	}
+	if got.BrowserID != "browser-2" || len(got.Pages) != 1 || got.Pages[0].ID != "page-2" {
+		t.Errorf("selectBrowserEntry(browser-2) = %+v, want browser-2's page", got)
+	}
+
+	_, err = selectBrowserEntry(entries, "browser-9", "page fetch")
+	if err == nil {
+		t.Fatal("selectBrowserEntry(browser-9) = nil error, want unknown-browser error")
+	}
+	want := `page fetch: browser "browser-9" not found (running: browser-1, browser-2)`
+	if err.Error() != want {
+		t.Errorf("selectBrowserEntry(browser-9) error = %q, want %q", err.Error(), want)
+	}
+}
 
 func TestParseFetchArgs(t *testing.T) {
 	tests := []struct {

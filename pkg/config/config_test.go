@@ -202,6 +202,37 @@ func TestResolveProfilePathWithBinRejectsRelativePath(t *testing.T) {
 	}
 }
 
+func TestResolveProfileSecondariesGetDistinctDirs(t *testing.T) {
+	for _, bin := range []string{"", "/usr/bin/brave-browser"} {
+		t.Run("bin="+bin, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+			defaultDir, err := ResolveProfilePathWithBin("", bin)
+			if err != nil {
+				t.Fatalf("ResolveProfilePathWithBin: %v", err)
+			}
+			second, ephemeral, err := ResolveProfile("", bin, "browser-2", false)
+			if err != nil {
+				t.Fatalf("ResolveProfile(browser-2): %v", err)
+			}
+			third, _, err := ResolveProfile("", bin, "browser-3", false)
+			if err != nil {
+				t.Fatalf("ResolveProfile(browser-3): %v", err)
+			}
+
+			if second == defaultDir || third == defaultDir {
+				t.Fatalf("secondary profile reused the default browser profile %q", defaultDir)
+			}
+			if second == third {
+				t.Fatalf("two secondary ids resolved the same profile directory %q", second)
+			}
+			if !ephemeral {
+				t.Error("secondary profile is not ephemeral")
+			}
+		})
+	}
+}
+
 func TestLoadSaveConfig(t *testing.T) {
 	tmpConfig := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", tmpConfig)

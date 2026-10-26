@@ -4,9 +4,7 @@ package cmd
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -40,9 +38,12 @@ fetch [id] [what]' reads an aspect of a live page; 'web-cli page act [id]
 page fetch <url>' skips the separate fetch step: it opens the URL in a new page
 first and reads the aspect in one go.
 
+Every page command honors the global --browser-id: when it is set, page ids
+resolve only against that browser and an unknown id fails with the live ids.
+
 Subcommands:
   list   List the browser's open pages (id, url)
-  fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, console, article, marks); a URL opens a new page first
+  fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, console, body, article, marks); a URL opens a new page first
   act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate, clear_logs)
   close  Close an open page
 
@@ -84,24 +85,21 @@ which sessions are still alive before acting on or closing them.`,
 			ctx, cancel := context.WithTimeout(cmdCtx(cmd), defaultCmdTimeout)
 			defer cancel()
 
+			browserID := explicitBrowserID(cmd)
 			// Forward to a live serve process when one is running; else fall
 			// back to the in-process path below (browser dies with this
 			// command — the serve hint on stderr says so).
 			if cl := dialServe(cmd); cl != nil {
 				defer cl.Close()
-				return pageListViaIPC(cmd, ctx, cl)
+				return pageListViaIPC(cmd, ctx, cl, browserID)
 			}
 			printServeHint(cmd)
 
-			// No lazy launch: listing must never start a browser (mirrors
-			// `browser list`). With no browser open there are no pages — the
-			// same "no open pages" answer below is the friendly result.
-			b, err := mgr.Browser("")
+			pages, err := browserPages(ctx, mgr, nil, browserID, "page list")
 			if err != nil {
-				fmt.Println("no open pages")
-				return nil
+				return err
 			}
-			pages := b.Pages()
+			reportBrowserTarget(cmd, browserID)
 			if len(pages) == 0 {
 				fmt.Println("no open pages")
 				return nil
@@ -114,14 +112,9 @@ which sessions are still alive before acting on or closing them.`,
 	}
 }
 
-// newPageFetchCmd builds `page fetch`: it extracts an aspect of a live page
-// (html, text, links, meta, dom, css, js, screenshot, interactives, a11y,
-// network, console, article, marks) and prints it, truncating to --max-bytes on
-// a UTF-8 rune boundary. Screenshots, interactives, a11y, network, console,
-// article and marks are the exceptions: the base64 data-URI (screenshot),
-// the machine-parseable JSON envelopes (interactives, a11y, network, console),
-// the self-capped article markdown and the marks screenshot data-URI bypass
-// truncation (see RunE).
+// newPageFetchCmd builds `page fetch`: it reads any aspect in the shared pageops
+// registry and prints it, truncating to --max-bytes on a UTF-8 rune boundary
+// except for the aspects whose reader caps its own output.
 func newPageFetchCmd(mgr *browsers.Manager) *cobra.Command {
 	var (
 		id       string
@@ -136,7 +129,7 @@ func newPageFetchCmd(mgr *browsers.Manager) *cobra.Command {
 		Use:   "fetch [id|url] [what]",
 		Short: "Extract an aspect of a live page",
 		Long: `Extracts an aspect of a live page (html, text, links, meta, dom, css,
-js, screenshot, interactives, a11y, network, console, article, marks) and prints
+js, screenshot, interactives, a11y, network, console, body, article, marks) and prints
 it. The page id is optional when
 only one page is open; 'last' means the most recently opened page; a bare number
 resolves to page-N. A URL in the [id] slot opens a NEW page for it first —
@@ -149,7 +142,7 @@ dance).
   [url]   an absolute URL (contains "://") to open in a new page first, then
           extract the aspect — mirrors 'web-cli fetch <url>' (wait: idle)
   [what]  the aspect to extract: html, text, links, meta, dom, css, js,
-          screenshot, interactives, a11y, network, console, article, marks
+          screenshot, interactives, a11y, network, console, body, article, marks
           (default: text)
 
   --id <session>     the page/session id (the positional [id] wins when both
@@ -158,14 +151,15 @@ dance).
                      both are given; default text)
   --selector <css>   optional CSS selector scoping html/text extraction
   --target <url>     fetch exactly one css/js resource's full content instead
-                     of the {url,type,size} list (with --what css|js)
+                     of the {url,type,size} list (with --what css|js); with
+                     --what body, select the entry by seq or URL substring
   --full-page        capture the entire scrollable page (screenshot only)
   --max-bytes <n>    cap output size (default 50000; screenshots,
-                     interactives, a11y, network, console, article and marks
-                     are never truncated)
+                     interactives, a11y, network, console, body, article and
+                     marks are never truncated)
 
-links, meta, dom, interactives, a11y, network, console, article and marks print
-JSON, mirroring the MCP page_fetch shapes. article is the readable prose body as
+links, meta, dom, interactives, a11y, network, console, body, article and marks
+print JSON, mirroring the MCP page_fetch shapes. article is the readable prose body as
 markdown ({title, byline?, excerpt?, text, words, truncated, url}); prefer it
 over text when you want the article rather than the whole page. marks is the
 numbered overlay ({marks:[{index, role, text?, x, y, width, height}], screenshot,
@@ -173,7 +167,10 @@ viewport_width, viewport_height, truncated}) whose x/y feed 'page act click_at'.
 Screenshots print a data:image/png;base64,... data-URI. network/console emit
 {entries,count,dropped,truncated} over the newest 100 buffered entries; capture is
 cumulative from page creation, so clear with 'page act clear_logs' right before the
-step you want to observe, then filter client-side.`,
+step you want to observe, then filter client-side. body fetches the browser's
+stored response body for one entry ({seq,url,content_type,bytes,truncated,
+body|base64}); target selects it by seq or URL substring (newest match wins), the
+payload is capped at 256 KB and binary bodies come back as base64.`,
 		Example: `  web-cli page fetch links                              # single open page → its links
   web-cli page fetch 12 dom                             # page-12's DOM tree
   web-cli page fetch 12 text --selector ".article"      # scoped text extraction
@@ -182,73 +179,65 @@ step you want to observe, then filter client-side.`,
   web-cli page fetch last screenshot --full-page        # full-page capture of the latest page
   web-cli page fetch last a11y                          # semantic roles + names + handles
   web-cli page fetch last network  # last 100 network requests + dropped count
+  web-cli page fetch last body --target /api/orders  # newest matching API body
   web-cli page fetch https://hackernews.com links       # open + extract in one step`,
 		Args: cobra.MaximumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, cancel := context.WithTimeout(cmdCtx(cmd), defaultCmdTimeout)
 			defer cancel()
 
-			// Positional args win over --id/--what; a URL-like positional
-			// fills the url slot (the "open a new page first" path); what
-			// defaults to text when neither supplies it ("show me the text of
-			// my page").
+			browserID := explicitBrowserID(cmd)
 			id, what, url = parseFetchArgs(args, id, what)
 
-			// The URL slot mirrors 'web-cli fetch <url>' (the "open a new page
-			// first" path): validate before any browser work — same fail-fast
-			// doctrine as fetch, so a bad scheme never launches Chromium. The
-			// serve path validates server-side too, but only after the daemon
-			// round-trip; failing here keeps both paths' errors identical.
 			if url != "" {
 				if err := pageops.ValidateURL(url); err != nil {
 					return fmt.Errorf("page fetch: %w", err)
 				}
 			}
-
-			switch what {
-			case "html", "text", "links", "meta", "dom", "css", "js", "screenshot", "interactives", "a11y", "network", "console", "article", "marks":
-			default:
-				return fmt.Errorf("page fetch: unknown what=%q (must be one of html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, article, marks)", what)
+			if err := pageops.ValidateAspect(what); err != nil {
+				return fmt.Errorf("page fetch: %w", err)
 			}
 
-			// Fail-fast switch passed: forward to a live serve process when one
-			// is running; else fall back to the in-process path below. The url
-			// path opens the page before extracting (browser.open + page.open
-			// are both idempotent/lazy server-side, mirroring fetchViaIPC).
 			if cl := dialServe(cmd); cl != nil {
 				defer cl.Close()
 				if url != "" {
-					var open ipc.BrowserOpenResult
-					if err := cl.Call(ctx, ipc.MethodBrowserOpen, &ipc.BrowserOpenParams{}, &open); err != nil {
-						return fmt.Errorf("page fetch: %w", err)
+					if browserID == "" {
+						var open ipc.BrowserOpenResult
+						if err := cl.Call(ctx, ipc.MethodBrowserOpen, &ipc.BrowserOpenParams{}, &open); err != nil {
+							return fmt.Errorf("page fetch: %w", err)
+						}
+					} else if err := requireLiveBrowser(ctx, cl, browserID, "page fetch"); err != nil {
+						return err
 					}
 					var summary ipc.PageOpenResult
-					if err := cl.Call(ctx, ipc.MethodPageOpen, &ipc.PageOpenParams{URL: url, Wait: "idle"}, &summary); err != nil {
+					if err := cl.Call(ctx, ipc.MethodPageOpen, &ipc.PageOpenParams{
+						URL:       url,
+						Wait:      "idle",
+						BrowserID: browserID,
+					}, &summary); err != nil {
 						return fmt.Errorf("page fetch: %w", err)
 					}
+					reportBrowserTarget(cmd, browserID)
 					return pageFetchViaIPC(cmd, ctx, cl, summary.SessionID, what, selector, target, fullPage, maxBytes)
 				}
-				rid, err := resolvePageID(ctx, cmd, mgr, cl, id, "page fetch")
+				rid, err := resolvePageID(ctx, cmd, mgr, cl, browserID, id, "page fetch")
 				if err != nil {
 					return err
 				}
+				reportBrowserTarget(cmd, browserID)
 				return pageFetchViaIPC(cmd, ctx, cl, rid, what, selector, target, fullPage, maxBytes)
 			}
 			printServeHint(cmd)
 
-			// Obtain the page: either resolve the id through the manager (never
-			// a lazy launch — that is what the "no open pages" wall guards), or
-			// open the URL in a fresh page, creating the browser if needed
-			// (mirrors the in-process fetch path: mgr.Open → NewPage plain →
-			// WaitForPage idle).
 			var p *browsers.Page
 			var err error
 			if url != "" {
 				var b *browsers.Browser
-				b, err = mgr.Open(ctx) // lazily launches (or returns) the single Browser
+				b, err = openTargetBrowser(ctx, mgr, browserID, "page fetch")
 				if err != nil {
-					return fmt.Errorf("page fetch: %w", err)
+					return err
 				}
+				reportBrowserTarget(cmd, browserID)
 				p, err = b.NewPage(ctx, url, nil, "", "") // new tab; plain launch; stealth applied by default
 				if err != nil {
 					return fmt.Errorf("page fetch: %w", err)
@@ -258,79 +247,29 @@ step you want to observe, then filter client-side.`,
 				}
 			} else {
 				var rid string
-				rid, err = resolvePageID(ctx, cmd, mgr, nil, id, "page fetch")
+				rid, err = resolvePageID(ctx, cmd, mgr, nil, browserID, id, "page fetch")
 				if err != nil {
 					return err
 				}
+				reportBrowserTarget(cmd, browserID)
 				p, err = mgr.Page(ctx, browsers.PageID(rid)) // opens the Browser if needed; probes for liveness
 				if err != nil {
 					return fmt.Errorf("page fetch: %w", err)
 				}
 			}
 
-			var out string
-			switch what {
-			case "html":
-				out, err = pageops.PageHTML(ctx, p, selector)
-			case "text":
-				out, err = pageops.PageText(ctx, p, selector)
-			case "links":
-				out, err = pageops.PageLinks(ctx, p)
-			case "meta":
-				out, err = pageops.PageMeta(ctx, p)
-			case "dom":
-				out, err = pageops.PageDOM(ctx, p)
-			case "css":
-				out, err = pageops.PageCSS(ctx, p, target)
-			case "js":
-				out, err = pageops.PageJS(ctx, p, target)
-			case "screenshot":
-				out, err = pageops.PageScreenshot(ctx, p, fullPage)
-			case "interactives":
-				out, err = pageops.PageInteractives(ctx, p)
-			case "a11y":
-				out, err = pageops.PageA11y(ctx, p)
-			case "network":
-				out, err = pageops.PageNetwork(ctx, p)
-			case "console":
-				out, err = pageops.PageConsole(ctx, p)
-			case "article":
-				out, err = pageops.PageArticle(ctx, p)
-			case "marks":
-				out, err = pageops.PageMarks(ctx, p)
-			}
+			out, err := pageops.PageAspect(ctx, p, what, selector, target, fullPage, maxBytes)
 			if err != nil {
 				return fmt.Errorf("page fetch: %w", err)
 			}
-			// Screenshots bypass PageTruncate: the data-URI is binary-as-text
-			// and cutting it mid-stream would produce an undecodable image.
-			// Image size scales with the viewport (or full-page height), not
-			// max_bytes — the 50KB truncation convention applies to text
-			// extractions only. Interactives, a11y, network and console bypass it
-			// too: all four are machine-parseable JSON envelopes whose designed
-			// incompleteness signal is their "truncated" field (the
-			// MaxInteractives / MaxA11yNodes / MaxLogEmit cap) plus, for the
-			// logs, the "dropped" ring-overflow counter — not a byte cut.
-			// Truncating would emit invalid JSON plus a misleading "narrow the
-			// selector" hint. Article and marks bypass it for the same reason:
-			// article self-caps at browsers.MaxArticleRunes and reports it
-			// through "truncated", while marks carries an annotated screenshot
-			// data-URI that a byte cut would corrupt. Mirrors the MCP page_fetch
-			// truncation exception.
-			if what == "screenshot" || what == "interactives" || what == "a11y" ||
-				what == "network" || what == "console" || what == "article" ||
-				what == "marks" {
-				fmt.Println(out)
-				return nil
-			}
-			fmt.Println(pageops.PageTruncate(out, maxBytes))
+			fmt.Println(out)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to fetch (optional with one page open; 'last'; or a bare number)")
-	cmd.Flags().StringVar(&what, "what", "", "aspect to extract: html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, article, marks (default text)")
+	cmd.Flags().StringVar(&what, "what", "", "aspect to extract: html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, marks (default text)")
 	cmd.Flags().StringVar(&selector, "selector", "", "optional CSS selector scoping html/text extraction")
-	cmd.Flags().StringVar(&target, "target", "", "resource URL to fetch exactly one css/js resource's content (with --what css|js)")
+	cmd.Flags().StringVar(&target, "target", "", "resource URL for one css/js resource, or seq/URL substring selecting one network body (with --what body)")
 	cmd.Flags().BoolVar(&fullPage, "full-page", false, "capture the entire scrollable page instead of the visible viewport (screenshot only)")
 	cmd.Flags().IntVar(&maxBytes, "max-bytes", pageops.DefaultPageMaxBytes, "maximum output size in bytes (default 50000)")
 	return cmd
@@ -465,20 +404,23 @@ you want to observe, then run 'page fetch last network|console' and filter clien
 			if action == "set_viewport" {
 				vp = &browsers.Viewport{Width: width, Height: height}
 			}
+			browserID := explicitBrowserID(cmd)
 			if cl := dialServe(cmd); cl != nil {
 				defer cl.Close()
-				rid, err := resolvePageID(ctx, cmd, mgr, cl, id, "page act")
+				rid, err := resolvePageID(ctx, cmd, mgr, cl, browserID, id, "page act")
 				if err != nil {
 					return err
 				}
+				reportBrowserTarget(cmd, browserID)
 				return pageActViaIPC(cmd, ctx, cl, rid, action, handle, selector, value, key, button, clickCount, x, y, targetX, targetY, targetSelector, paths, waitMode, timeoutMS, vp, device)
 			}
 			printServeHint(cmd)
 
-			rid, err := resolvePageID(ctx, cmd, mgr, nil, id, "page act")
+			rid, err := resolvePageID(ctx, cmd, mgr, nil, browserID, id, "page act")
 			if err != nil {
 				return err
 			}
+			reportBrowserTarget(cmd, browserID)
 			p, err := mgr.Page(ctx, browsers.PageID(rid)) // opens the Browser if needed; probes for liveness
 			if err != nil {
 				return fmt.Errorf("page act: %w", err)
@@ -593,24 +535,27 @@ afterwards.`,
 			ctx, cancel := context.WithTimeout(cmdCtx(cmd), defaultCmdTimeout)
 			defer cancel()
 
+			browserID := explicitBrowserID(cmd)
 			if cl := dialServe(cmd); cl != nil {
 				defer cl.Close()
-				rid, err := resolvePageID(ctx, cmd, mgr, cl, id, "page close")
+				rid, err := resolvePageID(ctx, cmd, mgr, cl, browserID, id, "page close")
 				if err != nil {
 					return err
 				}
-				return pageCloseViaIPC(cmd, ctx, cl, rid)
+				reportBrowserTarget(cmd, browserID)
+				return pageCloseViaIPC(cmd, ctx, cl, rid, browserID)
 			}
 			printServeHint(cmd)
 
-			rid, err := resolvePageID(ctx, cmd, mgr, nil, id, "page close")
+			rid, err := resolvePageID(ctx, cmd, mgr, nil, browserID, id, "page close")
 			if err != nil {
 				return err
 			}
+			reportBrowserTarget(cmd, browserID)
 
-			b, err := mgr.Open(ctx) // lazily launches (or returns) the single Browser
+			b, err := openTargetBrowser(ctx, mgr, browserID, "page close")
 			if err != nil {
-				return fmt.Errorf("page close: %w", err)
+				return err
 			}
 			// Resolve through the manager first so a pre-restart session id
 			// surfaces the explicit "browser was restarted" error (mirrors the
@@ -630,28 +575,32 @@ afterwards.`,
 }
 
 // pageListViaIPC implements `page list` against a live serve process: it asks
-// for the browser's open pages via browser.list (which, like the CLI `browser
-// list` command, never lazily launches the browser) and prints "id\turl" rows
-// byte-identically to the in-process path. The server's own "no browser open"
-// answer maps to the friendly "no open pages" output with exit 0 (mirroring
-// browserListViaIPC); any other failure propagates as a real error.
-func pageListViaIPC(cmd *cobra.Command, ctx context.Context, cl *ipc.Client) error {
-	var res ipc.BrowserListResult
-	if err := cl.Call(ctx, ipc.MethodBrowserList, nil, &res); err != nil {
-		var serverErr *ipc.ServerError
-		if errors.As(err, &serverErr) &&
-			serverErr.Code == ipc.CodeServerError &&
-			strings.Contains(serverErr.Message, "no browser open") {
-			fmt.Println("no open pages")
-			return nil
-		}
-		return fmt.Errorf("page list: %w", err)
+// for the daemon's live browsers via browser.list (which, like the CLI `browser
+// list` command, never lazily launches a browser) and prints "id\turl" rows
+// byte-identically to the in-process path. A pinned browserID narrows the rows
+// to that browser and fails with the live ids when it is not running. The
+// server's own "no browser open" answer maps to the friendly "no open pages"
+// output with exit 0 (mirroring browserListViaIPC); any other failure
+// propagates as a real error.
+func pageListViaIPC(cmd *cobra.Command, ctx context.Context, cl *ipc.Client, browserID string) error {
+	res, err := browserSnapshotViaIPC(ctx, cl, "page list")
+	if err != nil {
+		return err
 	}
-	if len(res.Pages) == 0 {
+	pages := res.Pages
+	if browserID != "" {
+		entry, err := selectBrowserEntry(res.Browsers, browserID, "page list")
+		if err != nil {
+			return err
+		}
+		pages = entry.Pages
+		reportBrowserTarget(cmd, browserID)
+	}
+	if len(pages) == 0 {
 		fmt.Println("no open pages")
 		return nil
 	}
-	for _, p := range res.Pages {
+	for _, p := range pages {
 		fmt.Printf("%s\t%s\n", p.ID, p.URL)
 	}
 	return nil
@@ -730,10 +679,16 @@ func pageActViaIPC(
 }
 
 // pageCloseViaIPC implements `page close` against a live serve process: it
-// forwards the close to page.close and prints the confirmation
-// byte-identically to the in-process path.
-func pageCloseViaIPC(cmd *cobra.Command, ctx context.Context, cl *ipc.Client, id string) error {
-	if err := cl.Call(ctx, ipc.MethodPageClose, &ipc.PageCloseParams{SessionID: id}, nil); err != nil {
+// forwards the close (and the optional owning browser id) to page.close and
+// prints the confirmation byte-identically to the in-process path.
+func pageCloseViaIPC(
+	cmd *cobra.Command,
+	ctx context.Context,
+	cl *ipc.Client,
+	id, browserID string,
+) error {
+	params := &ipc.PageCloseParams{SessionID: id, BrowserID: browserID}
+	if err := cl.Call(ctx, ipc.MethodPageClose, params, nil); err != nil {
 		return fmt.Errorf("page close: %w", err)
 	}
 	fmt.Printf("session %s closed\n", id)

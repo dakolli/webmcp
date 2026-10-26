@@ -3,6 +3,7 @@ package browsers
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os/exec"
 	"sort"
 	"strings"
@@ -62,6 +63,25 @@ type Browser struct {
 	cleanupOnce sync.Once
 	// position specifies initial window placement ("left", "right", "max", "normal").
 	position string
+	// proxy is the validated upstream proxy (host:port or scheme://host:port);
+	// empty leaves the browser on a direct connection.
+	proxy string
+	// proxyBypass is the comma-separated proxy bypass list; empty keeps
+	// Chromium's default bypass behavior.
+	proxyBypass string
+	// ignoreCerts makes Chromium accept invalid TLS certificates (e.g. the
+	// MITM CA of an intercept proxy).
+	ignoreCerts bool
+	// proxyAuth holds the proxy.json credentials for this browser; nil when no
+	// proxy is configured. Set once at launch, immutable afterwards.
+	proxyAuth *proxyAuth
+	// authPages maps each live rod page to its armed proxy-auth handler. Guarded
+	// by mu; entries are added in the pre-registration window and removed on
+	// every close path.
+	authPages map[*rod.Page]*proxyAuthPage
+	// logger records best-effort background failures (proxy auth). Defaults to
+	// a no-op logger; the manager injects its own.
+	logger *slog.Logger
 	// baseCtx is the manager-owned, process-lifetime context the rod browser's
 	// default ctx is bound to (WEB-59): a transient tool-call ctx can never
 	// poison it, so canceling a request aborts a call but never the browser
@@ -84,11 +104,13 @@ func NewBrowser(id BrowserID, baseCtx context.Context, headless, stealth bool, b
 	return &Browser{
 		id:         id,
 		pages:      make(map[PageID]*Page),
+		authPages:  make(map[*rod.Page]*proxyAuthPage),
 		headless:   headless,
 		stealth:    stealth,
 		binPath:    binPath,
 		profileDir: profileDir,
 		position:   pos,
+		logger:     slog.New(slog.DiscardHandler),
 		baseCtx:    baseCtx,
 	}
 }
@@ -163,6 +185,30 @@ func (b *Browser) Launch(ctx context.Context) error {
 	l.Delete("disable-site-isolation-trials")               // remove "unsupported command-line flag: --disable-site-isolation-trials" infobar
 	l.Set("disable-infobars")                               // suppress warning infobars
 	l.Set("no-default-browser-check")                       // suppress "Chromium isn't your default browser" prompt
+	if b.proxy != "" {
+		server, host, err := parseProxy(b.proxy)
+		if err != nil {
+			return err
+		}
+		creds, err := config.LoadProxyCredentials()
+		if err != nil {
+			return fmt.Errorf("browsers: load proxy credentials: %w", err)
+		}
+		cred, ok := creds[host]
+		b.proxyAuth = &proxyAuth{
+			host: host,
+			cred: cred,
+			ok:   ok,
+			file: proxyConfigFile(),
+		}
+		l.Proxy(server)
+	}
+	if b.proxyBypass != "" {
+		l.Set("proxy-bypass-list", b.proxyBypass)
+	}
+	if b.ignoreCerts {
+		l.Set("ignore-certificate-errors")
+	}
 	binPath := b.binPath
 	if binPath == "" {
 		binPath = DefaultBinPath()
@@ -172,11 +218,7 @@ func (b *Browser) Launch(ctx context.Context) error {
 	}
 	profileDir := b.profileDir
 	if profileDir == "" {
-		resolved, err := config.ResolveProfilePathWithBin("", binPath)
-		if err != nil {
-			return fmt.Errorf("browsers: resolve profile directory: %w", err)
-		}
-		profileDir = resolved
+		return fmt.Errorf("browsers: launch %s: no profile directory resolved; the manager must resolve one before launch", b.id)
 	}
 	l.UserDataDir(profileDir)
 	if !b.headless {
@@ -200,14 +242,14 @@ func (b *Browser) Launch(ctx context.Context) error {
 	}
 	u, err := l.Launch() // error form; no Must*
 	if err != nil {
-		if profileDir != "" && strings.Contains(err.Error(), "SingletonLock") {
+		if strings.Contains(err.Error(), "SingletonLock") || strings.Contains(err.Error(), "Opening in existing browser session") {
 			return fmt.Errorf(
-				"browsers: launch chromium: profile %q appears to be in use by another running browser — pass a distinct profile name: %w",
+				"browsers: launch chromium: profile %q is already in use by another running browser — create this browser with a distinct profile or an ephemeral one: %w",
 				profileDir,
 				err,
 			)
 		}
-		return fmt.Errorf("browsers: launch chromium: %w", err)
+		return fmt.Errorf("browsers: launch chromium with profile %q: %w", profileDir, err)
 	}
 	// The Chromium process is now live (WEB-60): if anything below fails — a
 	// caller ctx that expired during launch, or a failed websocket connect —
@@ -310,6 +352,7 @@ func (b *Browser) NewPage(
 	// ID, URL and lastAccess are filled at registration below.
 	page := &Page{Rod: p}
 	page.startObservation()
+	b.startProxyAuth(p)
 
 	// Apply the stealth preload script (the same JS stealth.Page injects,
 	// error form; no Must*) immediately after creation — before the
@@ -378,12 +421,24 @@ func (b *Browser) NewPage(
 		// Bound to ctx so a hung navigation cannot outlive the tool call.
 		pc := p.Context(ctx)
 		if err := pc.Navigate(url); err != nil {
+			authErr := b.takeProxyAuthError(p)
 			b.closeUnregisteredPage(page) // do not leak the orphaned tab
+			if authErr != nil {
+				return nil, authErr
+			}
 			return nil, fmt.Errorf("browsers: navigate: %w", err)
 		}
 		if err := pc.WaitLoad(); err != nil {
+			authErr := b.takeProxyAuthError(p)
 			b.closeUnregisteredPage(page) // do not leak the orphaned tab
+			if authErr != nil {
+				return nil, authErr
+			}
 			return nil, fmt.Errorf("browsers: wait load: %w", err)
+		}
+		if authErr := b.takeProxyAuthError(p); authErr != nil {
+			b.closeUnregisteredPage(page) // do not leak the orphaned tab
+			return nil, authErr
 		}
 	}
 
@@ -410,6 +465,7 @@ func (b *Browser) NewPage(
 // create/attach failures, so this never needs to run on Page()'s own error path.
 // Best-effort by design.
 func (b *Browser) closeUnregisteredPage(page *Page) {
+	b.stopProxyAuth(page.Rod)
 	page.stopObservation()
 	closeCtx, cancel := context.WithTimeout(b.baseCtx, closePageTimeout)
 	defer cancel()
@@ -455,6 +511,7 @@ func (b *Browser) Page(ctx context.Context, id PageID) (*Page, error) {
 		}
 		b.mu.Unlock()
 		if handle != nil {
+			b.stopProxyAuth(handle)
 			// Close the captured handle outside the locks, via closeRodPage
 			// (the sweeper's path): it honors a bound close ctx and converts a
 			// concurrent-close panic into an error — an in-flight tool call on
@@ -674,6 +731,7 @@ func (b *Browser) ClosePage(ctx context.Context, id PageID) error {
 	if handle == nil {
 		return nil
 	}
+	b.stopProxyAuth(handle)
 	closeCtx, cancel := context.WithTimeout(b.baseCtx, teardownBudget)
 	defer cancel()
 	if err := closeRodPage(closeCtx, handle); err != nil {
@@ -712,9 +770,15 @@ func (b *Browser) Close(ctx context.Context) error {
 		p.mu.Unlock()
 	}
 	b.pages = make(map[PageID]*Page)
+	authPages := b.authPages
+	b.authPages = make(map[*rod.Page]*proxyAuthPage)
 	rb := b.rod
 	b.rod = nil
 	b.mu.Unlock()
+
+	for _, a := range authPages {
+		a.cancel()
+	}
 
 	// Close the captured pages outside the locks, all bounded by ONE shared
 	// teardown budget derived from the manager-owned baseCtx (the caller's ctx
