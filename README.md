@@ -1,358 +1,309 @@
-# web-mcp 🚀
+# web-mcp
 
-A Go **browser engine** with two front-ends — an MCP server for LLM agents and a `browser` CLI for
-humans — over one live, stateful Chromium driven by [go-rod](https://go-rod.github.io/).
+A Go browser engine. It has two front-ends. One is an MCP server for LLM agents. The other is a
+`browser` CLI for humans. Both drive one live, stateful Chromium through
+[go-rod](https://go-rod.github.io/).
 
-Two things it is for:
-
-1. **Browsing for agents.** Open pages, click, type, press keys, scroll, upload, run JS, take
-   screenshots — all against a real browser that keeps state across tool calls.
-2. **Dissecting pages.** Ask granular structural questions about a live page: the full DOM tree with
-   bounds and visibility, every interactive element with a stable handle, the loaded CSS/JS resources,
-   links, meta, iframes and shadow DOM. The goal is for an LLM to be able to *build* a scraper or
-   automation for a site (or edit that site) without guessing.
+The engine answers granular structural questions about a live page. It reports the DOM tree, the
+accessibility tree, every interactive element, the loaded CSS and JS, the network traffic, and the
+console. An agent can build a scraper or an automation for a site without a guess.
 
 ---
 
-## Features
+## Install
 
-- 🌐 **Live, stateful browser**: sessions are real tabs that survive navigations, redirects, and
-  `back`/`forward` between tool calls.
-- 📐 **Granular decomposition**: `dom` (frames + shadow DOM + bounds + visibility), `interactives`
-  (dense action map with `g<document>-b<backendNodeId>` handles), `a11y` (computed accessibility
-  tree: roles, accessible names, values, state flags), `article` (readable body as markdown),
-  `marks` (numbered overlay boxes + annotated screenshot), `css`/`js` resource trees with
-  source fetch,
-  `meta`, `links`, `text`, `html`, `screenshot`.
-- 🖱️ **20 interaction actions**: click, input, type, key combos (`Control+a`, `Meta+c`), coordinate
-  mouse (`click_at`/`hover_at`), drag & drop, file upload, eval, navigate/history, hover, scroll,
-  select, wait modes (`load`/`idle`/`stable`/`interactable`/`ms`), viewport and device emulation,
-  and `clear_logs`.
-- 🧭 **Multi-browser aware**: a manager owns a map of browsers, each with its own pages and owner;
-  `browser-1` is just the first id minted, not a shared singleton.
-- 🥷 **Stealth on by default** (`go-rod/stealth`) and **profiles under the config dir**
-  (`~/.config/browser-mcp/profiles/`). Browsers are ephemeral by default — their profile is
-  deleted on close. Pass `--persist` / `"persist": true` to keep a named profile and its logins.
-- 📱 **Opt-in device emulation** (`IPhoneX`, `IPadPro`, `LaptopWithHiDPIScreen`), applied before
-  navigation; pages otherwise launch plain at your real display metrics.
-- ⚡ **Dual interface**: the `browser` CLI mirrors the MCP tools 1:1, plus a daemon over a Unix socket
-  so the same browser survives between shell commands.
+Go 1.26 or later is necessary. The first run downloads Chromium (~100 MB) unless Brave, Chrome or
+Chromium is on `PATH`. The probe order is `brave-browser`, `brave`, `google-chrome`, `chrome`,
+`chromium`.
+
+```sh
+go install ./cmd/browser     # installs the browser binary
+make install                 # same, and it stops a running daemon first
+```
+
+## Add the agent skill
+
+The skill helps when a tool description is not clear or a call fails. One command copies it into a
+harness.
+
+```sh
+browser skill claude         # install into ~/.claude/skills/web-mcp
+browser skill opencode       # install into ~/.config/opencode/skills/web-mcp
+browser skill codex          # install into ~/.codex/skills/web-mcp
+browser skill pi             # install into ~/.pi/skills/web-mcp
+```
+
+Other targets:
+
+| Command | Result |
+| :--- | :--- |
+| `browser skill` | Print the preset table. Write nothing. |
+| `browser skill .` | Install into `./.agents/skills/web-mcp`. This needs `./.agents/skills` to exist. |
+| `browser skill ./some/dir` | Install into that directory. |
+| `browser skill claude --dir ./x` | Same, and the flag wins over the preset. |
+| `browser skill claude --dry-run` | Print every path. Write nothing. |
+| `browser skill claude --force` | Overwrite. A second run refuses without this flag. |
+
+The command writes `SKILL.md` and the `references` tree. It never writes `AGENTS.md`. Start a new
+agent session after the install so the harness reads the skill.
 
 ---
 
-## Installation
-
-Requires Go 1.26+. First run downloads Chromium (~100 MB) unless a host Brave/Chrome/Chromium is
-found on `PATH` (probe order: `brave-browser` → `brave` → `google-chrome` → `chrome` → `chromium`).
+## Start the server
 
 ```sh
-go install ./cmd/browser     # installs the `browser` binary
-make install                 # same, after stopping any running daemon
-make install-dev             # DEV RESET: see below
+browser serve mcp --port 4099
+# daemonized: CLI, Unix socket, and MCP HTTP/SSE on http://127.0.0.1:4099/sse
 ```
 
-`make install-dev` stops the daemon, **deletes the whole config directory**
-(`~/.config/browser-mcp`: every profile including saved logins and cookies, `config.json`, and
-`proxy.json` with its proxy credentials), reinstalls the binary, and relaunches
-`browser serve mcp` on `PORT` (default 4089). It refuses to run when `BROWSER_MCP_CONFIG` or
-`CONFIG_DIR` points outside `$HOME`, or when `HOME` is unset. `make install` is unchanged and
-non-destructive.
+- The default port is `4099`.
+- `serve mcp` starts no browser. An agent calls `browser_create`, or a first `fetch_page` creates one.
+- The server binds all interfaces and has no authentication. Keep it local.
+
+```sh
+browser serve mcp --port 4099 --profile brave --bin brave-browser   # persistent profile
+browser serve mcp --port 4099 --headless                            # headless
+browser serve stop                                                  # stop the daemon
+```
+
+Connect an MCP client:
+
+```json
+"web-mcp": {
+    "type": "remote",
+    "url": "http://127.0.0.1:4099/sse",
+    "enabled": true
+}
+```
 
 ---
 
-## Quick Start
+## What it does
 
-### 1. Launch the server
+### Engine and lifecycle
 
-```sh
-browser serve mcp --port 4089
-# daemonized: CLI + Unix socket + MCP HTTP/SSE on http://127.0.0.1:4089/sse
-# starts no browser — agents create their own with browser_create (or a first fetch_page)
-```
+- One Chromium process for each browser. Many tabs.
+- A profile is ephemeral by default and the directory is deleted on close.
+- `persist:true` with a name keeps the profile and its logins.
+- An `owner` label claims a browser. The same owner and the same options reuse one browser.
+- An idle browser closes after 30 minutes. A dead Chromium relaunches with the same id.
+- `purge` deletes one owned profile. `prune` removes orphan ephemeral profiles.
+- Stealth applies to every page. Device, viewport, window position and user agent are per page.
+- The page lock is context-bound. A slow action cannot block the daemon.
 
-```sh
-browser serve mcp --port 4089 --profile brave --bin brave-browser   # persistent Brave profile
-browser serve mcp --port 4089 --headless                            # headless
-browser serve stop                                                  # or: browser stop
-browser serve --foreground                                          # stay attached (debug)
-```
+### Isolation and control
 
-`--port` defaults to `4099` when omitted; the Makefile and the examples here use `4089`.
-The MCP server binds all interfaces and has **no authentication** — keep it local-only.
+- Named incognito identities share one Chromium process. Each identity keeps its own cookies and
+  storage.
+- A scope allowlist limits navigation. The engine refuses an off-scope host.
+- Extra headers go on every request of a browser.
+- Proxy support includes credentials, a bypass list, and `ignore_certs`.
+- Replay sends a captured request through Go. It carries the page cookies and follows redirects.
 
-### Profiles and browser lifecycle
+### Reads: `page_fetch` has 17 aspects
 
-- Every profile lives under `~/.config/browser-mcp/profiles/`. A bare profile name resolves to
-  `profiles/<name>`; an absolute path is used as given; a relative path with a separator is rejected.
-- **`browser serve mcp` starts no browser.** The daemon binds the IPC socket and the MCP/SSE port
-  and waits; `browser_list` returns `[]` until an agent creates a browser with `browser_create` (or
-  the first `fetch_page` creates one owned by that caller). Close it when done. Plain
-  `browser serve` still pre-launches the persistent `browser-1` for the human CLI path.
-- **Browsers are ephemeral by default.** A browser gets a throwaway profile under
-  `profiles/.ephemeral/` that is deleted on close or when the browser expires. The MCP
-  (`browser serve mcp`) path and a bare in-process `browser create` are ephemeral.
-- Add `--persist` (CLI) or `"persist": true` (`browser_create`) to keep a named profile and its
-  logins after close. The plain human `browser serve` daemon keeps its lazily launched `browser-1`
-  persistent.
-- **Close is the normal end.** `browser close <id>` closes one browser and its pages.
-  `--purge` also deletes that browser's profile (config-dir guarded). `--prune` closes every browser
-  and removes orphan `profiles/.ephemeral/` directories; named persistent profiles are never
-  auto-deleted.
-- `--owner <label>` (CLI) / `"owner": "<label>"` (`browser_create`) labels a browser and joins the
-  create key: the same owner with the same options reuses one browser, a different owner gets a
-  separate one.
-- **Extra headers.** `--header NAME=VALUE` (repeatable) / `"headers": {"NAME": "VALUE"}`
-  (`browser_create`) sends a header with every request from every page of that browser, the first
-  navigation included. Use it for a program identity header, e.g.
-  `browser create --header X-Bug-Bounty=your-handle`.
-- **Scope allowlist.** `--scope HOST` (repeatable) / `"scope": ["HOST", …]` (`browser_create`)
-  confines navigation. A bare host also covers its subdomains, a leading `*.` glob is accepted,
-  `host:port` is accepted, and `*` allows all. **No scope means no limit**; `browser_list` reports
-  the live state as `scope` (`open` when unrestricted) plus `scope_strict`. `--scope-strict` /
-  `"scope_strict": true` is opt-in and makes an empty allowlist deny every navigation. A refusal
-  names the host, the allowed list and the fix (`browser_create scope=[…]`). **The limit is
-  navigation-only:** subresources and redirects are not gated, so a redirect can still land on an
-  out-of-scope host (the final URL in the action result shows where you are).
-- **Idle browsers expire** after 30 minutes by default. Set `browser_ttl` in
-  `~/.config/browser-mcp/config.json` as a Go duration (`"15m"`, `"0"` to disable); pages keep their
-  separate 15-minute TTL.
-- **Incognito identities** isolate two accounts inside one Chromium process. Pass
-  `"identity": "victim"` to `fetch_page` (or `browser page fetch <url> --identity victim`) and the
-  page opens in that incognito context, with its own cookies and storage. `default` is the browser's
-  own jar; a new name is created on first use and reused afterwards. Every identity dies with its
-  parent browser. `session_list` / `page_list` report each session's `context` (the identity name),
-  and `session_list {"identity": "victim"}` lists one identity. An unknown identity is refused with
-  the live names — nothing is auto-created.
+- Document: `html`, `text`, `dom`, `links`, `meta`.
+- Sources: `css`, `js`, and `body` for one resource.
+- Pixels: `screenshot`, and `marks` for numbered boxes over a screenshot.
+- Action map: `interactives` reports 200 visible elements with handles and centre points.
+- Accessibility: `a11y` reports 400 nodes with role, name, value, state flags, and handles.
+- Runtime: `network` with request and response headers. `console` for logs.
+- Text: `article` returns the readable body as markdown.
+- Security: `security` audits headers, CSP, cookie flags, mixed content, and form targets.
+- State: `storage` reports cookies with flags, local and session storage, IndexedDB and caches. Values
+  are redacted by default.
 
-### Proxy & TLS (Burp, Caido, ZAP)
+### Actions: `page_act` has 21 actions
 
-Route the browser through a local intercept proxy with `--proxy` (CLI) or `proxy`
-(`browser_create`). Both accept `host:port` or `scheme://host:port`:
+- Mouse: `click`, `click_at`, `hover`, `hover_at`, `drag_and_drop`.
+- Keyboard: `input`, `type`, `press_key` with combos such as `Control+a`.
+- Forms: `select`, `upload_file`.
+- Navigation: `navigate`, `back`, `forward`, `reload`.
+- View and time: `scroll`, `wait`, `set_viewport`, `emulate`.
+- Code and logs: `eval`, `clear_logs`.
+- Network: `replay`.
+
+### Surfaces
+
+- 9 MCP tools. Every result is `{"ok":true,"data":…}` or `{"ok":false,"error":{…}}`.
+- 8 error types: `invalid_args`, `element_not_found`, `not_interactable`, `anti_bot`, `page_closed`,
+  `timeout`, `nav_failed`, `unknown`.
+- The CLI mirrors the tools and adds the daemon lifecycle.
+- IPC is JSON-RPC 2.0 over a Unix socket with mode `0600`.
+
+---
+
+## Profiles and browser lifecycle
+
+- Every profile lives under `~/.config/browser-mcp/profiles/`. A bare name maps to `profiles/<name>`.
+  An absolute path is used as given. A relative path with a separator is refused.
+- The MCP path and a bare `browser create` are ephemeral. The plain human `browser serve` daemon keeps
+  its `browser-1` profile.
+- `browser close <id>` closes one browser and its pages. `--purge` also deletes that profile.
+  `--prune` closes all browsers and removes orphan ephemeral directories. Named profiles are never
+  deleted by a prune.
+- `--owner <label>` labels a browser and joins the create key.
+- `--header NAME=VALUE` sends a header on every request. Repeat the flag for more headers.
+- Idle browsers expire after 30 minutes. Set `browser_ttl` in `~/.config/browser-mcp/config.json` as a
+  Go duration, for example `"15m"` or `"0"` to disable. Pages have a separate 15-minute TTL.
+- `--identity <name>` opens a page in an incognito context. `default` is the browser's own jar. A new
+  name is created on first use. Every identity dies with its parent browser. An unknown identity is
+  refused with the live names.
+
+## Scope and headers
+
+- `--scope HOST` confines navigation. A bare host covers its subdomains. A leading `*.` glob and
+  `host:port` are accepted. `*` allows all.
+- No scope means no limit. `browser_list` reports the live state as `scope` plus `scope_strict`.
+- `--scope-strict` is opt-in. It makes an empty allowlist deny every navigation.
+- A refusal names the host, the allowed list, and the fix.
+- The limit applies to navigation only. Subresources and redirects are not gated.
+
+## Proxy and TLS
+
+Use a local intercept proxy such as Burp, Caido, or ZAP:
 
 ```sh
 browser create --proxy http://127.0.0.1:8080 --ignore-certs
 browser fetch https://example.org --wait load    # the request appears in the proxy history
 ```
 
-```json
-{ "proxy": "http://127.0.0.1:8080", "ignore_certs": true }
-```
-
-- `--proxy-bypass` / `proxy_bypass` takes a comma-separated host list
-  (`localhost,*.internal`) that skips the proxy.
-- `--ignore-certs` / `ignore_certs` accepts invalid TLS certificates, such as the
-  proxy's MITM CA. It is independent of the proxy: set it explicitly.
-- Chromium receives `--proxy-server=<value>`, `--proxy-bypass-list=<list>` and
-  `--ignore-certificate-errors`. These are process-start flags, so they are per
-  browser: create a new browser to change them.
-- Proxy credentials never go in a flag or tool argument. For a remote proxy, put
-  them in `~/.config/browser-mcp/proxy.json` with mode `0600`, keyed by proxy
-  `host:port`:
+- `--proxy-bypass` takes a comma-separated host list, for example `localhost,*.internal`.
+- `--ignore-certs` accepts an invalid TLS certificate, for example the proxy CA. It is independent of
+  the proxy. Set it explicitly.
+- Chromium receives `--proxy-server`, `--proxy-bypass-list`, and `--ignore-certificate-errors`. These
+  are start flags, so they are per browser.
+- Proxy credentials never go in a flag or a tool argument. Put a remote proxy credential in
+  `~/.config/browser-mcp/proxy.json` with mode `0600`, keyed by proxy `host:port`:
 
 ```json
-{
-  "proxies": {
-    "proxy.example.com:8080": { "username": "user", "password": "pass" }
-  }
-}
+{ "proxies": { "proxy.example.com:8080": { "username": "user", "password": "pass" } } }
 ```
 
-The engine answers Chromium's proxy auth challenge from that file. A proxy that
-demands auth with no matching entry fails with an error naming the file path. A
-local intercept proxy needs no credentials; do not point an agent at a remote
-proxy unless the user asks.
-
-### 2. Use it from the CLI
-
-```sh
-browser fetch https://news.ycombinator.com --wait stable
-# -> session_id page-1, title, url, text snippet, html size, load time
-
-browser page fetch last meta
-browser page fetch last links
-browser page fetch last interactives            # handles + roles + text + x/y
-browser page fetch last dom --max-bytes 30000
-browser page fetch last article                  # readable body as markdown
-browser page fetch last marks                    # numbered boxes + annotated screenshot
-browser page fetch last network                 # newest 100 requests + counters
-browser page fetch https://app.test/login --identity attacker   # incognito context
-browser page act click ".titleline a"
-browser page act last clear_logs                # reset both log buffers
-browser page act click --handle g3k9x2ab-b6      # handle from the same document only
-browser page act eval "() => document.title"
-browser page close last
-```
-
-### 3. Connect an MCP client
-
-```json
-"web-mcp": {
-    "type": "remote",
-    "url": "http://127.0.0.1:4089/sse",
-    "enabled": true
-}
-```
-
-The agent skill lives at [`.agents/skills/web-mcp/SKILL.md`](.agents/skills/web-mcp/SKILL.md).
-The MCP tool descriptions stay primary. The skill covers cross-cutting rules and exact limits.
+A local intercept proxy needs no credentials. Point an agent at a remote proxy only when the user
+asks for it.
 
 ---
 
-## MCP Tools
+## MCP tools
 
 | Tool | Purpose |
 | :--- | :--- |
-| `browser_create` | Create or reuse a browser (`bin`, `profile`, `persist`, `owner`, `headless`, `stealth`, `position`, `proxy`, `proxy_bypass`, `ignore_certs`, `headers`, `scope`, `scope_strict`). Ephemeral by default; `persist: true` keeps the profile. Same owner + same options reuses the same id. `headers` applies to every request; `scope` is the navigation allowlist (no scope = no limit; `scope_strict` makes an empty list deny all). Scope does not gate subresources or redirects. |
-| `browser_list` | List live browsers with `owner`, `persist`, `ephemeral`, `created_at`, `idle_for`, `ttl`, `scope`, `scope_strict`, `profile_dir` and their pages. |
-| `browser_close` | Close one browser, or all when `browser_id` is empty. `purge: true` also deletes that profile; `prune: true` (no `browser_id`) closes all and removes orphan `.ephemeral` profiles. An unknown id fails with `browser "browser-42" not found (running: browser-1)`. |
-| `fetch_page` | Open a URL in a new session and return `session_id` + summary. `wait_for` defaults to `idle`. `identity` opens it in an incognito context (`default` = the browser's own jar); a new identity is created on first use and keeps separate cookies/storage. |
-| `page_list` | List the pages of a browser, each with its `context` (identity name). `browser_id` is required, and an unknown id fails with `browser "browser-42" not found (running: browser-1)`. |
-| `session_list` | List all live sessions with their `context`. Optional `identity` lists one identity; an unknown name fails with the live names and creates nothing. |
-| `session_close` | Close a session (tab). |
-| `page_fetch` | Read one aspect of a live page (see below). |
-| `page_act` | Perform one interaction action on a live page. |
+| `browser_create` | Create or reuse a browser. Inputs: `bin`, `profile`, `persist`, `owner`, `headless`, `stealth`, `position`, `proxy`, `proxy_bypass`, `ignore_certs`, `headers`, `scope`, `scope_strict`. |
+| `browser_list` | List live browsers with `owner`, `persist`, `ephemeral`, `created_at`, `idle_for`, `ttl`, `scope`, `scope_strict`, `profile_dir`, and their pages. |
+| `browser_close` | Close one browser, or all when `browser_id` is empty. `purge` deletes one profile. `prune` removes orphan ephemeral profiles. |
+| `fetch_page` | Open a URL in a new session. Returns `session_id` and a summary. `wait_for` defaults to `idle`. `identity` selects an incognito context. |
+| `page_list` | List the pages of a browser with the live URL, title, and `context`. |
+| `session_list` | List all live sessions with the live URL, title, and `context`. |
+| `session_close` | Close one session. |
+| `page_fetch` | Read one aspect of a live page. |
+| `page_act` | Run one action on a live page. |
 
-### MCP Prompts
+Five MCP prompts are registered: `fetch_and_summarize`, `inspect_page_decomposition`,
+`form_search_and_submit`, `browser_setup_and_emulate`, and `manage_session_lifecycle`. A prompt is a
+template. It names the tools. You still call them.
 
-`prompts/list` returns five prompt templates. They are templates, not tools: each one returns a short
-step-by-step message that names the tools to call.
+## Page aspects
 
-| Prompt | Purpose | Arguments |
-| :--- | :--- | :--- |
-| `fetch_and_summarize` | Open one URL, read `meta` and `text`, then summarize the page. | `url` (required) |
-| `inspect_page_decomposition` | Decompose a live session into `meta`, `links` and `dom`. | `session_id` (required) |
-| `form_search_and_submit` | Fill a search or form field, submit it, and wait for the result. | `session_id` and `search_query` (required), `selector` (optional) |
-| `browser_setup_and_emulate` | Create a browser, open a page, and apply an optional device preset. | `device` (optional) |
-| `manage_session_lifecycle` | Audit live sessions and close the stale ones. | none |
-
-Call `prompts/get` with the prompt name and its arguments to receive the message. The prompt only
-guides the workflow. You still run `fetch_page`, `page_fetch` and `page_act` yourself.
-
----
-
-## Page Extractions (`page_fetch`)
-
-`what` accepts fourteen values. `selector` scopes `html` and `text`. `max_bytes` defaults to
-50000. `full_page` applies to screenshots.
+`what` accepts 17 values. `selector` scopes `html` and `text`. `max_bytes` defaults to 50000.
+`full_page` applies to `screenshot`.
 
 | `what` | Returns |
 | :--- | :--- |
-| `dom` | Re-nested DOM tree: every document/frame, `tag`, `id`, `class`, `attrs`, `text`, `handle`, `visible`, `bounds`, `frame_url`, `children`. Every element node carries a `g<document>-b<backendNodeId>` handle. Shadow DOM included, script/style bodies elided. |
-| `interactives` | `{interactives:[{handle, role, text, href, type, x, y, visible}], truncated}` — visible clickable/typeable elements, capped at 200. Handles are `g<document>-b<backendNodeId>`, usable as `page_act`'s `handle`. |
-| `a11y` | `{nodes:[{handle?, depth, role, name?, value?, states?}], count, truncated}` — flattened accessibility tree in DFS order: computed roles, accessible names, values, and the state flags that are true (checked, expanded, selected, disabled, required, pressed, invalid, focused; `flag=mixed` when the value is mixed). Capped at 400. Handles on DOM-backed nodes are usable as `page_act`'s `handle`. Root frame only. Text-fragment roles (StaticText, InlineTextBox, paragraph, code, …) and unnamed images are omitted, and `name`/`value` are clipped at 200 runes — use `text` for prose. |
-| `network` | `{entries:[{method, url, type?, status?, mime?, bytes?, ms?, failed?, error?, seq}], count, dropped, truncated}` — observed requests/responses. Emits the newest 100 buffered entries in chronological order; `dropped` counts entries lost to the 200-entry ring, `truncated` counts buffered older entries omitted by the 100 cap. Capture is cumulative from page creation. `data:` URLs are skipped; `url`, `error` and `text` are clipped at 300, 200 and 500 bytes. |
-| `console` | Same envelope over `{level, text, source?, line?, seq}` — `console.*` calls, uncaught exceptions and browser log entries. Cumulative from page creation. |
-| `article` | `{title, byline?, excerpt?, text, words, truncated, url}` — the readable article body rendered as markdown (headings, paragraphs, lists, code, quotes, links, images, tables) with nav/aside/footer/forms/scripts stripped. `text` is capped at 40000 runes and `truncated` reports the cut. Prefer it over `text` for prose; never byte-truncated. |
-| `marks` | A text block `{marks:[{index, role, text?, x, y, width, height}], viewport_width, viewport_height, truncated}` plus the annotated viewport PNG as a separate image content block — a numbered box over every visible interactive element. `x`/`y` are the box's top-left in viewport CSS px, so `x + width/2`, `y + height/2` feed `page_act`'s `click_at`. Capped at 60 marks; `truncated` counts the remainder. The overlay is removed again before returning. |
-| `links` | `[{text, href, handle?}]`, deduped by href, non-navigable schemes filtered; `handle` is the first anchor carrying that href. |
+| `dom` | The DOM tree with frames and shadow roots. Each element has `tag`, `id`, `class`, `attrs`, `text`, `handle`, `visible`, `bounds`, `frame_url`, and `children`. |
+| `interactives` | `{interactives:[{handle, role, text, href, type, x, y, visible}], truncated}`. Capped at 200 visible elements. |
+| `a11y` | `{nodes:[{handle?, depth, role, name?, value?, states?}], count, truncated}`. DFS order, capped at 400. Root frame only. |
+| `network` | `{entries:[{method, url, type?, status?, mime?, bytes?, ms?, failed?, error?, seq}], count, dropped, truncated}`. Headers included. Newest 100 of a 200-entry ring. |
+| `console` | The same envelope over `{level, text, source?, line?, seq}`. |
+| `article` | `{title, byline?, excerpt?, text, words, truncated, url}` as markdown. Capped at 40000 runes. |
+| `marks` | `{marks:[{index, role, text?, x, y, width, height}], viewport_width, viewport_height, truncated}` plus an annotated PNG. Capped at 60 marks. |
+| `security` | `{checks:[{id, status, evidence, detail}], count}`. A passive audit. |
+| `storage` | `{cookies, local_storage, session_storage, indexed_db, caches}`. Values are `<redacted>` unless `include_values` is true. |
+| `links` | `[{text, href, handle?}]`. Deduped, non-navigable schemes removed. |
 | `meta` | `{title, url, meta:[{name/property/http-equiv/content/charset}]}`. |
 | `text` | Visible `innerText`. |
 | `html` | `outerHTML`. |
-| `css` / `js` | Loaded stylesheet/script resources as `[{url, type, size}]`; pass `target=<url>` to fetch one resource's raw source. |
-| `screenshot` | A PNG image content block (`mimeType: image/png`) plus a text block `{mime_type, bytes, width, height, full_page}`; `full_page: true` captures the whole scrollable page. |
+| `css`, `js` | Loaded resources as `[{url, type, size}]`. Pass `target=<url>` for one raw source. |
+| `body` | One captured response body. |
+| `screenshot` | A PNG image block plus `{mime_type, bytes, width, height, full_page}`. |
 
-`screenshot` and `marks` return the PNG as an MCP image content block, so a vision-capable client
-renders it without a base64 wall of text. Image blocks are enabled by default (MCP defines no
-standard image capability); a text-only client opts out at `initialize` with
-`capabilities.experimental.imageContent: false` and then receives the base64 data URI in the text
-block instead — under `data` for `screenshot`, under `data.screenshot` for `marks`. The bytes are
-sent exactly once either way.
+`screenshot` and `marks` return the PNG as a separate image content block. A text-only client can opt
+out at `initialize` with `capabilities.experimental.imageContent: false`. It then receives the base64
+data URI in the text block.
 
-`dom`, `links` and `meta` always return parseable JSON. When the result does not fit `max_bytes`,
-the tool returns an envelope with `truncated: true`, the applied `max_bytes`, and `omitted` (the
-number of entries dropped). `links` returns `{items, omitted, truncated, max_bytes}`. `dom` and
-`meta` keep their fields and trim their first array field. Raise `max_bytes` to read the whole
-result. `selector` does not apply to these three. `html`, `text` and the css/js list are cut at
-`max_bytes` as plain text.
+`dom`, `links` and `meta` always return parseable JSON. When the result does not fit `max_bytes`, the
+tool returns `truncated`, the applied `max_bytes`, and `omitted`. Raise `max_bytes` to read the whole
+result. `interactives`, `a11y`, `network`, `console`, `article`, `marks`, `security` and `storage`
+report their own `truncated` flag and are never cut mid-value.
 
-`interactives`, `a11y`, `network`, `console`, `article`, `marks`, and `screenshot` are never
-byte-truncated: `interactives`, `a11y` and `article` report `truncated` as an omitted-node/cut-body
-signal, `network` and `console` report `truncated` (buffered older entries left out) plus `dropped`
-(lost to the 200-entry ring), and `marks` carries a screenshot that must stay decodable.
+## Page actions
 
----
+`press_key` accepts named keys and combos: `Enter`, `Escape`, `Tab`, `ArrowDown`, `F5`, `Control+a`,
+`Meta+c`, `Shift+Tab`. `input` replaces the value. `type` inserts at the caret. `wait_mode` is one of
+`load`, `idle`, `stable`, `interactable`, and `ms`.
 
-## Page Actions (`page_act`)
+Element actions accept a `handle` from `page_fetch` instead of a selector. The handle wins when both
+are given. A handle looks like `g<document>-b<backendNodeId>`. It goes stale when the element leaves
+the page or the page navigates. Re-run the fetch for a new handle.
 
-```
-click · input · type · press_key · click_at · hover_at · drag_and_drop · upload_file
-eval · navigate · back · forward · reload · hover · scroll · select · wait
-set_viewport · emulate · clear_logs
-```
-
-`press_key` accepts named keys and combos: `Enter`, `Escape`, `Tab`, `ArrowDown`, `F5`,
-`Control+a`, `Meta+c`, `Shift+Tab`. `input` selects-all then types (value is replaced); `type`
-inserts at the caret. `wait_mode` is one of `load`, `idle`, `stable`, `interactable`, `ms`.
-`clear_logs` takes no parameters and returns `{"network":N,"console":M}`. Network and console
-capture is cumulative from page creation, so the per-step recipe is
-`clear_logs` → act → `page_fetch` `network`/`console` → filter on the client side.
-
-Element actions (`click`, `input`, `type`, `press_key`, `hover`, `select`, `wait` in `interactable`
-mode, `upload_file`) also accept a `handle` from `page_fetch` (`interactives`, `dom`, `links`,
-`a11y`) instead
-of a selector; the handle wins when both are supplied. Handles look like
-`g<document>-b<backendNodeId>` and go stale when the element is removed or re-rendered, or when the
-page navigates, reloads or redirects (the handle carries the document that minted it) — re-run the
-fetch to mint fresh ones.
-
-Arguments are checked before the page is touched, so a missing one fails fast with a one-line hint.
-`click`, `input`, `type`, `hover`, `select` and `upload_file` need `selector` or `handle`:
-
-```
-page_act: click requires selector (or a handle from page_fetch what=interactives)
-```
-
-`click_at` and `hover_at` need `x` and `y`. `eval` and `navigate` need `value`. `set_viewport` needs
-`viewport`, and `emulate` needs `device`.
-
-When an action changes the page address or title, the result gains one final line. Only the fields
-that changed appear. A click that navigates reports the new destination:
+When an action changes the address or the title, the result gains one final line:
 
 ```
 clicked selector="a.next"
 → url=https://example.com/next title="Next page"
 ```
 
-Nothing is added when the page did not change. `navigate` never adds the line because it reports the
-destination itself.
+Network and console capture is cumulative from page creation. The per-step recipe is `clear_logs`,
+then the action, then `page_fetch` with `network` or `console`.
+
+`replay` resends one captured request through a Go HTTP client. It carries the page cookies for the
+target host and follows up to 5 redirects. It returns `{status, headers, body, bytes, truncated, ms,
+request, chain}`. Sensitive response headers are redacted.
 
 ---
 
-## CLI ⇄ MCP Parity
+## CLI
 
-The CLI exposes the same capabilities with shell conveniences:
+```sh
+browser fetch https://news.ycombinator.com --wait stable
+browser page fetch last meta
+browser page fetch last interactives            # handles, roles, text, x/y
+browser page fetch last storage --include-values
+browser page fetch last security
+browser page fetch https://app.test/login --identity attacker
+browser page act click ".titleline a"
+browser page act replay "api.example.com/session" --method PUT --value '{"role":"admin"}'
+browser page act last clear_logs
+browser page close last
+```
 
 | CLI | MCP |
 | :--- | :--- |
 | `browser fetch <url>` | `fetch_page` |
 | `browser page list` | `page_list` / `session_list` |
 | `browser page fetch [id\|url] [what]` | `page_fetch` |
-| `browser page act [id] [action] [payload...] [--handle g<doc>-b<id>]` | `page_act` |
+| `browser page act [id] [action] [payload...]` | `page_act` |
 | `browser page close [id]` | `session_close` |
-| `browser create [--owner --persist --header --scope --scope-strict]` / `list` / `close [--purge\|--prune]` | `browser_create` / `browser_list` / `browser_close` |
+| `browser create` / `list` / `close` | `browser_create` / `browser_list` / `browser_close` |
+| `browser skill <harness>` | — (CLI-only: install the agent skill) |
 | `browser focus` | — (CLI-only: raise the window) |
 | `browser serve` / `stop` | — (CLI-only: daemon lifecycle) |
 
-CLI-only conveniences: `--json` on `fetch`, page-id shorthand (`last`, `5` → `page-5`, single open
-page by default), one-step `page fetch <url> [what]`, and `--max-bytes 0` for unbounded output.
+CLI-only conveniences: `--json` on `fetch`, page-id shorthand (`last`, `5` becomes `page-5`), a single
+open page as the default target, one-step `page fetch <url> [what]`, and `--max-bytes 0` for unbounded
+output.
 
 ---
 
-## Operating Notes
+## Operating notes
 
-- **Sessions expire** after 15 minutes idle. If a `session_id` disappears or the browser restarted,
-  re-open the page; the error message says so.
-- **Browsers expire** after 30 minutes idle by default (`browser_ttl` in `config.json`; `"0"`
-  disables). Closing explicitly is still the normal end: `browser close <id>` or `browser_close`.
-- **`wait_for` defaults to `idle`.** Omit it on a normal page. Pass `load` or `stable` on JS-heavy
-  sites, where the idle network-wait can stall.
-- **50 KB default output cap.** Narrow with `selector` / `target` where those apply. Raise
-  `max_bytes` for `dom`, `links` and `meta`, which return a truncated envelope instead of cutting
-  the JSON.
-- **Local-only by default.** No auth, permissive CORS, arbitrary `eval` and `upload_file` paths.
-- Known gaps and the roadmap: `improvements.md` in this repo, plus the mininote ROADMAP.
-
----
+- A session expires after 15 minutes idle. Re-open the page when a `session_id` disappears.
+- A browser expires after 30 minutes idle by default. Close it explicitly when the work is done.
+- `wait_for` defaults to `idle`. Use `load` or `stable` on a site with heavy JavaScript.
+- Output is capped at 50 KB by default. Narrow it with `selector` or `target`. Raise `max_bytes` for
+  `dom`, `links` and `meta`.
+- The server has no authentication, permissive CORS, and `eval` plus arbitrary `upload_file` paths.
+  Treat the port as local-only.
 
 ## License
 

@@ -120,6 +120,7 @@ browser_list and browser_close tools.`,
 		NewPageCmd(mgr),
 		NewServeCmd(),
 		NewServeStopCmd(),
+		NewSkillCmd(),
 	)
 	return root
 }
