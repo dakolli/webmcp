@@ -378,10 +378,10 @@ func (s *Server) handlePageList(ctx context.Context, params json.RawMessage) (an
 // through the shared pageops aspect registry — html, text, links, meta, dom,
 // css/js (resource list or one target resource), screenshot, interactives, a11y,
 // network/console (bounded log envelopes), body (one stored response body),
-// article, marks, security and storage. The registry owns both the accepted
-// what values and the truncation policy, so this handler mirrors the CLI page
-// fetch command without duplicating either. An unknown extractor is a -32602
-// invalid-params error.
+// article, marks, security, storage and sinks. The registry owns both the
+// accepted what values and the truncation policy, so this handler mirrors the
+// CLI page fetch command without duplicating either. An unknown extractor is a
+// -32602 invalid-params error.
 func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (any, *Error) {
 	p, rpcErr := decodeParams[PageFetchParams](params)
 	if rpcErr != nil {
@@ -423,8 +423,9 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 // handlePageAct implements page.act: it performs the requested action on a
 // live page — click, input, type, press_key, click_at, hover_at, drag_and_drop,
 // upload_file, hover, scroll, select, eval, navigate, back, forward, reload,
-// wait, set_viewport, emulate or clear_logs — mirroring the CLI page act
-// command. An unknown action is a -32602 invalid-params error.
+// wait, set_viewport, emulate, clear_logs, sinks_install or sinks_clear —
+// mirroring the CLI page act command. An unknown action is a -32602
+// invalid-params error.
 func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any, *Error) {
 	p, rpcErr := decodeParams[PageActParams](params)
 	if rpcErr != nil {
@@ -437,11 +438,11 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		return nil, &Error{Code: CodeInvalidParams, Message: `page.act: missing required param "action"`}
 	}
 	switch p.Action {
-	case "click", "input", "type", "press_key", "click_at", "hover_at", "drag_and_drop", "upload_file", "eval", "navigate", "back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport", "emulate", "clear_logs":
+	case "click", "input", "type", "press_key", "click_at", "hover_at", "drag_and_drop", "upload_file", "eval", "navigate", "back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport", "emulate", "clear_logs", "sinks_install", "sinks_clear":
 	default:
 		return nil, &Error{
 			Code:    CodeInvalidParams,
-			Message: fmt.Sprintf("page.act: unknown action=%q (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs)", p.Action),
+			Message: fmt.Sprintf("page.act: unknown action=%q (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear)", p.Action),
 		}
 	}
 	if p.Action == "eval" && p.Value == "" {
@@ -540,6 +541,10 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		out, err = pageops.PageEmulate(ctx, page, p.Device)
 	case "clear_logs":
 		out, err = pageops.PageClearLogs(page)
+	case "sinks_install":
+		out, err = pageops.PageSinksInstall(ctx, page)
+	case "sinks_clear":
+		out, err = pageops.PageSinksClear(ctx, page)
 	}
 	if err != nil {
 		return nil, serverError(err)

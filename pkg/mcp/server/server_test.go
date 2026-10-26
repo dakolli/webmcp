@@ -219,6 +219,117 @@ func TestImageSupport(t *testing.T) {
 	}
 }
 
+func TestListenAddress(t *testing.T) {
+	tests := []struct {
+		name    string
+		host    string
+		port    int
+		want    string
+		wantErr bool
+	}{
+		{"loopback default", DefaultBind, 4099, "127.0.0.1:4099", false},
+		{"wildcard opt out", "0.0.0.0", 4099, "0.0.0.0:4099", false},
+		{"ipv6 loopback", "::1", 4099, "[::1]:4099", false},
+		{"hostname", "localhost", 4099, "localhost:4099", false},
+		{"empty host", "", 4099, "", true},
+		{"url instead of host", "http://0.0.0.0", 4099, "", true},
+		{"host carrying a port", "0.0.0.0:8080", 4099, "", true},
+		{"port out of range", DefaultBind, 70000, "", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ListenAddress(tc.host, tc.port)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("ListenAddress(%q, %d) = %q, want an error", tc.host, tc.port, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ListenAddress(%q, %d): %v", tc.host, tc.port, err)
+			}
+			if got != tc.want {
+				t.Errorf("ListenAddress(%q, %d) = %q, want %q", tc.host, tc.port, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestListenAddressErrorsNameBindFlag pins WEB-169: every bad --bind value
+// produces an error that names the flag instead of the vague "bind host".
+func TestListenAddressErrorsNameBindFlag(t *testing.T) {
+	for _, host := range []string{"", "http://0.0.0.0", "0.0.0.0:8080"} {
+		t.Run(host, func(t *testing.T) {
+			_, err := ListenAddress(host, 4099)
+			if err == nil {
+				t.Fatalf("ListenAddress(%q) = nil error", host)
+			}
+			if !strings.Contains(err.Error(), "--bind") {
+				t.Errorf("ListenAddress(%q) error %q does not name --bind", host, err)
+			}
+		})
+	}
+}
+
+func TestIsLoopbackAddress(t *testing.T) {
+	tests := []struct {
+		addr string
+		want bool
+	}{
+		{"127.0.0.1:4099", true},
+		{"[::1]:4099", true},
+		{"localhost:4099", true},
+		{"0.0.0.0:4099", false},
+		{"[::]:4099", false},
+		{"192.168.1.10:4099", false},
+		{"not-an-address", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.addr, func(t *testing.T) {
+			if got := isLoopbackAddress(tc.addr); got != tc.want {
+				t.Errorf("isLoopbackAddress(%q) = %t, want %t", tc.addr, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestNoAuthWarning pins that only a non-loopback bind produces the operator
+// warning, and that the warning names the address and the safe default.
+func TestNoAuthWarning(t *testing.T) {
+	tests := []struct {
+		name string
+		addr string
+		want bool
+	}{
+		{"ipv4 loopback", "127.0.0.1:4099", false},
+		{"ipv6 loopback", "[::1]:4099", false},
+		{"hostname loopback", "localhost:4099", false},
+		{"ipv4 wildcard", "0.0.0.0:4099", true},
+		{"ipv6 wildcard", "[::]:4099", true},
+		{"specific interface", "192.168.1.10:4099", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := NoAuthWarning(tc.addr)
+			if !tc.want {
+				if got != "" {
+					t.Fatalf("NoAuthWarning(%q) = %q, want empty", tc.addr, got)
+				}
+				return
+			}
+			if !strings.Contains(got, "no authentication") {
+				t.Errorf("NoAuthWarning(%q) = %q, missing the no-auth warning", tc.addr, got)
+			}
+			if !strings.Contains(got, tc.addr) {
+				t.Errorf("NoAuthWarning(%q) = %q, missing the bound address", tc.addr, got)
+			}
+			if !strings.Contains(got, DefaultBind) {
+				t.Errorf("NoAuthWarning(%q) = %q, missing the safe default %q", tc.addr, got, DefaultBind)
+			}
+		})
+	}
+}
+
 func TestProcessRequestInjectsSSEOwner(t *testing.T) {
 	capture := &ownerCaptureTool{}
 	r := tools.NewEmptyRegistry()

@@ -32,12 +32,15 @@ func (t *SessionClose) Name() string {
 // Description returns a customer/LLM-facing description of session_close.
 func (t *SessionClose) Description() string {
 	return "Closes a live browser session opened by fetch_page, releasing its " +
-		"browser tab. Call this when you are done with a page to free memory; " +
-		"the session_id becomes invalid afterwards. Use session_list to see " +
-		"which sessions are still open. If no browser is running this may launch " +
-		"one with default options; call browser_create first when you want to " +
-		"control launch options. Example: { \"session_id\": \"page-1\" }." +
-		resultEnvelopeDoc
+		"browser tab. The session_id is resolved from the live browser registry " +
+		"without probing the tab, then closed through the browser that owns it, " +
+		"without launching a browser. A page an operation still holds is evicted " +
+		"from the session registry after a short bound, and its tab is left to " +
+		"the browser teardown. The session_id becomes invalid afterwards. Use " +
+		"session_list to see which sessions are still open; an unknown id fails " +
+		"and names the live ids. This never launches a browser and never touches " +
+		"a browser that does not own the session. Example: " +
+		"{ \"session_id\": \"page-1\" }." + resultEnvelopeDoc
 }
 
 // InputSchema returns the JSON Schema for session_close's arguments: a required
@@ -61,9 +64,10 @@ type sessionCloseArgs struct {
 	SessionID browsers.PageID `json:"session_id"`
 }
 
-// Execute parses the session_id and closes the page via the browsers.Manager.
-// This is thin glue around Manager.Open -> Browser.ClosePage and is implemented
-// fully (no browser work lives here).
+// Execute parses the session_id and closes the page through the browser that
+// owns it. Manager.ClosePage resolves the id from the live registry without
+// probing the tab; the result names the browser and whether the tab was
+// released or only its registry entry was evicted.
 func (t *SessionClose) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var a sessionCloseArgs
 	if err := decodeArgs("session_close", args, &a); err != nil {
@@ -72,20 +76,22 @@ func (t *SessionClose) Execute(ctx context.Context, args json.RawMessage) (strin
 	if a.SessionID == "" {
 		return failResult(fmt.Errorf("session_close: missing required argument %q", "session_id"))
 	}
-	b, err := t.mgr.Open(ctx) // lazily launches (or returns) the single Browser
+	closed, err := t.mgr.ClosePage(ctx, a.SessionID)
 	if err != nil {
 		return failResult(fmt.Errorf("session_close: %w", err))
 	}
-	// Resolve the session through the manager so a pre-restart session id
-	// surfaces the explicit "browser was restarted" error instead of a bare
-	// "not found" (or a raw CDP error).
-	if _, err := t.mgr.Page(ctx, a.SessionID); err != nil {
-		return failResult(fmt.Errorf("session_close: %w", err))
+	if closed.Evicted {
+		return okResult(fmt.Sprintf(
+			"session %s closed (browser %s) — tab evicted, it goes with the browser",
+			a.SessionID,
+			closed.Browser,
+		))
 	}
-	if err := b.ClosePage(ctx, a.SessionID); err != nil {
-		return failResult(fmt.Errorf("session_close: %w", err))
-	}
-	return okResult(fmt.Sprintf("session %s closed", a.SessionID))
+	return okResult(fmt.Sprintf(
+		"session %s closed (browser %s) — tab released",
+		a.SessionID,
+		closed.Browser,
+	))
 }
 
 // SessionList implements the "session_list" tool: it lists every live browser

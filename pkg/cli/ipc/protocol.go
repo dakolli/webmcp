@@ -39,7 +39,7 @@ const (
 	MethodPageList = "page.list"
 	// MethodPageFetch extracts any aspect in the shared pageops registry from a live page.
 	MethodPageFetch = "page.fetch"
-	// MethodPageAct performs an action on a live page (click/input/hover/scroll/select/eval/navigate/back/forward/reload/wait/set_viewport/emulate/clear_logs).
+	// MethodPageAct performs an action on a live page (click/input/hover/scroll/select/eval/navigate/back/forward/reload/wait/set_viewport/emulate/clear_logs/sinks_install/sinks_clear).
 	MethodPageAct = "page.act"
 	// MethodPageClose closes an open page.
 	MethodPageClose = "page.close"
@@ -276,7 +276,9 @@ type PageListResult struct {
 // storage values with what=storage instead of <redacted>. network/console return
 // {entries,count,dropped,truncated} over the newest 100 buffered entries;
 // capture is cumulative from page creation, so clear with page.act clear_logs
-// before the step under observation.
+// before the step under observation. what=sinks returns the source-to-sink
+// tracer ring {installed,hits,dropped,truncated}; arming it is the separate
+// page.act sinks_install action.
 type PageFetchParams struct {
 	// SessionID identifies the live page to fetch from.
 	SessionID string `json:"session_id"`
@@ -305,19 +307,23 @@ type PageFetchResult struct {
 
 // PageActParams carries the page.act parameters. action ∈ click|input|type|
 // press_key|click_at|hover_at|drag_and_drop|upload_file|eval|navigate|back|
-// forward|reload|hover|scroll|select|wait|set_viewport|emulate|clear_logs;
-// selector/handle/value/key/button/click_count/x/y/target_x/target_y/
-// target_selector/paths are the per-action payloads (handle wins over selector
-// for element actions); viewport carries the target size for set_viewport and
-// device the preset for emulate; timeout_ms bounds the action (default 30000)
-// and sizes the wait action's "ms" sleep; wait_mode selects what the wait
-// action waits for: load|idle|stable|interactable|ms (default ms). clear_logs
-// takes no payload: it empties both log buffers and returns the cleared counts.
+// forward|reload|hover|scroll|select|wait|set_viewport|emulate|clear_logs|
+// sinks_install|sinks_clear; selector/handle/value/key/button/click_count/x/y/
+// target_x/target_y/target_selector/paths are the per-action payloads (handle
+// wins over selector for element actions); viewport carries the target size for
+// set_viewport and device the preset for emulate; timeout_ms bounds the action
+// (default 30000) and sizes the wait action's "ms" sleep; wait_mode selects what
+// the wait action waits for: load|idle|stable|interactable|ms (default ms).
+// clear_logs, sinks_install and sinks_clear take no payload: clear_logs empties
+// both log buffers and returns the cleared counts; sinks_install arms the
+// source-to-sink tracer and returns {"installed":true}; sinks_clear empties its
+// ring and returns {"cleared":N}.
 type PageActParams struct {
 	// SessionID identifies the live page to act on.
 	SessionID string `json:"session_id"`
-	// Action is the action to perform (including clear_logs, which takes no
-	// payload and returns {"network":N,"console":M} cleared counts).
+	// Action is the action to perform (including clear_logs, sinks_install and
+	// sinks_clear, which take no payload; they return {"network":N,"console":M},
+	// {"installed":true} and {"cleared":N} respectively).
 	Action string `json:"action"`
 	// Value is the payload: a JS function for eval, text for input/type, URL for
 	// navigate, an option value for select, fallback key for press_key, or single path for upload_file.

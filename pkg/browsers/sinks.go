@@ -49,10 +49,11 @@ type SinkHit struct {
 }
 
 // SinksResult is the wire shape of what=sinks. Installed reports whether the
-// instrumentation is live in the current document; the ring is per document,
-// so a navigation starts a fresh one.
+// tracer is armed for the page, which survives navigation; the ring is per
+// document, so a navigation starts a fresh one.
 type SinksResult struct {
-	// Installed reports whether the tracer is active in the current document.
+	// Installed reports whether the tracer is armed and running in the current
+	// document.
 	Installed bool `json:"installed"`
 	// Hits are the newest MaxSinkHits records, oldest first, never nil on the
 	// wire.
@@ -71,11 +72,14 @@ type sinkSnapshot struct {
 }
 
 // InstallSinks arms the source-to-sink tracer on the current document and
-// registers it for every later document of the page, so the wrappers survive a
-// full navigation; a client-side route change keeps them anyway. The script is
-// registered once per page and its in-page guard makes a repeated install a
-// no-op. Instrumentation changes page behavior (wrapped setters and constructors
-// stay visible to the page), so it is opt-in and off by default.
+// registers it for every later document of the page, so the arm survives a
+// full navigation and the script re-injects before each new document's own
+// scripts; a client-side route change keeps it anyway. The ring restarts per
+// document while the arm lives on the Page, so only a page close disarms it.
+// The script is registered once per page and its in-page guard makes a
+// repeated install a no-op. Instrumentation changes page behavior (wrapped
+// setters and constructors stay visible to the page), so it is opt-in and off
+// by default.
 //
 // The method takes the page lock itself (mirroring Page.Marks): callers must
 // NOT pre-lock, and the nil-Rod guard runs under the lock.
@@ -88,7 +92,7 @@ func (p *Page) InstallSinks(ctx context.Context) error {
 
 	page := p.Rod.Context(ctx)
 	if !p.sinkScriptInstalled {
-		if _, err := page.EvalOnNewDocument(sinkScript); err != nil {
+		if _, err := page.EvalOnNewDocument(sinkNewDocumentScript); err != nil {
 			return fmt.Errorf("install sink tracer: %w", err)
 		}
 		p.sinkScriptInstalled = true
@@ -248,15 +252,34 @@ const wmTag = (name, value) => {
   return value;
 };
 
+const wmLiveLocation = (s) => {
+  let best = '';
+  let score = 0;
+  const consider = (name, v) => {
+    if (typeof v !== 'string' || v.length < WM_SOURCE_MIN) return;
+    if (s.indexOf(v) >= 0 && v.length > score) { best = name; score = v.length; }
+  };
+  try {
+    for (let i = wmSources.length - 1; i >= 0; i--) {
+      if (wmSources[i].name.indexOf('location.') === 0) consider(wmSources[i].name, wmSources[i].value);
+    }
+    consider('location.hash', location.hash);
+    consider('location.search', location.search);
+    consider('location.href', location.href);
+  } catch (e) {}
+  return best;
+};
+
 const wmSourceOf = (value) => {
   const s = String(value);
   if (s.length < WM_SOURCE_MIN) return 'unknown';
   for (let i = wmSources.length - 1; i >= 0; i--) {
     const src = wmSources[i];
+    if (src.name.indexOf('location.') === 0) continue;
     if (s.indexOf(src.value) >= 0) return src.name;
     if (s.length >= 6 && src.value.indexOf(s) >= 0) return src.name;
   }
-  return 'unknown';
+  return wmLiveLocation(s) || 'unknown';
 };
 
 const __wmStack = () => {
@@ -391,13 +414,21 @@ const wmGlobalMethod = (name, record) => {
   } catch (e) {}
 };
 
-wmAccessor(Location.prototype, 'search', function __wmLocationSearch(v) { wmTag('location.search', v); });
-wmAccessor(Location.prototype, 'hash', function __wmLocationHash(v) { wmTag('location.hash', v); });
-wmAccessor(Location.prototype, 'href', function __wmLocationHref(v) {
-  wmTag('location.href', v);
-}, function __wmLocationHrefSet(v) {
-  __wmPush('location.href', 'url', v, null);
-});
+// Location members are unforgeable own properties, so tag them instead of
+// wrapping them.
+const wmTagLocation = () => {
+  try {
+    wmTag('location.hash', location.hash);
+    wmTag('location.search', location.search);
+    wmTag('location.href', location.href);
+  } catch (e) {}
+};
+wmTagLocation();
+try {
+  window.addEventListener('hashchange', wmTagLocation);
+  window.addEventListener('popstate', wmTagLocation);
+} catch (e) {}
+
 wmAccessor(Document.prototype, 'URL', function __wmDocumentURL(v) { wmTag('document.URL', v); });
 wmAccessor(Document.prototype, 'referrer', function __wmDocumentReferrer(v) { wmTag('document.referrer', v); });
 
@@ -518,6 +549,11 @@ var sinkScript = fmt.Sprintf(sinkScriptTemplate, SinkRingCap, maxSinkValueRunes)
 // sinkInstallJS runs the tracer once in the current document: Page.Eval needs a
 // function expression, so the shared body is wrapped and invoked.
 var sinkInstallJS = "() => {" + sinkScript + "}"
+
+// sinkNewDocumentScript re-injects the tracer before each new document's own
+// scripts. Init scripts run as raw statements, where the body's top-level guard
+// return is a syntax error, so the body runs inside a self-invoking function.
+var sinkNewDocumentScript = "(() => {" + sinkScript + "})()"
 
 // sinkReadJS returns the whole ring as a JSON string, or "null" when the tracer
 // is not installed in the current document.

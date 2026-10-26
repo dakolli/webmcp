@@ -16,6 +16,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,7 +37,7 @@ const shutdownTimeout = 5 * time.Second
 type Server struct {
 	// mgr is the engine backing every registered tool.
 	mgr *browsers.Manager
-	// addr is the HTTP listen address (e.g. ":4099").
+	// addr is the HTTP listen address (e.g. "127.0.0.1:4099").
 	addr string
 	// registry holds the MCP tools, all wired to mgr.
 	registry *tools.Registry
@@ -56,8 +57,36 @@ type Server struct {
 	images     map[string]bool
 }
 
-// New constructs an MCP Server listening on addr (e.g. ":4099") that drives the
-// injected manager's live browser. Nothing is served until Serve is called.
+// DefaultBind is the host the MCP server binds when the operator passes no
+// explicit bind address. The MCP surface has no authentication, so loopback is
+// the only safe default.
+const DefaultBind = "127.0.0.1"
+
+// ListenAddress validates host and returns the "host:port" listen address. A
+// bare host, hostname or IP is accepted; an empty value, a URL, or a value that
+// carries its own port is rejected with an actionable error, so a typo fails at
+// startup instead of surfacing as a late bind failure.
+func ListenAddress(host string, port int) (string, error) {
+	if port < 0 || port > 65535 {
+		return "", fmt.Errorf("--port %d is out of range 0-65535", port)
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return "", errors.New("--bind host is empty; use 127.0.0.1 for loopback or 0.0.0.0 to expose the server")
+	}
+	if strings.Contains(host, "://") || strings.ContainsAny(host, "/ ") {
+		return "", fmt.Errorf("--bind host %q must be a bare host or IP, not a URL; pass the port with --port", host)
+	}
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+	if _, err := net.ResolveTCPAddr("tcp", addr); err != nil {
+		return "", fmt.Errorf("--bind host %q is not a usable host or IP: %w; use 127.0.0.1 for loopback or 0.0.0.0 to expose the server", host, err)
+	}
+	return addr, nil
+}
+
+// New constructs an MCP Server listening on addr (e.g. "127.0.0.1:4099") that
+// drives the injected manager's live browser. Nothing is served until Serve is
+// called.
 func New(mgr *browsers.Manager, addr string) *Server {
 	s := &Server{
 		mgr:      mgr,
@@ -119,20 +148,53 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 	}()
 
-	log.Printf("web-mcp Server listening on http://0.0.0.0%s", s.addr)
-	if s.ln != nil {
-		// Serve on the pre-bound listener (web-cli serve mcp): the caller
-		// already owns the bind, so a port conflict surfaced synchronously
-		// instead of as an async log after launch.
-		if err := s.httpSrv.Serve(s.ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return fmt.Errorf("web-mcp: server aborted: %w", err)
+	ln := s.ln
+	if ln == nil {
+		bound, err := net.Listen("tcp", s.addr)
+		if err != nil {
+			return fmt.Errorf("web-mcp: listen on %s: %w", s.addr, err)
 		}
-		return nil
+		ln = bound
+		s.ln = ln
 	}
-	if err := s.httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+
+	addr := ln.Addr().String()
+	log.Printf("web-mcp Server listening on http://%s", addr)
+	if warning := NoAuthWarning(addr); warning != "" {
+		log.Printf("web-mcp: %s", warning)
+	}
+	if err := s.httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("web-mcp: server aborted: %w", err)
 	}
 	return nil
+}
+
+// isLoopbackAddress reports whether a host:port address is reachable only from
+// the local machine. An empty or wildcard host ("0.0.0.0", "[::]") is not
+// loopback because it accepts connections from other hosts.
+func isLoopbackAddress(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return host == "localhost"
+}
+
+// NoAuthWarning returns the warning an operator must see when the MCP server is
+// bound beyond loopback, or "" for a loopback-only address. The server logs it;
+// the CLI also prints it so a daemonized run surfaces it on the console.
+func NoAuthWarning(addr string) string {
+	if isLoopbackAddress(addr) {
+		return ""
+	}
+	return fmt.Sprintf(
+		"WARNING: MCP has no authentication and is bound to %s; restart with --bind %s to restrict it to loopback",
+		addr,
+		DefaultBind,
+	)
 }
 
 // registerAll wires every MCP tool to the given manager, so a page opened by

@@ -58,6 +58,12 @@ const closePageTimeout = 30 * time.Second
 // background and never holds a request deadline.
 const teardownBudget = 10 * time.Second
 
+// closePageLockWait bounds how long a close waits for a page operation to
+// release the page lock. A try-lock runs first; only a page still held after
+// this short wait is evicted from the registry and left to the browser teardown
+// (WEB-166), so closing a stuck page never wedges the caller.
+const closePageLockWait = 2 * time.Second
+
 // probeTimeout bounds every liveness probe (browser-level and per-page): rod
 // has no auto-reconnect, so on a dead CDP websocket a Call blocks until its
 // ctx deadline. Probes therefore always derive a short timeout off the caller's
@@ -88,6 +94,10 @@ type ownerLabelCtxKey struct{}
 // explicitOwnerCtxKey marks an owner as a caller-chosen label rather than an
 // ambient session identity.
 type explicitOwnerCtxKey struct{}
+
+// sessionOwnerCtxKey preserves the ambient surface identity when
+// WithExplicitOwner replaces the owner key with a caller-chosen label.
+type sessionOwnerCtxKey struct{}
 
 // WithOwnerKey returns a context that records owner as the caller's identity.
 // The engine reads it in CreateBrowser and OpenBrowser, so one MCP session can
@@ -128,11 +138,26 @@ func OwnerLabelFrom(ctx context.Context) string {
 // WithExplicitOwner returns a context that records owner as the caller's own
 // explicit choice: it sets both the ownership key (which joins the create key)
 // and the display label, and it stops an omitted browser id from resolving to
-// the shared unowned browser.
+// the shared unowned browser. The ambient surface identity is preserved under
+// sessionOwnerCtxKey so a browser created under the label can still be closed by
+// the session that created it (see SessionOwnerFrom).
 func WithExplicitOwner(ctx context.Context, owner string) context.Context {
+	ctx = context.WithValue(ctx, sessionOwnerCtxKey{}, OwnerFrom(ctx))
 	ctx = WithOwnerKey(ctx, owner)
 	ctx = WithOwnerLabel(ctx, owner)
 	return context.WithValue(ctx, explicitOwnerCtxKey{}, true)
+}
+
+// SessionOwnerFrom returns the surface identity that made the call: the ambient
+// owner key preserved across WithExplicitOwner, or OwnerFrom(ctx) when no
+// explicit label replaced it. It is the key a browser records at creation so a
+// later call from the same surface can address the browser even when the
+// browser's owner key is an explicit label.
+func SessionOwnerFrom(ctx context.Context) string {
+	if session, ok := ctx.Value(sessionOwnerCtxKey{}).(string); ok && session != "" {
+		return session
+	}
+	return OwnerFrom(ctx)
 }
 
 // HasExplicitOwner reports whether ctx carries a caller-chosen owner.
@@ -570,6 +595,7 @@ func (m *Manager) Create(ctx context.Context, opts ...Option) (Created, error) {
 	if owner == "" {
 		owner = OwnerFrom(ctx)
 	}
+	sessionOwner := SessionOwnerFrom(ctx)
 	key := launchKeyOf(owner, effective)
 	if effective.proxy != "" {
 		if _, _, err := parseProxy(effective.proxy); err != nil {
@@ -613,6 +639,7 @@ func (m *Manager) Create(ctx context.Context, opts ...Option) (Created, error) {
 
 	b := NewBrowser(id, m.baseCtx, effective.headless, effective.stealth, effective.binPath, profileDir, effective.position)
 	b.owner = owner
+	b.sessionOwner = sessionOwner
 	b.ownerLabel = ownerLabel
 	b.key = key
 	b.ttl = effective.browserTTL
@@ -734,6 +761,7 @@ func (m *Manager) Open(ctx context.Context) (*Browser, error) {
 // identity is recorded on a browser this call launches (see WithOwnerKey).
 func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, error) {
 	owner := OwnerFrom(ctx)
+	sessionOwner := SessionOwnerFrom(ctx)
 
 	if id == "" {
 		resolved, ok := m.ownerDefaultID(owner, !HasExplicitOwner(ctx))
@@ -824,6 +852,7 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 
 	b := NewBrowser(id, m.baseCtx, headless, stealth, binPath, profileDir, position)
 	b.owner = owner
+	b.sessionOwner = sessionOwner
 	b.ownerLabel = ownerLabel
 	b.key = key
 	b.ttl = browserTTL
@@ -1246,6 +1275,122 @@ func (m *Manager) Page(ctx context.Context, id PageID) (*Page, error) {
 		return nil, fmt.Errorf("session %q no longer exists: browser was restarted; call fetch_page to re-open URLs", id)
 	}
 	return nil, fmt.Errorf("session %q not found", id)
+}
+
+// PageClose reports how Manager.ClosePage carried out a close.
+type PageClose struct {
+	// Browser is the browser that owned the closed page.
+	Browser BrowserID
+	// Evicted reports that an operation still held the page after the bounded
+	// wait, so only its registry entry was removed and its tab is left to the
+	// browser teardown.
+	Evicted bool
+}
+
+// ClosePage closes the live page id through the browser that owns it, without
+// probing the tab. It resolves the id in the browsers this caller may address —
+// the ones created under the caller's owner key or by the caller's own surface
+// identity (see SessionOwnerFrom), plus the shared unowned pool unless the
+// caller chose an explicit owner. The resolved page is then closed only through
+// the browser that holds it, so it never falls back to a default or guessed
+// browser and never touches another owner's browser. An unknown id fails naming
+// every live page id.
+func (m *Manager) ClosePage(ctx context.Context, id PageID) (PageClose, error) {
+	owner := OwnerFrom(ctx)
+	session := SessionOwnerFrom(ctx)
+	allowUnowned := !HasExplicitOwner(ctx)
+
+	m.mu.Lock()
+	candidates := make([]*Browser, 0, len(m.browsers))
+	for _, b := range m.browsers {
+		if browserOwnedBy(b, owner) || browserOwnedBy(b, session) ||
+			(allowUnowned && b.Owner() == UnownedOwner) {
+			candidates = append(candidates, b)
+		}
+	}
+	relaunched := m.relaunched
+	m.mu.Unlock()
+
+	sort.Slice(candidates, func(i, j int) bool {
+		a, b := candidates[i].id, candidates[j].id
+		if (a == DefaultBrowserID) != (b == DefaultBrowserID) {
+			return a == DefaultBrowserID
+		}
+		return a < b
+	})
+
+	for _, b := range candidates {
+		pageOwner, _, ok := b.lookupPage(id)
+		if !ok {
+			continue
+		}
+		released, err := pageOwner.closePage(ctx, id)
+		if err != nil {
+			return PageClose{Browser: pageOwner.id}, err
+		}
+		return PageClose{Browser: pageOwner.id, Evicted: !released}, nil
+	}
+
+	live := m.livePageIDs()
+	if relaunched {
+		return PageClose{}, fmt.Errorf(
+			"session %q no longer exists: browser was restarted; call fetch_page to re-open URLs (live: %s)",
+			id,
+			pageIDsOrNone(live),
+		)
+	}
+	return PageClose{}, fmt.Errorf("session %q not found (live: %s)", id, pageIDsOrNone(live))
+}
+
+// browserOwnedBy reports whether owner addresses b: either through the owner
+// key used for reuse, or through the surface identity that created it. The
+// second key matters because an explicit owner label replaces the owner key at
+// creation (WEB-166); an empty sessionOwner falls back to the owner key.
+func browserOwnedBy(b *Browser, owner string) bool {
+	if b.Owner() == owner {
+		return true
+	}
+	session := b.sessionOwner
+	if session == "" {
+		session = b.Owner()
+	}
+	return session == owner
+}
+
+// livePageIDs returns every page id registered in a live browser or identity,
+// read from the registry without probing a tab, sorted for stable messages.
+func (m *Manager) livePageIDs() []PageID {
+	m.mu.Lock()
+	browsers := make([]*Browser, 0, len(m.browsers))
+	for _, b := range m.browsers {
+		browsers = append(browsers, b)
+	}
+	m.mu.Unlock()
+
+	var ids []PageID
+	for _, b := range browsers {
+		for _, owner := range b.pageOwners() {
+			owner.mu.Lock()
+			for id := range owner.pages {
+				ids = append(ids, id)
+			}
+			owner.mu.Unlock()
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+// pageIDsOrNone renders a page-id list for an error message, "none" when empty.
+func pageIDsOrNone(ids []PageID) string {
+	if len(ids) == 0 {
+		return "none"
+	}
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = string(id)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // CloseBrowser closes a specific Browser by BrowserID and all of its pages.

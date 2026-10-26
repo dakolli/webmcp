@@ -7,7 +7,6 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -24,7 +23,14 @@ func main() {
 	// (pkg/cli/cmd.defaultServeMcpPort, WEB-43): the const cannot cross the
 	// package boundary, so the two defaults must stay in lockstep by hand.
 	port := flag.Int("port", 4099, "HTTP port for the MCP/SSE server")
+	bind := flag.String("bind", server.DefaultBind,
+		"host/interface to bind (default 127.0.0.1; 0.0.0.0 exposes the unauthenticated server to the network)")
 	flag.Parse()
+
+	addr, err := server.ListenAddress(*bind, *port)
+	if err != nil {
+		log.Fatalf("mcp: %v", err)
+	}
 
 	// The shared manager: headful Chromium, stealth on — the engine defaults.
 	// Constructed here and injected into the MCP server so the tools own one
@@ -49,7 +55,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	srv := server.New(mgr, fmt.Sprintf(":%d", *port))
+	srv := server.New(mgr, addr)
 	if err := srv.Serve(ctx); err != nil {
 		log.Fatal(err)
 	}

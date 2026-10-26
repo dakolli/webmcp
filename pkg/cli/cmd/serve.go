@@ -34,6 +34,9 @@ type serveRunOptions struct {
 	// mcpPort is the HTTP port for the in-process MCP server; 0 disables the
 	// MCP server entirely (plain `serve`).
 	mcpPort int
+	// mcpAddr is the resolved "host:port" listen address of the MCP server
+	// (default loopback); empty when the MCP server is disabled.
+	mcpAddr string
 }
 
 // serveFlags holds the serve-tree flags, defined once on the `serve` parent as
@@ -234,6 +237,7 @@ exits 0) when no serve daemon is running.`,
 // stop` reaches it through the same IPC socket.
 func NewServeMcpCmd() *cobra.Command {
 	var port int
+	var bind string
 	mcpCmd := &cobra.Command{
 		Use:   "mcp",
 		Short: "Serve the browser over IPC and MCP (HTTP/SSE) from one daemon",
@@ -242,15 +246,24 @@ log, same daemonization) and additionally hosts the MCP HTTP/SSE server on
 --port in the same process, so LLM agents and the CLI drive the SAME live
 browser. Stop the daemon with 'web-cli serve stop'.
 
-  --port <n>  HTTP port for the MCP/SSE server (default 4099)`,
-		Example: `  web-cli serve mcp                # daemonize + host the MCP SSE server on :4099
-  web-cli serve mcp --port 4089    # pick a different port`,
+The MCP server has no authentication, so it binds loopback only by default.
+Pass --bind 0.0.0.0 to expose it to the network.
+
+  --port <n>   HTTP port for the MCP/SSE server (default 4099)
+  --bind <h>   host/interface to bind (default 127.0.0.1)`,
+		Example: `  web-cli serve mcp                 # daemonize + host MCP/SSE on http://127.0.0.1:4099
+  web-cli serve mcp --port 4089     # pick a different port
+  web-cli serve mcp --bind 0.0.0.0  # expose MCP to the network (no auth)`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			flags, err := serveFlagsFromCmd(cmd)
 			if err != nil {
 				return fmt.Errorf("serve mcp: %w", err)
 			}
 			path, err := socketPath(cmd)
+			if err != nil {
+				return fmt.Errorf("serve mcp: %w", err)
+			}
+			addr, err := mcpServer.ListenAddress(bind, port)
 			if err != nil {
 				return fmt.Errorf("serve mcp: %w", err)
 			}
@@ -261,6 +274,7 @@ browser. Stop the daemon with 'web-cli serve stop'.
 				profile:  flags.profile,
 				socket:   path,
 				mcpPort:  port,
+				mcpAddr:  addr,
 			}
 			if flags.foreground {
 				return runServeForeground(cmdCtx(cmd), opts)
@@ -269,6 +283,7 @@ browser. Stop the daemon with 'web-cli serve stop'.
 				"serve", "mcp",
 				"--foreground",
 				"--port=" + strconv.Itoa(port),
+				"--bind=" + bind,
 				"--headless=" + strconv.FormatBool(flags.headless),
 				"--stealth=" + strconv.FormatBool(flags.stealth),
 				"--bin=" + flags.bin,
@@ -283,6 +298,8 @@ browser. Stop the daemon with 'web-cli serve stop'.
 	}
 	mcpCmd.Flags().IntVar(&port, "port", defaultServeMcpPort,
 		fmt.Sprintf("HTTP port for the MCP/SSE server (default %d)", defaultServeMcpPort))
+	mcpCmd.Flags().StringVar(&bind, "bind", mcpServer.DefaultBind,
+		"host/interface for the MCP/SSE server (default 127.0.0.1; 0.0.0.0 exposes it to the network)")
 	return mcpCmd
 }
 
@@ -298,20 +315,51 @@ func mcpServeHint() string {
 	return fmt.Sprintf("host the MCP SSE endpoint for LLM agents: web-cli serve mcp --port %d", defaultServeMcpPort)
 }
 
+// mcpEndpointAddress returns the address to advertise for the MCP endpoint: the
+// listener's real bound address when one exists, else the requested bind (the
+// detached-daemon parent never binds, so it advertises what its child binds).
+func mcpEndpointAddress(ln net.Listener, requested string) string {
+	if ln != nil {
+		return ln.Addr().String()
+	}
+	return requested
+}
+
+// mcpBanner renders the one-line MCP endpoint banner for a resolved address.
+func mcpBanner(addr string) string {
+	return fmt.Sprintf("mcp: http://%s", addr)
+}
+
+// mcpProbeAddress rewrites a wildcard bind to a loopback address of the same
+// family so the daemon readiness probe can dial it.
+func mcpProbeAddress(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	switch host {
+	case "", "0.0.0.0":
+		host = mcpServer.DefaultBind
+	case "::":
+		host = "::1"
+	}
+	return net.JoinHostPort(host, port)
+}
+
 // mcpClientConfig renders the MCP client config instructions for the SSE
-// endpoint on port: a one-line explanation followed by the JSON snippet to add
-// to an MCP client config (Claude Desktop, mem-mcp, ...). The snippet stays
-// byte-identical to the README "## MCP" section (key "web-mcp", type remote,
-// url http://127.0.0.1:<port>/sse, enabled true) so the CLI and the docs never
-// diverge.
-func mcpClientConfig(port int) string {
+// endpoint on addr: a one-line explanation followed by the JSON snippet to add
+// to an MCP client config (Claude Desktop, mem-mcp, ...). With the default
+// loopback bind the snippet stays byte-identical to the README "## MCP" section
+// (key "web-mcp", type remote, url http://127.0.0.1:<port>/sse, enabled true)
+// so the CLI and the docs never diverge.
+func mcpClientConfig(addr string) string {
 	return fmt.Sprintf(`Add to your MCP client config, e.g. Claude Desktop / mem-mcp:
 
 "web-mcp": {
     "type": "remote",
-    "url": "http://127.0.0.1:%d/sse",
+    "url": "http://%s/sse",
     "enabled": true
-}`, port)
+}`, addr)
 }
 
 // daemonizeServe spawns the serve loop (childArgs, e.g. ["serve",
@@ -341,19 +389,22 @@ func daemonizeServe(cmd *cobra.Command, opts serveRunOptions, childArgs []string
 	cmd.Printf("socket: %s\n", opts.socket)
 	cmd.Printf("daemonized (log: %s); stop with 'web-cli serve stop'\n", logPath)
 	if opts.mcpPort != 0 {
-		// Probe the daemon's MCP port before advertising the endpoint and the
-		// client-config snippet: the daemon may have failed to bind it (e.g.
-		// port already occupied), in which case a URL or snippet would point
-		// the user at a dead endpoint. A short dial is enough — the bind
-		// already happened (or failed) synchronously before the daemon
-		// answered ping.
-		conn, err := net.DialTimeout("tcp", fmt.Sprintf("localhost:%d", opts.mcpPort), 300*time.Millisecond)
+		// Probe the daemon's MCP endpoint before advertising it and the
+		// client-config snippet: the daemon may have failed to bind (e.g. port
+		// already occupied), in which case a URL or snippet would point the
+		// user at a dead endpoint. A short dial is enough — the bind already
+		// happened (or failed) synchronously before the daemon answered ping.
+		addr := mcpEndpointAddress(nil, opts.mcpAddr)
+		conn, err := net.DialTimeout("tcp", mcpProbeAddress(addr), 300*time.Millisecond)
 		if err != nil {
-			cmd.Printf("mcp: http server did not start on :%d (see log)\n", opts.mcpPort)
+			cmd.Printf("mcp: http server did not start on %s (see log)\n", addr)
 		} else {
 			_ = conn.Close()
-			cmd.Printf("mcp: http://localhost:%d\n", opts.mcpPort)
-			cmd.Printf("%s\n", mcpClientConfig(opts.mcpPort))
+			cmd.Println(mcpBanner(addr))
+			if warning := mcpServer.NoAuthWarning(addr); warning != "" {
+				cmd.Println(warning)
+			}
+			cmd.Printf("%s\n", mcpClientConfig(addr))
 		}
 	} else {
 		cmd.Printf("%s\n", mcpServeHint())
@@ -431,15 +482,17 @@ func runServeForeground(ctx context.Context, opts serveRunOptions) error {
 	// browser work — so a bind failure (e.g. port already occupied) surfaces
 	// as a warning in the output block instead of an async log.
 	var httpSrv *mcpServer.Server
+	var mcpLn net.Listener
 	var mcpBindErr error
 	if opts.mcpPort != 0 {
-		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", opts.mcpPort))
+		ln, err := net.Listen("tcp", opts.mcpAddr)
 		if err != nil {
 			// Keep httpSrv nil: no HTTP goroutine starts, and the output
 			// block prints a warning instead of the client-config snippet.
 			mcpBindErr = err
 		} else {
-			httpSrv = mcpServer.New(mgr, fmt.Sprintf(":%d", opts.mcpPort))
+			mcpLn = ln
+			httpSrv = mcpServer.New(mgr, opts.mcpAddr)
 			httpSrv.SetListener(ln)
 			go func() {
 				if err := httpSrv.Serve(serveCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -467,14 +520,18 @@ func runServeForeground(ctx context.Context, opts serveRunOptions) error {
 		fmt.Printf("browser_id: none (created on demand by browser_create or fetch_page)\n")
 	}
 	fmt.Printf("socket: %s\n", path)
+	mcpAddr := mcpEndpointAddress(mcpLn, opts.mcpAddr)
 	if mcpBindErr != nil {
-		fmt.Printf("mcp: failed to bind :%d: %v\n", opts.mcpPort, mcpBindErr)
+		fmt.Printf("mcp: failed to bind %s: %v\n", opts.mcpAddr, mcpBindErr)
 	} else if httpSrv != nil {
-		fmt.Printf("mcp: http://localhost:%d\n", opts.mcpPort)
+		fmt.Println(mcpBanner(mcpAddr))
+		if warning := mcpServer.NoAuthWarning(mcpAddr); warning != "" {
+			fmt.Println(warning)
+		}
 	}
 	fmt.Printf("press Ctrl-C to stop\n")
 	if httpSrv != nil {
-		fmt.Printf("%s\n", mcpClientConfig(opts.mcpPort))
+		fmt.Printf("%s\n", mcpClientConfig(mcpAddr))
 	} else if mcpBindErr == nil {
 		fmt.Printf("%s\n", mcpServeHint())
 	}

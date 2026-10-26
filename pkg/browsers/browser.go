@@ -75,6 +75,11 @@ type Browser struct {
 	// owner is the caller identity recorded at creation (UnownedOwner when the
 	// surface had none). Informational only: browsers are closed by id.
 	owner string
+	// sessionOwner is the surface identity that created the browser, preserved
+	// even when an explicit owner label replaced the owner key. It lets a later
+	// call from the same surface address the browser without treating the label
+	// as the lookup key. Immutable.
+	sessionOwner string
 	// ownerLabel is the human-friendly identity shown in listings and errors
 	// (e.g. an MCP client name); owner stays the ownership key. Immutable.
 	ownerLabel string
@@ -352,6 +357,7 @@ func (b *Browser) newIdentity(name string, clone *rod.Browser) *Browser {
 		identity:       name,
 		parent:         b,
 		owner:          b.owner,
+		sessionOwner:   b.sessionOwner,
 		ownerLabel:     b.ownerLabel,
 		key:            b.key,
 		createdAt:      b.createdAt,
@@ -1115,16 +1121,25 @@ func (b *Browser) pageInfos(ctx context.Context) []PageInfo {
 // if the underlying tab close fails — so a wedged/dead CDP connection cannot
 // leave a phantom session that session_list keeps reporting (WEB-60 MED-1).
 // The map entry is dropped under b.mu only, so a busy page can never block
-// other browser operations. The operation lock is then taken with a bounded
-// wait off the manager-owned baseCtx (never the caller's ctx) so a stuck tab
-// cannot wedge the close and a canceled request cannot abort a teardown that
-// already succeeded. When the page is still held by an operation after that
-// wait, its tab is left to Browser.Close: the session is already evicted, so
-// session_list stops reporting it immediately (WEB-60 MED-1).
+// other browser operations. The operation lock is taken with a try-lock first
+// and then a short bounded wait off the manager-owned baseCtx (never the
+// caller's ctx), so a stuck tab cannot wedge the close and a canceled request
+// cannot abort a teardown that already succeeded. When the page is still held
+// by an operation after that wait, its tab is left to Browser.Close: the session
+// is already evicted, so session_list stops reporting it immediately (WEB-60
+// MED-1, WEB-166).
 func (b *Browser) ClosePage(ctx context.Context, id PageID) error {
+	_, err := b.closePage(ctx, id)
+	return err
+}
+
+// closePage performs ClosePage and reports whether the tab handle was released.
+// A false result with a nil error means an operation still held the page: the
+// registry entry was removed and the tab is left to the browser teardown.
+func (b *Browser) closePage(ctx context.Context, id PageID) (released bool, err error) {
 	owner, p, ok := b.lookupPage(id)
 	if !ok {
-		return fmt.Errorf("browsers: page %q not found", id)
+		return false, fmt.Errorf("browsers: page %q not found", id)
 	}
 
 	owner.mu.Lock()
@@ -1134,27 +1149,31 @@ func (b *Browser) ClosePage(ctx context.Context, id PageID) error {
 	owner.mu.Unlock()
 	b.root().touch()
 
-	waitCtx, waitCancel := context.WithTimeout(b.baseCtx, teardownBudget)
-	defer waitCancel()
-	if err := p.LockContext(waitCtx, "close page"); err != nil {
-		return nil
+	unlock, locked := p.TryLock()
+	if !locked {
+		waitCtx, waitCancel := context.WithTimeout(b.baseCtx, closePageLockWait)
+		defer waitCancel()
+		if err := p.LockContext(waitCtx, "close page"); err != nil {
+			return false, nil
+		}
+		unlock = p.Unlock
 	}
 	p.stopObservation()
 	handle := p.Rod
 	p.Rod = nil
-	p.Unlock()
+	unlock()
 
 	if handle == nil {
-		return nil
+		return true, nil
 	}
 	owner.stopProxyAuth(handle)
 	owner.stopHeaderCleanup(handle)
 	closeCtx, cancel := context.WithTimeout(b.baseCtx, teardownBudget)
 	defer cancel()
 	if err := closeRodPage(closeCtx, handle); err != nil {
-		return fmt.Errorf("browsers: close page %q: %w", id, err)
+		return false, fmt.Errorf("browsers: close page %q: %w", id, err)
 	}
-	return nil
+	return true, nil
 }
 
 // Close closes the Browser and all of its live pages, releasing the underlying

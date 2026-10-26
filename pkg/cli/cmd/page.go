@@ -44,8 +44,8 @@ resolve only against that browser and an unknown id fails with the live ids.
 
 Subcommands:
   list   List the browser's open pages (id, url)
-  fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, console, body, article, marks, security); a URL opens a new page first
-  act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate, clear_logs)
+  fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, console, body, article, marks, security, storage, sinks, har); a URL opens a new page first
+  act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear)
   close  Close an open page
 
 Run a subcommand with --help for its flags and examples.`,
@@ -133,7 +133,7 @@ func newPageFetchCmd(mgr *browsers.Manager) *cobra.Command {
 		Short: "Extract an aspect of a live page",
 		Long: `Extracts an aspect of a live page (html, text, links, meta, dom, css,
 js, screenshot, interactives, a11y, network, console, body, article, marks,
-security, storage) and prints it. The page id is optional when
+security, storage, sinks, har) and prints it. The page id is optional when
 only one page is open; 'last' means the most recently opened page; a bare number
 resolves to page-N. A URL in the [id] slot opens a NEW page for it first —
 creating the browser if needed, exactly like 'web-cli fetch <url>' — and then
@@ -146,7 +146,7 @@ dance).
           extract the aspect — mirrors 'web-cli fetch <url>' (wait: idle)
   [what]  the aspect to extract: html, text, links, meta, dom, css, js,
           screenshot, interactives, a11y, network, console, body, article, marks,
-          security, storage (default: text)
+          security, storage, sinks, har (default: text)
 
   --id <session>     the page/session id (the positional [id] wins when both
                      are given; never treated as a URL)
@@ -161,14 +161,14 @@ dance).
                      instead of <redacted> (exposes live session tokens)
   --max-bytes <n>    cap output size (default 50000; screenshots,
                      interactives, a11y, network, console, body, article,
-                     marks and security are never truncated)
+                     marks, security and sinks are never truncated)
   --identity <name>  open the URL in an incognito identity inside the target
                      browser (default "default"): a new name is created on
                      first use, and identities keep separate cookies/storage
                      in one Chromium process. Only valid with a URL.
 
-links, meta, dom, interactives, a11y, network, console, body, article, marks and
-security print JSON, mirroring the MCP page_fetch shapes. article is the readable prose body as
+links, meta, dom, interactives, a11y, network, console, body, article, marks,
+security and sinks print JSON, mirroring the MCP page_fetch shapes. article is the readable prose body as
 markdown ({title, byline?, excerpt?, text, words, truncated, url}); prefer it
 over text when you want the article rather than the whole page. marks is the
 numbered overlay ({marks:[{index, role, text?, x, y, width, height}], screenshot,
@@ -178,7 +178,10 @@ covering response headers, CSP (header or meta), cookie flags, mixed content,
 subresource integrity, form targets and CORS. storage is a read-only snapshot of
 the browser context ({cookies, local_storage, session_storage, indexed_db,
 caches} with a *_truncated counter per section); every value is <redacted>
-unless --include-values is set, which exposes live session tokens.
+unless --include-values is set, which exposes live session tokens. sinks is the
+source-to-sink tracer ring ({installed, hits:[{source, sink, context, value,
+value_cut, stack, selector, ts}], dropped, truncated}); arm it with
+'page act sinks_install' and reset it with 'page act sinks_clear'.
 Screenshots print a data:image/png;base64,... data-URI. network/console emit
 {entries,count,dropped,truncated} over the newest 100 buffered entries; capture is
 cumulative from page creation, so clear with 'page act clear_logs' right before the
@@ -198,6 +201,7 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
   web-cli page fetch last security                      # passive headers/CSP/cookie/mixed-content audit
   web-cli page fetch last storage                       # cookie flags + storage keys, values redacted
   web-cli page fetch last storage --include-values      # real values: exposes live session tokens
+  web-cli page fetch last sinks                         # source-to-sink hits after 'page act sinks_install'
   web-cli page fetch https://hackernews.com links       # open + extract in one step`,
 		Args: cobra.MaximumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -308,7 +312,7 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to fetch (optional with one page open; 'last'; or a bare number)")
-	cmd.Flags().StringVar(&what, "what", "", "aspect to extract: html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, marks, security, storage (default text)")
+	cmd.Flags().StringVar(&what, "what", "", "aspect to extract: html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, marks, security, storage, sinks, har (default text)")
 	cmd.Flags().StringVar(&selector, "selector", "", "optional CSS selector scoping html/text extraction")
 	cmd.Flags().StringVar(&target, "target", "", "resource URL for one css/js resource, or seq/URL substring selecting one network body (with --what body)")
 	cmd.Flags().BoolVar(&fullPage, "full-page", false, "capture the entire scrollable page instead of the visible viewport (screenshot only)")
@@ -321,7 +325,8 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 // newPageActCmd builds `page act`: it performs an action on a live page —
 // click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file,
 // hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport,
-// emulate and clear_logs (mirroring the MCP page_act surface).
+// emulate, clear_logs, sinks_install and sinks_clear (mirroring the MCP page_act
+// surface).
 func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 	var (
 		id             string
@@ -347,7 +352,8 @@ func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 		Short: "Perform an action on a live page",
 		Long: `Performs an action on a live page (click, input, type, press_key, click_at,
 hover_at, drag_and_drop, upload_file, hover, scroll, select, eval, navigate, back,
-forward, reload, wait, set_viewport, emulate, clear_logs) and prints the confirmation. The page id
+forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install,
+sinks_clear) and prints the confirmation. The page id
 is optional when only one page is open; 'last' means the most recently opened page;
 a bare number resolves to page-N.
 Positional payloads fill each action's fields — flags remain as fallbacks.
@@ -375,19 +381,26 @@ redirect it is rejected as stale, so re-fetch before acting.
   set_viewport [w] [h]
   emulate      [device]
   clear_logs   (none)
+  sinks_install (none)
+  sinks_clear  (none)
   back/forward/reload    (none)
   type         [selector] [text]
 
 clear_logs empties the network and console buffers and prints {"network":N,"console":M}.
 Logs are cumulative from page creation: clear right before the step whose traffic/logs
-you want to observe, then run 'page fetch last network|console' and filter client-side.`,
+you want to observe, then run 'page fetch last network|console' and filter client-side.
+sinks_install arms the source-to-sink tracer and prints {"installed":true}; it changes
+page behavior, so capture stays opt-in. sinks_clear empties the tracer ring and prints
+{"cleared":N}; read the hits with 'page fetch <id> sinks'.`,
 		Example: `  web-cli page act click "#submit"                          # click on the single open page
   web-cli page act 12 input "#search" "pizza"               # type into a search box
   web-cli page act 12 press_key "Enter"                     # press Enter key
   web-cli page act 12 click_at 100 200                     # click at x=100 y=200
   web-cli page act 12 navigate https://news.ycombinator.com # go somewhere
   web-cli page act last eval '() => document.title'         # run JS on the latest page
-  web-cli page act last clear_logs  # reset both buffers, print {network,console} counts`,
+  web-cli page act last clear_logs  # reset both buffers, print {network,console} counts
+  web-cli page act last sinks_install  # arm the source-to-sink tracer
+  web-cli page act last sinks_clear    # empty the tracer ring, print {cleared}`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Positional args win over the --flags; payload counts are
 			// validated here, before any browser work.
@@ -418,9 +431,9 @@ you want to observe, then run 'page fetch last network|console' and filter clien
 			defer cancel()
 
 			switch action {
-			case "click", "input", "type", "press_key", "click_at", "hover_at", "drag_and_drop", "upload_file", "eval", "navigate", "back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport", "emulate", "clear_logs":
+			case "click", "input", "type", "press_key", "click_at", "hover_at", "drag_and_drop", "upload_file", "eval", "navigate", "back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport", "emulate", "clear_logs", "sinks_install", "sinks_clear":
 			default:
-				return fmt.Errorf("page act: unknown action=%q (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs)", action)
+				return fmt.Errorf("page act: unknown action=%q (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear)", action)
 			}
 
 			if action == "set_viewport" && (width <= 0 || height <= 0) {
@@ -521,6 +534,10 @@ you want to observe, then run 'page fetch last network|console' and filter clien
 				out, err = pageops.PageEmulate(ctx, p, device)
 			case "clear_logs":
 				out, err = pageops.PageClearLogs(p)
+			case "sinks_install":
+				out, err = pageops.PageSinksInstall(ctx, p)
+			case "sinks_clear":
+				out, err = pageops.PageSinksClear(ctx, p)
 			}
 			if err != nil {
 				return fmt.Errorf("page act: %w", err)
@@ -534,7 +551,7 @@ you want to observe, then run 'page fetch last network|console' and filter clien
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to act on (optional with one page open; 'last'; or a bare number)")
-	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs")
+	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear")
 	cmd.Flags().StringVar(&selector, "selector", "", "CSS selector targeting the element (element actions)")
 	cmd.Flags().StringVar(&handle, "handle", "", "element handle from page fetch (g<document>-b<backendNodeId>, scoped to its document); wins over --selector (element actions)")
 	cmd.Flags().StringVar(&value, "value", "", "value for eval (JS function), input (text), type (text), navigate (URL), select (option value)")

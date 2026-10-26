@@ -141,9 +141,11 @@ func newPageObserver() *pageObserver {
 	}
 }
 
-// indexOfRequest returns the ring position currently keyed by id, or -1.
+// indexOfRequest returns the newest ring position keyed by id, or -1. A
+// redirect keeps the same RequestID across hops, so the newest entry is the
+// hop the following response and finish events belong to.
 func (o *pageObserver) indexOfRequest(id proto.NetworkRequestID) int {
-	for i := range o.net.items {
+	for i := len(o.net.items) - 1; i >= 0; i-- {
 		if o.net.items[i].requestID == id {
 			return i
 		}
@@ -151,9 +153,25 @@ func (o *pageObserver) indexOfRequest(id proto.NetworkRequestID) int {
 	return -1
 }
 
-// recordRequest opens an entry for a request, or rewrites the existing entry in
-// place when the same RequestID re-fires on a redirect hop. The request headers
-// are captured bounded and redacted unless the page opted into secret capture.
+// applyResponse copies the status, MIME type, encoded byte count and redacted
+// headers of r onto entry. The caller holds o.mu.
+func (o *pageObserver) applyResponse(entry *NetworkEntry, r *proto.NetworkResponse) {
+	if r == nil {
+		return
+	}
+	entry.Status = r.Status
+	entry.MIME = r.MIMEType
+	entry.RespHeaders, entry.RespHeadersTruncated = redactHeaders(r.Headers, o.secrets)
+	if r.EncodedDataLength > 0 {
+		entry.Bytes = int64(r.EncodedDataLength)
+	}
+}
+
+// recordRequest opens an entry for a request. A redirect re-fires the same
+// RequestID with redirectResponse set: the previous hop is finalized from that
+// response, which carries the 3xx status and its Set-Cookie, then the new hop is
+// appended as its own entry. The request headers are captured bounded and
+// redacted unless the page opted into secret capture.
 func (o *pageObserver) recordRequest(e *proto.NetworkRequestWillBeSent) {
 	if e.Request == nil {
 		return
@@ -165,17 +183,22 @@ func (o *pageObserver) recordRequest(e *proto.NetworkRequestWillBeSent) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	headers, cut := redactHeaders(e.Request.Headers, o.secrets)
-	if i := o.indexOfRequest(e.RequestID); i >= 0 {
-		entry := &o.net.items[i]
-		entry.Method = e.Request.Method
-		entry.URL = cutString(e.Request.URL, networkURLLimit)
-		entry.ReqHeaders = headers
-		entry.ReqHeadersTruncated = cut
-		if e.Type != "" {
-			entry.Type = string(e.Type)
+	i := o.indexOfRequest(e.RequestID)
+	if e.RedirectResponse == nil {
+		if i >= 0 {
+			entry := &o.net.items[i]
+			entry.Method = e.Request.Method
+			entry.URL = cutString(e.Request.URL, networkURLLimit)
+			entry.ReqHeaders = headers
+			entry.ReqHeadersTruncated = cut
+			if e.Type != "" {
+				entry.Type = string(e.Type)
+			}
+			entry.requestedAt = e.Timestamp
+			return
 		}
-		entry.requestedAt = e.Timestamp
-		return
+	} else if i >= 0 {
+		o.applyResponse(&o.net.items[i], e.RedirectResponse)
 	}
 	o.netSeq++
 	o.net.push(NetworkEntry{
@@ -191,7 +214,7 @@ func (o *pageObserver) recordRequest(e *proto.NetworkRequestWillBeSent) {
 }
 
 // recordResponse joins the response status, MIME type, resource type and
-// redacted response headers onto the entry keyed by the request ID.
+// redacted response headers onto the newest hop keyed by the request ID.
 func (o *pageObserver) recordResponse(e *proto.NetworkResponseReceived) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -200,11 +223,7 @@ func (o *pageObserver) recordResponse(e *proto.NetworkResponseReceived) {
 		return
 	}
 	entry := &o.net.items[i]
-	if e.Response != nil {
-		entry.Status = e.Response.Status
-		entry.MIME = e.Response.MIMEType
-		entry.RespHeaders, entry.RespHeadersTruncated = redactHeaders(e.Response.Headers, o.secrets)
-	}
+	o.applyResponse(entry, e.Response)
 	entry.Type = string(e.Type)
 }
 

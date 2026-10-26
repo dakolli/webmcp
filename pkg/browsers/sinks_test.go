@@ -68,6 +68,29 @@ func TestSinkHitsEnvelope(t *testing.T) {
 		}
 	})
 
+	t.Run("new-document script re-arms the tracer", func(t *testing.T) {
+		if !strings.Contains(sinkScript, "if (window.__wmSinkInstalled) return;") {
+			t.Fatal("sinkScript: want the in-page guard return")
+		}
+		if sinkNewDocumentScript == sinkScript {
+			t.Fatal("sinkNewDocumentScript: the raw body's top-level return is not a valid init script")
+		}
+		if !strings.HasPrefix(sinkNewDocumentScript, "(() => {") || !strings.HasSuffix(sinkNewDocumentScript, "})()") {
+			t.Fatal("sinkNewDocumentScript: want a self-invoking function")
+		}
+		if !strings.Contains(sinkNewDocumentScript, sinkScript) {
+			t.Fatal("sinkNewDocumentScript: want the shared tracer body")
+		}
+		if !strings.Contains(sinkNewDocumentScript, "wmTagLocation") || !strings.Contains(sinkNewDocumentScript, "wmLiveLocation") {
+			t.Fatal("sinkNewDocumentScript: want location tagging in every document")
+		}
+		for _, tag := range []string{"'location.hash'", "'location.search'", "'location.href'"} {
+			if !strings.Contains(sinkNewDocumentScript, tag) {
+				t.Fatalf("sinkNewDocumentScript: want source tag %s", tag)
+			}
+		}
+	})
+
 	t.Run("value clipping marks cuts", func(t *testing.T) {
 		long := strings.Repeat("x", 250)
 		stack := make([]string, 7)

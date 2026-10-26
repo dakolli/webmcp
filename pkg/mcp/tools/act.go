@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"webmcp/pkg/browsers"
@@ -19,6 +20,21 @@ const defaultActTimeout = 30 * time.Second
 // sleep is bounded by timeout_ms, but the tool-call deadline would otherwise
 // be set to the same duration and fire first.
 const waitSleepMargin = 5 * time.Second
+
+// actActionNames lists page_act's actions in schema order. The schema enum and
+// the unknown-action error both read it so the two cannot drift.
+var actActionNames = []string{
+	"click", "input", "type", "press_key", "click_at", "hover_at",
+	"drag_and_drop", "upload_file", "eval", "navigate",
+	"back", "forward", "reload", "hover", "scroll", "select",
+	"wait", "set_viewport", "emulate", "clear_logs",
+	"sinks_install", "sinks_clear", "replay",
+}
+
+// actActionList renders actActionNames for an error message.
+func actActionList() string {
+	return strings.Join(actActionNames, ", ")
+}
 
 // Act implements the "page_act" tool: it interacts with a LIVE page that was
 // previously opened with fetch_page. Interaction logic is backed by package
@@ -47,7 +63,13 @@ func (t *Act) Description() string {
 		"upload_file (set files on <input type='file'>), eval (run JS — the primary escape hatch), " +
 		"navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, " +
 		"clear_logs (empties the network and console buffers, returning the cleared counts, e.g. " +
-		"page_act { action: \"clear_logs\" } → {\"network\":12,\"console\":5}), or " +
+		"page_act { action: \"clear_logs\" } → {\"network\":12,\"console\":5}), " +
+		"sinks_install (arms the source-to-sink tracer and returns {\"installed\":true}; capture is " +
+		"opt-in and never starts by itself because instrumentation changes page behavior. The " +
+		"wrappers survive client-side route changes and full navigations, but the hit ring is per " +
+		"document and resets after a full navigation. Read it with page_fetch what=sinks, which is " +
+		"read-only and never arms capture; it emits the newest 100 hits of a 200-hit ring), " +
+		"sinks_clear (empties the tracer ring and returns {\"cleared\":N}), or " +
 		"replay (resends one captured network entry through a Go HTTP client — bypasses CORS, " +
 		"carries the page's cookies for the target host without writing any back, follows up to 5 " +
 		"redirects, and returns {status,headers,body,bytes,truncated,ms,request,chain} with " +
@@ -71,14 +93,9 @@ func (t *Act) InputSchema() models.InputSchema {
 				"description": "The session_id returned by fetch_page for the page to act on.",
 			},
 			"action": map[string]any{
-				"type": "string",
-				"enum": []string{
-					"click", "input", "type", "press_key", "click_at", "hover_at",
-					"drag_and_drop", "upload_file", "eval", "navigate",
-					"back", "forward", "reload", "hover", "scroll", "select",
-					"wait", "set_viewport", "emulate", "clear_logs", "replay",
-				},
-				"description": "The interaction to perform: click (selector), input (set field text), type (keystrokes), press_key (key/combo e.g. Enter, Escape, Control+A), click_at/hover_at ({x, y} coordinates), drag_and_drop (from {x,y}/selector to {target_x,target_y}/target_selector), upload_file (set file input paths), eval (run JS), navigate (URL), back/forward/reload, hover (selector), scroll (x/y), select (option value), wait (readiness mode), set_viewport (W x H), emulate (device preset), clear_logs (empty both log buffers; no parameters; returns {\"network\":N,\"console\":M} cleared counts), replay (resend one captured network entry; needs target, optionally method, headers and value; returns {status,headers,body,bytes,truncated,ms,request,chain}). Logs are cumulative from page creation — filter client-side or clear_logs right before the step under observation.",
+				"type":        "string",
+				"enum":        append([]string(nil), actActionNames...),
+				"description": "The interaction to perform: click (selector), input (set field text), type (keystrokes), press_key (key/combo e.g. Enter, Escape, Control+A), click_at/hover_at ({x, y} coordinates), drag_and_drop (from {x,y}/selector to {target_x,target_y}/target_selector), upload_file (set file input paths), eval (run JS), navigate (URL), back/forward/reload, hover (selector), scroll (x/y), select (option value), wait (readiness mode), set_viewport (W x H), emulate (device preset), clear_logs (empty both log buffers; no parameters; returns {\"network\":N,\"console\":M} cleared counts), sinks_install (arm the source-to-sink tracer; no parameters; returns {\"installed\":true}; capture is opt-in, changes page behavior, survives client-side route changes and full navigations while its per-document ring resets on a full navigation; read it with page_fetch what=sinks, which is read-only and never arms capture), sinks_clear (empty the tracer ring; no parameters; returns {\"cleared\":N}), replay (resend one captured network entry; needs target, optionally method, headers and value; returns {status,headers,body,bytes,truncated,ms,request,chain}). Logs are cumulative from page creation — filter client-side or clear_logs right before the step under observation.",
 			},
 			"selector": map[string]any{
 				"type":        "string",
@@ -343,6 +360,10 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 		out, err = pageops.PageEmulate(ctx, p, a.Device)
 	case "clear_logs":
 		out, err = pageops.PageClearLogs(p)
+	case "sinks_install":
+		out, err = pageops.PageSinksInstall(ctx, p)
+	case "sinks_clear":
+		out, err = pageops.PageSinksClear(ctx, p)
 	case "replay":
 		_, bodySet := provided["value"]
 		out, err = pageops.PageReplay(ctx, p, pageops.ReplayRequest{
@@ -356,7 +377,7 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 			},
 		})
 	default:
-		return failResult(fmt.Errorf("page_act: unknown action=%q (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, replay)", a.Action))
+		return failResult(fmt.Errorf("page_act: unknown action=%q (must be one of %s)", a.Action, actActionList()))
 	}
 	if err != nil {
 		return failResultForPage(ctx, p, fmt.Errorf("page_act: %w", err))

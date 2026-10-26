@@ -25,7 +25,7 @@ import (
 var whatVocab = map[string]bool{
 	"html": true, "text": true, "links": true, "meta": true,
 	"dom": true, "css": true, "js": true, "screenshot": true,
-	"interactives": true,
+	"interactives": true, "sinks": true,
 }
 
 // actionVocab is the page-act action vocabulary shared by `page act` parsing
@@ -37,14 +37,16 @@ var actionVocab = map[string]bool{
 	"upload_file": true, "eval": true, "navigate": true, "back": true,
 	"forward": true, "reload": true, "hover": true, "scroll": true,
 	"select": true, "wait": true, "set_viewport": true, "emulate": true,
+	"clear_logs": true, "sinks_install": true, "sinks_clear": true,
 }
 
 // actPayloadSpecs maps each page act action to its positional payload slots,
 // in order. The payload count is validated against the slot count (extra args
 // are rejected with an expected-payload error; zero payloads is always allowed
 // — the --selector/--value/--x/--y/--width/--height/--device flags fill the
-// same fields as the fallback). Each slot fills the same-named field of
-// actArgs (see parseActArgs).
+// same fields as the fallback). An action with no slots takes no payload at
+// all, so --value is rejected for it as well. Each slot fills the same-named
+// field of actArgs (see parseActArgs).
 var actPayloadSpecs = map[string][]string{
 	"click":         {"selector"},
 	"hover":         {"selector"},
@@ -65,6 +67,9 @@ var actPayloadSpecs = map[string][]string{
 	"hover_at":      {"x", "y"},
 	"drag_and_drop": {"from_x", "from_y", "to_x", "to_y"},
 	"upload_file":   {"selector", "path"},
+	"clear_logs":    {},
+	"sinks_install": {},
+	"sinks_clear":   {},
 }
 
 // resolvePageID resolves a user-supplied page id (possibly empty) to a live
@@ -574,6 +579,9 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 	}
 	if !hSet {
 		a.height = f.height
+	}
+	if slots, ok := actPayloadSpecs[a.action]; ok && len(slots) == 0 && a.value != "" {
+		return a, fmt.Errorf("page act: action %q takes no payload; got --value %q", a.action, a.value)
 	}
 	return a, nil
 }

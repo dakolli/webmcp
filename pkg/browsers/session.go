@@ -44,9 +44,10 @@ type Page struct {
 	// been installed on this page (see CaptureSnapshot). Guarded by the
 	// operation lock.
 	docMarkerInstalled bool
-	// sinkScriptInstalled reports whether the source-to-sink tracer script
-	// has been registered for later documents (see InstallSinks). Guarded by
-	// the operation lock.
+	// sinkScriptInstalled reports whether the source-to-sink tracer is armed:
+	// the page-level flag outlives any single document, so a navigation
+	// re-injects the script and only a page close disarms it (see InstallSinks).
+	// Guarded by the operation lock.
 	sinkScriptInstalled bool
 	// observer holds the page's network/console capture rings. It is assigned
 	// once in the pre-registration window and never replaced, so read methods

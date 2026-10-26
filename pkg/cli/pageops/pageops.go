@@ -535,9 +535,10 @@ func PageMeta(ctx context.Context, p *browsers.Page) (string, error) {
 
 // PageInteractives returns the page's interactive elements as a dense JSON
 // action map: every visible, non-inert clickable/typeable element with a
-// stable handle, role, text, href, input type and center x/y — the whole-page
-// snapshot used to act immediately (page act { handle: ... }) without selector
-// guesswork. Mirrors the MCP page_fetch what=interactives shape exactly.
+// stable handle, role, text, href, input type, center x/y and width/height —
+// the whole-page snapshot used to act immediately (page act { handle: ... })
+// without selector guesswork. Mirrors the MCP page_fetch what=interactives
+// shape exactly.
 //
 // Deliberately does NOT lock: the engine method Page.Interactives takes the
 // page lock itself and owns the nil-Rod guard (mirroring PageSetViewport/
@@ -748,6 +749,9 @@ var aspectEntries = []aspectEntry{
 	}},
 	{name: "sinks", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
 		return PageSinks(ctx, p)
+	}},
+	{name: "har", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
+		return PageHAR(ctx, p)
 	}},
 }
 

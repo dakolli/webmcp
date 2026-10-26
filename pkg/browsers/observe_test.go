@@ -5,10 +5,11 @@ import (
 	"testing"
 
 	"github.com/go-rod/rod/lib/proto"
+	"github.com/ysmood/gson"
 )
 
 func TestObserverRingAndRequestJoin(t *testing.T) {
-	t.Run("redirect dedupe and response join", func(t *testing.T) {
+	t.Run("redirect hops keep one entry and join the final response", func(t *testing.T) {
 		page := &Page{observer: newPageObserver()}
 		id := proto.NetworkRequestID("req-1")
 
@@ -21,20 +22,35 @@ func TestObserverRingAndRequestJoin(t *testing.T) {
 			RequestID: id,
 			Request:   &proto.NetworkRequest{Method: "GET", URL: "https://example.com/final"},
 			Timestamp: 10.5,
+			RedirectResponse: &proto.NetworkResponse{
+				URL:      "https://example.com/start",
+				Status:   302,
+				MIMEType: "text/html",
+				Headers: proto.NetworkHeaders{
+					"Location":   gson.New("/final"),
+					"Set-Cookie": gson.New("sid=abc; Path=/"),
+				},
+			},
 		})
 
 		entries, dropped := page.NetworkEntries()
-		if len(entries) != 1 {
-			t.Fatalf("redirect hops: got %d entries, want 1", len(entries))
+		if len(entries) != 2 {
+			t.Fatalf("redirect hops: got %d entries, want 2", len(entries))
 		}
 		if dropped != 0 {
 			t.Fatalf("dropped: got %d, want 0", dropped)
 		}
-		if entries[0].URL != "https://example.com/final" {
-			t.Fatalf("url: got %q, want the last redirect hop", entries[0].URL)
+		if entries[0].URL != "https://example.com/start" || entries[0].Seq != 1 {
+			t.Fatalf("first hop: got url=%q seq=%d", entries[0].URL, entries[0].Seq)
 		}
-		if entries[0].Seq != 1 {
-			t.Fatalf("seq: got %d, want 1", entries[0].Seq)
+		if entries[1].URL != "https://example.com/final" || entries[1].Seq != 2 {
+			t.Fatalf("second hop: got url=%q seq=%d", entries[1].URL, entries[1].Seq)
+		}
+		if entries[0].Status != 302 || entries[0].RespHeaders["Location"] != "/final" {
+			t.Fatalf("redirect response: got status=%d headers=%v", entries[0].Status, entries[0].RespHeaders)
+		}
+		if entries[0].RespHeaders["Set-Cookie"] == "" {
+			t.Fatal("redirect hop lost its Set-Cookie")
 		}
 
 		page.observer.recordResponse(&proto.NetworkResponseReceived{
@@ -49,7 +65,10 @@ func TestObserverRingAndRequestJoin(t *testing.T) {
 		})
 
 		entries, _ = page.NetworkEntries()
-		got := entries[0]
+		if entries[0].Status != 302 {
+			t.Fatalf("first hop status: got %d, want it untouched by the final response", entries[0].Status)
+		}
+		got := entries[1]
 		if got.Status != 200 || got.MIME != "text/html" || got.Type != "Document" {
 			t.Fatalf("response join: got %+v", got)
 		}

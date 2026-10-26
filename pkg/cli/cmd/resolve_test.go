@@ -54,6 +54,7 @@ func TestParseFetchArgs(t *testing.T) {
 		{"no args, what flag", nil, "", "html", "", "html", ""},
 		{"no args, id flag", nil, "page-1", "", "page-1", "text", ""},
 		{"1 arg aspect is what", []string{"links"}, "", "", "", "links", ""},
+		{"1 arg sinks aspect is what", []string{"sinks"}, "", "", "", "sinks", ""},
 		{"1 arg aspect, what flag loses", []string{"dom"}, "", "html", "", "dom", ""},
 		{"1 arg digits is id", []string{"12"}, "", "", "12", "text", ""},
 		{"1 arg literal id", []string{"page-1"}, "", "", "page-1", "text", ""},
@@ -218,6 +219,36 @@ func TestParseActArgs(t *testing.T) {
 			actArgFlags{},
 			actArgs{id: "12", action: "hover", selector: "nav a"},
 		},
+		{
+			"sinks_install takes no payload",
+			[]string{"sinks_install"},
+			actArgFlags{},
+			actArgs{action: "sinks_install"},
+		},
+		{
+			"id + sinks_clear",
+			[]string{"12", "sinks_clear"},
+			actArgFlags{},
+			actArgs{id: "12", action: "sinks_clear"},
+		},
+		{
+			"flag-only sinks_install",
+			nil,
+			actArgFlags{id: "page-1", action: "sinks_install"},
+			actArgs{id: "page-1", action: "sinks_install"},
+		},
+		{
+			"id + clear_logs",
+			[]string{"12", "clear_logs"},
+			actArgFlags{},
+			actArgs{id: "12", action: "clear_logs"},
+		},
+		{
+			"action-first clear_logs",
+			[]string{"clear_logs"},
+			actArgFlags{},
+			actArgs{action: "clear_logs"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -236,62 +267,108 @@ func TestParseActArgsErrors(t *testing.T) {
 	tests := []struct {
 		name    string
 		args    []string
+		flags   actArgFlags
 		wantErr string
 	}{
 		{
 			"click extra payload",
 			[]string{"click", "a", "b"},
+			actArgFlags{},
 			`page act: action "click" takes at most 1 positional arg ([selector]); got 2`,
 		},
 		{
 			"select extra payload",
 			[]string{"12", "select", "a", "b", "c"},
+			actArgFlags{},
 			`page act: action "select" takes at most 2 positional args ([selector] [value]); got 3`,
 		},
 		{
 			"reload no payload allowed",
 			[]string{"reload", "x"},
+			actArgFlags{},
 			`page act: action "reload" takes no positional args; got 1`,
+		},
+		{
+			"sinks_install no payload allowed",
+			[]string{"sinks_install", "x"},
+			actArgFlags{},
+			`page act: action "sinks_install" takes no positional args; got 1`,
+		},
+		{
+			"sinks_clear no payload allowed",
+			[]string{"sinks_clear", "x"},
+			actArgFlags{},
+			`page act: action "sinks_clear" takes no positional args; got 1`,
+		},
+		{
+			"clear_logs no payload allowed",
+			[]string{"12", "clear_logs", "x"},
+			actArgFlags{},
+			`page act: action "clear_logs" takes no positional args; got 1`,
+		},
+		{
+			"sinks_install refuses --value",
+			[]string{"12", "sinks_install"},
+			actArgFlags{value: "x"},
+			`page act: action "sinks_install" takes no payload; got --value "x"`,
+		},
+		{
+			"sinks_clear refuses --value",
+			[]string{"12", "sinks_clear"},
+			actArgFlags{value: "x"},
+			`page act: action "sinks_clear" takes no payload; got --value "x"`,
+		},
+		{
+			"clear_logs refuses --value",
+			[]string{"12", "clear_logs"},
+			actArgFlags{value: "x"},
+			`page act: action "clear_logs" takes no payload; got --value "x"`,
 		},
 		{
 			"scroll partial payload",
 			[]string{"12", "scroll", "5"},
+			actArgFlags{},
 			`page act: scroll requires both x and y; got 1 positional arg`,
 		},
 		{
 			"set_viewport partial payload",
 			[]string{"12", "set_viewport", "800"},
+			actArgFlags{},
 			`page act: set_viewport requires both width and height; got 1 positional arg`,
 		},
 		{
 			"scroll non-numeric x",
 			[]string{"12", "scroll", "abc", "500"},
+			actArgFlags{},
 			`page act: scroll x must be a number, got "abc"`,
 		},
 		{
 			"scroll non-numeric y",
 			[]string{"12", "scroll", "1", "abc"},
+			actArgFlags{},
 			`page act: scroll y must be a number, got "abc"`,
 		},
 		{
 			"set_viewport non-integer width",
 			[]string{"12", "set_viewport", "abc", "500"},
+			actArgFlags{},
 			`page act: set_viewport width must be an integer, got "abc"`,
 		},
 		{
 			"set_viewport non-integer height",
 			[]string{"12", "set_viewport", "800", "abc"},
+			actArgFlags{},
 			`page act: set_viewport height must be an integer, got "abc"`,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := parseActArgs(tt.args, actArgFlags{})
+			_, err := parseActArgs(tt.args, tt.flags)
 			if err == nil {
-				t.Fatalf("parseActArgs(%v) = nil error, want %q", tt.args, tt.wantErr)
+				t.Fatalf("parseActArgs(%v, %+v) = nil error, want %q", tt.args, tt.flags, tt.wantErr)
 			}
 			if err.Error() != tt.wantErr {
-				t.Errorf("parseActArgs(%v) error = %q, want %q", tt.args, err.Error(), tt.wantErr)
+				t.Errorf("parseActArgs(%v, %+v) error = %q, want %q", tt.args, tt.flags, err.Error(), tt.wantErr)
 			}
 		})
 	}

@@ -71,7 +71,7 @@ func TestClientCallBadParams(t *testing.T) {
 			name:    "page.fetch unknown what",
 			method:  MethodPageFetch,
 			params:  PageFetchParams{SessionID: "page-1", What: "bogus"},
-			wantMsg: `page.fetch: unknown what="bogus" (must be one of html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, marks, security, storage)`,
+			wantMsg: `page.fetch: unknown what="bogus" (must be one of html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, marks, security, storage, sinks, har)`,
 		},
 	}
 	for _, tt := range tests {

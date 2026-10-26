@@ -74,6 +74,35 @@ func TestPageFetchIncludeValues(t *testing.T) {
 	}
 }
 
+// TestPageFetchSinks pins the read side of the tracer surface: sinks is a
+// self-capped aspect present in the enum, and the description carries the
+// read-only and arming contract.
+func TestPageFetchSinks(t *testing.T) {
+	asp, ok := aspects["sinks"]
+	if !ok || asp.read == nil {
+		t.Fatal("sinks aspect is not registered")
+	}
+	if asp.trunc != truncationNone {
+		t.Errorf("sinks truncation = %v, want truncationNone", asp.trunc)
+	}
+
+	what, ok := (&Page{}).InputSchema().Properties["what"].(map[string]any)
+	if !ok {
+		t.Fatal("what schema property is missing")
+	}
+	enum, _ := what["enum"].([]string)
+	if !slices.Contains(enum, "sinks") {
+		t.Errorf("what enum = %v, want sinks included", enum)
+	}
+
+	desc := (&Page{}).Description()
+	for _, want := range []string{"read-only", "never arms capture", "sinks_install", "200-hit ring", "per document"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("page_fetch description is missing %q", want)
+		}
+	}
+}
+
 func TestScreenshotCarrier(t *testing.T) {
 	uri, encoded := testPNG(t)
 

@@ -600,3 +600,176 @@ func TestSessionsResolvesIdentityAcrossBrowsers(t *testing.T) {
 		t.Fatalf("Sessions(ghost) error = %q, want it to contain %q", err, want)
 	}
 }
+
+// TestManagerClosePageUsesOwningBrowser is the WEB-166 regression: a listed
+// page is closed through the browser that owns it, not through whichever
+// browser a default open happens to return.
+func TestManagerClosePageUsesOwningBrowser(t *testing.T) {
+	m := NewManager(WithTTL(0), WithBrowserTTL(0))
+	first := NewBrowser(DefaultBrowserID, m.baseCtx, false, false, "", "")
+	second := NewBrowser("browser-2", m.baseCtx, false, false, "", "")
+	p := &Page{ID: "page-2", URL: "https://example.com/"}
+	second.pages[p.ID] = p
+	m.browsers[first.id] = first
+	m.browsers[second.id] = second
+
+	closed, err := m.ClosePage(context.Background(), p.ID)
+	if err != nil {
+		t.Fatalf("ClosePage(%q): %v", p.ID, err)
+	}
+	if closed.Browser != second.id {
+		t.Fatalf("ClosePage closed via %q, want the owning browser %q", closed.Browser, second.id)
+	}
+	if closed.Evicted {
+		t.Fatal("ClosePage evicted an idle page, want the tab released")
+	}
+	if _, ok := second.pages[p.ID]; ok {
+		t.Fatalf("ClosePage left %q registered in %s", p.ID, second.id)
+	}
+	if len(first.pages) != 0 {
+		t.Fatalf("ClosePage touched %s, which owned no page", first.id)
+	}
+}
+
+// TestSessionOwnerPreservedAcrossExplicitOwner pins the WEB-166 key contract:
+// an explicit owner label replaces the owner key, but the ambient surface
+// identity survives so a browser created under the label stays addressable by
+// the session that created it.
+func TestSessionOwnerPreservedAcrossExplicitOwner(t *testing.T) {
+	session := WithOwnerKey(context.Background(), "sse-1")
+	explicit := WithExplicitOwner(session, "scraper-a")
+	if got := OwnerFrom(explicit); got != "scraper-a" {
+		t.Fatalf("OwnerFrom = %q, want the explicit label", got)
+	}
+	if got := SessionOwnerFrom(explicit); got != "sse-1" {
+		t.Fatalf("SessionOwnerFrom = %q, want the preserved session key", got)
+	}
+	if got := SessionOwnerFrom(context.Background()); got != UnownedOwner {
+		t.Fatalf("SessionOwnerFrom(background) = %q, want %q", got, UnownedOwner)
+	}
+}
+
+// TestManagerClosePageClosesListedPageWithHangingInfo is the WEB-166
+// regression for the live failure: the tab read never returns, session_list
+// still reports page-5, and session_close closes exactly that id even though the
+// owning browser was created under an explicit owner label rather than the
+// caller's session key.
+func TestManagerClosePageClosesListedPageWithHangingInfo(t *testing.T) {
+	m := NewManager(WithTTL(0), WithBrowserTTL(0))
+	b := NewBrowser(DefaultBrowserID, m.baseCtx, false, false, "", "")
+	b.owner = "sub-tester"
+	b.sessionOwner = "sse-session-1"
+	p := &Page{ID: "page-5", URL: "https://www.rfc-editor.org/"}
+	p.info = func(ctx context.Context) (string, string, error) {
+		<-ctx.Done()
+		return "", "", ctx.Err()
+	}
+	b.pages[p.ID] = p
+	m.browsers[b.id] = b
+
+	listed, err := m.Sessions("")
+	if err != nil {
+		t.Fatalf("Sessions: %v", err)
+	}
+	if len(listed) != 1 || listed[0].ID != p.ID {
+		t.Fatalf("Sessions = %+v, want the listed %q", listed, p.ID)
+	}
+	if !listed[0].Stale {
+		t.Fatal("Sessions reported a live read for a tab whose info never returns")
+	}
+
+	ctx := WithOwnerKey(context.Background(), "sse-session-1")
+	closed, err := m.ClosePage(ctx, listed[0].ID)
+	if err != nil {
+		t.Fatalf("ClosePage(%q) from the listing: %v", listed[0].ID, err)
+	}
+	if closed.Browser != b.id {
+		t.Fatalf("ClosePage closed via %q, want the owning %q", closed.Browser, b.id)
+	}
+	b.mu.Lock()
+	_, registered := b.pages[p.ID]
+	b.mu.Unlock()
+	if registered {
+		t.Fatalf("ClosePage left the listed %q registered", p.ID)
+	}
+}
+
+// TestManagerClosePageEvictsStuckPage pins that a page whose operation lock is
+// held (a timed-out navigate) still closes: the close uses the try-lock path,
+// waits only its bounded budget, removes the session from the registry, and
+// never wedges the caller.
+func TestManagerClosePageEvictsStuckPage(t *testing.T) {
+	m := NewManager(WithTTL(0), WithBrowserTTL(0))
+	b := NewBrowser(DefaultBrowserID, m.baseCtx, false, false, "", "")
+	p := &Page{ID: "page-2"}
+	b.pages[p.ID] = p
+	m.browsers[b.id] = b
+	p.Lock()
+	defer p.Unlock()
+
+	start := time.Now()
+	closed, err := m.ClosePage(context.Background(), p.ID)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("ClosePage(%q) on a stuck page: %v", p.ID, err)
+	}
+	if !closed.Evicted {
+		t.Fatal("ClosePage reported a released tab for a page held by an operation")
+	}
+	if elapsed > closePageLockWait+time.Second {
+		t.Fatalf("ClosePage waited %s on a stuck page, want it bounded near %s", elapsed, closePageLockWait)
+	}
+	b.mu.Lock()
+	_, registered := b.pages[p.ID]
+	b.mu.Unlock()
+	if registered {
+		t.Fatalf("ClosePage left the stuck page %q registered", p.ID)
+	}
+}
+
+// TestManagerClosePageUnknownNamesLivePages pins the failure contract: an
+// unknown id still fails and names every live page id.
+func TestManagerClosePageUnknownNamesLivePages(t *testing.T) {
+	m := NewManager(WithTTL(0), WithBrowserTTL(0))
+	b := NewBrowser(DefaultBrowserID, m.baseCtx, false, false, "", "")
+	b.pages["page-1"] = &Page{ID: "page-1"}
+	b.pages["page-2"] = &Page{ID: "page-2"}
+	m.browsers[b.id] = b
+
+	_, err := m.ClosePage(context.Background(), "page-99")
+	if err == nil {
+		t.Fatal("ClosePage(page-99) succeeded, want the live ids named")
+	}
+	for _, want := range []string{`session "page-99" not found`, "live: page-1, page-2"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("ClosePage error = %q, want it to contain %q", err, want)
+		}
+	}
+	if len(b.pages) != 2 {
+		t.Fatalf("ClosePage(page-99) removed live pages: %d remain", len(b.pages))
+	}
+}
+
+// TestManagerClosePageNeverTouchesAnotherOwner pins ownership: a page id that
+// belongs to another client's browser is refused, never closed.
+func TestManagerClosePageNeverTouchesAnotherOwner(t *testing.T) {
+	m := NewManager(WithTTL(0), WithBrowserTTL(0))
+	mine := NewBrowser(DefaultBrowserID, m.baseCtx, false, false, "", "")
+	mine.owner = "agent-a"
+	mine.sessionOwner = "agent-a"
+	theirs := NewBrowser("browser-2", m.baseCtx, false, false, "", "")
+	theirs.owner = "agent-b"
+	theirs.sessionOwner = "session-b"
+	p := &Page{ID: "page-2"}
+	theirs.pages[p.ID] = p
+	m.browsers[mine.id] = mine
+	m.browsers[theirs.id] = theirs
+
+	ctx := WithOwnerKey(context.Background(), "agent-a")
+	if _, err := m.ClosePage(ctx, p.ID); err == nil {
+		t.Fatal("ClosePage closed a page in another client's browser")
+	}
+	if _, ok := theirs.pages[p.ID]; !ok {
+		t.Fatal("ClosePage removed another client's page")
+	}
+}

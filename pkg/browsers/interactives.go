@@ -3,6 +3,7 @@ package browsers
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/url"
 	"strings"
 
@@ -42,6 +43,12 @@ type Interactive struct {
 	X float64 `json:"x"`
 	// Y is the center y of the element's layout bounds, page-absolute CSS px.
 	Y float64 `json:"y"`
+	// Width is the width of the element's layout bounds in CSS px (0 for a
+	// zero-size box), so an agent can size a target instead of only locating it.
+	Width float64 `json:"width"`
+	// Height is the height of the element's layout bounds in CSS px (0 for a
+	// zero-size box).
+	Height float64 `json:"height"`
 	// Visible is always true: hidden/inert elements are skipped before the
 	// snapshot is built, so every reported entry is rendered and interactable.
 	Visible bool `json:"visible"`
@@ -63,8 +70,9 @@ type InteractivesResult struct {
 // every visible, non-inert clickable/typeable element (anchors, buttons,
 // inputs, selects, textareas, ARIA-role widgets, tabindex/onclick/
 // contenteditable elements) with a WEB-51 handle, role, truncated text, href,
-// input type and center x/y — the whole-page snapshot an agent uses to act
-// immediately (page_act { handle: ... }) without selector guesswork.
+// input type and the center x/y plus width/height of its layout bounds — the
+// whole-page snapshot an agent uses to act immediately (page_act { handle: ... })
+// without selector guesswork.
 //
 // The method takes the page lock itself (via CaptureSnapshot, mirroring
 // Page.Close): callers must NOT pre-lock. The nil-Rod guard runs UNDER the
@@ -260,8 +268,9 @@ func ancestorAccepted(parents []int, i int, accepted map[int]bool) bool {
 // buildInteractive assembles one Interactive entry from the node's snapshot
 // rows: the WEB-51 handle (guarded parallel-array read), the ARIA-role-else-
 // tag role, the text with its fallback chain, the resolved href (links), the
-// input type (inputs) and the center of the layout bounds. li is the node's
-// layout-tree entry index (always valid for accepted candidates).
+// input type and the center plus size of the layout bounds. li is the node's
+// layout-tree entry index (always valid for accepted candidates); a zero-size
+// box reports width/height 0 rather than omitting them.
 func buildInteractive(
 	strs []string,
 	doc *proto.DOMSnapshotDocumentSnapshot,
@@ -291,10 +300,18 @@ func buildInteractive(
 	}
 	if li >= 0 && li < len(doc.Layout.Bounds) && len(doc.Layout.Bounds[li]) >= 4 {
 		b := doc.Layout.Bounds[li]
-		it.X = b[0] + b[2]/2
-		it.Y = b[1] + b[3]/2
+		it.X = round10(b[0] + b[2]/2)
+		it.Y = round10(b[1] + b[3]/2)
+		it.Width = round10(b[2])
+		it.Height = round10(b[3])
 	}
 	return it
+}
+
+// round10 rounds v to one decimal place — the precision the action map reports
+// coordinates and sizes at, matching the set-of-marks table.
+func round10(v float64) float64 {
+	return math.Round(v*10) / 10
 }
 
 // roleOf returns the element's ARIA role attribute, else its lowercased tag.
