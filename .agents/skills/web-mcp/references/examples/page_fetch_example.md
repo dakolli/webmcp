@@ -101,7 +101,7 @@ Expect `{"seq":N,"method":"POST","url":"https://httpbin.org/post","status":200,"
 {"tool":"page_fetch","arguments":{"session_id":"page-4","what":"network"}}
 ```
 
-Expect one httpbin entry with `"Cookie":"<redacted>"` in `req_headers`. `Set-Cookie`, `Authorization`, and `X-CSRF-Token` redact the same way.
+Expect one httpbin entry with `"Cookie":"<redacted>"` in `req_headers`. `Authorization` and `X-CSRF-Token` redact the same way. `Set-Cookie` is absent, because Chrome omits it from CDP events.
 
 ## 10. Capture a screenshot as two blocks
 
@@ -111,7 +111,7 @@ Expect one httpbin entry with `"Cookie":"<redacted>"` in `req_headers`. `Set-Coo
 
 Expect two blocks in `result.content`. The text block is `{"ok":true,"data":{"mime_type":"image/png","bytes":91543,"full_page":false,"width":1280,"height":800}}`. The next block is `{"type":"image","data":"<base64 PNG>","mimeType":"image/png"}`. `marks` returns the mark table as text plus the annotated PNG. A client that sends `capabilities.imageContent:false` at `initialize` gets one text block instead. Then `data` holds the data URI.
 
-## 11. Trace a source to a sink (draft, not in the built server)
+## 11. Trace a source to a sink
 
 Open a new page with a hash, arm, load the hash into `innerHTML`, read, clear:
 

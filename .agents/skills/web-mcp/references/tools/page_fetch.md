@@ -18,8 +18,9 @@ The live schema is `code://pkg/mcp/tools/page.go#L90`. The aspect registry is `c
 | `max_bytes` | integer | no | `50000` | Output cap. A value of `0` or less means `50000`, not unbounded. |
 | `target` | string | no | — | Resource URL for `css`/`js`. For `body`: a `seq` number or a substring of the request URL, newest match wins. |
 | `full_page` | boolean | no | `false` | Capture the whole scrollable page. Only `screenshot` uses it. |
+| `include_values` | boolean | no | `false` | With `what=storage`, return real cookie and storage values instead of `<redacted>`. `true` exposes live session tokens. |
 
-The live `what` enum has 16 values, in registration order: `html`, `dom`, `text`, `css`, `js`, `links`, `screenshot`, `meta`, `interactives`, `a11y`, `network`, `body`, `console`, `article`, `marks`, `security`. A 17th value, `sinks`, is specified by WEB-157 to WEB-159 but is not registered in the built server yet, so treat it as draft. The tool has no `timeout_ms` input, every call has a fixed 30 second bound, and a full-page screenshot gets its own 90 second budget.
+The live `what` enum has 19 values, in registration order: `html`, `dom`, `text`, `css`, `js`, `links`, `screenshot`, `meta`, `interactives`, `a11y`, `network`, `body`, `console`, `article`, `marks`, `security`, `sinks`, `storage`, `har`. The tool has no `timeout_ms` input, every call has a fixed 30 second bound, and a full-page screenshot gets its own 90 second budget.
 
 ## Returns
 
@@ -35,7 +36,7 @@ The live `what` enum has 16 values, in registration order: `html`, `dom`, `text`
 | `links` | JSON array `[{text,href,handle?}]`. | no | yes, JSON envelope |
 | `screenshot` | One text block `{mime_type,bytes,full_page,width?,height?}`, then one PNG image block. | no | **no** |
 | `meta` | JSON object `{title,url,meta:[...]}`. | no | yes, JSON envelope |
-| `interactives` | JSON `{interactives:[...],truncated}`. | no | **no** |
+| `interactives` | JSON `{interactives:[...],truncated}`, each item with `x`, `y`, `width`, `height`. `x`/`y` are the element centre and `left = x - width/2`. Whole values serialize without a decimal. `marks` reports top-left instead. | no | **no** |
 | `a11y` | JSON `{nodes:[...],count,truncated}`. | no | **no** |
 | `network` | JSON `{entries,count,dropped,truncated}`. | no | **no** |
 | `body` | JSON `{seq,method,url,status,content_type,bytes,truncated}` plus `body` or `base64`. | no | **no** |
@@ -43,9 +44,9 @@ The live `what` enum has 16 values, in registration order: `html`, `dom`, `text`
 | `article` | JSON `{title,byline?,excerpt?,text,words,truncated,url}`. | no | **no** |
 | `marks` | One text block `{marks,viewport_width,viewport_height,truncated}`, then one PNG image block. | no | **no** |
 | `security` | JSON `{url,checks:[{id,status,evidence,detail}],count,truncated}`. | no | **no** |
-| `sinks` | JSON `{installed,hits:[{source,sink,context,value,value_cut?,stack?,selector?,ts}],dropped,truncated}`. Draft. | no | **no** |
-
-`dom`, `meta`, and `links` keep their JSON parseable when cut. `css` and `js` do not. Read the truncation matrix below.
+| `sinks` | JSON `{installed,hits:[{source,sink,context,value,value_cut?,stack?,selector?,ts}],dropped,truncated}`. | no | **no** |
+| `storage` | JSON `{cookies,local_storage,session_storage,indexed_db,caches}`, each with a `*_truncated` counter. | no | **no** |
+| `har` | JSON `{log:{version,creator,pages,entries,comment?,truncated?}}`. Tested: 2026-10-26. | no | **no** |
 
 ### Image results
 
@@ -61,8 +62,6 @@ The image block is a sibling, not wrapped by `ok` or `data`:
 {"type":"image","data":"<base64 PNG>","mimeType":"image/png"}
 ```
 
-The `marks` text block holds `marks`, `viewport_width`, `viewport_height`, and `truncated`. Its annotated PNG is the image block. Mark `x` and `y` values feed `page_act` `click_at`.
-
 ### Text-only clients
 
 Image blocks are on by default. A client opts out at `initialize` with `capabilities.imageContent:false` or `capabilities.experimental.imageContent:false`, and then gets one text block. For `screenshot`, `data` is the data URI string `{"ok":true,"data":"data:image/png;base64,<payload>"}`. For `marks`, `data.screenshot` holds that data URI and other fields are unchanged. The opt-out is read per SSE session.
@@ -72,11 +71,11 @@ Image blocks are on by default. A client opts out at `initialize` with `capabili
 - **`dom`** returns one entry per document with `title`, `url`, `frame_id`, and `root`. A node has `tag`, `id`, `class`, `attrs`, `text`, `handle`, `visible`, `bounds`, `frame_url`, and `children`. A node without `handle` is structural.
 - **`links`** is deduplicated by `href`, first wins. It drops `javascript:`, `mailto:`, `data:`, `tel:`, empty hrefs, exactly `#`, and anchors with no text. `text` falls back to `aria-label`, `title`, then `img[alt]`.
 - **`meta`** holds `title`, `url`, and a `meta` array with any of `name`, `property`, `http-equiv`, `content`, `charset`. **`css`** and **`js`** list resources, with inline `<style>`/`<script>` blocks appearing as `inline-style[1]`. Both lists end with a hint naming `what=<css|js>&target=<url>`.
-- **`interactives`** holds `handle`, `role`, `text`, `href`, `type`, `x`, `y`, `visible`. `visible: true` means the node has a layout box, not that it is in the viewport.
+- **`interactives`** holds `handle`, `role`, `text`, `href`, `type`, `x`, `y`, `width`, `height`, `visible`. `visible: true` means the node has a layout box, not that it is in the viewport.
 - **`a11y`** holds `handle`, `depth`, `role`, `name`, `value`, `states`, plus `count` and `truncated`. Names and values are clipped at 200 runes. Root frame only.
 - **`network`** entries hold `method`, `url`, `type`, `status`, `mime`, `bytes`, `ms`, `failed`, `error`, `seq`, `req_headers`, `resp_headers`. Each header map keeps at most 32 headers per direction at 512 bytes per value under a 4 KB name+value budget, and a cut set adds `req_headers_truncated` or `resp_headers_truncated`. No bodies. **`console`** entries hold `level`, `text`, `source`, `line`, `seq`.
 - **`body`** adds `body` for UTF-8 text or `base64` plus `content_type` for binary, both exclusive. `bytes` is the pre-cap payload size. `truncated` marks the 256 KB cut.
-- **`marks`** items hold `index`, `role`, `text`, `x`, `y`, `width`, `height`. Coordinates are viewport CSS pixels and can be negative. The `screenshot` field appears only for a text-only client.
+- **`marks`** items hold `index`, `role`, `text`, `x`, `y`, `width`, `height`. Coordinates are viewport CSS pixels and can be negative, and the top-left `x`/`y` feed `page_act` `click_at` directly. The `screenshot` field appears only for a text-only client.
 
 ## Behavior and limits
 
@@ -86,8 +85,7 @@ Every handle has the form `g<document>-b<backendNodeId>`, for example `gy1g0vstq
 
 ### Caps
 
-- `interactives`: 200 entries, `truncated` counts the rest. Live Wikipedia result had `truncated: 335`.
-- `a11y`: 400 nodes. Live Wikipedia result had `count: 400` and `truncated: 299`.
+- `interactives`: 200 entries, about 32 KB at full cap on a link-dense docs page. `a11y`: 400 nodes. `truncated` counts the rest, for example `335` and `299` on the live Wikipedia page.
 - `network` and `console`: 200-entry ring per page. One call emits the newest 100. `dropped` counts true ring loss, `truncated` counts buffered entries above the emit cap.
 - `article`: 40000 runes in `text`, reported by a boolean `truncated`. `marks`: 60 boxes, with `truncated` for the rest. Only nodes inside the viewport are boxed.
 
@@ -97,7 +95,7 @@ Capture starts before the first document loads. Both rings are cumulative from p
 
 #### Header redaction
 
-`Cookie`, `Set-Cookie`, `Authorization`, and `X-CSRF-Token` values show `<redacted>` by default. The name match is case-insensitive (`code://pkg/browsers/redact.go#L24`). The engine switch `Page.CaptureSecrets(true)` keeps the values of entries captured after the switch, and entries already captured are not rewritten (`code://pkg/browsers/observe.go#L400`). No surface exposes the switch today.
+`Cookie` and `Set-Cookie` are absent, not redacted, because Chrome omits them from CDP events. `Authorization` and `X-CSRF-Token` values show `<redacted>` by default, and the name match is case-insensitive (`code://pkg/browsers/redact.go#L24`). The engine switch `Page.CaptureSecrets(true)` keeps the values of entries captured after the switch, and entries already captured are not rewritten (`code://pkg/browsers/observe.go#L400`). No surface exposes the switch today.
 
 #### Response bodies with what=body
 
@@ -129,7 +127,7 @@ Evidence names at most 10 offending values, then `(+N more)`. The script, form, 
 
 ### Sinks tracer with what=sinks
 
-**Draft — the surface is not in the built server yet. Every value below follows the WEB-157 to WEB-159 spec. Do not claim a live test for it.**
+**Tested live on 2026-10-26 against `https://www.postgresql.org/`.**
 
 `sinks` reads a source-to-sink tracer. Arm it first with `page_act action=sinks_install`. The arm step is opt-in and changes page behavior because it wraps page setters and constructors. Keep it off for normal page use.
 
@@ -139,11 +137,21 @@ The payload is `{installed, hits:[{source, sink, context, value, value_cut?, sta
 
 An unarmed page returns `{"installed":false,"hits":[],"dropped":0,"truncated":0}` with no error. A read is not a state change.
 
-The ring is per document. A full navigation starts a fresh ring, because the arm step re-injects the script before the new document's own scripts, so `installed` stays true and `hits` is empty. A client-side route change keeps the same ring and appends to it. Clear with `page_act action=sinks_clear`, which returns `{"cleared":N}`.
+The ring is per document. A full navigation starts a fresh ring, because the arm step re-injects the script before the new document's own scripts, so `installed` stays true. The new document's own scripts can write hits at once, so a post-navigation read can be non-empty. A client-side route change keeps the same ring and appends to it. Clear with `page_act action=sinks_clear`, which returns `{"cleared":N}`.
+
+### Storage snapshot with what=storage
+
+`storage` is a read-only snapshot of the browser context. `cookies` hold `name`, `value`, `domain`, `path`, `secure`, `http_only`, `same_site`, `expires`, and `size`. `local_storage` and `session_storage` items hold `key`, `value_length`, and `value`. `indexed_db` items hold `name` and `stores`, and `caches` is a name list. Every section is present even when empty. Caps are 200 cookies, 200 keys per store, 20 databases, and 40 caches, each reported by its own `<section>_truncated`. Values are the literal `<redacted>` unless `include_values: true` (`code://pkg/cli/pageops/storage.go#L135-L156`). `max_bytes` does not apply.
+
+### HAR export with what=har
+
+**Tested: 2026-10-26 on `python.org` and `httpbingo.org`.** The shape comes from `code://pkg/har/har.go`. `har` exports the observed network ring as a HAR 1.2 document. It is read-only and never arms capture. The payload is `{log:{version:"1.2",creator:{name:"web-mcp",version:"1.0"},pages:[{startedDateTime,id:"page_1",title,pageTimings:{onContentLoad:-1,onLoad:-1}}],entries:[...],comment,truncated?}}`. Entries hold `request` and `response` with headers, query strings, status, sizes, and `time`. `startedDateTime` is the export time, because the ring keeps monotonic timestamps only. `time` is the measured round trip and is booked as `timings.wait`. Each redirect hop is its own entry. The 3xx entry sets `response.redirectURL` from its `Location`. The final response is a separate entry. `Cookie` and `Set-Cookie` are absent, not redacted, because Chrome omits them from CDP events. Only `Authorization` and `X-CSRF-Token` read `<redacted>`. The document is capped at 512 KiB. The oldest entries drop first, and `log.truncated` reports the byte-cap and ring drops and reads `0` when nothing dropped. `max_bytes` does not apply.
 
 ### Screenshots and timeouts
 
 `screenshot` returns PNG only, as an image block plus a metadata text block. There is no format input. `full_page: false` captures the visible viewport. `full_page: true` captures the whole scrollable page on a 90 second budget that is independent of the 30 second bound, and a very tall page can still time out. Large images are not cut by `max_bytes` — a 400x300 full-page capture produced over 87 KB of base64. Prefer a small viewport for `marks`.
+
+With `--bind 0.0.0.0`, the server prints `http://[::]:<port>`. Put a reachable host in the client URL.
 
 ## Truncation matrix
 
@@ -152,7 +160,7 @@ The ring is per document. A full navigation starts a fresh ring, because the arm
 | `html`, `text`, `css`, `js` | Cut on a rune boundary. A note is appended. | No. A `css`/`js` list is cut inside its JSON. | Text note |
 | `dom`, `links` | Array root becomes an envelope object. | Yes | `truncated: true`, `omitted` |
 | `meta` | Object keeps its fields, its first array field shrinks. | Yes | `truncated: true`, `omitted` |
-| `screenshot`, `interactives`, `a11y`, `network`, `body`, `console`, `article`, `marks`, `security`, `sinks` | Not cut. | Yes | Shape's own `truncated` or `count` |
+| `screenshot`, `interactives`, `a11y`, `network`, `body`, `console`, `article`, `marks`, `security`, `sinks`, `storage`, `har` | Not cut. | Yes | Shape's own `truncated` or `count` |
 
 The text note is exact: `… (truncated at max_bytes=600 bytes; raise max_bytes — dom/links/meta do not use selector)`. The array envelope is `{"items":[...],"max_bytes":N,"omitted":N,"truncated":true}`.
 
@@ -160,17 +168,11 @@ The text note is exact: `… (truncated at max_bytes=600 bytes; raise max_bytes 
 
 ## Failure modes and recovery
 
-Every error rides the envelope: `{"ok":false,"error":{"type":…,"message":…,"hint":…}}`. Read `message` first. The prefix `page_fetch: ` opens the message. This tool produces the types `invalid_args`, `element_not_found`, `page_closed`, `timeout`, `nav_failed`, and `unknown` (`code://pkg/mcp/tools/envelope.go#L67-L130`). Two full envelopes below were recorded live on 2026-10-26.
+Every error rides the envelope: `{"ok":false,"error":{"type":…,"message":…,"hint":…}}`. Read `message` first. The prefix `page_fetch: ` opens the message. This tool produces the types `invalid_args`, `element_not_found`, `page_closed`, `timeout`, `nav_failed`, and `unknown` (`code://pkg/mcp/tools/envelope.go#L67-L130`). One full envelope below was recorded live on 2026-10-26.
 
 **Unknown session.** Type `page_closed`. Message `page_fetch: session "page-999" not found`. Recovery: re-read `session_list` or `page_list`, because the idle sweep removes pages.
 
-**Unknown `what`.** Type `invalid_args`. Live envelope, tested on 2026-10-26 with `sinks` as the probe before this draft aspect existed:
-
-```json
-{"ok":false,"error":{"type":"invalid_args","message":"page_fetch: unknown what=\"sinks\" (must be one of html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, body, console, article, marks, security)","hint":"fix the arguments per the tool InputSchema (required fields, enum values)"}}
-```
-
-Recovery: send one listed value. `sinks` is draft and `canary` is not on the tool surface.
+**Unknown `what`.** Type `invalid_args`. `message` is `page_fetch: unknown what="<value>" (must be one of <the live enum>)`. Recovery: send one listed value. `canary` is not on the tool surface.
 
 **No selector match on `text`.** Type `element_not_found`. Live envelope, tested on 2026-10-26:
 
@@ -199,7 +201,7 @@ Recovery: re-read `what=network` for the current `seq` values, then read the bod
 
 - 2026-10-25 — `meta`, `text` with selector, `css` with `target`, `interactives`, `network`, `body`, `network` header redaction, and the unknown-`what` failure. Commit `819ba12`.
 - 2026-10-26 — `security` on `https://go.dev/` returned `count: 20`, `truncated: 0`. Failure envelopes for `unknown what` and a no-match selector were recorded live. The no-match selector returned `element_not_found`.
-- Draft `sinks` has no live test. Its values come from the WEB-157 to WEB-159 spec.
+- 2026-10-26 — `sinks` on `https://www.postgresql.org/`: `sinks_install` returned `{"installed":true}`, the arm survived a full navigation, `sinks_clear` returned `{"cleared":N}`, and 250 hits reported `hits:100`, `dropped:50`, `truncated:100`.
 
 ## When not to use it
 

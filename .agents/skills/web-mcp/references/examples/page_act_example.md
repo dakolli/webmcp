@@ -108,7 +108,7 @@ The second `target` is the seq of this run's `news.css` request. Success rides `
 
 Replay re-reads the request and carries the page's cookies for the target host, and it never writes to the page. Pass `method` to override the method, `headers` to replace captured headers, or `value` to replace the request body.
 
-## 8. Arm the sink tracer (draft, not in the built server)
+## 8. Arm the sink tracer
 
 Open a page with a hash, then install, inject the hash into `innerHTML`, read, and clear:
 

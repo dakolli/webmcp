@@ -58,7 +58,9 @@ browser serve mcp --port 4099
 
 - The default port is `4099`.
 - `serve mcp` starts no browser. An agent calls `browser_create`, or a first `fetch_page` creates one.
-- The server binds all interfaces and has no authentication. Keep it local.
+- The server binds `127.0.0.1` by default and it has no authentication.
+- Pass `--bind 0.0.0.0` to listen on all interfaces. The server prints a warning when it does.
+- A wildcard bind prints `http://[::]:<port>`. Put a reachable host in the client URL.
 
 ```sh
 browser serve mcp --port 4099 --profile brave --bin brave-browser   # persistent profile
@@ -100,20 +102,22 @@ Connect an MCP client:
 - Proxy support includes credentials, a bypass list, and `ignore_certs`.
 - Replay sends a captured request through Go. It carries the page cookies and follows redirects.
 
-### Reads: `page_fetch` has 17 aspects
+### Reads: `page_fetch` has 19 aspects
 
 - Document: `html`, `text`, `dom`, `links`, `meta`.
 - Sources: `css`, `js`, and `body` for one resource.
 - Pixels: `screenshot`, and `marks` for numbered boxes over a screenshot.
-- Action map: `interactives` reports 200 visible elements with handles and centre points.
+- Action map: `interactives` reports 200 visible elements with handles, centre points, and size.
 - Accessibility: `a11y` reports 400 nodes with role, name, value, state flags, and handles.
 - Runtime: `network` with request and response headers. `console` for logs.
 - Text: `article` returns the readable body as markdown.
 - Security: `security` audits headers, CSP, cookie flags, mixed content, and form targets.
 - State: `storage` reports cookies with flags, local and session storage, IndexedDB and caches. Values
   are redacted by default.
+- Tracer: `sinks` reports source-to-sink hits. It is read-only. Arm it with `page_act sinks_install`.
+- Export: `har` returns HAR 1.2 for the observed network traffic.
 
-### Actions: `page_act` has 21 actions
+### Actions: `page_act` has 23 actions
 
 - Mouse: `click`, `click_at`, `hover`, `hover_at`, `drag_and_drop`.
 - Keyboard: `input`, `type`, `press_key` with combos such as `Control+a`.
@@ -121,6 +125,7 @@ Connect an MCP client:
 - Navigation: `navigate`, `back`, `forward`, `reload`.
 - View and time: `scroll`, `wait`, `set_viewport`, `emulate`.
 - Code and logs: `eval`, `clear_logs`.
+- Tracer: `sinks_install`, `sinks_clear`. Both take no payload.
 - Network: `replay`.
 
 ### Surfaces
@@ -130,6 +135,22 @@ Connect an MCP client:
   `timeout`, `nav_failed`, `unknown`.
 - The CLI mirrors the tools and adds the daemon lifecycle.
 - IPC is JSON-RPC 2.0 over a Unix socket with mode `0600`.
+
+### Security lane
+
+Use these on a target you are authorized to test.
+
+1. `page_act sinks_install` arms the source-to-sink tracer.
+2. Send a payload. For example, put a canary in the URL hash and push it into a sink.
+   ```js
+   () => { document.body.innerHTML = location.hash }
+   ```
+3. `page_fetch what=sinks` reports `source`, `sink`, `value`, the call stack, and the selector.
+4. `page_act sinks_clear` empties the ring. `browser_close` ends the test.
+
+The arm survives a full navigation. The hit ring restarts for each document.
+`page_fetch what=har` exports the observed traffic for Burp, Caido, or ZAP.
+`page_fetch what=security` audits the response headers and the cookies.
 
 ---
 
@@ -205,19 +226,21 @@ template. It names the tools. You still call them.
 
 ## Page aspects
 
-`what` accepts 17 values. `selector` scopes `html` and `text`. `max_bytes` defaults to 50000.
+`what` accepts 19 values. `selector` scopes `html` and `text`. `max_bytes` defaults to 50000.
 `full_page` applies to `screenshot`.
 
 | `what` | Returns |
 | :--- | :--- |
 | `dom` | The DOM tree with frames and shadow roots. Each element has `tag`, `id`, `class`, `attrs`, `text`, `handle`, `visible`, `bounds`, `frame_url`, and `children`. |
-| `interactives` | `{interactives:[{handle, role, text, href, type, x, y, visible}], truncated}`. Capped at 200 visible elements. |
+| `interactives` | `{interactives:[{handle, role, text, href, type, x, y, width, height, visible}], truncated}`. Capped at 200 visible elements. `x`/`y` are the element centre, so `left = x - width/2`. `marks` reports the top-left instead. |
 | `a11y` | `{nodes:[{handle?, depth, role, name?, value?, states?}], count, truncated}`. DFS order, capped at 400. Root frame only. |
-| `network` | `{entries:[{method, url, type?, status?, mime?, bytes?, ms?, failed?, error?, seq}], count, dropped, truncated}`. Headers included. Newest 100 of a 200-entry ring. |
+| `network` | `{entries:[{method, url, type?, status?, mime?, bytes?, ms?, failed?, error?, seq}], count, dropped, truncated}`. Headers included. One entry per redirect hop. Newest 100 of a 200-entry ring. |
 | `console` | The same envelope over `{level, text, source?, line?, seq}`. |
 | `article` | `{title, byline?, excerpt?, text, words, truncated, url}` as markdown. Capped at 40000 runes. |
-| `marks` | `{marks:[{index, role, text?, x, y, width, height}], viewport_width, viewport_height, truncated}` plus an annotated PNG. Capped at 60 marks. |
+| `marks` | `{marks:[{index, role, text?, x, y, width, height}], viewport_width, viewport_height, truncated}` plus an annotated PNG. `x`/`y` are the top-left. Capped at 60 marks. |
 | `security` | `{checks:[{id, status, evidence, detail}], count}`. A passive audit. |
+| `sinks` | `{installed, hits:[{source, sink, context, value, stack, selector, ts}], dropped, truncated}`. Read-only. Capped at 100 hits from a 200-hit ring. |
+| `har` | HAR 1.2 `{log:{version, creator, pages, entries[]}}` for the observed traffic. Capped at 512 KiB. `Authorization` and `X-CSRF-Token` read `<redacted>`. |
 | `storage` | `{cookies, local_storage, session_storage, indexed_db, caches}`. Values are `<redacted>` unless `include_values` is true. |
 | `links` | `[{text, href, handle?}]`. Deduped, non-navigable schemes removed. |
 | `meta` | `{title, url, meta:[{name/property/http-equiv/content/charset}]}`. |

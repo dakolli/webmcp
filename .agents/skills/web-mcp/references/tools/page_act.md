@@ -9,7 +9,7 @@ Interact with a live page that `fetch_page` opened.
 `page_act` performs one action in an open session. The `session_id` picks the tab, the
 `action` field picks the operation. Actions cover clicking, typing, keys, mouse
 coordinates, drag, upload, JavaScript, navigation, waiting, emulation, log clearing,
-replaying a captured network request, and draft sink control.
+replaying a captured network request, and sink control.
 
 The confirmation rides the result envelope: the full reply is
 `{"ok":true,"data":<payload>}`. See `SKILL.md` for the envelope rules and the
@@ -24,7 +24,7 @@ required. Actions ignore fields they do not use.
 | Name | Type | Required by | Default | Meaning |
 | :--- | :--- | :--- | :--- | :--- |
 | `session_id` | string | always | — | Tab from `fetch_page`, for example `page-3`. |
-| `action` | string | always | — | One of the actions below. `sinks_install` and `sinks_clear` are draft. |
+| `action` | string | always | — | One of the actions below. |
 | `selector` | string | `click`, `input`, `type`, `hover`, `select`, `upload_file` | — | CSS selector or XPath. Optional for `press_key` and the drag source. |
 | `handle` | string | alternative to `selector` | — | Handle from `page_fetch` `what=interactives\|dom\|links`. Wins over `selector`. |
 | `value` | string | `eval`, `navigate`, `input`, `type`, `select`, `replay` | — | Payload text, JavaScript source, URL, or option value. For `replay` it replaces the request body and is sent only when the field is present. |
@@ -71,8 +71,8 @@ it touches the page. For `upload_file`, pass `paths` (a single `value` path also
 | `set_viewport` | `viewport` | Applies a manual width and height override. | `set viewport to 800x600` | No. |
 | `emulate` | `device` | Applies a device preset, or clears it. | `emulated device: IPhoneX` | No. |
 | `clear_logs` | — | Empties the network and console rings. | `{"network":132,"console":1}` | No. |
-| `sinks_install` | — | Arms the source-to-sink tracer. Draft. Idempotent. | `{"installed":true}` | No. |
-| `sinks_clear` | — | Empties the tracer ring and resets `dropped`. Draft. | `{"cleared":N}` | No. |
+| `sinks_install` | — | Arms the source-to-sink tracer. Idempotent. | `{"installed":true}` | No. |
+| `sinks_clear` | — | Empties the tracer ring and resets `dropped`. | `{"cleared":N}` | No. |
 | `replay` | `target` | Resends one captured network entry. See below. | Compact JSON result. | No. |
 
 A non-positive `click_count` becomes `1`. An unknown `button` is rejected before the
@@ -150,13 +150,13 @@ The recipe is `clear_logs`, then one action, then `page_fetch` `network` or `con
 
 ### Sinks tracer
 
-**Draft — not in the built server yet. Every value below follows the WEB-157 to WEB-159 spec.**
+**Tested live on 2026-10-26 against `https://www.postgresql.org/`.**
 
-`sinks_install` arms the source-to-sink tracer on the page and returns `{"installed":true}`. A second call is a no-op. The arm step is opt-in because instrumentation wraps page setters and constructors and changes page behavior. The script survives a full navigation and re-arms before the new document's own scripts, but the hit ring is per document, so a navigation starts a fresh ring. A client-side route change keeps the ring.
+`sinks_install` arms the source-to-sink tracer on the page and returns `{"installed":true}`. A second call is a no-op. The arm step is opt-in because instrumentation wraps page setters and constructors and changes page behavior. The script survives a full navigation and re-arms before the new document's own scripts, but the hit ring is per document, so a navigation starts a fresh ring that the new document's own scripts can fill at once. A client-side route change keeps the ring.
 
-`sinks_clear` empties the ring and resets `dropped`. It returns `{"cleared":N}` and returns `{"cleared":0}` on an unarmed page. Both actions take only `session_id` and `action`. The unknown-action message gains both names after registration.
+`sinks_clear` empties the ring and resets `dropped`. It returns `{"cleared":N}` and returns `{"cleared":0}` on an unarmed page. Both actions take only `session_id` and `action`, and the CLI rejects a payload for either.
 
-Recipe: 1. `sinks_install`. 2. Navigate or click. 3. `page_fetch what=sinks`. 4. `sinks_clear`. Read the payload, caps, and unarmed shape in [page_fetch.md](page_fetch.md).
+Probe order: 1. `sinks_install`. 2. Send the payload with a navigation, a click, or `eval`. 3. Read `page_fetch what=sinks`. 4. `sinks_clear` when done. Read the payload, caps, and unarmed shape in [page_fetch.md](page_fetch.md).
 
 ### Replay with what=network as the source
 
@@ -203,7 +203,7 @@ An absent selector for `click`, `input`, `hover` or `select` fails immediately w
 | `set_viewport` without `viewport` | `page_act: set_viewport requires a viewport` | Pass `width` and `height`. |
 | Non-positive viewport | `page_act: viewport width and height must be positive` | Send positive integers. |
 | Unknown session | `page_act: session "page-999" not found` | Use `page_list` or `fetch_page`. |
-| Unknown action | `page_act: unknown action="konami" (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, replay)` | Use a listed action. |
+| Unknown action | `page_act: unknown action="konami" (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay)` | Use a listed action. |
 | Unknown button | `page_act: click: unknown mouse button "back" (must be left, right, or middle)` | Use `left`, `right`, or `middle`. |
 | `upload_file` without paths | `page_act: upload_file: no file paths provided` | Pass `paths` or `value`. |
 | `interactable` without a target | `page_act: wait: interactable mode requires a selector or handle` | Add a target. |
@@ -233,7 +233,7 @@ normal browsing, because instrumentation changes page behavior.
 
 - 2026-10-25 — input, type, press_key, select, upload, clicks, hover, scroll, keyboard combo, drag, navigate, back/forward/reload, eval, clear_logs, viewport, emulate, and miss-path errors.
 - 2026-10-26 — replay ambiguity failure on `https://news.ycombinator.com/news`, and submit-click with a state delta in `data`.
-- Draft `sinks_install` and `sinks_clear` have no live test. Their values come from the WEB-157 to WEB-159 spec.
+- 2026-10-26 — `sinks_install`, a payload, and `page_fetch what=sinks` on `https://www.postgresql.org/`. The arm survived a full navigation and `sinks_clear` returned `{"cleared":N}`.
 
 ## Related tools
 

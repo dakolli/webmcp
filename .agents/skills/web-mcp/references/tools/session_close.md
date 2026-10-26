@@ -26,13 +26,13 @@ Pass the id as a string, for example `"page-2"`. Do not pass a bare number.
 
 The success payload rides inside the result envelope, so the full reply is `{"ok":true,"data":<payload>}`. See `SKILL.md` for the envelope rules and the `{"ok":false,"error":…}` shape.
 
-The payload is one prose string inside `data`. Source (`code://pkg/mcp/tools/session_tools.go#L88`), tested live on 2026-10-26:
+The payload is one prose string inside `data`. Source (`code://pkg/mcp/tools/session_tools.go#L88`), tested live on 2026-10-26 on `https://www.iana.org/`:
 
 ```json
-{"ok":true,"data":"session page-1 closed"}
+{"ok":true,"data":"session page-1 closed (browser browser-1) — tab released"}
 ```
 
-The id in the string is the exact value you sent. There is no state delta and no count.
+The string names the exact id you sent and the browser that owned it. There is no state delta and no count.
 
 ## Behavior and limits
 
@@ -85,7 +85,7 @@ Recovery in all cases: a close is final. Do not retry. Read live ids with `sessi
 ## Tested calls
 
 - 2026-10-25 — close, missing id, empty id, unknown id, double close. Exact message strings recorded live.
-- 2026-10-26 — success envelope tested live: `{"ok":true,"data":"session page-1 closed"}`. Failure envelopes for the same message strings verified live across the shared dispatch (`page_fetch`, `page_act`) in the same session.
+- 2026-10-26 — success envelope tested live on `https://www.iana.org/`: `{"ok":true,"data":"session page-1 closed (browser browser-1) — tab released"}`. Failure envelopes for the same message strings verified live across the shared dispatch (`page_fetch`, `page_act`) in the same session.
 
 ## When not to use it
 

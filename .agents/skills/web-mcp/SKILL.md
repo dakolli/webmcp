@@ -62,10 +62,10 @@ Install or refresh this skill with `browser skill <harness|path|.>`. With no arg
 ## Cross-cutting rules
 
 1. Call `browser_list` before you use a `browser_id`. Confirm the id and its `profile_dir`.
-2. If your client does not show `persist` or `owner`, reconnect it before you create a browser.
+2. If your client does not show `persist` or `owner`, reconnect it before you create a browser. Reconnect it when a cached `page_fetch` `what` enum lacks `har`, `sinks`, or `storage`, because the live enum has 19 values.
 3. Never close `browser-1` unless the user asks for a full reset. Never call `browser_close` with an empty `browser_id` in a shared session. A misspelled `browser` key is ignored and becomes an empty id. Use the exact key `browser_id`.
 4. Use one browser per agent and task. Page ids collide across browsers, and `page_fetch` and `page_act` resolve an id across live browsers.
-5. `session_close` is not browser-scoped. It closes the tab in the default browser. For a tab in a secondary browser, use `browser_close` with your own id.
+5. `session_close` resolves the page through the browser that owns it and returns `session page-N closed (browser browser-N)`. Page ids still collide across browsers, so pass the exact id.
 6. `session_list` reads every live browser and identity. Use `page_list` with a required `browser_id` for one browser. Both report the live URL and title, refreshed after navigation and redirects.
 7. An unknown `browser_id` can create a new browser. A typo spends a full Chromium process. Verify the id first.
 8. `fetch_page` creates a new session on every call. Close sessions you no longer need.
@@ -120,7 +120,7 @@ Each tool reference states only its own payload and its failure types, and links
 
 ## Known live-server limits
 
-- `page_fetch` large aspects bypass `max_bytes`: `interactives`, `a11y`, `network`, `console`, `article`, `marks`, and `screenshot`. The client can cut the response.
+- `page_fetch` large aspects bypass `max_bytes`: `interactives`, `a11y`, `network`, `console`, `article`, `marks`, `screenshot`, `sinks`, `storage`, and `har`. The client can cut the response.
 - `page_fetch` `dom` truncation can return an empty `items` array for one huge document. A larger `max_bytes` does not always help.
 - `page_fetch` `css` and `js` lists are cut as plain text. A cut list is not valid JSON.
 - `fetch_page` `browser_id` is not checked. It can launch a new browser with a literal unknown id.
@@ -154,4 +154,4 @@ Keep these shapes in the rotation, with a new host each time:
 - All 9 tools have a tested reference and an example.
 - The result envelope is documented once here and referenced from every tool page.
 - Lifecycle, proxy, scope, headers, `what=body`, `what=security` and `page_act replay` are documented.
-- Open extension work: `sinks` and `canary` are engine-only and not on the tool surface yet.
+- `sinks` is on the tool surface: `sinks_install` → `what=sinks` → `sinks_clear`. `canary` stays engine-only.
