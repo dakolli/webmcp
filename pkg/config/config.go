@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // DirName is the base configuration directory name under user config.
@@ -20,6 +21,27 @@ type Config struct {
 	DefaultProfile string `json:"default_profile,omitempty"`
 	// BinPaths maps browser names ("brave", "chrome", "firefox") to custom binary paths.
 	BinPaths map[string]string `json:"bin_paths,omitempty"`
+	// BrowserTTL is the browser idle timeout as a Go duration string (e.g.
+	// "30m"); "0" or a negative value disables browser sweeping. Absent or
+	// unparsable values fall back to the engine default.
+	BrowserTTL string `json:"browser_ttl,omitempty"`
+}
+
+// BrowserIdleTTL parses BrowserTTL, returning def when the key is absent or
+// unparsable. A parsed zero or negative duration disables browser sweeping.
+func (c *Config) BrowserIdleTTL(def time.Duration) time.Duration {
+	if c == nil {
+		return def
+	}
+	raw := strings.TrimSpace(c.BrowserTTL)
+	if raw == "" {
+		return def
+	}
+	ttl, err := time.ParseDuration(raw)
+	if err != nil {
+		return def
+	}
+	return ttl
 }
 
 // ConfigDir returns the absolute path to ~/.config/browser-mcp (or $XDG_CONFIG_HOME/browser-mcp).

@@ -36,6 +36,7 @@ import (
 
 	"webmcp/pkg/browsers"
 	"webmcp/pkg/cli/cmd"
+	"webmcp/pkg/config"
 )
 
 func main() {
@@ -44,10 +45,19 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// The shared manager: headful Chromium, stealth on — the engine defaults.
-	// Constructed once and injected into the root command so every subcommand
-	// operates on the SAME browser (mirrors cmd/mcp/main.go's registry wiring).
-	mgr := browsers.NewManager()
+	// The shared manager: headful Chromium, stealth on, ephemeral profiles by
+	// default (a caller opts into persistence), and the configured browser idle
+	// TTL. Constructed once and injected into the root command so every
+	// subcommand operates on the SAME browser (mirrors cmd/mcp/main.go's
+	// registry wiring).
+	ttl := browsers.DefaultBrowserTTL
+	if cfg, err := config.LoadConfig(); err == nil {
+		ttl = cfg.BrowserIdleTTL(ttl)
+	}
+	mgr := browsers.NewManager(
+		browsers.WithPersistentDefault(false),
+		browsers.WithBrowserTTL(ttl),
+	)
 	defer mgr.Shutdown(context.Background()) // graceful teardown (best-effort)
 
 	if err := cmd.NewRootCmd(mgr).ExecuteContext(ctx); err != nil {

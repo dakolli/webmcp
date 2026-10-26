@@ -6,13 +6,16 @@ package cmd
 // exact error for anything else.
 
 import (
+	"bytes"
 	"context"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
 
 	"webmcp/pkg/browsers"
+	"webmcp/pkg/cli/ipc"
 )
 
 // TestExplicitBrowserID pins WEB-133's flag-explicitness rule: an omitted
@@ -117,5 +120,64 @@ func TestNormalizeFocusState(t *testing.T) {
 				t.Errorf("normalizeFocusState(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestValidateCloseCleanup pins the CLI half of browser_close's cleanup rules:
+// the three refusal sentences match the MCP tool, and a plain close is allowed.
+func TestValidateCloseCleanup(t *testing.T) {
+	tests := []struct {
+		name       string
+		idExplicit bool
+		purge      bool
+		prune      bool
+		wantErr    string
+	}{
+		{"plain close", false, false, false, ""},
+		{"purge with id", true, true, false, ""},
+		{"prune alone", false, false, true, ""},
+		{"purge and prune", true, true, true, "purge and prune are mutually exclusive — pass purge with a browser_id, or prune alone"},
+		{"prune with id", true, false, true, "prune takes no browser_id — it closes all browsers and cleans orphan ephemeral profiles; use purge with browser_id to delete one profile"},
+		{"purge without id", false, true, false, "purge requires a browser_id — pass the browser whose profile to delete, or use prune to clean orphan ephemeral profiles"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateCloseCleanup(tt.idExplicit, tt.purge, tt.prune)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateCloseCleanup = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || err.Error() != tt.wantErr {
+				t.Fatalf("validateCloseCleanup = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestPrintBrowserEntries pins the human list shape: owner, persist, ttl and
+// profile_dir are all present, and pages stay indented under their browser.
+func TestPrintBrowserEntries(t *testing.T) {
+	var buf bytes.Buffer
+	printBrowserEntries(&buf, []ipc.BrowserEntry{{
+		BrowserID:  "browser-2",
+		Owner:      "scraper-a",
+		Bin:        "brave",
+		ProfileDir: "profiles/.ephemeral/browser-2-x",
+		Persist:    false,
+		TTL:        "30m0s",
+		Pages:      []browsers.PageInfo{{ID: "page-1", URL: "https://example.com"}},
+	}})
+
+	got := buf.String()
+	for _, want := range []string{
+		"browser_id: browser-2 (owner: scraper-a, persist: false, ttl: 30m0s, bin: brave)",
+		"  profile_dir: profiles/.ephemeral/browser-2-x",
+		"  page-1\thttps://example.com",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output missing %q:\n%s", want, got)
+		}
 	}
 }

@@ -1,6 +1,6 @@
 ---
 name: web-mcp
-description: Drive a live, stateful Chromium browser over MCP. Open pages (sessions) inside a persistent browser instance, inspect page state (meta, text, links, DOM snapshot, HTML, CSS/JS resources, screenshot), and execute interactions (click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, scroll, select, wait, set_viewport, emulate). Use whenever a real browser is needed for scraping JS-rendered content, testing web UIs, filling forms, exploring multi-page sites, or verifying live web behavior.
+description: Drive a live, stateful Chromium browser over MCP. Open pages (sessions) inside a live browser instance, inspect page state (meta, text, links, DOM snapshot, HTML, CSS/JS resources, screenshot), and execute interactions (click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, scroll, select, wait, set_viewport, emulate). Use whenever a real browser is needed for scraping JS-rendered content, testing web UIs, filling forms, exploring multi-page sites, or verifying live web behavior.
 disable-model-invocation: true
 ---
 
@@ -13,11 +13,13 @@ Drive Chromium via MCP tools using stateful sessions, structured DOM/text extrac
 ## Core Architecture and Mental Model
 
 - **Browser (`browser_id`, e.g., `browser-1`)**: The underlying Chromium/Brave process managed by the server. Created lazily or via `browser_create`, closed with `browser_close`. Auto-detects Brave (`brave-browser` / `brave`) as the default browser when available.
-- **Profiles**: `browser-1` uses the persistent profile at `~/.config/browser-mcp/profiles/<browser_name>` (e.g. `profiles/brave` or `profiles/default`) and keeps cookies, storage, and logins across runs. A bare `profile` name resolves under the config dir, an absolute path is used as given, and a relative path is rejected. A secondary `browser-N` is ephemeral by default and its profile is removed on close. Pass `persist: true` with a profile name to keep it. `browser_create` with **no options** reuses a live `browser-1`; passing any option creates a new `browser-N`.
+- **Profiles and lifecycle**: Browsers are **ephemeral by default** — the profile lives under `~/.config/browser-mcp/profiles/.ephemeral/` and is deleted on close. Pass `persist: true` (with an optional `profile` name) only when the workflow needs logins or cookies to survive restarts. `browser-1` is just the first id minted, not a shared singleton. Closing is the normal end; idle browsers are swept automatically.
+- **Ownership**: `browser_create` is idempotent for the same owner + options and returns the same `browser_id`. Pass `owner` to claim a browser when several agents share one session: different owners get separate browsers; ownership is informational (any `browser_close` may close any id).
 - **Sessions expire**: idle pages are closed after 15 minutes, and a crashed Chromium is relaunched under the same `browser_id`. A vanished `session_id` is normal — re-open the URL rather than retrying it.
+- **Browsers expire**: a browser idle for 30 minutes is closed automatically (configurable with `browser_ttl` in `~/.config/browser-mcp/config.json`; `"0"` disables). `browser_list` shows the current `idle_for` and `ttl`, so read it before assuming a browser still exists.
 - **Session (`session_id`, e.g., `page-1`, `page-2`)**: A distinct browser tab created by `fetch_page`. All read (`page_fetch`) and interaction (`page_act`) operations require a valid `session_id`.
 - **Navigation Continuity**: A session maintains state across navigations, redirects, and history traversal (`back`/`forward`). Reading after a navigation reads the new page.
-- **Resource Management**: Always close sessions with `session_close` and shut down browsers with `browser_close` when workflows conclude.
+- **Resource Management**: Always close sessions with `session_close` and shut down browsers with `browser_close` when workflows conclude. Closing is the designed end of the lifecycle; leave a browser open only while you are using it.
 
 ---
 
@@ -27,9 +29,9 @@ Drive Chromium via MCP tools using stateful sessions, structured DOM/text extrac
 
 | Tool | Parameters | Purpose and Returns |
 |---|---|---|
-| `browser_create` | `{ bin?: string, profile?: string, persist?: boolean, headless?: boolean, stealth?: boolean, position?: "left"\|"right"\|"max"\|"normal" }` | Launches a browser instance. Returns `{ browser_id }`. Omit all options to reuse `browser-1`. A bare `profile` resolves under the browser-mcp profiles dir. Secondary browsers are ephemeral unless `persist: true`. |
-| `browser_list` | `{}` | Lists all active browsers and their pages. |
-| `browser_close` | `{ browser_id?: string }` | Terminates that Chromium instance and all its open tabs, or every browser when `browser_id` is empty. An unknown id fails with `browser "browser-42" not found (running: browser-1)`. |
+| `browser_create` | `{ bin?: string, profile?: string, owner?: string, persist?: boolean, headless?: boolean, stealth?: boolean, position?: "left"\|"right"\|"max"\|"normal" }` | Creates or reuses a browser. Ephemeral by default: the profile is deleted on close. Pass `persist: true` (with a `profile` name) only to keep logins across restarts. `owner` (1–64 chars: `A-Za-z0-9._-`) joins the create key, so the same owner + options reuses the same id. A bare `profile` resolves under the browser-mcp profiles dir; relative paths are rejected. Returns compact JSON `{ browser_id, owner, persist, ttl, reused }`. |
+| `browser_list` | `{}` | Lists live browsers as compact JSON: `browser_id`, `owner`, `bin`, `profile_dir`, `persist`, `ephemeral`, `created_at`, `idle_for`, `ttl`, `pages`. Returns `[]` when none are running. Use it to see what you own and what to close. |
+| `browser_close` | `{ browser_id?: string, purge?: boolean, prune?: boolean }` | Closes that browser and all its pages, or every browser when `browser_id` is empty. `purge: true` (with `browser_id`) also deletes that profile under `~/.config/browser-mcp/profiles` — the only way to delete a named persistent profile. `prune: true` (no `browser_id`) closes all browsers and removes orphan `profiles/.ephemeral/` dirs; named profiles are never deleted. An unknown id fails with `browser "browser-42" not found (running: browser-1)`. |
 | `fetch_page` | `{ url: string, browser_id?: string, wait_for?: "load"\|"idle"\|"stable", timeout_ms?: number, viewport?: { width, height }, device?: string, user_agent?: string }` | Opens URL in a new tab. `wait_for` defaults to `"idle"` when omitted. On JS-heavy sites (bot WAFs, trackers, infinite polling) the idle network-wait can stall, so pass `"load"` or `"stable"` there. Pass `device` (e.g. `"IPhoneX"`) to apply emulation *before* navigation. Returns `{ session_id, title, url, text_snippet, html_bytes, load_ms }`. |
 | `session_list` | `{}` | Lists live sessions as `[{ id, url }]` (today: the default browser's pages only). |
 | `session_close` | `{ session_id: string }` | Closes tab and invalidates `session_id`. |
@@ -295,7 +297,7 @@ Use `marks` when selectors are unreliable (icon-only buttons, canvas widgets) or
 
 ```
 1. browser_create
-   -> { browser_id: "browser-1" }
+   -> { browser_id: "browser-1", owner: "unowned", persist: false, ttl: "30m0s", reused: false }
 
 2. fetch_page { url: "https://news.google.com", wait_for: "load" }
    -> { session_id: "page-1", title: "Google News", ... }

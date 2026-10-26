@@ -15,6 +15,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"webmcp/pkg/browsers"
 )
 
 // TestClientPingRoundTrip drives the full client/server stack: Dial + Ping
@@ -379,3 +381,123 @@ func TestStubEngineErrorSurfacing(t *testing.T) {
 
 // compile-time guard: stubbedManager satisfies the manager seam.
 var _ manager = (*stubbedManager)(nil)
+
+// TestBrowserOpenOwnerWirePins pins browser.open's owner rule: an invalid
+// label is a -32602 with the same sentence browser_create uses, a valid one
+// reaches the engine.
+func TestBrowserOpenOwnerWirePins(t *testing.T) {
+	path := startServer(t, newStubServer())
+	c, err := Dial(path)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	ctx := context.Background()
+
+	err = c.Call(ctx, MethodBrowserOpen, BrowserOpenParams{Owner: "bad owner"}, nil)
+	var se *ServerError
+	if !errors.As(err, &se) {
+		t.Fatalf("Call error = %v (%T), want a wrapped *ServerError", err, err)
+	}
+	if se.Code != CodeInvalidParams {
+		t.Errorf("code = %d, want %d (-32602)", se.Code, CodeInvalidParams)
+	}
+	want := `owner "bad owner" is invalid — use 1 to 64 characters from A-Z, a-z, 0-9, '.', '_' and '-' only`
+	if se.Message != want {
+		t.Errorf("message = %q, want %q", se.Message, want)
+	}
+
+	if err := c.Call(ctx, MethodBrowserOpen, BrowserOpenParams{Owner: "scraper-a"}, nil); err != nil {
+		t.Fatalf("browser.open with a valid owner: %v", err)
+	}
+}
+
+// TestBrowserCloseCleanupWirePins pins browser.close's purge/prune wire shape:
+// the three refusal sentences match browser_close, prune reports the removed
+// count, and purge closes one profile.
+func TestBrowserCloseCleanupWirePins(t *testing.T) {
+	stub := &stubbedManager{
+		browser: browsers.NewBrowser("browser-1", context.Background(), false, false, "", ""),
+		pruneN:  2,
+	}
+	path := startServer(t, newServer(stub))
+	c, err := Dial(path)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	ctx := context.Background()
+
+	refusals := []struct {
+		name   string
+		params BrowserCloseParams
+		want   string
+	}{
+		{"purge and prune", BrowserCloseParams{BrowserID: "browser-1", Purge: true, Prune: true},
+			"purge and prune are mutually exclusive — pass purge with a browser_id, or prune alone"},
+		{"prune with id", BrowserCloseParams{BrowserID: "browser-1", Prune: true},
+			"prune takes no browser_id — it closes all browsers and cleans orphan ephemeral profiles; use purge with browser_id to delete one profile"},
+		{"purge without id", BrowserCloseParams{Purge: true},
+			"purge requires a browser_id — pass the browser whose profile to delete, or use prune to clean orphan ephemeral profiles"},
+	}
+	for _, tt := range refusals {
+		t.Run(tt.name, func(t *testing.T) {
+			err := c.Call(ctx, MethodBrowserClose, tt.params, nil)
+			var se *ServerError
+			if !errors.As(err, &se) {
+				t.Fatalf("Call error = %v (%T), want a wrapped *ServerError", err, err)
+			}
+			if se.Code != CodeInvalidParams || se.Message != tt.want {
+				t.Fatalf("got code=%d message=%q, want code=%d message=%q",
+					se.Code, se.Message, CodeInvalidParams, tt.want)
+			}
+		})
+	}
+
+	var pruneRes BrowserCloseResult
+	if err := c.Call(ctx, MethodBrowserClose, BrowserCloseParams{Prune: true}, &pruneRes); err != nil {
+		t.Fatalf("browser.close prune: %v", err)
+	}
+	if want := "all browsers closed; pruned 2 orphan ephemeral profile(s)"; pruneRes.Message != want {
+		t.Errorf("prune message = %q, want %q", pruneRes.Message, want)
+	}
+
+	var purgeRes BrowserCloseResult
+	if err := c.Call(ctx, MethodBrowserClose, BrowserCloseParams{BrowserID: "browser-1", Purge: true}, &purgeRes); err != nil {
+		t.Fatalf("browser.close purge: %v", err)
+	}
+	if want := "browser browser-1 closed and its profile deleted"; purgeRes.Message != want {
+		t.Errorf("purge message = %q, want %q", purgeRes.Message, want)
+	}
+	if len(stub.purged) != 1 || stub.purged[0] != "browser-1" {
+		t.Errorf("purged ids = %v, want [browser-1]", stub.purged)
+	}
+}
+
+// TestBrowserListLifecycleFields pins the browser.list entry shape: the
+// lifecycle fields an agent needs are present alongside the existing id/bin/
+// profile_dir/pages contract.
+func TestBrowserListLifecycleFields(t *testing.T) {
+	b := browsers.NewBrowser("browser-1", context.Background(), false, false, "brave", "profiles/default")
+	path := startServer(t, newServer(&stubbedManager{browser: b}))
+	c, err := Dial(path)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+
+	var res BrowserListResult
+	if err := c.Call(context.Background(), MethodBrowserList, nil, &res); err != nil {
+		t.Fatalf("browser.list: %v", err)
+	}
+	if len(res.Browsers) != 1 {
+		t.Fatalf("browsers = %d, want 1", len(res.Browsers))
+	}
+	entry := res.Browsers[0]
+	if entry.BrowserID != "browser-1" || entry.Owner != "unowned" || !entry.Persist {
+		t.Errorf("entry = %+v, want browser-1/unowned/persist", entry)
+	}
+	if entry.ProfileDir != "profiles/default" || entry.Bin != "brave" {
+		t.Errorf("entry profile_dir/bin = %q/%q, want profiles/default/brave", entry.ProfileDir, entry.Bin)
+	}
+	if entry.TTL != "0s" || entry.CreatedAt.IsZero() {
+		t.Errorf("entry ttl/created_at = %q/%v, want 0s/non-zero", entry.TTL, entry.CreatedAt)
+	}
+}

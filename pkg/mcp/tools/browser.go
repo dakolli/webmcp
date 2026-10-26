@@ -4,19 +4,37 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
 
 	"webmcp/pkg/browsers"
 	"webmcp/pkg/mcp/models"
 )
 
-// singleBrowserID is the id reported for the manager's one Browser. The Manager
-// owns a single Browser (AGENTS.md "Browser-first paradigm"); a browser_id →
-// Browser map is the planned growth path when multi-browser support lands.
-const singleBrowserID = "browser-1"
+// ownerPattern is the accepted shape of a caller-supplied owner label.
+var ownerPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
-// BrowserCreate implements the "browser_create" tool: it lazily launches the
-// manager's single Browser (a live Chromium instance) and returns its
-// browser_id so the agent can open pages inside it via fetch_page / page_list.
+// normalizeOwner trims and validates a caller-supplied owner label, returning
+// "" when none was supplied.
+func normalizeOwner(owner string) (string, error) {
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return "", nil
+	}
+	if !ownerPattern.MatchString(owner) {
+		return "", fmt.Errorf(
+			"owner %q is invalid — use 1 to 64 characters from A-Z, a-z, 0-9, '.', '_' and '-' only",
+			owner,
+		)
+	}
+	return owner, nil
+}
+
+// BrowserCreate implements the "browser_create" tool: it creates or reuses a
+// live Chromium browser owned by the calling client and returns its browser_id
+// so the agent can open pages inside it via fetch_page / page_list.
 type BrowserCreate struct {
 	// mgr is the shared browsers.Manager owning the single Browser.
 	mgr *browsers.Manager
@@ -35,21 +53,21 @@ func (t *BrowserCreate) Name() string {
 
 // Description returns a customer/LLM-facing description of browser_create.
 func (t *BrowserCreate) Description() string {
-	return "Lazily launches the shared live browser (Brave by default, or Chromium) and " +
-		"returns its browser_id (browser-1). Reuses browser-1 idempotently when running. " +
-		"browser-1 with no profile uses the persistent profile at " +
-		"~/.config/browser-mcp/profiles/<browser_name>. A bare profile name resolves under " +
-		"~/.config/browser-mcp/profiles; an absolute path is used as given and relative paths " +
-		"are rejected. Secondary browsers default to an ephemeral profile that is deleted on close. " +
-		"Set persist=true with a profile name to keep that profile (and its logins) after close. " +
-		"Passing any option (headless, profile, bin, …) creates a NEW browser id rather than " +
-		"reusing browser-1, and fails with a Chromium SingletonLock error if another running " +
-		"browser holds the same profile — pass a distinct profile name per browser. " +
-		"Local proxy for intercept tools, for example 127.0.0.1:8080. Do not set a remote proxy " +
-		"unless the user asks. Proxy credentials never go in a tool argument: put them in " +
-		"~/.config/browser-mcp/proxy.json (mode 0600), keyed by proxy host:port. " +
-		"Example: { \"proxy\": \"http://127.0.0.1:8080\", \"ignore_certs\": true }. " +
-		"Example: { \"headless\": true, \"profile\": \"audit\", \"persist\": true }."
+	return "Creates or reuses a live Chromium browser and returns its browser_id. " +
+		"Idempotent: calling again in the same session with identical options gets the same " +
+		"browser_id back, without launching a second process. Set owner to claim your own " +
+		"browser when several agents share one session: it joins the create key, so the same " +
+		"owner with the same options reuses one browser and a different owner gets a separate " +
+		"one. Browsers are EPHEMERAL by default: the profile lives under " +
+		"~/.config/browser-mcp/profiles/.ephemeral and is deleted when the browser closes, so " +
+		"close browsers you are done with (browser_close) and idle ones expire automatically. " +
+		"Pass persist=true (with an optional profile name) to keep a persistent profile and its " +
+		"logins across restarts. A bare profile name resolves under " +
+		"~/.config/browser-mcp/profiles; relative paths are rejected. Proxy: pass a local proxy " +
+		"such as 127.0.0.1:8080 for intercept tools; credentials never go in an argument — put " +
+		"them in ~/.config/browser-mcp/proxy.json (mode 0600). " +
+		"Example: { \"owner\": \"scraper-a\" } and { \"owner\": \"scraper-b\" } get two browsers; " +
+		"{ \"persist\": true, \"profile\": \"audit\" } keeps a profile."
 }
 
 // InputSchema returns the JSON Schema for browser_create's arguments: optional
@@ -68,7 +86,7 @@ func (t *BrowserCreate) InputSchema() models.InputSchema {
 			},
 			"persist": map[string]any{
 				"type":        "boolean",
-				"description": "Keep the profile (and its logins) after the browser closes. Default false: secondary browsers get an ephemeral profile deleted on close, while browser-1 with no explicit profile stays persistent.",
+				"description": "Keep the profile (and its logins) after the browser closes. Default false: the browser gets an ephemeral profile under profiles/.ephemeral that is deleted on close. Set true with a profile name to keep a persistent profile.",
 			},
 			"headless": map[string]any{
 				"type":        "boolean",
@@ -98,6 +116,12 @@ func (t *BrowserCreate) InputSchema() models.InputSchema {
 				"description": "Accept invalid TLS certificates, for example an intercept proxy's MITM CA. " +
 					"Independent of proxy: set it explicitly.",
 			},
+			"owner": map[string]any{
+				"type": "string",
+				"description": "Optional owner label for your agent (1 to 64 characters from A-Z, a-z, 0-9, '.', '_', '-'). " +
+					"Different owners with identical options get separate browsers; the same owner with the same options reuses one. " +
+					"Defaults to the session identity, else 'unowned'.",
+			},
 		},
 	}
 }
@@ -109,6 +133,7 @@ type browserCreateArgs struct {
 	Position    string `json:"position,omitempty"`
 	Proxy       string `json:"proxy,omitempty"`
 	ProxyBypass string `json:"proxy_bypass,omitempty"`
+	Owner       string `json:"owner,omitempty"`
 	Headless    *bool  `json:"headless,omitempty"`
 	Stealth     *bool  `json:"stealth,omitempty"`
 	Persist     *bool  `json:"persist,omitempty"`
@@ -122,6 +147,14 @@ func (t *BrowserCreate) Execute(ctx context.Context, args json.RawMessage) (stri
 		if err := json.Unmarshal(args, &a); err != nil {
 			return "", fmt.Errorf("browser_create: invalid arguments: %w", err)
 		}
+	}
+
+	owner, err := normalizeOwner(a.Owner)
+	if err != nil {
+		return "", fmt.Errorf("browser_create: %w", err)
+	}
+	if owner != "" {
+		ctx = browsers.WithExplicitOwner(ctx, owner)
 	}
 
 	var opts []browsers.Option
@@ -153,16 +186,39 @@ func (t *BrowserCreate) Execute(ctx context.Context, args json.RawMessage) (stri
 		opts = append(opts, browsers.WithStealth(*a.Stealth))
 	}
 
-	id, _, err := t.mgr.CreateBrowser(ctx, opts...)
+	created, err := t.mgr.Create(ctx, opts...)
 	if err != nil {
 		return "", fmt.Errorf("browser_create: %w", err)
 	}
 
-	data, err := json.Marshal(map[string]string{"browser_id": string(id)})
+	data, err := json.Marshal(newBrowserCreateResult(created))
 	if err != nil {
 		return "", fmt.Errorf("browser_create: %w", err)
 	}
 	return string(data), nil
+}
+
+// browserCreateResult is the compact create outcome: the browser_id plus the
+// lifecycle facts an agent needs to decide when to close it.
+type browserCreateResult struct {
+	BrowserID string `json:"browser_id"`
+	Owner     string `json:"owner"`
+	Persist   bool   `json:"persist"`
+	TTL       string `json:"ttl"`
+	Reused    bool   `json:"reused"`
+}
+
+// newBrowserCreateResult projects a create outcome into the bounded one-line
+// reply shape.
+func newBrowserCreateResult(created browsers.Created) browserCreateResult {
+	info := created.Browser.Info()
+	return browserCreateResult{
+		BrowserID: string(created.ID),
+		Owner:     info.Owner,
+		Persist:   info.Persist,
+		TTL:       info.TTL,
+		Reused:    created.Reused,
+	}
 }
 
 // Ensure BrowserCreate satisfies the Tool interface at compile time.
@@ -189,9 +245,11 @@ func (t *BrowserList) Name() string {
 
 // Description returns a customer/LLM-facing description of browser_list.
 func (t *BrowserList) Description() string {
-	return "Lists the live browser(s) with their open pages (id, url) as JSON. " +
-		"Returns an empty array when no browser is running yet. Use it to see " +
-		"what is alive before opening or closing pages or the browser."
+	return "Lists live browsers with their lifecycle state as compact JSON: browser_id, " +
+		"owner, bin, profile_dir, persist, ephemeral, created_at, idle_for (how long the " +
+		"browser has been unused), ttl (when idle cleanup closes it) and pages (id, url). " +
+		"Returns [] when none are running. Use it to see what you own and what to close; " +
+		"idle browsers expire automatically. Example: {}."
 }
 
 // InputSchema returns the JSON Schema for browser_list's arguments: none.
@@ -202,6 +260,40 @@ func (t *BrowserList) InputSchema() models.InputSchema {
 	}
 }
 
+// browserEntry is the compact lifecycle read-out for one live browser.
+type browserEntry struct {
+	BrowserID  string              `json:"browser_id"`
+	Owner      string              `json:"owner"`
+	Bin        string              `json:"bin,omitempty"`
+	ProfileDir string              `json:"profile_dir,omitempty"`
+	Persist    bool                `json:"persist"`
+	Ephemeral  bool                `json:"ephemeral"`
+	CreatedAt  time.Time           `json:"created_at"`
+	IdleFor    string              `json:"idle_for"`
+	TTL        string              `json:"ttl"`
+	Pages      []browsers.PageInfo `json:"pages"`
+}
+
+// browserListEntry projects a BrowserInfo snapshot and its pages into the
+// bounded listing shape.
+func browserListEntry(info browsers.BrowserInfo, pages []browsers.PageInfo) browserEntry {
+	if pages == nil {
+		pages = []browsers.PageInfo{}
+	}
+	return browserEntry{
+		BrowserID:  string(info.BrowserID),
+		Owner:      info.Owner,
+		Bin:        info.Bin,
+		ProfileDir: info.ProfileDir,
+		Persist:    info.Persist,
+		Ephemeral:  info.Ephemeral,
+		CreatedAt:  info.CreatedAt,
+		IdleFor:    info.IdleFor,
+		TTL:        info.TTL,
+		Pages:      pages,
+	}
+}
+
 // Execute returns the snapshot of all live browsers and their open pages.
 func (t *BrowserList) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	active := t.mgr.Browsers()
@@ -209,24 +301,19 @@ func (t *BrowserList) Execute(ctx context.Context, args json.RawMessage) (string
 		return "[]", nil
 	}
 
-	type browserEntry struct {
-		BrowserID  string              `json:"browser_id"`
-		Bin        string              `json:"bin,omitempty"`
-		ProfileDir string              `json:"profile_dir,omitempty"`
-		Pages      []browsers.PageInfo `json:"pages"`
+	ids := make([]string, 0, len(active))
+	for id := range active {
+		ids = append(ids, string(id))
+	}
+	sort.Strings(ids)
+
+	result := make([]browserEntry, 0, len(ids))
+	for _, id := range ids {
+		b := active[browsers.BrowserID(id)]
+		result = append(result, browserListEntry(b.Info(), b.Pages()))
 	}
 
-	var result []browserEntry
-	for id, b := range active {
-		result = append(result, browserEntry{
-			BrowserID:  string(id),
-			Bin:        b.BinPath(),
-			ProfileDir: b.ProfileDir(),
-			Pages:      b.Pages(),
-		})
-	}
-
-	data, err := json.MarshalIndent(result, "", "  ")
+	data, err := json.Marshal(result)
 	if err != nil {
 		return "", fmt.Errorf("browser_list: %w", err)
 	}
@@ -256,14 +343,19 @@ func (t *BrowserClose) Name() string {
 
 // Description returns a customer/LLM-facing description of browser_close.
 func (t *BrowserClose) Description() string {
-	return "Closes the live browser and all of its open pages, releasing the " +
-		"underlying Chromium process. Pass browser_id to close a specific browser, " +
-		"or omit to close all browsers. An unknown browser_id returns a not-found " +
-		"error listing the running ids — call browser_list first to confirm ids. " +
-		"Example: { \"browser_id\": \"browser-1\" } (omit to close all)."
+	return "Closes a live browser and all of its pages, releasing the Chromium process. " +
+		"Pass browser_id to close one browser, or omit to close all. purge=true also " +
+		"deletes that browser's profile directory (guarded: only paths under " +
+		"~/.config/browser-mcp/profiles; this is the only way to delete a named persistent " +
+		"profile). prune=true (with no browser_id) closes all browsers and deletes leftover " +
+		"profiles under profiles/.ephemeral that no live browser owns — named persistent " +
+		"profiles are never deleted by prune. Idle browsers expire on their own, but close " +
+		"explicitly when done; an unknown browser_id returns a not-found error listing live " +
+		"ids and owners. Example: { \"browser_id\": \"browser-2\", \"purge\": true }."
 }
 
-// InputSchema returns the JSON Schema for browser_close's arguments: an optional browser_id.
+// InputSchema returns the JSON Schema for browser_close's arguments: an optional
+// browser_id plus purge/prune cleanup flags.
 func (t *BrowserClose) InputSchema() models.InputSchema {
 	return models.InputSchema{
 		Type: "object",
@@ -272,6 +364,14 @@ func (t *BrowserClose) InputSchema() models.InputSchema {
 				"type":        "string",
 				"description": "Optional browser_id returned by browser_create to close. Omit to close all browsers.",
 			},
+			"purge": map[string]any{
+				"type":        "boolean",
+				"description": "After closing browser_id, delete its profile directory (must resolve under ~/.config/browser-mcp/profiles). Refused for paths outside it. Requires browser_id.",
+			},
+			"prune": map[string]any{
+				"type":        "boolean",
+				"description": "Close all browsers, then delete leftover directories under profiles/.ephemeral that no live browser owns. Named persistent profiles are never deleted. Pass without browser_id.",
+			},
 		},
 	}
 }
@@ -279,15 +379,40 @@ func (t *BrowserClose) InputSchema() models.InputSchema {
 // browserCloseArgs is the strict decoding target for browser_close arguments.
 type browserCloseArgs struct {
 	BrowserID string `json:"browser_id"`
+	Purge     bool   `json:"purge"`
+	Prune     bool   `json:"prune"`
 }
 
-// Execute closes the target browser or all browsers.
+// Execute closes the target browser or all browsers, optionally purging its
+// profile or pruning orphan ephemeral profiles.
 func (t *BrowserClose) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var a browserCloseArgs
 	if len(args) > 0 && string(args) != "{}" {
 		if err := json.Unmarshal(args, &a); err != nil {
 			return "", fmt.Errorf("browser_close: invalid arguments: %w", err)
 		}
+	}
+	if a.Purge && a.Prune {
+		return "", fmt.Errorf("browser_close: purge and prune are mutually exclusive — pass purge with a browser_id, or prune alone")
+	}
+	if a.Prune {
+		if a.BrowserID != "" {
+			return "", fmt.Errorf("browser_close: prune takes no browser_id — it closes all browsers and cleans orphan ephemeral profiles; use purge with browser_id to delete one profile")
+		}
+		removed, err := t.mgr.PruneProfiles(ctx)
+		if err != nil {
+			return "", fmt.Errorf("browser_close: %w", err)
+		}
+		return fmt.Sprintf("all browsers closed; pruned %d orphan ephemeral profile(s)", len(removed)), nil
+	}
+	if a.Purge {
+		if a.BrowserID == "" {
+			return "", fmt.Errorf("browser_close: purge requires a browser_id — pass the browser whose profile to delete, or use prune to clean orphan ephemeral profiles")
+		}
+		if err := t.mgr.PurgeProfile(ctx, browsers.BrowserID(a.BrowserID)); err != nil {
+			return "", fmt.Errorf("browser_close: %w", err)
+		}
+		return fmt.Sprintf("browser %s closed and its profile deleted", a.BrowserID), nil
 	}
 	if err := t.mgr.CloseBrowser(ctx, browsers.BrowserID(a.BrowserID)); err != nil {
 		return "", fmt.Errorf("browser_close: %w", err)

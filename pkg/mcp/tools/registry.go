@@ -9,10 +9,14 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"reflect"
 	"sort"
+	"strings"
 
 	"webmcp/pkg/browsers"
+	"webmcp/pkg/config"
 	"webmcp/pkg/mcp/models"
 )
 
@@ -40,10 +44,11 @@ type Registry struct {
 }
 
 // NewRegistry constructs a Registry and registers all available tools and prompts,
-// wiring them to a single shared browsers.Manager.
+// wiring them to a single shared browsers.Manager. The manager defaults to
+// ephemeral profiles and honors the configured browser idle TTL.
 func NewRegistry() *Registry {
 	r := NewEmptyRegistry()
-	mgr := browsers.NewManager()
+	mgr := browsers.NewManager(mcpManagerOptions()...)
 	r.Register(NewFetch(mgr))
 	r.Register(NewPage(mgr))
 	r.Register(NewAct(mgr))
@@ -60,6 +65,20 @@ func NewRegistry() *Registry {
 	r.RegisterPrompt(NewBrowserSetupAndEmulatePrompt())
 	r.RegisterPrompt(NewManageSessionLifecyclePrompt())
 	return r
+}
+
+// mcpManagerOptions returns the browser-manager options for an MCP-owned pool:
+// ephemeral profiles by default (so a forgotten close cannot leak profiles) and
+// the configured browser idle TTL from config.json (browser_ttl).
+func mcpManagerOptions() []browsers.Option {
+	ttl := browsers.DefaultBrowserTTL
+	if cfg, err := config.LoadConfig(); err == nil {
+		ttl = cfg.BrowserIdleTTL(ttl)
+	}
+	return []browsers.Option{
+		browsers.WithPersistentDefault(false),
+		browsers.WithBrowserTTL(ttl),
+	}
 }
 
 // NewEmptyRegistry constructs a Registry without registering any tools or prompts.
@@ -131,11 +150,170 @@ func (r *Registry) GetPrompt(name string, args map[string]string) (*models.GetPr
 	}, nil
 }
 
-// Execute runs a call to the registered tool with the given name.
+// toolExamples maps each tool to its shortest valid retry call. It is shown
+// alongside an argument type mismatch so the agent can copy a working call.
+var toolExamples = map[string]string{
+	"browser_create": `{"proxy":"127.0.0.1:8080","ignore_certs":true}`,
+	"browser_close":  `{"browser_id":"browser-1"}`,
+	"page_list":      `{"browser_id":"browser-1"}`,
+	"fetch_page":     `{"url":"https://example.com"}`,
+	"page_fetch":     `{"session_id":"page-1","what":"text"}`,
+	"page_act":       `{"session_id":"page-1","action":"reload"}`,
+	"session_close":  `{"session_id":"page-1"}`,
+	"browser_list":   `{}`,
+	"session_list":   `{}`,
+}
+
+// Execute runs a call to the registered tool with the given name. Boolean
+// strings are coerced, argument type mismatches are rewritten into one
+// actionable sentence, and every other error is returned as the tool produced it.
 func (r *Registry) Execute(ctx context.Context, name string, args json.RawMessage) (string, error) {
 	t, ok := r.tools[name]
 	if !ok {
 		return "", fmt.Errorf("unsupported tool: %s", name)
 	}
-	return t.Execute(ctx, args)
+	normalized := coerceBooleanStrings(args)
+	out, err := t.Execute(ctx, normalized)
+	if err != nil {
+		return "", explainArgTypeError(name, normalized, err)
+	}
+	return out, nil
+}
+
+// coerceBooleanStrings rewrites top-level arguments whose value is the JSON
+// string "true" or "false" (case-insensitive, trimmed) into the JSON boolean
+// literal. Clients that stringify every argument can then still set boolean
+// fields; every other string is left untouched so type errors stay actionable.
+func coerceBooleanStrings(args json.RawMessage) json.RawMessage {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(args, &obj); err != nil {
+		return args
+	}
+	changed := false
+	for key, raw := range obj {
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			continue
+		}
+		switch {
+		case strings.EqualFold(strings.TrimSpace(s), "true"):
+			obj[key] = json.RawMessage("true")
+			changed = true
+		case strings.EqualFold(strings.TrimSpace(s), "false"):
+			obj[key] = json.RawMessage("false")
+			changed = true
+		}
+	}
+	if !changed {
+		return args
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return args
+	}
+	return out
+}
+
+// explainArgTypeError replaces a JSON type mismatch in tool arguments with a
+// sentence naming the tool, field, wanted type and received value, followed by
+// a working retry call for that tool.
+func explainArgTypeError(
+	tool string,
+	args json.RawMessage,
+	err error,
+) error {
+	var typeErr *json.UnmarshalTypeError
+	if !errors.As(err, &typeErr) || typeErr.Field == "" ||
+		!strings.Contains(err.Error(), ": invalid arguments:") {
+		return err
+	}
+	msg := fmt.Sprintf(
+		"%s: %q must be %s, but the request sent %s.",
+		tool,
+		typeErr.Field,
+		wantedType(typeErr.Type),
+		sentValue(args, typeErr.Field),
+	)
+	if example, ok := toolExamples[tool]; ok {
+		msg += "\nRetry with: " + example
+	}
+	return errors.New(msg)
+}
+
+// wantedType renders a JSON field's expected type in plain words.
+func wantedType(t reflect.Type) string {
+	for t != nil && t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t == nil {
+		return "the correct type"
+	}
+	switch t.Kind() {
+	case reflect.Bool:
+		return "a boolean (true or false)"
+	case reflect.String:
+		return "a string"
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		return "a number"
+	case reflect.Slice, reflect.Array:
+		return "an array"
+	case reflect.Map, reflect.Struct:
+		return "an object"
+	default:
+		return "a " + t.Kind().String()
+	}
+}
+
+// sentValue describes the raw argument value that failed to decode. The field
+// may be nested, so it is resolved segment by segment through the arguments.
+func sentValue(args json.RawMessage, field string) string {
+	raw, ok := fieldValue(args, field)
+	if !ok {
+		return "an unexpected value"
+	}
+	s := strings.TrimSpace(string(raw))
+	switch {
+	case s == "" || s == "null":
+		return "null"
+	case s[0] == '"':
+		return "the string " + clipValue(s)
+	case s[0] == '{':
+		return "the object " + clipValue(s)
+	case s[0] == '[':
+		return "the array " + clipValue(s)
+	case s == "true" || s == "false":
+		return "the boolean " + s
+	default:
+		return "the number " + clipValue(s)
+	}
+}
+
+// fieldValue resolves a dotted JSON field path against the raw arguments.
+func fieldValue(args json.RawMessage, field string) (json.RawMessage, bool) {
+	cur := args
+	for _, part := range strings.Split(field, ".") {
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(cur, &obj); err != nil {
+			return nil, false
+		}
+		next, ok := obj[part]
+		if !ok {
+			return nil, false
+		}
+		cur = next
+	}
+	return cur, true
+}
+
+// clipValue caps a rendered value so a large array or object cannot flood the
+// error message.
+func clipValue(s string) string {
+	const limit = 80
+	r := []rune(s)
+	if len(r) <= limit {
+		return s
+	}
+	return string(r[:limit]) + "…"
 }

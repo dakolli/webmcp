@@ -8,6 +8,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -92,9 +94,10 @@ opened page; a bare number resolves to page-N.`,
 	browserCmd := &cobra.Command{
 		Use:   "browser",
 		Short: "Manage the live browser",
-		Long: `Manage the live browser: list its open pages, close it (and every page in
-it), or raise its OS window to the foreground. The CLI manages a single
-browser (browser-1), mirroring the MCP browser_create/list/close tools.`,
+		Long: `Manage live browsers: list them with their owner/profile lifecycle, close one
+or all (optionally purging a profile or pruning orphan ephemeral profiles), or
+raise a browser window to the foreground. Mirrors the MCP browser_create,
+browser_list and browser_close tools.`,
 		Example: `  web-cli browser list              # show the live browser and its open pages (id, url)
   web-cli browser close             # close the browser and every page in it
   web-cli browser focus             # raise the browser window (best-effort)
@@ -128,14 +131,13 @@ browser (browser-1), mirroring the MCP browser_create/list/close tools.`,
 func NewBrowserListCmd(mgr *browsers.Manager) *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
-		Short: "List the live browser and its open pages",
-		Long: `Shows the live browser's id and its open pages as "id<TAB>url" rows.
-Never launches the browser: with nothing running it prints a friendly hint and
+		Short: "List live browsers with their lifecycle state and pages",
+		Long: `Shows every live browser with its lifecycle header (owner, persist, ttl),
+its profile directory, and its open pages as "id<TAB>url" rows.
+Never launches a browser: with nothing running it prints a friendly hint and
 exits 0, so listing is safe in scripts.`,
-		Example: `  web-cli browser list              # show the live browser and its open pages (id, url)
-  web-cli browser close             # close the browser and every page in it
-  web-cli browser focus             # raise the browser window (best-effort)
-  web-cli browser focus --state maximize`,
+		Example: `  browser list                      # browsers, owners, persist/ttl, profile dirs and pages
+  browser close --prune             # close all and clean orphan ephemeral profiles`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			// Forward to a live serve process when one is running (browser.list
 			// never lazily launches over IPC either — the server only reports
@@ -152,43 +154,65 @@ exits 0, so listing is safe in scripts.`,
 				fmt.Println("no browsers running; start one with 'browser serve' or 'browser fetch <url>'")
 				return nil
 			}
-			for id, b := range active {
-				info := ""
-				if b.BinPath() != "" {
-					info += fmt.Sprintf(" (bin: %s)", b.BinPath())
-				}
-				if b.ProfileDir() != "" {
-					info += fmt.Sprintf(" (profile: %s)", b.ProfileDir())
-				}
-				fmt.Printf("browser_id: %s%s\n", id, info)
-				for _, p := range b.Pages() {
-					fmt.Printf("  %s\t%s\n", p.ID, p.URL)
-				}
+			ids := make([]string, 0, len(active))
+			for id := range active {
+				ids = append(ids, string(id))
 			}
+			sort.Strings(ids)
+			entries := make([]ipc.BrowserEntry, 0, len(ids))
+			for _, id := range ids {
+				b := active[browsers.BrowserID(id)]
+				info := b.Info()
+				entries = append(entries, ipc.BrowserEntry{
+					BrowserID:  string(info.BrowserID),
+					Owner:      info.Owner,
+					Bin:        info.Bin,
+					ProfileDir: info.ProfileDir,
+					Persist:    info.Persist,
+					Ephemeral:  info.Ephemeral,
+					CreatedAt:  info.CreatedAt,
+					IdleFor:    info.IdleFor,
+					TTL:        info.TTL,
+					Pages:      b.Pages(),
+				})
+			}
+			printBrowserEntries(cmd.OutOrStdout(), entries)
 			return nil
 		},
 	}
 }
 
-// NewBrowserCloseCmd constructs the "browser close" command: it validates the
-// inherited --browser-id flag (only the singleBrowserID is supported) and
-// closes the manager's Browser and all of its open pages. Closing when no
-// browser is open succeeds (Manager.Close is an idempotent no-op).
+// NewBrowserCloseCmd constructs the "browser close" command: it closes the
+// target browser and all of its pages, optionally deleting its profile
+// (--purge) or closing every browser and removing orphan ephemeral profiles
+// (--prune). Closing when no browser is open succeeds (idempotent no-op).
 func NewBrowserCloseCmd(mgr *browsers.Manager) *cobra.Command {
-	return &cobra.Command{
-		Use:   "close",
-		Short: "Close the live browser and all of its pages",
-		Long: `Closes the browser and every page in it. Closing when nothing is open
+	var purge, prune bool
+	cmd := &cobra.Command{
+		Use:   "close [id]",
+		Short: "Close a browser and all of its pages",
+		Long: `Closes a browser and every page in it. Closing when nothing is open
 succeeds silently (idempotent, exit 0). Note: this closes the browser, not the
-serve daemon — stop that with 'web-cli serve stop'.`,
-		Example: `  web-cli browser list              # show the live browser and its open pages (id, url)
-  web-cli browser close             # close the browser and every page in it
-  web-cli browser focus             # raise the browser window (best-effort)
-  web-cli browser focus --state maximize`,
+serve daemon — stop that with 'web-cli serve stop'.
+
+  --purge  delete the closed browser's profile directory (and its logins); the
+           directory must resolve under ~/.config/browser-mcp/profiles
+  --prune  close every browser, then delete leftover profiles under
+           profiles/.ephemeral that no live browser owns; named persistent
+           profiles are never deleted`,
+		Example: `  web-cli browser close                    # close the default browser (browser-1)
+  web-cli browser close browser-2          # close one browser
+  web-cli browser close browser-2 --purge  # close it and delete its profile
+  web-cli browser close --prune            # close all, clean orphan ephemeral profiles`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			id, _ := cmd.Flags().GetString("browser-id")
+			idExplicit := cmd.Flags().Changed("browser-id")
 			if len(args) > 0 {
 				id = args[0]
+				idExplicit = true
+			}
+			if err := validateCloseCleanup(idExplicit, purge, prune); err != nil {
+				return fmt.Errorf("browser close: %w", err)
 			}
 
 			ctx, cancel := context.WithTimeout(cmdCtx(cmd), 30*time.Second)
@@ -196,14 +220,17 @@ serve daemon — stop that with 'web-cli serve stop'.`,
 
 			if cl := dialServe(cmd); cl != nil {
 				defer cl.Close()
-				params := map[string]string{}
-				if id != "" {
-					params["browser_id"] = id
+				params := ipc.BrowserCloseParams{BrowserID: id, Purge: purge, Prune: prune}
+				if prune {
+					params.BrowserID = ""
 				}
-				if err := cl.Call(ctx, ipc.MethodBrowserClose, params, nil); err != nil {
+				var res ipc.BrowserCloseResult
+				if err := cl.Call(ctx, ipc.MethodBrowserClose, params, &res); err != nil {
 					return fmt.Errorf("browser close: %w", err)
 				}
-				if id != "" {
+				if res.Message != "" {
+					fmt.Println(res.Message)
+				} else if id != "" {
 					fmt.Printf("browser %s closed\n", id)
 				} else {
 					fmt.Println("all browsers closed")
@@ -212,17 +239,48 @@ serve daemon — stop that with 'web-cli serve stop'.`,
 			}
 			printServeHint(cmd)
 
-			if err := mgr.CloseBrowser(ctx, browsers.BrowserID(id)); err != nil {
-				return fmt.Errorf("browser close: %w", err)
-			}
-			if id != "" {
-				fmt.Printf("browser %s closed\n", id)
-			} else {
-				fmt.Println("all browsers closed")
+			switch {
+			case prune:
+				removed, err := mgr.PruneProfiles(ctx)
+				if err != nil {
+					return fmt.Errorf("browser close: %w", err)
+				}
+				fmt.Printf("all browsers closed; pruned %d orphan ephemeral profile(s)\n", len(removed))
+			case purge:
+				if err := mgr.PurgeProfile(ctx, browsers.BrowserID(id)); err != nil {
+					return fmt.Errorf("browser close: %w", err)
+				}
+				fmt.Printf("browser %s closed and its profile deleted\n", id)
+			default:
+				if err := mgr.CloseBrowser(ctx, browsers.BrowserID(id)); err != nil {
+					return fmt.Errorf("browser close: %w", err)
+				}
+				if id != "" {
+					fmt.Printf("browser %s closed\n", id)
+				} else {
+					fmt.Println("all browsers closed")
+				}
 			}
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&purge, "purge", false, "delete the closed browser's profile directory (config-dir guarded)")
+	cmd.Flags().BoolVar(&prune, "prune", false, "close all browsers and delete orphan ephemeral profiles")
+	return cmd
+}
+
+// validateCloseCleanup applies browser_close's purge/prune rules: the flags are
+// mutually exclusive, prune takes no browser id, and purge needs one.
+func validateCloseCleanup(idExplicit, purge, prune bool) error {
+	switch {
+	case purge && prune:
+		return errors.New("purge and prune are mutually exclusive — pass purge with a browser_id, or prune alone")
+	case prune && idExplicit:
+		return errors.New("prune takes no browser_id — it closes all browsers and cleans orphan ephemeral profiles; use purge with browser_id to delete one profile")
+	case purge && !idExplicit:
+		return errors.New("purge requires a browser_id — pass the browser whose profile to delete, or use prune to clean orphan ephemeral profiles")
+	}
+	return nil
 }
 
 // NewBrowserFocusCmd constructs the "browser focus" command: it validates the
@@ -362,19 +420,7 @@ func browserListViaIPC(cmd *cobra.Command, cl *ipc.Client) error {
 		return fmt.Errorf("browser list: %w", err)
 	}
 	if len(res.Browsers) > 0 {
-		for _, b := range res.Browsers {
-			info := ""
-			if b.Bin != "" {
-				info += fmt.Sprintf(" (bin: %s)", b.Bin)
-			}
-			if b.ProfileDir != "" {
-				info += fmt.Sprintf(" (profile: %s)", b.ProfileDir)
-			}
-			fmt.Printf("browser_id: %s%s\n", b.BrowserID, info)
-			for _, p := range b.Pages {
-				fmt.Printf("  %s\t%s\n", p.ID, p.URL)
-			}
-		}
+		printBrowserEntries(cmd.OutOrStdout(), res.Browsers)
 	} else {
 		fmt.Printf("browser_id: %s\n", res.BrowserID)
 		for _, p := range res.Pages {
@@ -384,23 +430,48 @@ func browserListViaIPC(cmd *cobra.Command, cl *ipc.Client) error {
 	return nil
 }
 
+// printBrowserEntries renders live browsers in the human-readable list shape:
+// a lifecycle header (owner, persist, ttl) per browser, an indented profile_dir
+// row, then its pages.
+func printBrowserEntries(w io.Writer, entries []ipc.BrowserEntry) {
+	for _, b := range entries {
+		fmt.Fprintf(w, "browser_id: %s (owner: %s, persist: %t, ttl: %s",
+			b.BrowserID, b.Owner, b.Persist, b.TTL)
+		if b.Bin != "" {
+			fmt.Fprintf(w, ", bin: %s", b.Bin)
+		}
+		fmt.Fprintln(w, ")")
+		if b.ProfileDir != "" {
+			fmt.Fprintf(w, "  profile_dir: %s\n", b.ProfileDir)
+		}
+		for _, p := range b.Pages {
+			fmt.Fprintf(w, "  %s\t%s\n", p.ID, p.URL)
+		}
+	}
+}
+
 // NewBrowserCreateCmd constructs the "browser create" command: launches a new
 // browser process with optional custom binary (--bin), profile (--profile),
-// persistence (--persist), and window position (--position).
+// persistence (--persist), owner label (--owner), and window position
+// (--position).
 func NewBrowserCreateCmd(mgr *browsers.Manager) *cobra.Command {
-	var bin, profile, position, proxy, proxyBypass string
+	var bin, profile, position, proxy, proxyBypass, owner string
 	var persist, ignoreCerts bool
 	cmd := &cobra.Command{
 		Use:   "create",
 		Short: "Create and launch a new browser instance",
 		Long: `Launches a new browser process with optional custom binary (--bin), profile
-(--profile), and window position (--position left|right|max|normal).
+(--profile), owner label (--owner), and window position (--position
+left|right|max|normal).
 
 A bare profile name resolves under ~/.config/browser-mcp/profiles; an absolute
-path is used as given; relative paths are rejected. Secondary browsers default
-to an ephemeral profile that is deleted on close. Pass --persist to keep a named
-profile (and its logins) after close. browser-1 with no explicit profile is
-always persistent.
+path is used as given; relative paths are rejected. Browsers are ephemeral by
+default: the profile is deleted on close. Pass --persist to keep a named
+profile (and its logins) after close. The plain human 'browser serve' daemon
+keeps its lazily launched browser-1 persistent.
+
+--owner labels the browser and joins the create key: the same owner with the
+same options reuses one browser, a different owner gets a separate one.
 
 --proxy sends traffic through an intercept proxy such as Burp, Caido or ZAP:
 accept host:port or scheme://host:port, for example 127.0.0.1:8080 or
@@ -408,34 +479,44 @@ http://127.0.0.1:8080. --proxy-bypass lists comma-separated hosts that skip it.
 --ignore-certs accepts the proxy's MITM certificate and is independent of
 --proxy. Proxy credentials never go on the command line: put them in
 ~/.config/browser-mcp/proxy.json (mode 0600), keyed by proxy host:port.`,
-		Example: `  browser browser create --proxy http://127.0.0.1:8080 --ignore-certs
-  browser browser create --proxy 127.0.0.1:8080 --proxy-bypass localhost,*.internal`,
+		Example: `  browser create --owner scraper-a
+  browser create --persist --profile audit
+  browser create --proxy http://127.0.0.1:8080 --ignore-certs
+  browser create --proxy 127.0.0.1:8080 --proxy-bypass localhost,*.internal`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx, cancel := context.WithTimeout(cmdCtx(cmd), 30*time.Second)
 			defer cancel()
 
+			owner, err := ipc.NormalizeOwner(owner)
+			if err != nil {
+				return fmt.Errorf("browser create: %w", err)
+			}
+			if owner != "" {
+				ctx = browsers.WithExplicitOwner(ctx, owner)
+			}
+
 			if cl := dialServe(cmd); cl != nil {
 				defer cl.Close()
-				params := map[string]any{
-					"bin":          bin,
-					"profile":      profile,
-					"position":     position,
-					"proxy":        proxy,
-					"proxy_bypass": proxyBypass,
+				params := ipc.BrowserOpenParams{
+					Bin:         bin,
+					Profile:     profile,
+					Position:    position,
+					Proxy:       proxy,
+					ProxyBypass: proxyBypass,
+					Owner:       owner,
 				}
 				if cmd.Flags().Changed("persist") {
-					params["persist"] = persist
+					params.Persist = &persist
 				}
 				if cmd.Flags().Changed("ignore-certs") {
-					params["ignore_certs"] = ignoreCerts
+					params.IgnoreCerts = &ignoreCerts
 				}
-				var res struct {
-					BrowserID string `json:"browser_id"`
-				}
+				var res ipc.BrowserOpenResult
 				if err := cl.Call(ctx, ipc.MethodBrowserOpen, params, &res); err != nil {
 					return fmt.Errorf("browser create: %w", err)
 				}
-				fmt.Printf("browser_id: %s\n", res.BrowserID)
+				fmt.Printf("browser_id: %s (owner: %s, persist: %t, ttl: %s)\n",
+					res.BrowserID, res.Owner, res.Persist, res.TTL)
 				return nil
 			}
 			printServeHint(cmd)
@@ -466,23 +547,29 @@ http://127.0.0.1:8080. --proxy-bypass lists comma-separated hosts that skip it.
 			if err != nil {
 				return fmt.Errorf("browser create: %w", err)
 			}
-			info := ""
-			if b.BinPath() != "" {
-				info += fmt.Sprintf(" (bin: %s)", b.BinPath())
+			info := b.Info()
+			details := []string{
+				fmt.Sprintf("owner: %s", info.Owner),
+				fmt.Sprintf("persist: %t", info.Persist),
+				fmt.Sprintf("ttl: %s", info.TTL),
 			}
-			if b.ProfileDir() != "" {
-				info += fmt.Sprintf(" (profile: %s)", b.ProfileDir())
+			if info.Bin != "" {
+				details = append(details, "bin: "+info.Bin)
+			}
+			if info.ProfileDir != "" {
+				details = append(details, "profile: "+info.ProfileDir)
 			}
 			if b.Position() != "" {
-				info += fmt.Sprintf(" (position: %s)", b.Position())
+				details = append(details, "position: "+b.Position())
 			}
-			fmt.Printf("browser_id: %s%s\n", id, info)
+			fmt.Printf("browser_id: %s (%s)\n", id, strings.Join(details, ", "))
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&bin, "bin", "", "custom browser binary executable path or command")
 	cmd.Flags().StringVar(&profile, "profile", "", "profile name resolved under the config dir, or an absolute directory path")
-	cmd.Flags().BoolVar(&persist, "persist", false, "keep the profile (and its logins) after close; secondary browsers are otherwise ephemeral")
+	cmd.Flags().BoolVar(&persist, "persist", false, "keep the profile (and its logins) after close; browsers are otherwise ephemeral")
+	cmd.Flags().StringVar(&owner, "owner", "", "owner label (1-64 chars: A-Z, a-z, 0-9, '.', '_', '-') that joins the create key")
 	cmd.Flags().StringVar(&position, "position", "", "window position split screen preset: left, right, max, normal")
 	cmd.Flags().StringVar(&proxy, "proxy", "", "upstream proxy host:port or scheme://host:port (e.g. 127.0.0.1:8080)")
 	cmd.Flags().StringVar(&proxyBypass, "proxy-bypass", "", "comma-separated hosts that skip the proxy (e.g. localhost,*.internal)")

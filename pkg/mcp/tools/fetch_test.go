@@ -1,6 +1,28 @@
 package tools
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+func TestFetchArgsOwnerValidation(t *testing.T) {
+	valid := fetchArgs{URL: "https://example.com", Owner: "  scraper-a  "}
+	if err := valid.validate(); err != nil {
+		t.Fatalf("validate valid owner: %v", err)
+	}
+	if valid.Owner != "scraper-a" {
+		t.Fatalf("Owner = %q, want the trimmed scraper-a", valid.Owner)
+	}
+
+	invalid := fetchArgs{URL: "https://example.com", Owner: "scraper/a"}
+	err := invalid.validate()
+	if err == nil {
+		t.Fatal("validate invalid owner = nil, want an actionable refusal")
+	}
+	if !strings.Contains(err.Error(), `"scraper/a"`) || !strings.Contains(err.Error(), "1 to 64 characters") {
+		t.Fatalf("error %q does not name the bad owner and the rule", err)
+	}
+}
 
 func TestFetchArgsWaitForDefault(t *testing.T) {
 	tests := []struct {

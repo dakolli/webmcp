@@ -364,18 +364,27 @@ func daemonizeServe(cmd *cobra.Command, opts serveRunOptions, childArgs []string
 // cancelled (SIGINT/SIGTERM) or a server.shutdown request arrives — then the
 // loop stops and the process tears the browser down via mgr.Shutdown.
 func runServeForeground(ctx context.Context, opts serveRunOptions) error {
-	profileDir, err := config.ResolveProfilePath(opts.profile)
-	if err != nil {
-		return fmt.Errorf("serve: resolve profile path: %w", err)
-	}
-
-	mgr := browsers.NewManager(
+	// serve mcp drives an agent pool, so its default browser is ephemeral: a
+	// forgotten close must not leak a profile into the config dir. A named
+	// --profile, or the plain human daemon, pins a persistent profile instead.
+	agentPool := opts.mcpPort != 0
+	managerOpts := []browsers.Option{
 		browsers.WithHeadless(opts.headless),
 		browsers.WithStealth(opts.stealth),
 		browsers.WithBin(opts.bin),
-		browsers.WithProfileDir(profileDir),
-		browsers.WithPersist(true),
-	)
+		browsers.WithPersistentDefault(!agentPool),
+	}
+	if profileDir, err := config.ResolveProfilePath(opts.profile); err != nil {
+		return fmt.Errorf("serve: resolve profile path: %w", err)
+	} else if opts.profile != "" || !agentPool {
+		managerOpts = append(managerOpts, browsers.WithProfileDir(profileDir))
+	}
+	browserTTL := browsers.DefaultBrowserTTL
+	if cfg, err := config.LoadConfig(); err == nil {
+		browserTTL = cfg.BrowserIdleTTL(browserTTL)
+	}
+	managerOpts = append(managerOpts, browsers.WithBrowserTTL(browserTTL))
+	mgr := browsers.NewManager(managerOpts...)
 	// Graceful teardown of the browser and all of its pages when the loop
 	// stops (SIGINT/SIGTERM cancels ctx, or a server.shutdown request makes
 	// Serve return): Shutdown closes the browser and every page.

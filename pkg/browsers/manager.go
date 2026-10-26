@@ -1,5 +1,5 @@
 // Package browsers implements the core browser engine that powers the MCP
-// tools. A Manager owns a single live Browser (one Chromium instance via
+// tools. A Manager owns the live Browsers (one Chromium instance each via
 // go-rod), and each Browser owns its live Pages (browser tabs, a.k.a. MCP
 // sessions). This package is rod-only: it owns all go-rod/Chromium logic and
 // never imports pkg/mcp; the MCP layer translates calls into this package.
@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -32,6 +33,17 @@ var ErrUnknownBrowser = errors.New("unknown browser")
 // WithTTL option is given. Pages that go unused for longer than the TTL are
 // closed by the manager's background sweeper.
 const defaultTTL = 15 * time.Minute
+
+// DefaultBrowserTTL is the per-browser idle timeout applied by NewManager when
+// no WithBrowserTTL option is given. A browser idle for longer than the TTL is
+// closed by the manager's background sweeper, which releases its profile
+// (deleting an ephemeral directory, keeping a persistent one).
+const DefaultBrowserTTL = 30 * time.Minute
+
+// UnownedOwner is the owner key recorded for a browser created by a surface
+// with no client identity (direct HTTP, CLI in-process, IPC). Such browsers
+// live in the shared pool and are addressed by explicit browser id.
+const UnownedOwner = "unowned"
 
 // closePageTimeout bounds each individual page close performed by the
 // background sweeper, so a single hung tab cannot stall the sweep loop.
@@ -57,10 +69,76 @@ const probeTimeout = 2 * time.Second
 type Option func(*Manager)
 
 // profileRef is the ownership record for one profile directory: how many live
-// browsers use it and whether it must be removed when the last one closes.
+// browsers use it, whether it must be removed when the last one closes, and
+// which browser claimed it first.
 type profileRef struct {
-	count     int
-	ephemeral bool
+	count      int
+	ephemeral  bool
+	browserID  BrowserID
+	owner      string
+	ownerLabel string
+}
+
+// ownerCtxKey is the context key carrying the calling surface's owner identity.
+type ownerCtxKey struct{}
+
+// ownerLabelCtxKey is the context key carrying a human-readable owner label.
+type ownerLabelCtxKey struct{}
+
+// explicitOwnerCtxKey marks an owner as a caller-chosen label rather than an
+// ambient session identity.
+type explicitOwnerCtxKey struct{}
+
+// WithOwnerKey returns a context that records owner as the caller's identity.
+// The engine reads it in CreateBrowser and OpenBrowser, so one MCP session can
+// tag every browser it touches without threading the value through each call.
+// An empty owner falls back to UnownedOwner.
+func WithOwnerKey(ctx context.Context, owner string) context.Context {
+	if owner == "" {
+		owner = UnownedOwner
+	}
+	return context.WithValue(ctx, ownerCtxKey{}, owner)
+}
+
+// OwnerFrom returns the owner identity recorded on ctx, or UnownedOwner when
+// the caller carries no identity.
+func OwnerFrom(ctx context.Context) string {
+	if owner, ok := ctx.Value(ownerCtxKey{}).(string); ok && owner != "" {
+		return owner
+	}
+	return UnownedOwner
+}
+
+// WithOwnerLabel returns a context carrying a human-readable owner label, such
+// as an MCP client name. The label is display-only: ownership and create
+// idempotency still key off WithOwnerKey.
+func WithOwnerLabel(ctx context.Context, label string) context.Context {
+	if label == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, ownerLabelCtxKey{}, label)
+}
+
+// OwnerLabelFrom returns the display label recorded on ctx, or "".
+func OwnerLabelFrom(ctx context.Context) string {
+	label, _ := ctx.Value(ownerLabelCtxKey{}).(string)
+	return label
+}
+
+// WithExplicitOwner returns a context that records owner as the caller's own
+// explicit choice: it sets both the ownership key (which joins the create key)
+// and the display label, and it stops an omitted browser id from resolving to
+// the shared unowned browser.
+func WithExplicitOwner(ctx context.Context, owner string) context.Context {
+	ctx = WithOwnerKey(ctx, owner)
+	ctx = WithOwnerLabel(ctx, owner)
+	return context.WithValue(ctx, explicitOwnerCtxKey{}, true)
+}
+
+// HasExplicitOwner reports whether ctx carries a caller-chosen owner.
+func HasExplicitOwner(ctx context.Context) bool {
+	explicit, _ := ctx.Value(explicitOwnerCtxKey{}).(bool)
+	return explicit
 }
 
 // WithHeadless controls whether the launcher runs Chromium in headless mode.
@@ -121,6 +199,14 @@ func WithPersist(persist bool) Option {
 	return func(m *Manager) { m.persist = persist }
 }
 
+// WithPersistentDefault sets whether browsers created without an explicit
+// persist choice get a persistent profile. It is the construction-time spelling
+// of WithPersist that makes the daemon's default an explicit decision: the MCP
+// server passes false (ephemeral profiles), the human CLI daemon passes true.
+func WithPersistentDefault(persist bool) Option {
+	return func(m *Manager) { m.persist = persist }
+}
+
 // WithPosition configures the initial window placement ("left", "right", "max", "normal").
 func WithPosition(position string) Option {
 	return func(m *Manager) { m.position = position }
@@ -129,11 +215,26 @@ func WithPosition(position string) Option {
 // WithTTL sets the per-page idle timeout enforced by the manager's background
 // sweeper: pages that go unused for longer than ttl are closed and removed,
 // reclaiming leaked tabs. The default is 15 minutes; the sweep interval is
-// derived from the TTL (see sweepIntervalForTTL). A non-positive ttl disables
-// sweeping entirely — pages are never reclaimed and no sweeper goroutine is
-// started at all.
+// derived from the TTL (see sweepIntervalFor). A non-positive ttl disables page
+// sweeping; browser sweeping is governed separately by WithBrowserTTL.
 func WithTTL(ttl time.Duration) Option {
 	return func(m *Manager) { m.ttl = ttl }
+}
+
+// WithBrowserTTL sets the per-browser idle timeout enforced by the same
+// background sweeper: a browser with no page access for longer than d is closed
+// and removed, releasing its profile directory (ephemeral directories are
+// deleted, persistent ones kept). The default is DefaultBrowserTTL (30
+// minutes); a non-positive d disables browser sweeping.
+func WithBrowserTTL(d time.Duration) Option {
+	return func(m *Manager) { m.browserTTL = d }
+}
+
+// WithOwner sets the owner key recorded on a browser created by CreateBrowser,
+// overriding the identity carried on the call's context. It is informational:
+// browsers are closed by id, never gated on ownership.
+func WithOwner(owner string) Option {
+	return func(m *Manager) { m.owner = owner }
 }
 
 // WithLogger sets the logger used for the manager's best-effort background
@@ -149,18 +250,17 @@ func WithLogger(logger *slog.Logger) Option {
 	}
 }
 
-// Manager owns the single Browser that all MCP sessions live in.
+// Manager owns the live Browsers of one daemon.
 //
 // Lifecycle:
 //
-//   - The Browser is launched lazily on the first Open call (via the go-rod
-//     launcher, headful by default) and kept for the life of the manager.
-//   - Close tears the Browser down so a fresh one can be opened later;
+//   - Browsers are launched lazily on first Open or created on demand via
+//     CreateBrowser (through the go-rod launcher, headful by default).
+//   - The background sweeper closes pages idle past the page TTL and browsers
+//     idle past the browser TTL, releasing their profile directories.
+//   - Close tears every Browser down so fresh ones can be opened later;
 //     Shutdown is the terminal variant — after Shutdown the manager must not
 //     be reused.
-//   - The manager currently holds ONE browser field, keeping the model simple;
-//     a browser_id → Browser map is the planned growth path when multi-browser
-//     support lands (AGENTS.md "Browser-first paradigm").
 type Manager struct {
 	// mu guards browsers map, shutdown, and the sweeper stop channel.
 	mu sync.Mutex
@@ -182,14 +282,17 @@ type Manager struct {
 	// profileName is the default profile name (or absolute path) resolved through
 	// pkg/config for browsers created without an explicit WithProfileDir.
 	profileName string
+	// owner is the default owner key recorded on created browsers; empty means
+	// the call's context identity (see WithOwnerKey) or UnownedOwner.
+	owner string
 	// persist keeps the DEFAULT browser's profile after close. Secondary
 	// browsers start ephemeral unless their own CreateBrowser call opts in:
 	// named and default profiles are shared, so inheriting this flag would
 	// point a second live browser at the directory browser-1 already holds
 	// (WEB-132).
 	persist bool
-	// profileRefs tracks how many live browsers own each profile directory and
-	// whether the directory is ephemeral.
+	// profileRefs tracks how many live browsers own each profile directory,
+	// whether the directory is ephemeral, and which browser claimed it.
 	profileRefs map[string]*profileRef
 	// position specifies default window placement ("left", "right", "max", "normal").
 	position string
@@ -203,14 +306,24 @@ type Manager struct {
 	// shutdown marks the manager as terminated; Open rejects further calls.
 	shutdown bool
 	// ttl is the per-page idle timeout enforced by the background sweeper
-	// (default: 15m; a non-positive value disables sweeping).
+	// (default: 15m; a non-positive value disables page sweeping).
 	ttl time.Duration
-	// sweepInterval is how often the background sweeper runs; derived from ttl
-	// at construction (see sweepIntervalForTTL).
+	// browserTTL is the per-browser idle timeout enforced by the same sweeper
+	// (default: DefaultBrowserTTL; a non-positive value disables browser
+	// sweeping).
+	browserTTL time.Duration
+	// sweepInterval is how often the background sweeper runs; derived from the
+	// shortest enabled TTL at construction (see sweepIntervalFor).
 	sweepInterval time.Duration
 	// sweepStop, when non-nil, is the stop channel of a running sweeper
 	// goroutine; nil means no sweeper is running. Guarded by mu.
 	sweepStop chan struct{}
+	// probe checks whether a browser's Chromium process is still alive. It is a
+	// field so tests can stub the CDP round trip; production uses probeBrowser.
+	probe func(*Browser) error
+	// launch starts a new Browser's Chromium process. It is a field so tests can
+	// stub the launch; production launches through Browser.Launch.
+	launch func(context.Context, *Browser) error
 	// logger is the sink for the manager's best-effort background logging
 	// (e.g. sweeper close failures). Defaults to a no-op discard logger;
 	// inject one with WithLogger. Read-only after construction, so it is safe
@@ -228,9 +341,10 @@ type Manager struct {
 }
 
 // NewManager constructs a Manager with the given options applied over sensible
-// defaults: headful Chromium, stealth on for every page, and a 15-minute
-// per-page idle TTL enforced by a background sweeper. Browsers are launched
-// lazily or created on demand via CreateBrowser / Open.
+// defaults: headful Chromium, stealth on for every page, a 15-minute per-page
+// idle TTL and a 30-minute per-browser idle TTL, both enforced by one
+// background sweeper. Browsers are launched lazily or created on demand via
+// CreateBrowser / Open.
 func NewManager(opts ...Option) *Manager {
 	// The manager-owned lifetime ctx: every Browser's rod default ctx hangs
 	// off it (WEB-59), so no tool-call ctx can ever poison the browser. It is
@@ -243,7 +357,10 @@ func NewManager(opts ...Option) *Manager {
 		stealth:       true,
 		persist:       true,
 		ttl:           defaultTTL,
-		sweepInterval: sweepIntervalForTTL(defaultTTL),
+		browserTTL:    DefaultBrowserTTL,
+		sweepInterval: sweepIntervalFor(defaultTTL, DefaultBrowserTTL),
+		probe:         probeBrowser,
+		launch:        func(ctx context.Context, b *Browser) error { return b.Launch(ctx) },
 		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 		profileRefs:   make(map[string]*profileRef),
 		baseCtx:       baseCtx,
@@ -252,10 +369,25 @@ func NewManager(opts ...Option) *Manager {
 	for _, o := range opts {
 		o(m)
 	}
-	// Re-derive the sweep interval after options so a custom WithTTL also gets
-	// a proportional polling cadence.
-	m.sweepInterval = sweepIntervalForTTL(m.ttl)
+	// Re-derive the sweep interval after options so custom TTLs also get a
+	// proportional polling cadence.
+	m.sweepInterval = sweepIntervalFor(m.ttl, m.browserTTL)
 	return m
+}
+
+// sweepIntervalFor derives the background sweep interval from the shortest
+// enabled TTL: half that TTL, floored at 1s so even a very short TTL yields a
+// sane polling cadence. With both TTLs disabled no sweeper starts, but the
+// interval is still given a harmless 1s floor.
+func sweepIntervalFor(pageTTL, browserTTL time.Duration) time.Duration {
+	shortest := pageTTL
+	switch {
+	case shortest <= 0:
+		shortest = browserTTL
+	case browserTTL > 0 && browserTTL < shortest:
+		shortest = browserTTL
+	}
+	return sweepIntervalForTTL(shortest)
 }
 
 // sweepIntervalForTTL derives the background sweep interval from a TTL: half
@@ -272,35 +404,104 @@ func sweepIntervalForTTL(ttl time.Duration) time.Duration {
 // DefaultBrowserID is the default BrowserID used when none is specified.
 const DefaultBrowserID BrowserID = "browser-1"
 
+// launchKey is the canonical identity of a browser launch request: two create
+// requests with the same owner and the same key mean the same browser. The
+// key is compared by value, so every launch-affecting option must be a field.
+type launchKey struct {
+	Owner       string
+	Bin         string
+	ProfileDir  string
+	ProfileName string
+	Persist     bool
+	Headless    bool
+	Stealth     bool
+	Position    string
+	Proxy       string
+	ProxyBypass string
+	IgnoreCerts bool
+}
+
+// launchKeyOf builds the canonical launch key from a manager's launch fields.
+func launchKeyOf(owner string, m *Manager) launchKey {
+	return launchKey{
+		Owner:       owner,
+		Bin:         m.binPath,
+		ProfileDir:  m.profileDir,
+		ProfileName: m.profileName,
+		Persist:     m.persist,
+		Headless:    m.headless,
+		Stealth:     m.stealth,
+		Position:    m.position,
+		Proxy:       m.proxy,
+		ProxyBypass: m.proxyBypass,
+		IgnoreCerts: m.ignoreCerts,
+	}
+}
+
+// effectivePersist reports whether a create for id should use a persistent
+// profile. A caller-requested persist always wins; otherwise the manager's
+// persistent default applies to the default browser only — secondary browsers
+// stay ephemeral so they never collide on a shared profile (WEB-132).
+func effectivePersist(requested bool, id BrowserID, defaultPersist bool) bool {
+	if id == DefaultBrowserID {
+		return defaultPersist || requested
+	}
+	return requested
+}
+
+// Summary renders a compact, LLM-readable form of the launch request for
+// browser listings.
+func (k launchKey) Summary() string {
+	profile := k.ProfileName
+	if profile == "" {
+		profile = k.ProfileDir
+	}
+	if profile == "" {
+		profile = "default"
+	}
+	return fmt.Sprintf(
+		"bin=%q headless=%t profile=%q persist=%t",
+		k.Bin,
+		k.Headless,
+		profile,
+		k.Persist,
+	)
+}
+
+// Created is the outcome of a create request: the live browser and whether the
+// call matched an existing one instead of launching a new process.
+type Created struct {
+	ID      BrowserID
+	Browser *Browser
+	Reused  bool
+}
+
 // CreateBrowser creates and launches a new Browser instance with custom options
+// (e.g. WithBin, WithProfileDir, WithHeadless, WithStealth). It is the
+// compatibility form of Create that drops the reuse flag.
+func (m *Manager) CreateBrowser(ctx context.Context, opts ...Option) (BrowserID, *Browser, error) {
+	created, err := m.Create(ctx, opts...)
+	return created.ID, created.Browser, err
+}
+
+// Create creates and launches a new Browser instance with custom options
 // (e.g. WithBin, WithProfileDir, WithHeadless, WithStealth). It assigns a fresh
 // BrowserID (e.g. "browser-1", "browser-2") and registers it in the manager.
-func (m *Manager) CreateBrowser(ctx context.Context, opts ...Option) (BrowserID, *Browser, error) {
+//
+// Creation is idempotent: when a live browser already matches the same owner
+// and canonical launch options (see launchKey), that browser is returned with
+// Reused set instead of minting a new id. The owner comes from WithOwner when
+// given, then from the identity on ctx (see WithOwnerKey), then from
+// UnownedOwner. A live browser already holding the resolved profile directory
+// fails the create before any Chromium launch.
+func (m *Manager) Create(ctx context.Context, opts ...Option) (Created, error) {
 	m.mu.Lock()
 	if m.shutdown {
 		m.mu.Unlock()
-		return "", nil, errors.New("browsers: manager has been shut down")
+		return Created{}, errors.New("browsers: manager has been shut down")
 	}
 
-	// Idempotent default browser reuse when no custom options provided
-	if len(opts) == 0 {
-		if b, ok := m.browsers[DefaultBrowserID]; ok && b.IsAlive(ctx) {
-			m.mu.Unlock()
-			return DefaultBrowserID, b, nil
-		}
-	}
-
-	id := BrowserID(fmt.Sprintf("browser-%d", m.nextBrowserID))
-	m.nextBrowserID++
-	for {
-		if _, exists := m.browsers[id]; !exists {
-			break
-		}
-		id = BrowserID(fmt.Sprintf("browser-%d", m.nextBrowserID))
-		m.nextBrowserID++
-	}
-
-	tempMgr := &Manager{
+	effective := &Manager{
 		headless:    m.headless,
 		stealth:     m.stealth,
 		binPath:     m.binPath,
@@ -309,78 +510,188 @@ func (m *Manager) CreateBrowser(ctx context.Context, opts ...Option) (BrowserID,
 		proxy:       m.proxy,
 		proxyBypass: m.proxyBypass,
 		ignoreCerts: m.ignoreCerts,
+		owner:       m.owner,
+		browserTTL:  m.browserTTL,
 	}
 	defaultProfileDir := m.profileDir
 	defaultPersist := m.persist
 	m.mu.Unlock()
 
 	for _, o := range opts {
-		o(tempMgr)
+		o(effective)
 	}
-	if tempMgr.proxy != "" {
-		if _, _, err := parseProxy(tempMgr.proxy); err != nil {
-			return "", nil, err
+	owner := effective.owner
+	if owner == "" {
+		owner = OwnerFrom(ctx)
+	}
+	key := launchKeyOf(owner, effective)
+	if effective.proxy != "" {
+		if _, _, err := parseProxy(effective.proxy); err != nil {
+			return Created{}, err
 		}
 	}
 
-	persist := tempMgr.persist
-	if tempMgr.profileName == "" && id == DefaultBrowserID {
-		persist = defaultPersist || persist
+	if b := m.reusableBrowser(ctx, key); b != nil {
+		return Created{ID: b.id, Browser: b, Reused: true}, nil
 	}
 
-	profileDir := tempMgr.profileDir
+	m.mu.Lock()
+	id := BrowserID(fmt.Sprintf("browser-%d", m.nextBrowserID))
+	m.nextBrowserID++
+	for m.browsers[id] != nil {
+		id = BrowserID(fmt.Sprintf("browser-%d", m.nextBrowserID))
+		m.nextBrowserID++
+	}
+	m.mu.Unlock()
+
+	persist := effectivePersist(effective.persist, id, defaultPersist)
+
+	profileDir := effective.profileDir
 	ephemeral := false
 	if profileDir == "" {
-		if tempMgr.profileName == "" && id == DefaultBrowserID && defaultProfileDir != "" {
+		if effective.profileName == "" && id == DefaultBrowserID && defaultProfileDir != "" {
 			profileDir = defaultProfileDir
 		} else {
-			resolved, eph, err := config.ResolveProfile(tempMgr.profileName, tempMgr.binPath, string(id), persist)
+			resolved, eph, err := config.ResolveProfile(effective.profileName, effective.binPath, string(id), persist)
 			if err != nil {
-				return "", nil, fmt.Errorf("browsers: resolve profile for %s: %w", id, err)
+				return Created{}, fmt.Errorf("browsers: resolve profile for %s: %w", id, err)
 			}
 			profileDir, ephemeral = resolved, eph
 		}
 	}
 
-	m.retainProfile(profileDir, ephemeral)
+	ownerLabel := OwnerLabelFrom(ctx)
+	if err := m.retainProfile(profileDir, ephemeral, id, owner, ownerLabel); err != nil {
+		return Created{}, err
+	}
 
-	b := NewBrowser(id, m.baseCtx, tempMgr.headless, tempMgr.stealth, tempMgr.binPath, profileDir, tempMgr.position)
-	b.proxy = tempMgr.proxy
-	b.proxyBypass = tempMgr.proxyBypass
-	b.ignoreCerts = tempMgr.ignoreCerts
+	b := NewBrowser(id, m.baseCtx, effective.headless, effective.stealth, effective.binPath, profileDir, effective.position)
+	b.owner = owner
+	b.ownerLabel = ownerLabel
+	b.key = key
+	b.ttl = effective.browserTTL
+	b.proxy = effective.proxy
+	b.proxyBypass = effective.proxyBypass
+	b.ignoreCerts = effective.ignoreCerts
 	b.logger = m.logger
 	b.ephemeral = ephemeral
 	b.profileCleanup = func() { m.releaseProfile(profileDir) }
-	if err := b.Launch(ctx); err != nil {
+	if err := m.launch(ctx, b); err != nil {
 		m.releaseProfile(profileDir)
-		return "", nil, fmt.Errorf("browsers: launch browser %s: %w", id, err)
+		return Created{}, fmt.Errorf("browsers: launch browser %s: %w", id, err)
 	}
 
 	m.mu.Lock()
 	if m.shutdown {
 		m.mu.Unlock()
 		_ = b.Close(ctx)
-		return "", nil, errors.New("browsers: manager has been shut down")
+		return Created{}, errors.New("browsers: manager has been shut down")
 	}
 	m.browsers[id] = b
-	if m.ttl > 0 {
-		m.startSweeperLocked()
-	}
+	m.startSweeperLocked()
 	m.mu.Unlock()
 
-	return id, b, nil
+	return Created{ID: id, Browser: b}, nil
 }
 
-// Open lazily opens or returns the default browser ("browser-1").
+// reusableBrowser returns the live browser whose canonical launch key matches
+// key, or nil. A matching browser that fails its liveness probe is evicted and
+// closed first, so a dead browser is never handed back as a successful create.
+func (m *Manager) reusableBrowser(ctx context.Context, key launchKey) *Browser {
+	m.mu.Lock()
+	var candidate *Browser
+	for _, b := range m.browsers {
+		if b.key == key {
+			candidate = b
+			break
+		}
+	}
+	m.mu.Unlock()
+	if candidate == nil {
+		return nil
+	}
+
+	if err := m.probe(candidate); err != nil {
+		var dead bool
+		m.mu.Lock()
+		if cur, ok := m.browsers[candidate.id]; ok && cur == candidate {
+			delete(m.browsers, candidate.id)
+			dead = true
+		}
+		if len(m.browsers) == 0 {
+			m.stopSweeperLocked()
+		}
+		m.mu.Unlock()
+		if dead {
+			_ = candidate.Close(ctx)
+		}
+		return nil
+	}
+
+	candidate.touch()
+	return candidate
+}
+
+// ownerDefaultID resolves an empty browser id to a live browser the caller may
+// use: its own browser first, then — unless the owner was explicitly chosen —
+// the unowned default. It never returns a browser owned by another client.
+func (m *Manager) ownerDefaultID(owner string, allowUnowned bool) (BrowserID, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if id, ok := m.preferredIDLocked(func(b *Browser) bool { return b.Owner() == owner }); ok {
+		return id, true
+	}
+	if allowUnowned && owner != UnownedOwner {
+		if id, ok := m.preferredIDLocked(func(b *Browser) bool { return b.Owner() == UnownedOwner }); ok {
+			return id, true
+		}
+	}
+	return "", false
+}
+
+// preferredIDLocked returns the default browser id when it matches, else any
+// matching live browser id. The caller must hold m.mu.
+func (m *Manager) preferredIDLocked(match func(*Browser) bool) (BrowserID, bool) {
+	if b, ok := m.browsers[DefaultBrowserID]; ok && match(b) {
+		return DefaultBrowserID, true
+	}
+	for id, b := range m.browsers {
+		if match(b) {
+			return id, true
+		}
+	}
+	return "", false
+}
+
+// createForOwner mints a browser for a caller with no reusable default. Create
+// uses the manager's persistent default, so an MCP manager yields an ephemeral
+// profile while the human daemon keeps its persistent default.
+func (m *Manager) createForOwner(ctx context.Context) (*Browser, error) {
+	_, b, err := m.CreateBrowser(ctx)
+	return b, err
+}
+
+// Open lazily opens or returns the default browser for the caller: its own
+// browser first, then the unowned default, else a new browser for the caller.
 func (m *Manager) Open(ctx context.Context) (*Browser, error) {
-	return m.OpenBrowser(ctx, DefaultBrowserID)
+	return m.OpenBrowser(ctx, "")
 }
 
 // OpenBrowser lazily opens or returns a Browser with the specified ID.
-// If id is empty, DefaultBrowserID ("browser-1") is used.
+// When id is empty it resolves to a live browser the caller may use: the
+// caller's own browser first, then (unless the owner was explicitly chosen with
+// WithExplicitOwner) the unowned default, else a new browser for the caller. A
+// browser owned by another client is never returned. The caller's owner
+// identity is recorded on a browser this call launches (see WithOwnerKey).
 func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, error) {
+	owner := OwnerFrom(ctx)
+
 	if id == "" {
-		id = DefaultBrowserID
+		resolved, ok := m.ownerDefaultID(owner, !HasExplicitOwner(ctx))
+		if !ok {
+			return m.createForOwner(ctx)
+		}
+		id = resolved
 	}
 
 	m.mu.Lock()
@@ -391,10 +702,10 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 
 	if b, ok := m.browsers[id]; ok {
 		m.mu.Unlock()
-		if err := probeBrowser(b); err == nil {
+		if err := m.probe(b); err == nil {
+			b.touch()
 			return b, nil
 		}
-		// Stale browser process died: remove and relaunch below
 		m.mu.Lock()
 		delete(m.browsers, id)
 		m.relaunched = true
@@ -404,36 +715,70 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 		m.mu.Unlock()
 	}
 
+	m.mu.Lock()
 	profileDir := ""
-	ephemeral := false
 	if id == DefaultBrowserID {
-		m.mu.Lock()
 		profileDir = m.profileDir
-		m.mu.Unlock()
 	}
-	if m.proxy != "" {
-		if _, _, err := parseProxy(m.proxy); err != nil {
+	binPath := m.binPath
+	headless := m.headless
+	stealth := m.stealth
+	position := m.position
+	proxy := m.proxy
+	proxyBypass := m.proxyBypass
+	ignoreCerts := m.ignoreCerts
+	browserTTL := m.browserTTL
+	m.mu.Unlock()
+
+	// Mirrors a bare CreateBrowser request so both paths share one launch key.
+	key := launchKeyOf(owner, &Manager{
+		binPath:     binPath,
+		profileName: "",
+		headless:    headless,
+		stealth:     stealth,
+		position:    position,
+		proxy:       proxy,
+		proxyBypass: proxyBypass,
+		ignoreCerts: ignoreCerts,
+	})
+
+	if proxy != "" {
+		if _, _, err := parseProxy(proxy); err != nil {
 			return nil, err
 		}
 	}
+	ephemeral := false
 	if profileDir == "" {
-		resolved, eph, err := config.ResolveProfile("", m.binPath, string(id), id == DefaultBrowserID)
+		resolved, eph, err := config.ResolveProfile("", binPath, string(id), id == DefaultBrowserID)
 		if err != nil {
 			return nil, fmt.Errorf("browsers: resolve profile for %s: %w", id, err)
 		}
 		profileDir, ephemeral = resolved, eph
 	}
 
-	m.retainProfile(profileDir, ephemeral)
+	ownerLabel := OwnerLabelFrom(ctx)
+	if err := m.retainProfile(profileDir, ephemeral, id, owner, ownerLabel); err != nil {
+		m.mu.Lock()
+		winner, ok := m.browsers[id]
+		m.mu.Unlock()
+		if ok {
+			return winner, nil
+		}
+		return nil, err
+	}
 
-	b := NewBrowser(id, m.baseCtx, m.headless, m.stealth, m.binPath, profileDir)
-	b.proxy = m.proxy
-	b.proxyBypass = m.proxyBypass
-	b.ignoreCerts = m.ignoreCerts
+	b := NewBrowser(id, m.baseCtx, headless, stealth, binPath, profileDir, position)
+	b.owner = owner
+	b.ownerLabel = ownerLabel
+	b.key = key
+	b.ttl = browserTTL
+	b.proxy = proxy
+	b.proxyBypass = proxyBypass
+	b.ignoreCerts = ignoreCerts
 	b.logger = m.logger
 	b.ephemeral = ephemeral
 	b.profileCleanup = func() { m.releaseProfile(profileDir) }
-	if err := b.Launch(ctx); err != nil {
+	if err := m.launch(ctx, b); err != nil {
 		m.releaseProfile(profileDir)
 		return nil, fmt.Errorf("browsers: launch browser %s: %w", id, err)
 	}
@@ -445,33 +790,53 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 		return nil, errors.New("browsers: manager has been shut down")
 	}
 	if winner, ok := m.browsers[id]; ok {
-		// Race condition loss: keep winner
 		m.mu.Unlock()
 		_ = b.Close(ctx)
 		return winner, nil
 	}
 	m.browsers[id] = b
-	if m.ttl > 0 {
-		m.startSweeperLocked()
-	}
+	m.startSweeperLocked()
 	m.mu.Unlock()
 	return b, nil
 }
 
-// retainProfile records one more live browser owning dir. The directory is
-// marked ephemeral when any owner says so, so a shared directory is only ever
-// removed when every owner has released it.
-func (m *Manager) retainProfile(dir string, ephemeral bool) {
+// retainProfile records one more live browser owning dir. It fails when the
+// directory is already owned by a live browser (Chromium cannot share one
+// profile directory across processes): the error names the holder and its
+// owner so the caller can close it or pick another profile.
+func (m *Manager) retainProfile(dir string, ephemeral bool, id BrowserID, owner, ownerLabel string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	ref, ok := m.profileRefs[dir]
+	if ok && ref.count > 0 {
+		return fmt.Errorf(
+			"profile %q is already in use by %s (owned by %s) — close it with browser_close {browser_id: %q} or pick a different profile name",
+			dir,
+			ref.browserID,
+			ownerDisplay(ref.ownerLabel, ref.owner),
+			ref.browserID,
+		)
+	}
 	if !ok {
 		ref = &profileRef{}
 		m.profileRefs[dir] = ref
 	}
 	ref.count++
 	ref.ephemeral = ref.ephemeral || ephemeral
+	ref.browserID = id
+	ref.owner = owner
+	ref.ownerLabel = ownerLabel
+	return nil
+}
+
+// ownerDisplay returns the human-readable owner label when one exists, else the
+// owner key.
+func ownerDisplay(label, key string) string {
+	if label != "" {
+		return label
+	}
+	return key
 }
 
 // releaseProfile releases one owner of dir. The directory is deleted once no
@@ -545,7 +910,7 @@ func (m *Manager) Browser(id BrowserID) (*Browser, error) {
 		return nil, fmt.Errorf("browser %q not found (running: %s): %w", id, running, ErrUnknownBrowser)
 	}
 
-	if err := probeBrowser(target); err != nil {
+	if err := m.probe(target); err != nil {
 		m.mu.Lock()
 		delete(m.browsers, target.id)
 		m.relaunched = true
@@ -558,6 +923,7 @@ func (m *Manager) Browser(id BrowserID) (*Browser, error) {
 		_ = target.Close(closeCtx)
 		return nil, fmt.Errorf("browsers: browser %s died", target.id)
 	}
+	target.touch()
 	return target, nil
 }
 func probeBrowser(b *Browser) error {
@@ -584,18 +950,135 @@ func (m *Manager) Browsers() map[BrowserID]*Browser {
 	return result
 }
 
-// runningIDsLocked returns a sorted comma-separated list of live browser ids,
-// or "none" when nothing is running. The caller must hold m.mu.
+// runningIDsLocked returns a sorted comma-separated list of live browser ids
+// with their owner labels, or "none" when nothing is running. The caller must
+// hold m.mu.
 func (m *Manager) runningIDsLocked() string {
 	ids := make([]string, 0, len(m.browsers))
-	for id := range m.browsers {
-		ids = append(ids, string(id))
+	for id, b := range m.browsers {
+		ids = append(ids, fmt.Sprintf("%s (owner: %s)", id, b.OwnerLabel()))
 	}
 	if len(ids) == 0 {
 		return "none"
 	}
 	sort.Strings(ids)
 	return strings.Join(ids, ", ")
+}
+
+// PurgeProfile closes the live browser id (when still running) and deletes its
+// profile directory. It refuses any path that resolves outside the config
+// profiles directory. This is the only path that deletes a named persistent
+// profile; prune never touches one.
+func (m *Manager) PurgeProfile(ctx context.Context, id BrowserID) error {
+	m.mu.Lock()
+	b, ok := m.browsers[id]
+	running := m.runningIDsLocked()
+	m.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("browser %q not found (running: %s): %w", id, running, ErrUnknownBrowser)
+	}
+
+	dir := b.ProfileDir()
+	checked, err := profileDirWithinProfiles(dir)
+	if err != nil {
+		return err
+	}
+
+	closeErr := m.CloseBrowser(ctx, id)
+	if err := os.RemoveAll(checked); err != nil {
+		return errors.Join(closeErr, fmt.Errorf("browsers: purge profile %q: %w", checked, err))
+	}
+	return closeErr
+}
+
+// PruneProfiles closes every live browser, then removes leftover directories
+// under the profiles .ephemeral directory that no live browser owns. Named
+// persistent profiles live outside .ephemeral and are never touched.
+func (m *Manager) PruneProfiles(ctx context.Context) ([]string, error) {
+	closeErr := m.CloseBrowser(ctx, "")
+
+	profiles, err := config.ProfilesDir()
+	if err != nil {
+		return nil, errors.Join(closeErr, err)
+	}
+	root, err := profileDirWithinProfiles(filepath.Join(profiles, ".ephemeral"))
+	if err != nil {
+		return nil, errors.Join(closeErr, err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, closeErr
+		}
+		return nil, errors.Join(closeErr, fmt.Errorf("browsers: read ephemeral profiles %q: %w", root, err))
+	}
+
+	var removed []string
+	var pruneErr error
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		dir := filepath.Join(root, entry.Name())
+		if m.profileInUse(dir) {
+			continue
+		}
+		checked, err := profileDirWithinProfiles(dir)
+		if err != nil {
+			pruneErr = errors.Join(pruneErr, err)
+			continue
+		}
+		if err := os.RemoveAll(checked); err != nil {
+			pruneErr = errors.Join(pruneErr, fmt.Errorf("browsers: prune profile %q: %w", checked, err))
+			continue
+		}
+		removed = append(removed, checked)
+	}
+	return removed, errors.Join(closeErr, pruneErr)
+}
+
+// profileInUse reports whether a live browser currently owns dir.
+func (m *Manager) profileInUse(dir string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.profileRefs[dir]
+	return ok
+}
+
+// profileDirWithinProfiles resolves dir and verifies it is strictly inside the
+// config profiles directory, returning the cleaned absolute path. It refuses
+// the profiles root itself and anything that resolves outside it.
+func profileDirWithinProfiles(dir string) (string, error) {
+	profiles, err := config.ProfilesDir()
+	if err != nil {
+		return "", fmt.Errorf("browsers: resolve profiles directory: %w", err)
+	}
+	root, err := filepath.Abs(profiles)
+	if err != nil {
+		return "", fmt.Errorf("browsers: resolve profiles directory: %w", err)
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("browsers: resolve profile path %q: %w", dir, err)
+	}
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = resolved
+	}
+
+	rel, err := filepath.Rel(root, abs)
+	if err != nil || rel == "." || rel == ".." ||
+		strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf(
+			"browsers: refuse to delete profile %q: it resolves outside the profiles directory %q — only profiles under %s/profiles can be purged",
+			dir,
+			root,
+			config.DirName,
+		)
+	}
+	return abs, nil
 }
 
 // Page resolves the live page with the given PageID across all active browsers.
@@ -680,10 +1163,10 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 }
 
 // startSweeperLocked launches the background TTL sweep goroutine unless one is
-// already running. It must be called with m.mu held. With a non-positive TTL
-// sweeping is disabled and no goroutine is started at all.
+// already running. It must be called with m.mu held. With both TTLs
+// non-positive, sweeping is disabled and no goroutine is started at all.
 func (m *Manager) startSweeperLocked() {
-	if m.ttl <= 0 {
+	if m.ttl <= 0 && m.browserTTL <= 0 {
 		return // sweeping disabled: no ticker goroutine at all
 	}
 	if m.sweepStop != nil {
@@ -706,8 +1189,8 @@ func (m *Manager) stopSweeperLocked() {
 	m.sweepStop = nil
 }
 
-// sweep runs the background TTL sweep loop until stop is closed: on every
-// tick it closes pages that have been idle for longer than the manager's TTL.
+// sweep runs the background TTL sweep loop until stop is closed: on every tick
+// it closes browsers idle past the browser TTL and pages idle past the page TTL.
 func (m *Manager) sweep(stop <-chan struct{}) {
 	ticker := time.NewTicker(m.sweepInterval)
 	defer ticker.Stop()
@@ -721,73 +1204,128 @@ func (m *Manager) sweep(stop <-chan struct{}) {
 	}
 }
 
-// sweepOnce closes every live page that has been idle longer than the
-// manager's TTL. Each candidate is removed from the pages map — and its rod
-// handle captured and nilled — while still holding the browser and page locks,
-// so the actual tab close happens strictly afterwards, outside any lock: a
-// Browser.Page lookup racing the sweep either sees the page (and touches it,
-// sparing it) or correctly reports "page not found" — never a page whose tab is
-// mid-close. Each close is best-effort, bounded by closePageTimeout, and never
-// retried, so a wedged tab cannot stall the sweep loop or resurface. ctx is the
-// sweep's base context (typically context.Background); per-close timeouts are
-// derived from it.
+// sweepOnce closes every live browser idle longer than the browser TTL (which
+// also closes its pages and releases its profile), then every remaining live
+// page idle longer than the page TTL. Closing a browser removes it from the map
+// under m.mu and runs Browser.Close strictly afterwards, outside every lock, so
+// a slow teardown never blocks lookups. Ephemeral profiles are deleted by the
+// existing releaseProfile path; persistent profiles stay on disk.
 func (m *Manager) sweepOnce(ctx context.Context) {
 	m.mu.Lock()
 	browsers := make([]*Browser, 0, len(m.browsers))
 	for _, b := range m.browsers {
 		browsers = append(browsers, b)
 	}
-	ttl := m.ttl
+	pageTTL := m.ttl
+	browserTTL := m.browserTTL
 	m.mu.Unlock()
-	if len(browsers) == 0 || ttl <= 0 {
-		return
-	}
 
 	for _, b := range browsers {
-		// Snapshot the idle candidates under the browser mutex.
+		if browserTTL > 0 && m.sweepIdleBrowser(ctx, b, browserTTL) {
+			continue
+		}
+		if pageTTL <= 0 {
+			continue
+		}
+		m.sweepIdlePages(ctx, b, pageTTL)
+	}
+}
+
+// sweepIdleBrowser closes b when it has been idle longer than ttl, reporting
+// whether it was closed. The map entry is removed under m.mu and Browser.Close
+// (which releases the profile, deleting an ephemeral directory) runs outside
+// the lock. A browser touched after the first idle check is spared.
+func (m *Manager) sweepIdleBrowser(ctx context.Context, b *Browser, ttl time.Duration) bool {
+	if b.idleFor() <= ttl {
+		return false
+	}
+
+	m.mu.Lock()
+	if cur, ok := m.browsers[b.id]; !ok || cur != b {
+		m.mu.Unlock()
+		return false
+	}
+	idle := b.idleFor()
+	if idle <= ttl {
+		m.mu.Unlock()
+		return false
+	}
+	delete(m.browsers, b.id)
+	if len(m.browsers) == 0 {
+		m.stopSweeperLocked()
+	}
+	m.mu.Unlock()
+
+	closeCtx, cancel := context.WithTimeout(ctx, teardownBudget)
+	err := b.Close(closeCtx)
+	cancel()
+
+	m.logger.Info("sweeper: closed idle browser",
+		slog.String("browser_id", string(b.id)),
+		slog.String("owner", b.OwnerLabel()),
+		slog.Duration("idle_for", idle),
+	)
+	if err != nil {
+		m.logger.Warn("sweeper: failed to close idle browser",
+			slog.String("browser_id", string(b.id)),
+			slog.String("error", err.Error()),
+		)
+	}
+	return true
+}
+
+// sweepIdlePages closes every page of b that has been idle longer than ttl.
+// Each candidate is removed from the pages map — and its rod handle captured
+// and nilled — while still holding the browser and page locks, so the actual tab
+// close happens strictly afterwards, outside any lock: a Browser.Page lookup
+// racing the sweep either sees the page (and touches it, sparing it) or
+// correctly reports "page not found" — never a page whose tab is mid-close.
+// Each close is best-effort, bounded by closePageTimeout, and never retried, so
+// a wedged tab cannot stall the sweep loop or resurface.
+func (m *Manager) sweepIdlePages(ctx context.Context, b *Browser, ttl time.Duration) {
+	// Snapshot the idle candidates under the browser mutex.
+	b.mu.Lock()
+	var idle []PageID
+	now := time.Now()
+	for id, p := range b.pages {
+		p.mu.Lock()
+		idleSince := p.lastAccess
+		p.mu.Unlock()
+		if now.Sub(idleSince) > ttl {
+			idle = append(idle, id)
+		}
+	}
+	b.mu.Unlock()
+
+	for _, id := range idle {
+		var handle *rod.Page
 		b.mu.Lock()
-		var idle []PageID
-		now := time.Now()
-		for id, p := range b.pages {
+		p, ok := b.pages[id]
+		if ok {
 			p.mu.Lock()
-			idleSince := p.lastAccess
-			p.mu.Unlock()
-			if now.Sub(idleSince) > ttl {
-				idle = append(idle, id)
+			if time.Since(p.lastAccess) > ttl {
+				p.stopObservation()
+				handle = p.Rod
+				p.Rod = nil
+				delete(b.pages, id)
 			}
+			p.mu.Unlock()
 		}
 		b.mu.Unlock()
+		if handle == nil {
+			continue
+		}
 
-		for _, id := range idle {
-			var handle *rod.Page
-			b.mu.Lock()
-			p, ok := b.pages[id]
-			if ok {
-				p.mu.Lock()
-				if time.Since(p.lastAccess) > ttl {
-					p.stopObservation()
-					handle = p.Rod
-					p.Rod = nil
-					delete(b.pages, id)
-				}
-				p.mu.Unlock()
-			}
-			b.mu.Unlock()
-			if handle == nil {
-				continue
-			}
-
-			closeCtx, cancel := context.WithTimeout(ctx, closePageTimeout)
-			b.stopProxyAuth(handle)
-			err := closeRodPage(closeCtx, handle)
-			cancel()
-			if err != nil {
-				m.logger.Warn("sweeper: failed to close idle page",
-					slog.String("page_id", string(id)),
-					slog.String("browser_id", string(b.id)),
-					slog.String("error", err.Error()),
-				)
-			}
+		closeCtx, cancel := context.WithTimeout(ctx, closePageTimeout)
+		b.stopProxyAuth(handle)
+		err := closeRodPage(closeCtx, handle)
+		cancel()
+		if err != nil {
+			m.logger.Warn("sweeper: failed to close idle page",
+				slog.String("page_id", string(id)),
+				slog.String("browser_id", string(b.id)),
+				slog.String("error", err.Error()),
+			)
 		}
 	}
 }

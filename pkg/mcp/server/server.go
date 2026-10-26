@@ -47,10 +47,12 @@ type Server struct {
 	// bind failure synchronously before any serving goroutine starts.
 	ln net.Listener
 
-	// sessionsMu guards sessions: the SSE session_id → outbound message
-	// channel map (an SSE stream buffers responses for its client).
+	// sessionsMu guards sessions and labels: the SSE session_id → outbound
+	// message channel map (an SSE stream buffers responses for its client) and
+	// the session_id → client label map captured at initialize.
 	sessionsMu sync.Mutex
 	sessions   map[string]chan []byte
+	labels     map[string]string
 }
 
 // New constructs an MCP Server listening on addr (e.g. ":4099") that drives the
@@ -61,6 +63,7 @@ func New(mgr *browsers.Manager, addr string) *Server {
 		addr:     addr,
 		registry: registerAll(mgr),
 		sessions: make(map[string]chan []byte),
+		labels:   make(map[string]string),
 	}
 	s.httpSrv = &http.Server{Addr: addr, Handler: s.Handler()}
 	return s
@@ -216,6 +219,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		s.sessionsMu.Lock()
 		delete(s.sessions, sessionID)
+		delete(s.labels, sessionID)
 		s.sessionsMu.Unlock()
 		close(sessionChan)
 		log.Printf("Session %s disconnected", sessionID)
@@ -277,14 +281,14 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := s.processRequest(r.Context(), req)
+	sessionID := r.URL.Query().Get("session_id")
+	resp := s.processRequest(withSSESession(r.Context(), sessionID), req)
 	respBytes, err := json.Marshal(resp)
 	if err != nil {
 		s.sendErrorDirectly(w, req.ID, -32603, "Internal marshalling error")
 		return
 	}
 
-	sessionID := r.URL.Query().Get("session_id")
 	var sessionChan chan []byte
 
 	if sessionID != "" {
@@ -319,17 +323,81 @@ func (s *Server) sendErrorDirectly(w http.ResponseWriter, id interface{}, code i
 	w.Write(bytes)
 }
 
+// sseSessionCtxKey carries the SSE connection id on a request context so the
+// owner identity can be injected before tools run.
+type sseSessionCtxKey struct{}
+
+// withSSESession records the SSE connection id on ctx. An empty id (direct POST
+// with no session) leaves ctx untouched, so the owner falls back to unowned.
+func withSSESession(ctx context.Context, id string) context.Context {
+	if id == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, sseSessionCtxKey{}, id)
+}
+
+// sseSessionFrom returns the SSE connection id recorded on ctx, or "".
+func sseSessionFrom(ctx context.Context) string {
+	id, _ := ctx.Value(sseSessionCtxKey{}).(string)
+	return id
+}
+
+// rememberClientLabel records the client name a session announced at initialize.
+func (s *Server) rememberClientLabel(sessionID, name string) {
+	if sessionID == "" || name == "" {
+		return
+	}
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	if s.labels == nil {
+		s.labels = make(map[string]string)
+	}
+	s.labels[sessionID] = name
+}
+
+// clientLabel returns the display label for a session: the client name when it
+// announced one, else a short synthetic label derived from the session id.
+func (s *Server) clientLabel(sessionID string) string {
+	s.sessionsMu.Lock()
+	name := s.labels[sessionID]
+	s.sessionsMu.Unlock()
+	if name != "" {
+		return name
+	}
+	short := sessionID
+	if len(short) > 6 {
+		short = short[len(short)-6:]
+	}
+	return "client-" + short
+}
+
 // processRequest runs one JSON-RPC request against the tool registry: it
-// handles the MCP handshake (initialize), the tool inventory (tools/list) and
-// tool invocations (tools/call), returning a JSON-RPC response.
+// injects the caller's owner identity, handles the MCP handshake (initialize),
+// the tool inventory (tools/list) and tool invocations (tools/call), returning a
+// JSON-RPC response.
 func (s *Server) processRequest(ctx context.Context, req models.JSONRPCRequest) models.JSONRPCResponse {
 	resp := models.JSONRPCResponse{
 		Jsonrpc: "2.0",
 		ID:      req.ID,
 	}
 
+	if sessionID := sseSessionFrom(ctx); sessionID != "" {
+		ctx = browsers.WithOwnerKey(ctx, sessionID)
+		ctx = browsers.WithOwnerLabel(ctx, s.clientLabel(sessionID))
+	}
+
 	switch req.Method {
 	case "initialize":
+		var params struct {
+			ClientInfo struct {
+				Name string `json:"name"`
+			} `json:"clientInfo"`
+		}
+		if len(req.Params) > 0 {
+			if err := json.Unmarshal(req.Params, &params); err == nil {
+				s.rememberClientLabel(sseSessionFrom(ctx), params.ClientInfo.Name)
+			}
+		}
 		resp.Result = models.InitializeResult{
 			ProtocolVersion: "2024-11-05",
 			ServerInfo: models.ServerInfo{

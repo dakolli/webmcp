@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"webmcp/pkg/browsers"
+	"webmcp/pkg/config"
 	"webmcp/pkg/mcp/server"
 )
 
@@ -27,8 +28,17 @@ func main() {
 
 	// The shared manager: headful Chromium, stealth on — the engine defaults.
 	// Constructed here and injected into the MCP server so the tools own one
-	// live browser for the process's lifetime.
-	mgr := browsers.NewManager()
+	// live browser for the process's lifetime. This binary drives agents only,
+	// so browsers are ephemeral unless a caller passes persist, and idle
+	// browsers are swept after the configured TTL.
+	browserTTL := browsers.DefaultBrowserTTL
+	if cfg, err := config.LoadConfig(); err == nil {
+		browserTTL = cfg.BrowserIdleTTL(browserTTL)
+	}
+	mgr := browsers.NewManager(
+		browsers.WithPersistentDefault(false),
+		browsers.WithBrowserTTL(browserTTL),
+	)
 	// Bounded so a hung page cannot block process exit.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

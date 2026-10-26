@@ -3,12 +3,35 @@ package ipc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"regexp"
+	"strings"
 	"time"
 
 	"webmcp/pkg/browsers"
 	"webmcp/pkg/cli/pageops"
 )
+
+// ownerPattern is the accepted shape of a caller-supplied owner label,
+// mirroring browser_create's rule.
+var ownerPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
+// NormalizeOwner trims and validates a caller-supplied owner label, returning
+// "" when none was supplied. The rule and error match browser_create's.
+func NormalizeOwner(owner string) (string, error) {
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return "", nil
+	}
+	if !ownerPattern.MatchString(owner) {
+		return "", fmt.Errorf(
+			"owner %q is invalid — use 1 to 64 characters from A-Z, a-z, 0-9, '.', '_' and '-' only",
+			owner,
+		)
+	}
+	return owner, nil
+}
 
 // manager is the minimal engine surface the JSON-RPC handlers dispatch
 // against. *browsers.Manager satisfies it (proven by the compile-time
@@ -23,6 +46,8 @@ type manager interface {
 	CreateBrowser(ctx context.Context, opts ...browsers.Option) (browsers.BrowserID, *browsers.Browser, error)
 	Close(ctx context.Context) error
 	CloseBrowser(ctx context.Context, id browsers.BrowserID) error
+	PurgeProfile(ctx context.Context, id browsers.BrowserID) error
+	PruneProfiles(ctx context.Context) ([]string, error)
 	Browser(id browsers.BrowserID) (*browsers.Browser, error)
 	Browsers() map[browsers.BrowserID]*browsers.Browser
 	Page(ctx context.Context, id browsers.PageID) (*browsers.Page, error)
@@ -67,19 +92,16 @@ func (s *Server) handle(ctx context.Context, req Request) (any, *Error) {
 }
 
 func (s *Server) handleBrowserOpen(ctx context.Context, params json.RawMessage) (any, *Error) {
-	var p struct {
-		Bin         string `json:"bin,omitempty"`
-		Profile     string `json:"profile,omitempty"`
-		Position    string `json:"position,omitempty"`
-		Proxy       string `json:"proxy,omitempty"`
-		ProxyBypass string `json:"proxy_bypass,omitempty"`
-		Headless    *bool  `json:"headless,omitempty"`
-		Stealth     *bool  `json:"stealth,omitempty"`
-		Persist     *bool  `json:"persist,omitempty"`
-		IgnoreCerts *bool  `json:"ignore_certs,omitempty"`
+	p, rpcErr := decodeParams[BrowserOpenParams](params)
+	if rpcErr != nil {
+		return nil, rpcErr
 	}
-	if len(params) > 0 && string(params) != "null" {
-		_ = json.Unmarshal(params, &p)
+	owner, err := NormalizeOwner(p.Owner)
+	if err != nil {
+		return nil, &Error{Code: CodeInvalidParams, Message: err.Error()}
+	}
+	if owner != "" {
+		ctx = browsers.WithExplicitOwner(ctx, owner)
 	}
 
 	var opts []browsers.Option
@@ -112,31 +134,82 @@ func (s *Server) handleBrowserOpen(ctx context.Context, params json.RawMessage) 
 	}
 
 	if len(opts) > 0 {
-		id, _, err := s.mgr.CreateBrowser(ctx, opts...)
+		_, b, err := s.mgr.CreateBrowser(ctx, opts...)
 		if err != nil {
 			return nil, serverError(err)
 		}
-		return BrowserOpenResult{BrowserID: string(id)}, nil
+		return browserOpenResult(b), nil
 	}
 
 	b, err := s.mgr.Open(ctx)
 	if err != nil {
 		return nil, serverError(err)
 	}
-	return BrowserOpenResult{BrowserID: string(b.ID())}, nil
+	return browserOpenResult(b), nil
+}
+
+// browserOpenResult projects a live browser's lifecycle snapshot into the
+// browser.open reply.
+func browserOpenResult(b *browsers.Browser) BrowserOpenResult {
+	info := b.Info()
+	return BrowserOpenResult{
+		BrowserID: string(info.BrowserID),
+		Owner:     info.Owner,
+		Persist:   info.Persist,
+		TTL:       info.TTL,
+	}
 }
 
 func (s *Server) handleBrowserClose(ctx context.Context, params json.RawMessage) (any, *Error) {
-	var p struct {
-		BrowserID string `json:"browser_id,omitempty"`
+	p, rpcErr := decodeParams[BrowserCloseParams](params)
+	if rpcErr != nil {
+		return nil, rpcErr
 	}
-	if len(params) > 0 && string(params) != "null" {
-		_ = json.Unmarshal(params, &p)
+	if err := validateCloseCleanup(p); err != nil {
+		return nil, &Error{Code: CodeInvalidParams, Message: err.Error()}
 	}
-	if err := s.mgr.CloseBrowser(ctx, browsers.BrowserID(p.BrowserID)); err != nil {
-		return nil, serverError(err)
+
+	switch {
+	case p.Prune:
+		removed, err := s.mgr.PruneProfiles(ctx)
+		if err != nil {
+			return nil, serverError(err)
+		}
+		return BrowserCloseResult{
+			OK:      true,
+			Message: fmt.Sprintf("all browsers closed; pruned %d orphan ephemeral profile(s)", len(removed)),
+		}, nil
+	case p.Purge:
+		if err := s.mgr.PurgeProfile(ctx, browsers.BrowserID(p.BrowserID)); err != nil {
+			return nil, serverError(err)
+		}
+		return BrowserCloseResult{
+			OK:      true,
+			Message: fmt.Sprintf("browser %s closed and its profile deleted", p.BrowserID),
+		}, nil
+	default:
+		if err := s.mgr.CloseBrowser(ctx, browsers.BrowserID(p.BrowserID)); err != nil {
+			return nil, serverError(err)
+		}
+		if p.BrowserID == "" {
+			return BrowserCloseResult{OK: true, Message: "all browsers closed"}, nil
+		}
+		return BrowserCloseResult{OK: true, Message: fmt.Sprintf("browser %s closed", p.BrowserID)}, nil
 	}
-	return BrowserCloseResult{OK: true}, nil
+}
+
+// validateCloseCleanup applies browser_close's purge/prune rules, with the
+// exact messages the MCP tool returns for the same request.
+func validateCloseCleanup(p *BrowserCloseParams) error {
+	switch {
+	case p.Purge && p.Prune:
+		return errors.New("purge and prune are mutually exclusive — pass purge with a browser_id, or prune alone")
+	case p.Prune && p.BrowserID != "":
+		return errors.New("prune takes no browser_id — it closes all browsers and cleans orphan ephemeral profiles; use purge with browser_id to delete one profile")
+	case p.Purge && p.BrowserID == "":
+		return errors.New("purge requires a browser_id — pass the browser whose profile to delete, or use prune to clean orphan ephemeral profiles")
+	}
+	return nil
 }
 
 func (s *Server) handleBrowserList(ctx context.Context, params json.RawMessage) (any, *Error) {
@@ -149,10 +222,17 @@ func (s *Server) handleBrowserList(ctx context.Context, params json.RawMessage) 
 	}
 	var list []BrowserEntry
 	for id, b := range active {
+		info := b.Info()
 		list = append(list, BrowserEntry{
 			BrowserID:  string(id),
-			Bin:        b.BinPath(),
-			ProfileDir: b.ProfileDir(),
+			Owner:      info.Owner,
+			Bin:        info.Bin,
+			ProfileDir: info.ProfileDir,
+			Persist:    info.Persist,
+			Ephemeral:  info.Ephemeral,
+			CreatedAt:  info.CreatedAt,
+			IdleFor:    info.IdleFor,
+			TTL:        info.TTL,
 			Pages:      b.Pages(),
 		})
 	}

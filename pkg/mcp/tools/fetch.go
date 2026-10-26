@@ -41,7 +41,13 @@ func (t *Fetch) Description() string {
 		"summary (title, url, session_id, byte-size hints). Call this FIRST to " +
 		"load a page; then use page_fetch with the returned session_id to read " +
 		"its html/dom/text/css/js/links/screenshot/meta, and page_act to " +
-		"interact with it. Each fetch_page call creates a new session."
+		"interact with it. Each fetch_page call creates a new session. Set owner " +
+		"(1 to 64 characters from A-Z, a-z, 0-9, '.', '_', '-') to use your own " +
+		"browser when several agents share one session; with an owner set it never " +
+		"falls back to the shared unowned browser. Example: " +
+		"{ \"owner\": \"scraper-a\", \"url\": \"https://example.com\" } and " +
+		"{ \"owner\": \"scraper-b\", \"url\": \"https://example.com\" } open two " +
+		"separate browsers."
 }
 
 // InputSchema returns the JSON Schema for fetch_page's arguments: a required
@@ -84,6 +90,12 @@ func (t *Fetch) InputSchema() models.InputSchema {
 				"type":        "integer",
 				"description": "Optional per-call timeout in milliseconds (default 30000).",
 			},
+			"owner": map[string]any{
+				"type": "string",
+				"description": "Optional owner label for your agent (1 to 64 characters from A-Z, a-z, 0-9, '.', '_', '-'). " +
+					"Uses the browser owned by this label, creating one if needed; it never falls back to the shared unowned browser. " +
+					"Defaults to the session identity, else 'unowned'.",
+			},
 		},
 		Required: []string{"url"},
 	}
@@ -114,6 +126,8 @@ type fetchArgs struct {
 	UserAgent string `json:"user_agent"`
 	// TimeoutMS bounds the whole call in milliseconds (default 30000).
 	TimeoutMS int `json:"timeout_ms"`
+	// Owner optionally claims the browser for the caller's own agent label.
+	Owner string `json:"owner"`
 }
 
 // validate checks fetchArgs for required fields and legal enum values. It is
@@ -144,6 +158,11 @@ func (a *fetchArgs) validate() error {
 	if a.TimeoutMS < 0 {
 		return fmt.Errorf("timeout_ms must be >= 0")
 	}
+	owner, err := normalizeOwner(a.Owner)
+	if err != nil {
+		return err
+	}
+	a.Owner = owner
 	return nil
 }
 
@@ -168,6 +187,10 @@ func (t *Fetch) Execute(ctx context.Context, args json.RawMessage) (string, erro
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+
+	if a.Owner != "" {
+		ctx = browsers.WithExplicitOwner(ctx, a.Owner)
+	}
 
 	start := time.Now() // load timing for the summary
 

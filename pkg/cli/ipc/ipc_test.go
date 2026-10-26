@@ -27,6 +27,12 @@ type stubbedManager struct {
 	openErr    error
 	closeErr   error
 	browserErr error
+	// purgeErr/pruneErr force the cleanup methods to fail; purged records the
+	// ids purge was called with and pruneN is the removed-directory count.
+	purgeErr error
+	pruneErr error
+	purged   []browsers.BrowserID
+	pruneN   int
 }
 
 // Open implements manager.
@@ -53,6 +59,25 @@ func (s *stubbedManager) Close(context.Context) error { return s.closeErr }
 
 func (s *stubbedManager) CloseBrowser(ctx context.Context, id browsers.BrowserID) error {
 	return s.closeErr
+}
+
+func (s *stubbedManager) PurgeProfile(ctx context.Context, id browsers.BrowserID) error {
+	if s.purgeErr != nil {
+		return s.purgeErr
+	}
+	s.purged = append(s.purged, id)
+	return s.closeErr
+}
+
+func (s *stubbedManager) PruneProfiles(context.Context) ([]string, error) {
+	if s.pruneErr != nil {
+		return nil, s.pruneErr
+	}
+	removed := make([]string, s.pruneN)
+	for i := range removed {
+		removed[i] = "removed"
+	}
+	return removed, s.closeErr
 }
 
 // Browser implements manager.

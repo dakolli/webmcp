@@ -8,6 +8,7 @@ package ipc
 
 import (
 	"encoding/json"
+	"time"
 
 	"webmcp/pkg/browsers"
 	"webmcp/pkg/cli/pageops"
@@ -113,10 +114,24 @@ type PingResult struct {
 // fixed by `web-cli serve --headless/--stealth`. The client-side launch flow
 // must pass the flags to serve itself, not rely on these params.
 type BrowserOpenParams struct {
+	// Bin is a custom browser executable path or command.
+	Bin string `json:"bin,omitempty"`
+	// Profile is a profile name resolved under the config dir, or an absolute
+	// directory path.
+	Profile string `json:"profile,omitempty"`
+	// Position is the window position preset: left, right, max or normal.
+	Position string `json:"position,omitempty"`
 	// Headless requests headless Chromium (accepted for parity only).
 	Headless *bool `json:"headless,omitempty"`
 	// Stealth requests go-rod/stealth (accepted for parity only).
 	Stealth *bool `json:"stealth,omitempty"`
+	// Owner is an explicit caller-chosen owner label. It joins the create key
+	// and is shown by browser.list, so two owners with identical options get
+	// separate browsers.
+	Owner string `json:"owner,omitempty"`
+	// Persist keeps the profile (and its logins) after close. Absent keeps the
+	// manager default (ephemeral on the `serve mcp` path).
+	Persist *bool `json:"persist,omitempty"`
 	// Proxy is an upstream proxy for the new browser: host:port or
 	// scheme://host:port. Credentials come only from proxy.json.
 	Proxy string `json:"proxy,omitempty"`
@@ -129,20 +144,47 @@ type BrowserOpenParams struct {
 
 // BrowserOpenResult is the result of browser.open.
 type BrowserOpenResult struct {
-	// BrowserID identifies the serve process's single Browser.
+	// BrowserID identifies the live browser.
 	BrowserID string `json:"browser_id"`
+	// Owner is the display label recorded at creation ("unowned" when none).
+	Owner string `json:"owner"`
+	// Persist reports whether the profile survives close.
+	Persist bool `json:"persist"`
+	// TTL is the idle timeout that closes the browser ("0s" when disabled).
+	TTL string `json:"ttl"`
+}
+
+// BrowserCloseParams carries the browser.close parameters. purge deletes the
+// closed browser's profile; prune closes every browser and removes orphan
+// directories under profiles/.ephemeral.
+type BrowserCloseParams struct {
+	// BrowserID names the browser to close; optional when prune is set.
+	BrowserID string `json:"browser_id,omitempty"`
+	// Purge deletes the closed browser's profile directory (config-dir guarded).
+	Purge bool `json:"purge,omitempty"`
+	// Prune closes all browsers and removes orphan ephemeral profiles.
+	Prune bool `json:"prune,omitempty"`
 }
 
 // BrowserCloseResult is the result of browser.close.
 type BrowserCloseResult struct {
-	// OK is true once the Browser and its pages are closed.
+	// OK is true once the requested close/cleanup completed.
 	OK bool `json:"ok"`
+	// Message is the human-readable outcome, byte-identical to the MCP
+	// browser_close reply for the same request.
+	Message string `json:"message,omitempty"`
 }
 
 type BrowserEntry struct {
 	BrowserID  string              `json:"browser_id"`
+	Owner      string              `json:"owner"`
 	Bin        string              `json:"bin,omitempty"`
 	ProfileDir string              `json:"profile_dir,omitempty"`
+	Persist    bool                `json:"persist"`
+	Ephemeral  bool                `json:"ephemeral"`
+	CreatedAt  time.Time           `json:"created_at"`
+	IdleFor    string              `json:"idle_for"`
+	TTL        string              `json:"ttl"`
 	Pages      []browsers.PageInfo `json:"pages"`
 }
 

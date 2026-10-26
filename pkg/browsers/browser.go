@@ -33,12 +33,14 @@ func DefaultBinPath() string {
 // Browser owns a single live Chromium instance (a *rod.Browser) and the map of
 // its live Pages (browser tabs, a.k.a. MCP sessions).
 //
-// Thread safety: the pages map is guarded by the Browser mutex; each Page
-// carries its own mutex because rod Pages are not thread-safe (see session.go).
+// Thread safety: the pages map, the idle clock and the rod handle are guarded
+// by the Browser mutex; each Page carries its own mutex because rod Pages are
+// not thread-safe (see session.go).
 type Browser struct {
 	// id is the unique BrowserID assigned by Manager (e.g. "browser-1").
 	id BrowserID
-	// mu guards the pages map and the rod browser pointer.
+	// mu guards the pages map, the rod browser pointer, the profile directory
+	// and the idle clock.
 	mu sync.Mutex
 	// rod is the live go-rod browser handle; nil until Launch succeeds.
 	rod *rod.Browser
@@ -46,6 +48,24 @@ type Browser struct {
 	pages map[PageID]*Page
 	// nextID is the counter used to mint fresh PageIDs in NewPage.
 	nextID int
+	// owner is the caller identity recorded at creation (UnownedOwner when the
+	// surface had none). Informational only: browsers are closed by id.
+	owner string
+	// ownerLabel is the human-friendly identity shown in listings and errors
+	// (e.g. an MCP client name); owner stays the ownership key. Immutable.
+	ownerLabel string
+	// key is the canonical launch-request identity used for create idempotency.
+	// Immutable after creation.
+	key launchKey
+	// createdAt is when the Browser was constructed. Immutable.
+	createdAt time.Time
+	// lastAccess is the last time the browser was used (page created, page
+	// closed, page or browser looked up). The manager's sweeper closes browsers
+	// idle for longer than the browser TTL. Guarded by mu.
+	lastAccess time.Time
+	// ttl is the browser idle TTL reported in Info (0 means sweeping is
+	// disabled). Set by Manager, immutable afterwards.
+	ttl time.Duration
 	// headless selects headless Chromium at launch time (default: headful).
 	headless bool
 	// stealth applies go-rod/stealth to every new page (default: on).
@@ -110,6 +130,8 @@ func NewBrowser(id BrowserID, baseCtx context.Context, headless, stealth bool, b
 		binPath:    binPath,
 		profileDir: profileDir,
 		position:   pos,
+		createdAt:  time.Now(),
+		lastAccess: time.Now(),
 		logger:     slog.New(slog.DiscardHandler),
 		baseCtx:    baseCtx,
 	}
@@ -123,6 +145,88 @@ func (b *Browser) Position() string {
 // ID returns the Browser's unique BrowserID (e.g. "browser-1").
 func (b *Browser) ID() BrowserID {
 	return b.id
+}
+
+// Owner returns the owner key recorded when the Browser was created
+// (UnownedOwner when the surface had no client identity).
+func (b *Browser) Owner() string {
+	if b.owner == "" {
+		return UnownedOwner
+	}
+	return b.owner
+}
+
+// OwnerLabel returns the human-friendly owner label for listings and errors,
+// falling back to the owner key when no label was recorded.
+func (b *Browser) OwnerLabel() string {
+	return ownerDisplay(b.ownerLabel, b.Owner())
+}
+
+// touch records that the browser was just used, resetting its idle clock so the
+// manager's sweeper does not close it.
+func (b *Browser) touch() {
+	b.mu.Lock()
+	b.lastAccess = time.Now()
+	b.mu.Unlock()
+}
+
+// idleFor returns how long the browser has gone unused.
+func (b *Browser) idleFor() time.Duration {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return time.Since(b.lastAccess)
+}
+
+// BrowserInfo is a JSON-ready snapshot of one live browser's lifecycle state.
+// It excludes the live rod handle and is safe to serialize from the MCP, CLI
+// and IPC surfaces.
+type BrowserInfo struct {
+	// BrowserID is the live browser id (e.g. "browser-1").
+	BrowserID BrowserID `json:"browser_id"`
+	// Owner is the caller's display label recorded at creation, or UnownedOwner
+	// when the surface supplied none. It never exposes the raw owner key.
+	Owner string `json:"owner"`
+	// Bin is the configured browser executable (empty means the default).
+	Bin string `json:"bin,omitempty"`
+	// ProfileDir is the resolved profile directory.
+	ProfileDir string `json:"profile_dir"`
+	// Persist reports whether the profile directory survives close.
+	Persist bool `json:"persist"`
+	// Ephemeral reports whether the profile directory is deleted on close.
+	Ephemeral bool `json:"ephemeral"`
+	// CreatedAt is when the browser was created.
+	CreatedAt time.Time `json:"created_at"`
+	// IdleFor is how long the browser has gone unused, rounded to seconds.
+	IdleFor string `json:"idle_for"`
+	// TTL is the browser idle timeout that closes it ("0s" when disabled).
+	TTL string `json:"ttl"`
+	// PageCount is the number of live pages.
+	PageCount int `json:"page_count"`
+	// CreateKey summarizes the launch options this browser was created with.
+	CreateKey string `json:"create_key"`
+}
+
+// Info returns a JSON-ready snapshot of the Browser's lifecycle state.
+func (b *Browser) Info() BrowserInfo {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	owner := b.ownerLabel
+	if owner == "" {
+		owner = UnownedOwner
+	}
+	return BrowserInfo{
+		BrowserID:  b.id,
+		Owner:      owner,
+		Bin:        b.binPath,
+		ProfileDir: b.profileDir,
+		Persist:    !b.ephemeral,
+		Ephemeral:  b.ephemeral,
+		CreatedAt:  b.createdAt,
+		IdleFor:    time.Since(b.lastAccess).Round(time.Second).String(),
+		TTL:        b.ttl.String(),
+		PageCount:  len(b.pages),
+		CreateKey:  b.key.Summary(),
+	}
 }
 
 // BinPath returns the Browser's configured executable path.
@@ -244,8 +348,9 @@ func (b *Browser) Launch(ctx context.Context) error {
 	if err != nil {
 		if strings.Contains(err.Error(), "SingletonLock") || strings.Contains(err.Error(), "Opening in existing browser session") {
 			return fmt.Errorf(
-				"browsers: launch chromium: profile %q is already in use by another running browser — create this browser with a distinct profile or an ephemeral one: %w",
+				"browsers: launch chromium: profile %q is already in use by another running browser (owned by %s) — close the browser holding it with browser_close {browser_id: \"<id>\"} or pick a different profile name: %w",
 				profileDir,
+				b.OwnerLabel(),
 				err,
 			)
 		}
@@ -447,7 +552,9 @@ func (b *Browser) NewPage(
 	b.nextID++
 	page.ID = PageID(fmt.Sprintf("page-%d", b.nextID))
 	page.URL = url
-	page.lastAccess = time.Now()
+	now := time.Now()
+	page.lastAccess = now
+	b.lastAccess = now
 	b.pages[page.ID] = page
 	return page, nil
 }
@@ -490,6 +597,7 @@ func (b *Browser) Page(ctx context.Context, id PageID) (*Page, error) {
 	b.mu.Lock()
 	p, ok := b.pages[id]
 	if ok {
+		b.lastAccess = time.Now()
 		p.touch()
 	}
 	b.mu.Unlock()
@@ -726,6 +834,7 @@ func (b *Browser) ClosePage(ctx context.Context, id PageID) error {
 	p.Rod = nil
 	delete(b.pages, id)
 	p.mu.Unlock()
+	b.lastAccess = time.Now()
 	b.mu.Unlock()
 
 	if handle == nil {

@@ -28,11 +28,11 @@ Two things it is for:
   mouse (`click_at`/`hover_at`), drag & drop, file upload, eval, navigate/history, hover, scroll,
   select, wait modes (`load`/`idle`/`stable`/`interactable`/`ms`), viewport and device emulation,
   and `clear_logs`.
-- 🧭 **Multi-browser aware**: a manager owns a map of browsers, each with its own pages; `browser-1`
-  is the default.
+- 🧭 **Multi-browser aware**: a manager owns a map of browsers, each with its own pages and owner;
+  `browser-1` is just the first id minted, not a shared singleton.
 - 🥷 **Stealth on by default** (`go-rod/stealth`) and **profiles under the config dir**
-  (`~/.config/browser-mcp/profiles/`). `browser-1` keeps its profile and logins across restarts.
-  Secondary browsers are ephemeral by default and their profile is removed on close.
+  (`~/.config/browser-mcp/profiles/`). Browsers are ephemeral by default — their profile is
+  deleted on close. Pass `--persist` / `"persist": true` to keep a named profile and its logins.
 - 📱 **Opt-in device emulation** (`IPhoneX`, `IPadPro`, `LaptopWithHiDPIScreen`), applied before
   navigation; pages otherwise launch plain at your real display metrics.
 - ⚡ **Dual interface**: the `browser` CLI mirrors the MCP tools 1:1, plus a daemon over a Unix socket
@@ -48,7 +48,15 @@ found on `PATH` (probe order: `brave-browser` → `brave` → `google-chrome` �
 ```sh
 go install ./cmd/browser     # installs the `browser` binary
 make install                 # same, after stopping any running daemon
+make install-dev             # DEV RESET: see below
 ```
+
+`make install-dev` stops the daemon, **deletes the whole config directory**
+(`~/.config/browser-mcp`: every profile including saved logins and cookies, `config.json`, and
+`proxy.json` with its proxy credentials), reinstalls the binary, and relaunches
+`browser serve mcp` on `PORT` (default 4089). It refuses to run when `BROWSER_MCP_CONFIG` or
+`CONFIG_DIR` points outside `$HOME`, or when `HOME` is unset. `make install` is unchanged and
+non-destructive.
 
 ---
 
@@ -71,15 +79,26 @@ browser serve --foreground                                          # stay attac
 `--port` defaults to `4099` when omitted; the Makefile and the examples here use `4089`.
 The MCP server binds all interfaces and has **no authentication** — keep it local-only.
 
-### Profiles
+### Profiles and browser lifecycle
 
-- A bare profile name resolves under `~/.config/browser-mcp/profiles/<name>`.
-- An absolute path is used as given. A relative path with a separator is rejected.
-- `browser-1` with no profile uses the persistent default profile.
-- A secondary browser gets an ephemeral profile under `profiles/.ephemeral/`.
-  The manager removes that profile on close, shutdown, or launch failure.
-- Add `--persist` to keep a named profile and its logins after close.
-  The MCP equivalent is `"persist": true` on `browser_create`.
+- Every profile lives under `~/.config/browser-mcp/profiles/`. A bare profile name resolves to
+  `profiles/<name>`; an absolute path is used as given; a relative path with a separator is rejected.
+- **Browsers are ephemeral by default.** A browser gets a throwaway profile under
+  `profiles/.ephemeral/` that is deleted on close or when the browser expires. The MCP
+  (`browser serve mcp`) path and a bare in-process `browser create` are ephemeral.
+- Add `--persist` (CLI) or `"persist": true` (`browser_create`) to keep a named profile and its
+  logins after close. The plain human `browser serve` daemon keeps its lazily launched `browser-1`
+  persistent.
+- **Close is the normal end.** `browser close <id>` closes one browser and its pages.
+  `--purge` also deletes that browser's profile (config-dir guarded). `--prune` closes every browser
+  and removes orphan `profiles/.ephemeral/` directories; named persistent profiles are never
+  auto-deleted.
+- `--owner <label>` (CLI) / `"owner": "<label>"` (`browser_create`) labels a browser and joins the
+  create key: the same owner with the same options reuses one browser, a different owner gets a
+  separate one.
+- **Idle browsers expire** after 30 minutes by default. Set `browser_ttl` in
+  `~/.config/browser-mcp/config.json` as a Go duration (`"15m"`, `"0"` to disable); pages keep their
+  separate 15-minute TTL.
 
 ### Proxy & TLS (Burp, Caido, ZAP)
 
@@ -87,7 +106,7 @@ Route the browser through a local intercept proxy with `--proxy` (CLI) or `proxy
 (`browser_create`). Both accept `host:port` or `scheme://host:port`:
 
 ```sh
-browser browser create --proxy http://127.0.0.1:8080 --ignore-certs
+browser create --proxy http://127.0.0.1:8080 --ignore-certs
 browser fetch https://example.org --wait load    # the request appears in the proxy history
 ```
 
@@ -155,9 +174,9 @@ browser page close last
 
 | Tool | Purpose |
 | :--- | :--- |
-| `browser_create` | Launch/reuse a browser (`bin`, `profile`, `persist`, `headless`, `stealth`, `position`, `proxy`, `proxy_bypass`, `ignore_certs`). |
-| `browser_list` | List live browsers and their pages. |
-| `browser_close` | Close one browser, or all when `browser_id` is empty. An unknown id fails with `browser "browser-42" not found (running: browser-1)`. |
+| `browser_create` | Create or reuse a browser (`bin`, `profile`, `persist`, `owner`, `headless`, `stealth`, `position`, `proxy`, `proxy_bypass`, `ignore_certs`). Ephemeral by default; `persist: true` keeps the profile. Same owner + same options reuses the same id. |
+| `browser_list` | List live browsers with `owner`, `persist`, `ephemeral`, `created_at`, `idle_for`, `ttl`, `profile_dir` and their pages. |
+| `browser_close` | Close one browser, or all when `browser_id` is empty. `purge: true` also deletes that profile; `prune: true` (no `browser_id`) closes all and removes orphan `.ephemeral` profiles. An unknown id fails with `browser "browser-42" not found (running: browser-1)`. |
 | `fetch_page` | Open a URL in a new session and return `session_id` + summary. `wait_for` defaults to `idle`. |
 | `page_list` | List the pages of a browser. `browser_id` is required, and an unknown id fails with `browser "browser-42" not found (running: browser-1)`. |
 | `session_list` | List all live sessions. |
@@ -275,7 +294,7 @@ The CLI exposes the same capabilities with shell conveniences:
 | `browser page fetch [id\|url] [what]` | `page_fetch` |
 | `browser page act [id] [action] [payload...] [--handle g<doc>-b<id>]` | `page_act` |
 | `browser page close [id]` | `session_close` |
-| `browser create` / `list` / `close` | `browser_create` / `browser_list` / `browser_close` |
+| `browser create [--owner --persist]` / `list` / `close [--purge\|--prune]` | `browser_create` / `browser_list` / `browser_close` |
 | `browser focus` | — (CLI-only: raise the window) |
 | `browser serve` / `stop` | — (CLI-only: daemon lifecycle) |
 
@@ -288,6 +307,8 @@ page by default), one-step `page fetch <url> [what]`, and `--max-bytes 0` for un
 
 - **Sessions expire** after 15 minutes idle. If a `session_id` disappears or the browser restarted,
   re-open the page; the error message says so.
+- **Browsers expire** after 30 minutes idle by default (`browser_ttl` in `config.json`; `"0"`
+  disables). Closing explicitly is still the normal end: `browser close <id>` or `browser_close`.
 - **`wait_for` defaults to `idle`.** Omit it on a normal page. Pass `load` or `stable` on JS-heavy
   sites, where the idle network-wait can stall.
 - **50 KB default output cap.** Narrow with `selector` / `target` where those apply. Raise
