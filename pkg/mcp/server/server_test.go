@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"webmcp/pkg/browsers"
@@ -150,6 +151,71 @@ func callCaptureTool(t *testing.T, s *Server, ctx context.Context) {
 	})
 	if resp.Error != nil {
 		t.Fatalf("tools/call error: %v", resp.Error)
+	}
+}
+
+func TestContentBlocks(t *testing.T) {
+	const payload = "cG5n"
+	const carrier = `{"ok":true,"data":{"marks":[{"index":1}],"viewport_width":10,"viewport_height":20,"truncated":0},"image":{"type":"image","data":"` + payload + `","mimeType":"image/png"},"fallback":{"field":"screenshot"}}`
+
+	t.Run("image capable client gets text and image", func(t *testing.T) {
+		blocks := contentBlocks(carrier, true)
+		if len(blocks) != 2 {
+			t.Fatalf("got %d blocks, want 2", len(blocks))
+		}
+		if blocks[0].Type != "text" || blocks[1].Type != "image" {
+			t.Fatalf("block types = %q, %q, want text, image", blocks[0].Type, blocks[1].Type)
+		}
+		if strings.Contains(blocks[0].Text, payload) {
+			t.Error("text block repeats the image base64 payload")
+		}
+		if blocks[1].Data != payload || blocks[1].MimeType != "image/png" {
+			t.Errorf("image block = %+v, want the PNG payload and mimeType", blocks[1])
+		}
+	})
+
+	t.Run("text only client gets the data URI", func(t *testing.T) {
+		blocks := contentBlocks(carrier, false)
+		if len(blocks) != 1 {
+			t.Fatalf("got %d blocks, want 1", len(blocks))
+		}
+		want := `"screenshot":"data:image/png;base64,` + payload + `"`
+		if !strings.Contains(blocks[0].Text, want) {
+			t.Errorf("text block does not expose the data URI under screenshot:\n%s", blocks[0].Text)
+		}
+	})
+
+	t.Run("plain envelope is unchanged", func(t *testing.T) {
+		const plain = `{"ok":true,"data":{"x":1}}`
+		blocks := contentBlocks(plain, true)
+		if len(blocks) != 1 || blocks[0].Text != plain {
+			t.Fatalf("plain result changed: %+v", blocks)
+		}
+	})
+}
+
+func TestImageSupport(t *testing.T) {
+	cases := []struct {
+		name string
+		caps string
+		want bool
+	}{
+		{"absent defaults to images", `{}`, true},
+		{"top level opt-out", `{"imageContent":false}`, false},
+		{"experimental opt-out", `{"experimental":{"imageContent":false}}`, false},
+		{"experimental opt-in", `{"experimental":{"imageContent":true}}`, true},
+		{"non boolean defaults to images", `{"imageContent":"no"}`, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var caps map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(tc.caps), &caps); err != nil {
+				t.Fatalf("decode capabilities: %v", err)
+			}
+			if got := imageSupport(caps); got != tc.want {
+				t.Errorf("imageSupport() = %t, want %t", got, tc.want)
+			}
+		})
 	}
 }
 

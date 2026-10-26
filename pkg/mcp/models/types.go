@@ -119,8 +119,11 @@ type CallToolResult struct {
 	Content []ContentBlock `json:"content"`
 }
 
-// ContentBlock contains a text output block for the client.
+// ContentBlock is one MCP content block: a text block, or an image block whose
+// base64 payload and MIME type let a vision client render it directly.
 type ContentBlock struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	Data     string `json:"data,omitempty"`
+	MimeType string `json:"mimeType,omitempty"`
 }

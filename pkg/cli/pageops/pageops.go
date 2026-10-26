@@ -644,65 +644,85 @@ func PageBody(ctx context.Context, p *browsers.Page, target string) (string, err
 	return string(b), nil
 }
 
+// AspectQuery selects one page aspect and the optional inputs it reads. Each
+// reader uses only the fields its aspect documents.
+type AspectQuery struct {
+	// What is the aspect name.
+	What string
+	// Selector optionally scopes html/text extraction to a CSS match.
+	Selector string
+	// Target selects one css/js resource, or with body one observed response.
+	Target string
+	// FullPage captures the whole scrollable page (screenshot only).
+	FullPage bool
+	// IncludeValues exposes cookie and storage values (storage only).
+	IncludeValues bool
+	// MaxBytes caps the output unless the aspect self-caps.
+	MaxBytes int
+}
+
 // aspectEntry is one page aspect: its what name, its reader and whether the
 // reader already caps its own output (bypassing max_bytes truncation).
 type aspectEntry struct {
 	name       string
 	selfCapped bool
-	read       func(ctx context.Context, p *browsers.Page, selector, target string, fullPage bool) (string, error)
+	read       func(ctx context.Context, p *browsers.Page, q AspectQuery) (string, error)
 }
 
 // aspectEntries is the single registry of page aspects, in the order error
 // messages list them. The CLI and the daemon resolve every what through it, so a
 // new aspect is one entry here instead of another hardcoded allow-list.
 var aspectEntries = []aspectEntry{
-	{name: "html", read: func(ctx context.Context, p *browsers.Page, selector, _ string, _ bool) (string, error) {
-		return PageHTML(ctx, p, selector)
+	{name: "html", read: func(ctx context.Context, p *browsers.Page, q AspectQuery) (string, error) {
+		return PageHTML(ctx, p, q.Selector)
 	}},
-	{name: "text", read: func(ctx context.Context, p *browsers.Page, selector, _ string, _ bool) (string, error) {
-		return PageText(ctx, p, selector)
+	{name: "text", read: func(ctx context.Context, p *browsers.Page, q AspectQuery) (string, error) {
+		return PageText(ctx, p, q.Selector)
 	}},
-	{name: "links", read: func(ctx context.Context, p *browsers.Page, _, _ string, _ bool) (string, error) {
+	{name: "links", read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
 		return PageLinks(ctx, p)
 	}},
-	{name: "meta", read: func(ctx context.Context, p *browsers.Page, _, _ string, _ bool) (string, error) {
+	{name: "meta", read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
 		return PageMeta(ctx, p)
 	}},
-	{name: "dom", read: func(ctx context.Context, p *browsers.Page, _, _ string, _ bool) (string, error) {
+	{name: "dom", read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
 		return PageDOM(ctx, p)
 	}},
-	{name: "css", read: func(ctx context.Context, p *browsers.Page, _, target string, _ bool) (string, error) {
-		return PageCSS(ctx, p, target)
+	{name: "css", read: func(ctx context.Context, p *browsers.Page, q AspectQuery) (string, error) {
+		return PageCSS(ctx, p, q.Target)
 	}},
-	{name: "js", read: func(ctx context.Context, p *browsers.Page, _, target string, _ bool) (string, error) {
-		return PageJS(ctx, p, target)
+	{name: "js", read: func(ctx context.Context, p *browsers.Page, q AspectQuery) (string, error) {
+		return PageJS(ctx, p, q.Target)
 	}},
-	{name: "screenshot", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _, _ string, fullPage bool) (string, error) {
-		return PageScreenshot(ctx, p, fullPage)
+	{name: "screenshot", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, q AspectQuery) (string, error) {
+		return PageScreenshot(ctx, p, q.FullPage)
 	}},
-	{name: "interactives", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _, _ string, _ bool) (string, error) {
+	{name: "interactives", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
 		return PageInteractives(ctx, p)
 	}},
-	{name: "a11y", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _, _ string, _ bool) (string, error) {
+	{name: "a11y", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
 		return PageA11y(ctx, p)
 	}},
-	{name: "network", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _, _ string, _ bool) (string, error) {
+	{name: "network", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
 		return PageNetwork(ctx, p)
 	}},
-	{name: "console", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _, _ string, _ bool) (string, error) {
+	{name: "console", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
 		return PageConsole(ctx, p)
 	}},
-	{name: "body", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _, target string, _ bool) (string, error) {
-		return PageBody(ctx, p, target)
+	{name: "body", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, q AspectQuery) (string, error) {
+		return PageBody(ctx, p, q.Target)
 	}},
-	{name: "article", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _, _ string, _ bool) (string, error) {
+	{name: "article", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
 		return PageArticle(ctx, p)
 	}},
-	{name: "marks", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _, _ string, _ bool) (string, error) {
+	{name: "marks", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
 		return PageMarks(ctx, p)
 	}},
-	{name: "security", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _, _ string, _ bool) (string, error) {
+	{name: "security", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
 		return PageSecurity(ctx, p)
+	}},
+	{name: "storage", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, q AspectQuery) (string, error) {
+		return PageStorage(ctx, p, q.IncludeValues)
 	}},
 }
 
@@ -728,17 +748,14 @@ func ValidateAspect(what string) error {
 	return unknownAspectError(what)
 }
 
-// PageAspect reads the aspect named what through the shared registry, truncating
-// the output to maxBytes on a rune boundary unless the reader self-caps. An
-// unknown what returns the shared error naming every supported value.
+// PageAspect reads the aspect named q.What through the shared registry,
+// truncating the output to q.MaxBytes on a rune boundary unless the reader
+// self-caps. An unknown what returns the shared error naming every supported
+// value.
 func PageAspect(
 	ctx context.Context,
 	p *browsers.Page,
-	what,
-	selector,
-	target string,
-	fullPage bool,
-	maxBytes int,
+	q AspectQuery,
 ) (string, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
@@ -746,16 +763,16 @@ func PageAspect(
 		defer cancel()
 	}
 	for _, a := range aspectEntries {
-		if a.name != what {
+		if a.name != q.What {
 			continue
 		}
-		out, err := a.read(ctx, p, selector, target, fullPage)
+		out, err := a.read(ctx, p, q)
 		if err != nil || a.selfCapped {
 			return out, err
 		}
-		return PageTruncate(out, maxBytes), nil
+		return PageTruncate(out, q.MaxBytes), nil
 	}
-	return "", unknownAspectError(what)
+	return "", unknownAspectError(q.What)
 }
 
 // PageClearLogs empties both capture rings, resets their dropped counters and

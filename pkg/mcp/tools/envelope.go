@@ -85,6 +85,8 @@ var invalidArgsMarkers = []string{
 	"requires target",
 	"requires x and y",
 	"unknown device",
+	"unknown identity",
+	"invalid identity",
 }
 
 // elementNotFoundMarkers identify a selector that matched nothing.

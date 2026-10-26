@@ -1008,6 +1008,82 @@ func (m *Manager) Browsers() map[BrowserID]*Browser {
 	return result
 }
 
+// Sessions returns a read-only snapshot of every live page across every live
+// browser and identity, sorted by page id. A non-empty identity narrows the
+// result to that identity and fails with every live name when it matches none.
+// It never launches, creates, or probes a browser: listing cannot start a
+// Chromium process.
+func (m *Manager) Sessions(identity string) ([]PageInfo, error) {
+	live := m.Browsers()
+	pages := make([]PageInfo, 0, len(live))
+	for _, b := range live {
+		pages = append(pages, b.Pages()...)
+	}
+
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		sortPageInfos(pages)
+		return pages, nil
+	}
+
+	names := liveIdentityNames(live)
+	if !hasIdentity(names, identity) {
+		return nil, fmt.Errorf("browsers: unknown identity %q (known: %s)", identity, namesOrNone(names))
+	}
+	filtered := make([]PageInfo, 0, len(pages))
+	for _, p := range pages {
+		if p.Context == identity {
+			filtered = append(filtered, p)
+		}
+	}
+	sortPageInfos(filtered)
+	return filtered, nil
+}
+
+// sortPageInfos orders a page snapshot by page id so listings are stable.
+func sortPageInfos(pages []PageInfo) {
+	sort.Slice(pages, func(i, j int) bool { return pages[i].ID < pages[j].ID })
+}
+
+// liveIdentityNames returns the sorted identity names live in at least one
+// browser, always including "default" (the parent's own cookie jar) for every
+// live browser. No live browser means no names.
+func liveIdentityNames(live map[BrowserID]*Browser) []string {
+	seen := make(map[string]struct{})
+	for _, b := range live {
+		b.mu.Lock()
+		names := b.identityNamesLocked()
+		b.mu.Unlock()
+		for _, name := range names {
+			seen[name] = struct{}{}
+		}
+	}
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// hasIdentity reports whether name is one of names.
+func hasIdentity(names []string, name string) bool {
+	for _, live := range names {
+		if live == name {
+			return true
+		}
+	}
+	return false
+}
+
+// namesOrNone renders a name list for an error message, "none" when empty.
+func namesOrNone(names []string) string {
+	if len(names) == 0 {
+		return "none"
+	}
+	return strings.Join(names, ", ")
+}
+
 // runningIDsLocked returns a sorted comma-separated list of live browser ids
 // with their owner labels, or "none" when nothing is running. The caller must
 // hold m.mu.
@@ -1341,6 +1417,14 @@ func (m *Manager) sweepIdleBrowser(ctx context.Context, b *Browser, ttl time.Dur
 // Each close is best-effort, bounded by closePageTimeout, and never retried, so
 // a wedged tab cannot stall the sweep loop or resurface.
 func (m *Manager) sweepIdlePages(ctx context.Context, b *Browser, ttl time.Duration) {
+	for _, owner := range b.pageOwners() {
+		m.sweepIdleOwnerPages(ctx, owner, ttl)
+	}
+}
+
+// sweepIdleOwnerPages closes the idle pages of one owner — the parent browser or
+// one identity clone — using that owner's proxy-auth and header cleanup state.
+func (m *Manager) sweepIdleOwnerPages(ctx context.Context, b *Browser, ttl time.Duration) {
 	// Snapshot the idle candidates under the browser mutex. Idle time is
 	// atomic, so this never waits on a page operation lock.
 	b.mu.Lock()

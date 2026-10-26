@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"webmcp/pkg/browsers"
@@ -47,11 +48,17 @@ func (t *Fetch) Description() string {
 		"falls back to the shared unowned browser. Example: " +
 		"{ \"owner\": \"scraper-a\", \"url\": \"https://example.com\" } and " +
 		"{ \"owner\": \"scraper-b\", \"url\": \"https://example.com\" } open two " +
-		"separate browsers." + resultEnvelopeDoc
+		"separate browsers. identity opens the page in an incognito context " +
+		"inside the target browser and defaults to 'default': a new name is " +
+		"created on first use, each name is one isolated context, and contexts " +
+		"keep separate cookies and storage while sharing one Chromium process. " +
+		"Example: { \"url\": \"https://x.test\", \"identity\": \"victim\" }." +
+		resultEnvelopeDoc
 }
 
 // InputSchema returns the JSON Schema for fetch_page's arguments: a required
-// url, plus optional wait_for / viewport / user_agent / timeout_ms controls.
+// url, plus optional wait_for / viewport / user_agent / timeout_ms / owner /
+// identity controls.
 func (t *Fetch) InputSchema() models.InputSchema {
 	return models.InputSchema{
 		Type: "object",
@@ -96,6 +103,15 @@ func (t *Fetch) InputSchema() models.InputSchema {
 					"Uses the browser owned by this label, creating one if needed; it never falls back to the shared unowned browser. " +
 					"Defaults to the session identity, else 'unowned'.",
 			},
+			"identity": map[string]any{
+				"type": "string",
+				"description": "Optional incognito identity inside the target browser (default 'default'). " +
+					"Each name is one incognito context created on first use and reused afterwards. " +
+					"Identities share one Chromium process but keep separate cookies and storage, so two accounts stay isolated. " +
+					"Use one identity per account. The page's identity is reported as context by page_list and session_list. " +
+					"Example: { \"url\": \"https://app.test/orders\", \"identity\": \"victim\" }. " +
+					"An invalid identity error means the name must be 1 to 64 characters from A-Z, a-z, 0-9, '.', '_' and '-'.",
+			},
 		},
 		Required: []string{"url"},
 	}
@@ -128,6 +144,10 @@ type fetchArgs struct {
 	TimeoutMS int `json:"timeout_ms"`
 	// Owner optionally claims the browser for the caller's own agent label.
 	Owner string `json:"owner"`
+	// Identity optionally selects the incognito context inside the target
+	// browser (default "default"). A new name is created on first use; every
+	// name keeps its own cookie jar and storage in the same Chromium process.
+	Identity string `json:"identity"`
 }
 
 // validate checks fetchArgs for required fields and legal enum values. It is
@@ -163,6 +183,13 @@ func (a *fetchArgs) validate() error {
 		return err
 	}
 	a.Owner = owner
+	a.Identity = strings.TrimSpace(a.Identity)
+	if a.Identity == "" {
+		a.Identity = browsers.DefaultIdentity
+	}
+	if err := browsers.ValidateIdentityName(a.Identity); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -197,6 +224,12 @@ func (t *Fetch) Execute(ctx context.Context, args json.RawMessage) (string, erro
 	b, err := t.mgr.OpenBrowser(ctx, browsers.BrowserID(a.BrowserID))
 	if err != nil {
 		return failResult(fmt.Errorf("fetch_page: %w", err))
+	}
+	if a.Identity != browsers.DefaultIdentity {
+		b, err = b.NewIdentity(a.Identity)
+		if err != nil {
+			return failResult(fmt.Errorf("fetch_page: %w", err))
+		}
 	}
 	// Device wins over a manual viewport when both are given (user decision
 	// 2026-08-14): a device preset is the primary emulation mechanism, so the

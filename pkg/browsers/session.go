@@ -155,6 +155,9 @@ type PageInfo struct {
 	ID PageID `json:"id"`
 	// URL is the URL the page was created with.
 	URL string `json:"url"`
+	// Context is the incognito identity the page lives in ("default" for the
+	// parent browser); identities share one Chromium process but not cookies.
+	Context string `json:"context"`
 }
 
 // Viewport is a page viewport size in CSS pixels. It is the engine's MCP-free

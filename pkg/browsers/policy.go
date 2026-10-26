@@ -61,11 +61,8 @@ func (m *Manager) CheckPageScope(id PageID, rawURL string) error {
 	m.mu.Unlock()
 
 	for _, b := range browsers {
-		b.mu.Lock()
-		_, ok := b.pages[id]
-		b.mu.Unlock()
-		if ok {
-			return b.CheckScope(rawURL)
+		if owner, _, ok := b.lookupPage(id); ok {
+			return owner.CheckScope(rawURL)
 		}
 	}
 	return nil

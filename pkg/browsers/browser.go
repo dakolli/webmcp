@@ -30,12 +30,22 @@ func DefaultBinPath() string {
 	return ""
 }
 
+// DefaultIdentity names the parent browser's own cookie jar. A page opened
+// without an identity lives here; incognito identities are separate contexts
+// inside the same Chromium process.
+const DefaultIdentity = "default"
+
 // Browser owns a single live Chromium instance (a *rod.Browser) and the map of
 // its live Pages (browser tabs, a.k.a. MCP sessions).
 //
-// Thread safety: the pages map, the idle clock and the rod handle are guarded
-// by the Browser mutex; each Page carries its own mutex because rod Pages are
-// not thread-safe (see session.go).
+// An identity clone is a Browser backed by a rod incognito context: it shares
+// the parent's Chromium process and launch options, but owns its own pages and
+// cookie jar. The parent's identities map is the only registry; a clone points
+// back at its parent and dies with it.
+//
+// Thread safety: the pages map, the identities map, the idle clock and the rod
+// handle are guarded by the Browser mutex; each Page carries its own mutex
+// because rod Pages are not thread-safe (see session.go).
 type Browser struct {
 	// id is the unique BrowserID assigned by Manager (e.g. "browser-1").
 	id BrowserID
@@ -46,7 +56,21 @@ type Browser struct {
 	rod *rod.Browser
 	// pages maps page IDs to their live pages.
 	pages map[PageID]*Page
-	// nextID is the counter used to mint fresh PageIDs in NewPage.
+	// identities maps identity names to live incognito clones. Only a root
+	// browser owns a non-nil registry; a clone's map is nil. Guarded by the
+	// root's mu and cleared by its Close.
+	identities map[string]*Browser
+	// identity is the incognito name this Browser represents ("default" for the
+	// root). Immutable.
+	identity string
+	// parent points at the root browser for a clone; nil for a root browser.
+	// Immutable.
+	parent *Browser
+	// incognito creates an incognito clone from a rod browser. It is a field so
+	// tests can stub the CDP round trip; nil uses rod's Browser.Incognito.
+	incognito func(*rod.Browser) (*rod.Browser, error)
+	// nextID is the counter used to mint fresh PageIDs in NewPage. A clone
+	// mints from its parent's counter so ids stay unique across identities.
 	nextID int
 	// owner is the caller identity recorded at creation (UnownedOwner when the
 	// surface had none). Informational only: browsers are closed by id.
@@ -135,6 +159,7 @@ func NewBrowser(id BrowserID, baseCtx context.Context, headless, stealth bool, b
 	return &Browser{
 		id:             id,
 		pages:          make(map[PageID]*Page),
+		identities:     make(map[string]*Browser),
 		authPages:      make(map[*rod.Page]*proxyAuthPage),
 		headerCleanups: make(map[*rod.Page]func()),
 		headless:       headless,
@@ -189,6 +214,204 @@ func (b *Browser) idleFor() time.Duration {
 	return time.Since(b.lastAccess)
 }
 
+// root returns the owning root browser: itself for a parent, its parent for an
+// incognito clone.
+func (b *Browser) root() *Browser {
+	if b.parent != nil {
+		return b.parent
+	}
+	return b
+}
+
+// IdentityName returns the incognito identity this browser represents, or
+// DefaultIdentity for the parent browser.
+func (b *Browser) IdentityName() string {
+	if b.identity == "" {
+		return DefaultIdentity
+	}
+	return b.identity
+}
+
+// NewIdentity returns the live incognito clone named name, creating it on first
+// use. A clone shares this browser's Chromium process and launch options but
+// has its own cookie jar and storage; closing the parent disposes every clone.
+// An already-live name is returned as-is, so repeated calls reuse one context.
+func (b *Browser) NewIdentity(name string) (*Browser, error) {
+	name = strings.TrimSpace(name)
+	if err := validateIdentityName(name); err != nil {
+		return nil, err
+	}
+	if name == DefaultIdentity {
+		return b.root(), nil
+	}
+
+	root := b.root()
+	root.mu.Lock()
+	if existing, ok := root.identities[name]; ok {
+		root.mu.Unlock()
+		return existing, nil
+	}
+	rb := root.rod
+	incognito := root.incognito
+	root.mu.Unlock()
+	if rb == nil {
+		return nil, fmt.Errorf("browsers: create identity %q: browser not launched", name)
+	}
+	if incognito == nil {
+		incognito = func(rb *rod.Browser) (*rod.Browser, error) { return rb.Incognito() }
+	}
+
+	clone, err := incognito(rb)
+	if err != nil {
+		return nil, fmt.Errorf("browsers: create identity %q: %w", name, err)
+	}
+	child := root.newIdentity(name, clone)
+
+	root.mu.Lock()
+	if existing, ok := root.identities[name]; ok {
+		root.mu.Unlock()
+		_ = clone.Context(root.baseCtx).Close()
+		return existing, nil
+	}
+	if root.identities == nil {
+		root.identities = make(map[string]*Browser)
+	}
+	root.identities[name] = child
+	root.mu.Unlock()
+	return child, nil
+}
+
+// Identity resolves an existing identity without creating one: DefaultIdentity
+// (or an empty name) is the parent, a live name is its clone, and an unknown
+// name fails with the live names so a typo cannot silently fork a session.
+func (b *Browser) Identity(name string) (*Browser, error) {
+	name = strings.TrimSpace(name)
+	if name == "" || name == DefaultIdentity {
+		return b.root(), nil
+	}
+
+	root := b.root()
+	root.mu.Lock()
+	child, ok := root.identities[name]
+	known := root.identityNamesLocked()
+	root.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("browsers: unknown identity %q (known: %s)", name, strings.Join(known, ", "))
+	}
+	return child, nil
+}
+
+// identityNamesLocked returns the sorted live identity names, including
+// DefaultIdentity. The caller must hold the root browser's mu.
+func (b *Browser) identityNamesLocked() []string {
+	names := make([]string, 0, len(b.identities)+1)
+	names = append(names, DefaultIdentity)
+	for name := range b.identities {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// ValidateIdentityName reports whether name is an accepted identity label (1
+// to 64 characters from A-Z, a-z, 0-9, '.', '_' and '-'); DefaultIdentity is
+// accepted.
+func ValidateIdentityName(name string) error {
+	return validateIdentityName(strings.TrimSpace(name))
+}
+
+// validateIdentityName applies the accepted identity-label shape: 1 to 64
+// characters from A-Z, a-z, 0-9, '.', '_' and '-'.
+func validateIdentityName(name string) error {
+	if name == "" {
+		return fmt.Errorf("browsers: identity name is required — pass a label such as \"victim\"")
+	}
+	if len(name) > 64 {
+		return fmt.Errorf("browsers: invalid identity %q — use 1 to 64 characters from A-Z, a-z, 0-9, '.', '_' and '-' only", name)
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+		case r == '.', r == '_', r == '-':
+		default:
+			return fmt.Errorf("browsers: invalid identity %q — use 1 to 64 characters from A-Z, a-z, 0-9, '.', '_' and '-' only", name)
+		}
+	}
+	return nil
+}
+
+// newIdentity builds the engine Browser for one incognito rod clone, copying
+// the parent's launch options and sharing its process-lifetime context.
+func (b *Browser) newIdentity(name string, clone *rod.Browser) *Browser {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return &Browser{
+		id:             b.id,
+		rod:            clone,
+		pages:          make(map[PageID]*Page),
+		identity:       name,
+		parent:         b,
+		owner:          b.owner,
+		ownerLabel:     b.ownerLabel,
+		key:            b.key,
+		createdAt:      b.createdAt,
+		lastAccess:     time.Now(),
+		ttl:            b.ttl,
+		headless:       b.headless,
+		stealth:        b.stealth,
+		binPath:        b.binPath,
+		profileDir:     b.profileDir,
+		position:       b.position,
+		proxy:          b.proxy,
+		proxyBypass:    b.proxyBypass,
+		ignoreCerts:    b.ignoreCerts,
+		extraHeaders:   cloneHeaders(b.extraHeaders),
+		scope:          append([]string(nil), b.scope...),
+		scopeStrict:    b.scopeStrict,
+		headerCleanups: make(map[*rod.Page]func()),
+		proxyAuth:      b.proxyAuth,
+		authPages:      make(map[*rod.Page]*proxyAuthPage),
+		logger:         b.logger,
+		baseCtx:        b.baseCtx,
+	}
+}
+
+// mintPageID allocates the next page id from the root counter, so ids stay
+// unique across the parent and every identity.
+func (b *Browser) mintPageID() PageID {
+	root := b.root()
+	root.mu.Lock()
+	defer root.mu.Unlock()
+	root.nextID++
+	return PageID(fmt.Sprintf("page-%d", root.nextID))
+}
+
+// lookupPage returns the browser whose pages map holds id and that page. The
+// root owns the identity registry, so a page opened inside a clone is still
+// addressable through the parent.
+func (b *Browser) lookupPage(id PageID) (*Browser, *Page, bool) {
+	b.mu.Lock()
+	if p, ok := b.pages[id]; ok {
+		b.mu.Unlock()
+		return b, p, true
+	}
+	identities := make([]*Browser, 0, len(b.identities))
+	for _, child := range b.identities {
+		identities = append(identities, child)
+	}
+	b.mu.Unlock()
+
+	for _, child := range identities {
+		child.mu.Lock()
+		p, ok := child.pages[id]
+		child.mu.Unlock()
+		if ok {
+			return child, p, true
+		}
+	}
+	return nil, nil, false
+}
+
 // BrowserInfo is a JSON-ready snapshot of one live browser's lifecycle state.
 // It excludes the live rod handle and is safe to serialize from the MCP, CLI
 // and IPC surfaces.
@@ -231,6 +454,12 @@ func (b *Browser) Info() BrowserInfo {
 	if owner == "" {
 		owner = UnownedOwner
 	}
+	pageCount := len(b.pages)
+	for _, child := range b.identities {
+		child.mu.Lock()
+		pageCount += len(child.pages)
+		child.mu.Unlock()
+	}
 	return BrowserInfo{
 		BrowserID:   b.id,
 		Owner:       owner,
@@ -243,7 +472,7 @@ func (b *Browser) Info() BrowserInfo {
 		TTL:         b.ttl.String(),
 		Scope:       scopeState(b.scope, b.scopeStrict),
 		ScopeStrict: b.scopeStrict,
-		PageCount:   len(b.pages),
+		PageCount:   pageCount,
 		CreateKey:   b.key.Summary(),
 	}
 }
@@ -581,14 +810,14 @@ func (b *Browser) NewPage(
 		}
 	}
 
+	pageID := b.mintPageID()
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.nextID++
-	page.ID = PageID(fmt.Sprintf("page-%d", b.nextID))
+	page.ID = pageID
 	page.URL = url
 	page.touch()
-	b.lastAccess = time.Now()
-	b.pages[page.ID] = page
+	b.pages[pageID] = page
+	b.mu.Unlock()
+	b.root().touch()
 	return page, nil
 }
 
@@ -629,9 +858,7 @@ func (b *Browser) closeUnregisteredPage(page *Page) {
 // is captured and nilled under the locks and closed strictly afterwards, so a
 // concurrent sweepOnce or Page lookup never double-closes or panics.
 func (b *Browser) Page(ctx context.Context, id PageID) (*Page, error) {
-	b.mu.Lock()
-	p, ok := b.pages[id]
-	b.mu.Unlock()
+	owner, p, ok := b.lookupPage(id)
 	if !ok {
 		return nil, fmt.Errorf("browsers: page %q not found", id)
 	}
@@ -642,19 +869,19 @@ func (b *Browser) Page(ctx context.Context, id PageID) (*Page, error) {
 		// The tab is dead: evict it (WEB-39 TOCTOU-safe capture pattern).
 		var handle *rod.Page
 		if unlock, locked := p.TryLock(); locked {
-			b.mu.Lock()
-			if cur, ok := b.pages[id]; ok && cur == p {
+			owner.mu.Lock()
+			if cur, ok := owner.pages[id]; ok && cur == p {
 				p.stopObservation()
 				handle = p.Rod
 				p.Rod = nil
-				delete(b.pages, id)
+				delete(owner.pages, id)
 			}
-			b.mu.Unlock()
+			owner.mu.Unlock()
 			unlock()
 		}
 		if handle != nil {
-			b.stopProxyAuth(handle)
-			b.stopHeaderCleanup(handle)
+			owner.stopProxyAuth(handle)
+			owner.stopHeaderCleanup(handle)
 			// Close the captured handle outside the locks, via closeRodPage
 			// (the sweeper's path): it honors a bound close ctx and converts a
 			// concurrent-close panic into an error — an in-flight tool call on
@@ -825,16 +1052,48 @@ func (b *Browser) Focus(ctx context.Context, state WindowState) error {
 	}
 }
 
-// Pages returns a read-only snapshot of the Browser's live pages (id + url),
-// safe to marshal and iterate; it never exposes the live *rod.Page handles.
+// Pages returns a read-only snapshot of the Browser's live pages (id, url and
+// owning identity), safe to marshal and iterate; it never exposes the live
+// *rod.Page handles. A root browser includes the pages of every identity.
 func (b *Browser) Pages() []PageInfo {
+	infos := b.pageInfos()
+
+	b.mu.Lock()
+	identities := make([]*Browser, 0, len(b.identities))
+	for _, child := range b.identities {
+		identities = append(identities, child)
+	}
+	b.mu.Unlock()
+
+	for _, child := range identities {
+		infos = append(infos, child.pageInfos()...)
+	}
+	sort.Slice(infos, func(i, j int) bool { return infos[i].ID < infos[j].ID })
+	return infos
+}
+
+// pageOwners returns this browser and every identity clone, so shared sweeps
+// can visit each pages map with the owning browser's own teardown state.
+func (b *Browser) pageOwners() []*Browser {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	owners := make([]*Browser, 0, len(b.identities)+1)
+	owners = append(owners, b)
+	for _, child := range b.identities {
+		owners = append(owners, child)
+	}
+	return owners
+}
+
+// pageInfos snapshots this browser's own pages, tagged with its identity name.
+func (b *Browser) pageInfos() []PageInfo {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	infos := make([]PageInfo, 0, len(b.pages))
+	identity := b.IdentityName()
 	for _, p := range b.pages {
-		infos = append(infos, PageInfo{ID: p.ID, URL: p.URL})
+		infos = append(infos, PageInfo{ID: p.ID, URL: p.URL, Context: identity})
 	}
-	sort.Slice(infos, func(i, j int) bool { return infos[i].ID < infos[j].ID })
 	return infos
 }
 
@@ -850,16 +1109,17 @@ func (b *Browser) Pages() []PageInfo {
 // wait, its tab is left to Browser.Close: the session is already evicted, so
 // session_list stops reporting it immediately (WEB-60 MED-1).
 func (b *Browser) ClosePage(ctx context.Context, id PageID) error {
-	b.mu.Lock()
-	p, ok := b.pages[id]
-	if ok {
-		delete(b.pages, id)
-		b.lastAccess = time.Now()
-	}
-	b.mu.Unlock()
+	owner, p, ok := b.lookupPage(id)
 	if !ok {
 		return fmt.Errorf("browsers: page %q not found", id)
 	}
+
+	owner.mu.Lock()
+	if cur, ok := owner.pages[id]; ok && cur == p {
+		delete(owner.pages, id)
+	}
+	owner.mu.Unlock()
+	b.root().touch()
 
 	waitCtx, waitCancel := context.WithTimeout(b.baseCtx, teardownBudget)
 	defer waitCancel()
@@ -874,8 +1134,8 @@ func (b *Browser) ClosePage(ctx context.Context, id PageID) error {
 	if handle == nil {
 		return nil
 	}
-	b.stopProxyAuth(handle)
-	b.stopHeaderCleanup(handle)
+	owner.stopProxyAuth(handle)
+	owner.stopHeaderCleanup(handle)
 	closeCtx, cancel := context.WithTimeout(b.baseCtx, teardownBudget)
 	defer cancel()
 	if err := closeRodPage(closeCtx, handle); err != nil {
@@ -910,6 +1170,11 @@ func (b *Browser) Close(ctx context.Context) error {
 		pages = append(pages, p)
 	}
 	b.pages = make(map[PageID]*Page)
+	identities := make([]*Browser, 0, len(b.identities))
+	for _, child := range b.identities {
+		identities = append(identities, child)
+	}
+	b.identities = make(map[string]*Browser)
 	authPages := b.authPages
 	b.authPages = make(map[*rod.Page]*proxyAuthPage)
 	headerCleanups := b.headerCleanups
@@ -917,6 +1182,16 @@ func (b *Browser) Close(ctx context.Context) error {
 	rb := b.rod
 	b.rod = nil
 	b.mu.Unlock()
+
+	// Identity contexts are disposed first: each clone owns a separate cookie
+	// jar and tab set, so its Close is the only clean way to release them. A
+	// clone close never touches the parent process.
+	var identityErr error
+	for _, child := range identities {
+		if err := child.Close(ctx); err != nil && identityErr == nil {
+			identityErr = err
+		}
+	}
 
 	handles := make([]*rod.Page, 0, len(pages))
 	for _, p := range pages {
@@ -964,5 +1239,8 @@ func (b *Browser) Close(ctx context.Context) error {
 			b.profileCleanup()
 		}
 	})
+	if closeErr == nil {
+		return identityErr
+	}
 	return closeErr
 }

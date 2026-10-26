@@ -5,6 +5,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -117,20 +118,22 @@ which sessions are still alive before acting on or closing them.`,
 // except for the aspects whose reader caps its own output.
 func newPageFetchCmd(mgr *browsers.Manager) *cobra.Command {
 	var (
-		id       string
-		what     string
-		url      string
-		selector string
-		target   string
-		fullPage bool
-		maxBytes int
+		id            string
+		what          string
+		url           string
+		selector      string
+		target        string
+		fullPage      bool
+		maxBytes      int
+		includeValues bool
+		identity      string
 	)
 	cmd := &cobra.Command{
 		Use:   "fetch [id|url] [what]",
 		Short: "Extract an aspect of a live page",
 		Long: `Extracts an aspect of a live page (html, text, links, meta, dom, css,
 js, screenshot, interactives, a11y, network, console, body, article, marks,
-security) and prints it. The page id is optional when
+security, storage) and prints it. The page id is optional when
 only one page is open; 'last' means the most recently opened page; a bare number
 resolves to page-N. A URL in the [id] slot opens a NEW page for it first —
 creating the browser if needed, exactly like 'web-cli fetch <url>' — and then
@@ -143,7 +146,7 @@ dance).
           extract the aspect — mirrors 'web-cli fetch <url>' (wait: idle)
   [what]  the aspect to extract: html, text, links, meta, dom, css, js,
           screenshot, interactives, a11y, network, console, body, article, marks,
-          security (default: text)
+          security, storage (default: text)
 
   --id <session>     the page/session id (the positional [id] wins when both
                      are given; never treated as a URL)
@@ -154,9 +157,15 @@ dance).
                      of the {url,type,size} list (with --what css|js); with
                      --what body, select the entry by seq or URL substring
   --full-page        capture the entire scrollable page (screenshot only)
+  --include-values   with --what storage, print real cookie and storage values
+                     instead of <redacted> (exposes live session tokens)
   --max-bytes <n>    cap output size (default 50000; screenshots,
                      interactives, a11y, network, console, body, article,
                      marks and security are never truncated)
+  --identity <name>  open the URL in an incognito identity inside the target
+                     browser (default "default"): a new name is created on
+                     first use, and identities keep separate cookies/storage
+                     in one Chromium process. Only valid with a URL.
 
 links, meta, dom, interactives, a11y, network, console, body, article, marks and
 security print JSON, mirroring the MCP page_fetch shapes. article is the readable prose body as
@@ -166,7 +175,10 @@ numbered overlay ({marks:[{index, role, text?, x, y, width, height}], screenshot
 viewport_width, viewport_height, truncated}) whose x/y feed 'page act click_at'.
 security is the passive audit ({checks:[{id, status, evidence, detail}], count})
 covering response headers, CSP (header or meta), cookie flags, mixed content,
-subresource integrity, form targets and CORS.
+subresource integrity, form targets and CORS. storage is a read-only snapshot of
+the browser context ({cookies, local_storage, session_storage, indexed_db,
+caches} with a *_truncated counter per section); every value is <redacted>
+unless --include-values is set, which exposes live session tokens.
 Screenshots print a data:image/png;base64,... data-URI. network/console emit
 {entries,count,dropped,truncated} over the newest 100 buffered entries; capture is
 cumulative from page creation, so clear with 'page act clear_logs' right before the
@@ -184,6 +196,8 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
   web-cli page fetch last network  # last 100 network requests + dropped count
   web-cli page fetch last body --target /api/orders  # newest matching API body
   web-cli page fetch last security                      # passive headers/CSP/cookie/mixed-content audit
+  web-cli page fetch last storage                       # cookie flags + storage keys, values redacted
+  web-cli page fetch last storage --include-values      # real values: exposes live session tokens
   web-cli page fetch https://hackernews.com links       # open + extract in one step`,
 		Args: cobra.MaximumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -200,6 +214,15 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 			}
 			if err := pageops.ValidateAspect(what); err != nil {
 				return fmt.Errorf("page fetch: %w", err)
+			}
+			identity = strings.TrimSpace(identity)
+			if identity != "" {
+				if url == "" {
+					return fmt.Errorf("page fetch: --identity only applies when opening a URL — omit it to read an existing page")
+				}
+				if err := browsers.ValidateIdentityName(identity); err != nil {
+					return fmt.Errorf("page fetch: %w", err)
+				}
 			}
 
 			if cl := dialServe(cmd); cl != nil {
@@ -218,18 +241,19 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 						URL:       url,
 						Wait:      "idle",
 						BrowserID: browserID,
+						Identity:  identity,
 					}, &summary); err != nil {
 						return fmt.Errorf("page fetch: %w", err)
 					}
 					reportBrowserTarget(cmd, browserID)
-					return pageFetchViaIPC(cmd, ctx, cl, summary.SessionID, what, selector, target, fullPage, maxBytes)
+					return pageFetchViaIPC(cmd, ctx, cl, summary.SessionID, what, selector, target, fullPage, maxBytes, includeValues)
 				}
 				rid, err := resolvePageID(ctx, cmd, mgr, cl, browserID, id, "page fetch")
 				if err != nil {
 					return err
 				}
 				reportBrowserTarget(cmd, browserID)
-				return pageFetchViaIPC(cmd, ctx, cl, rid, what, selector, target, fullPage, maxBytes)
+				return pageFetchViaIPC(cmd, ctx, cl, rid, what, selector, target, fullPage, maxBytes, includeValues)
 			}
 			printServeHint(cmd)
 
@@ -240,6 +264,12 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 				b, err = openTargetBrowser(ctx, mgr, browserID, "page fetch")
 				if err != nil {
 					return err
+				}
+				if identity != "" && identity != browsers.DefaultIdentity {
+					b, err = b.NewIdentity(identity)
+					if err != nil {
+						return fmt.Errorf("page fetch: %w", err)
+					}
 				}
 				reportBrowserTarget(cmd, browserID)
 				p, err = b.NewPage(ctx, url, nil, "", "") // new tab; plain launch; stealth applied by default
@@ -262,7 +292,14 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 				}
 			}
 
-			out, err := pageops.PageAspect(ctx, p, what, selector, target, fullPage, maxBytes)
+			out, err := pageops.PageAspect(ctx, p, pageops.AspectQuery{
+				What:          what,
+				Selector:      selector,
+				Target:        target,
+				FullPage:      fullPage,
+				IncludeValues: includeValues,
+				MaxBytes:      maxBytes,
+			})
 			if err != nil {
 				return fmt.Errorf("page fetch: %w", err)
 			}
@@ -271,11 +308,13 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to fetch (optional with one page open; 'last'; or a bare number)")
-	cmd.Flags().StringVar(&what, "what", "", "aspect to extract: html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, marks, security (default text)")
+	cmd.Flags().StringVar(&what, "what", "", "aspect to extract: html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, marks, security, storage (default text)")
 	cmd.Flags().StringVar(&selector, "selector", "", "optional CSS selector scoping html/text extraction")
 	cmd.Flags().StringVar(&target, "target", "", "resource URL for one css/js resource, or seq/URL substring selecting one network body (with --what body)")
 	cmd.Flags().BoolVar(&fullPage, "full-page", false, "capture the entire scrollable page instead of the visible viewport (screenshot only)")
+	cmd.Flags().BoolVar(&includeValues, "include-values", false, "with --what storage, print real cookie and localStorage/sessionStorage values instead of <redacted> (exposes live tokens)")
 	cmd.Flags().IntVar(&maxBytes, "max-bytes", pageops.DefaultPageMaxBytes, "maximum output size in bytes (default 50000)")
+	cmd.Flags().StringVar(&identity, "identity", "", "incognito identity for a URL open (default \"default\"); a new name is created on first use, cookies/storage stay separate")
 	return cmd
 }
 
@@ -617,18 +656,27 @@ func pageListViaIPC(cmd *cobra.Command, ctx context.Context, cl *ipc.Client, bro
 // truncation" (pageops.PageTruncate returns s unchanged), which the wire
 // contract cannot express (0 → the server default), so it is forwarded as an
 // effectively-unbounded cap.
-func pageFetchViaIPC(cmd *cobra.Command, ctx context.Context, cl *ipc.Client, id, what, selector, target string, fullPage bool, maxBytes int) error {
+func pageFetchViaIPC(
+	cmd *cobra.Command,
+	ctx context.Context,
+	cl *ipc.Client,
+	id, what, selector, target string,
+	fullPage bool,
+	maxBytes int,
+	includeValues bool,
+) error {
 	if maxBytes <= 0 {
 		maxBytes = int(^uint(0) >> 1) // CLI parity: 0 means "no truncation"
 	}
 	var res ipc.PageFetchResult
 	if err := cl.Call(ctx, ipc.MethodPageFetch, &ipc.PageFetchParams{
-		SessionID: id,
-		What:      what,
-		Selector:  selector,
-		Target:    target,
-		FullPage:  fullPage,
-		MaxBytes:  maxBytes,
+		SessionID:     id,
+		What:          what,
+		Selector:      selector,
+		Target:        target,
+		FullPage:      fullPage,
+		MaxBytes:      maxBytes,
+		IncludeValues: includeValues,
 	}, &res); err != nil {
 		return fmt.Errorf("page fetch: %w", err)
 	}

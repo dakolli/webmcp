@@ -116,6 +116,13 @@ The MCP server binds all interfaces and has **no authentication** — keep it lo
 - **Idle browsers expire** after 30 minutes by default. Set `browser_ttl` in
   `~/.config/browser-mcp/config.json` as a Go duration (`"15m"`, `"0"` to disable); pages keep their
   separate 15-minute TTL.
+- **Incognito identities** isolate two accounts inside one Chromium process. Pass
+  `"identity": "victim"` to `fetch_page` (or `browser page fetch <url> --identity victim`) and the
+  page opens in that incognito context, with its own cookies and storage. `default` is the browser's
+  own jar; a new name is created on first use and reused afterwards. Every identity dies with its
+  parent browser. `session_list` / `page_list` report each session's `context` (the identity name),
+  and `session_list {"identity": "victim"}` lists one identity. An unknown identity is refused with
+  the live names — nothing is auto-created.
 
 ### Proxy & TLS (Burp, Caido, ZAP)
 
@@ -168,6 +175,7 @@ browser page fetch last dom --max-bytes 30000
 browser page fetch last article                  # readable body as markdown
 browser page fetch last marks                    # numbered boxes + annotated screenshot
 browser page fetch last network                 # newest 100 requests + counters
+browser page fetch https://app.test/login --identity attacker   # incognito context
 browser page act click ".titleline a"
 browser page act last clear_logs                # reset both log buffers
 browser page act click --handle g3k9x2ab-b6      # handle from the same document only
@@ -197,9 +205,9 @@ The MCP tool descriptions stay primary. The skill covers cross-cutting rules and
 | `browser_create` | Create or reuse a browser (`bin`, `profile`, `persist`, `owner`, `headless`, `stealth`, `position`, `proxy`, `proxy_bypass`, `ignore_certs`, `headers`, `scope`, `scope_strict`). Ephemeral by default; `persist: true` keeps the profile. Same owner + same options reuses the same id. `headers` applies to every request; `scope` is the navigation allowlist (no scope = no limit; `scope_strict` makes an empty list deny all). Scope does not gate subresources or redirects. |
 | `browser_list` | List live browsers with `owner`, `persist`, `ephemeral`, `created_at`, `idle_for`, `ttl`, `scope`, `scope_strict`, `profile_dir` and their pages. |
 | `browser_close` | Close one browser, or all when `browser_id` is empty. `purge: true` also deletes that profile; `prune: true` (no `browser_id`) closes all and removes orphan `.ephemeral` profiles. An unknown id fails with `browser "browser-42" not found (running: browser-1)`. |
-| `fetch_page` | Open a URL in a new session and return `session_id` + summary. `wait_for` defaults to `idle`. |
-| `page_list` | List the pages of a browser. `browser_id` is required, and an unknown id fails with `browser "browser-42" not found (running: browser-1)`. |
-| `session_list` | List all live sessions. |
+| `fetch_page` | Open a URL in a new session and return `session_id` + summary. `wait_for` defaults to `idle`. `identity` opens it in an incognito context (`default` = the browser's own jar); a new identity is created on first use and keeps separate cookies/storage. |
+| `page_list` | List the pages of a browser, each with its `context` (identity name). `browser_id` is required, and an unknown id fails with `browser "browser-42" not found (running: browser-1)`. |
+| `session_list` | List all live sessions with their `context`. Optional `identity` lists one identity; an unknown name fails with the live names and creates nothing. |
 | `session_close` | Close a session (tab). |
 | `page_fetch` | Read one aspect of a live page (see below). |
 | `page_act` | Perform one interaction action on a live page. |
@@ -235,13 +243,20 @@ guides the workflow. You still run `fetch_page`, `page_fetch` and `page_act` you
 | `network` | `{entries:[{method, url, type?, status?, mime?, bytes?, ms?, failed?, error?, seq}], count, dropped, truncated}` — observed requests/responses. Emits the newest 100 buffered entries in chronological order; `dropped` counts entries lost to the 200-entry ring, `truncated` counts buffered older entries omitted by the 100 cap. Capture is cumulative from page creation. `data:` URLs are skipped; `url`, `error` and `text` are clipped at 300, 200 and 500 bytes. |
 | `console` | Same envelope over `{level, text, source?, line?, seq}` — `console.*` calls, uncaught exceptions and browser log entries. Cumulative from page creation. |
 | `article` | `{title, byline?, excerpt?, text, words, truncated, url}` — the readable article body rendered as markdown (headings, paragraphs, lists, code, quotes, links, images, tables) with nav/aside/footer/forms/scripts stripped. `text` is capped at 40000 runes and `truncated` reports the cut. Prefer it over `text` for prose; never byte-truncated. |
-| `marks` | `{marks:[{index, role, text?, x, y, width, height}], screenshot, viewport_width, viewport_height, truncated}` — a numbered box over every visible interactive element plus the annotated viewport as a base64 PNG data-URI (`screenshot`). `x`/`y` are the box's top-left in viewport CSS px, so `x + width/2`, `y + height/2` feed `page_act`'s `click_at`. Capped at 60 marks; `truncated` counts the remainder. The overlay is removed again before returning. |
+| `marks` | A text block `{marks:[{index, role, text?, x, y, width, height}], viewport_width, viewport_height, truncated}` plus the annotated viewport PNG as a separate image content block — a numbered box over every visible interactive element. `x`/`y` are the box's top-left in viewport CSS px, so `x + width/2`, `y + height/2` feed `page_act`'s `click_at`. Capped at 60 marks; `truncated` counts the remainder. The overlay is removed again before returning. |
 | `links` | `[{text, href, handle?}]`, deduped by href, non-navigable schemes filtered; `handle` is the first anchor carrying that href. |
 | `meta` | `{title, url, meta:[{name/property/http-equiv/content/charset}]}`. |
 | `text` | Visible `innerText`. |
 | `html` | `outerHTML`. |
 | `css` / `js` | Loaded stylesheet/script resources as `[{url, type, size}]`; pass `target=<url>` to fetch one resource's raw source. |
-| `screenshot` | Base64 PNG data-URI; `full_page: true` captures the whole scrollable page. |
+| `screenshot` | A PNG image content block (`mimeType: image/png`) plus a text block `{mime_type, bytes, width, height, full_page}`; `full_page: true` captures the whole scrollable page. |
+
+`screenshot` and `marks` return the PNG as an MCP image content block, so a vision-capable client
+renders it without a base64 wall of text. Image blocks are enabled by default (MCP defines no
+standard image capability); a text-only client opts out at `initialize` with
+`capabilities.experimental.imageContent: false` and then receives the base64 data URI in the text
+block instead — under `data` for `screenshot`, under `data.screenshot` for `marks`. The bytes are
+sent exactly once either way.
 
 `dom`, `links` and `meta` always return parseable JSON. When the result does not fit `max_bytes`,
 the tool returns an envelope with `truncated: true`, the applied `max_bytes`, and `omitted` (the

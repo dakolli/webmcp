@@ -89,11 +89,11 @@ func (t *SessionClose) Execute(ctx context.Context, args json.RawMessage) (strin
 }
 
 // SessionList implements the "session_list" tool: it lists every live browser
-// page (id, url) as a JSON array so the agent can see what tabs are still open
-// across its session lifecycle.
+// page (id, url, context) of every live browser and identity as a JSON array so
+// the agent can see what tabs are still open across its session lifecycle.
 type SessionList struct {
-	// mgr is the shared browsers.Manager owning the single Browser and its
-	// live pages (sessions).
+	// mgr is the shared browsers.Manager owning the live browsers, their
+	// identities and their live pages (sessions).
 	mgr *browsers.Manager
 }
 
@@ -110,30 +110,49 @@ func (t *SessionList) Name() string {
 
 // Description returns a customer/LLM-facing description of session_list.
 func (t *SessionList) Description() string {
-	return "Lists all live browser sessions (id, url, title, timestamps) as a " +
-		"JSON array. Use it to see which fetch_page sessions are still open " +
-		"before closing them with session_close. If no browser is running this " +
-		"may launch one with default options; call browser_create first when you " +
-		"want to control launch options. Example: {}." + resultEnvelopeDoc
+	return "Lists every live browser session (id, url, context) across every " +
+		"live browser and identity as a JSON array, where context is the " +
+		"incognito identity ('default' for the browser's own cookie jar). Use " +
+		"it to see which fetch_page sessions are still open before closing them " +
+		"with session_close. Pass identity to list one identity only; an " +
+		"unknown identity reports the live names and creates nothing. It never " +
+		"launches a browser: with none running it returns an empty array. " +
+		"Example: {}." + resultEnvelopeDoc
 }
 
-// InputSchema returns the JSON Schema for session_list's arguments: none.
+// InputSchema returns the JSON Schema for session_list's arguments: an optional
+// identity filter.
 func (t *SessionList) InputSchema() models.InputSchema {
 	return models.InputSchema{
-		Type:       "object",
-		Properties: map[string]any{},
+		Type: "object",
+		Properties: map[string]any{
+			"identity": map[string]any{
+				"type":        "string",
+				"description": "Optional incognito identity to list (e.g. 'victim', or 'default'). Must already exist; an unknown name reports the live identities and is not created.",
+			},
+		},
 	}
 }
 
-// Execute returns the current pages as a JSON array. This is thin glue around
-// Manager.Open -> Browser.Pages and is implemented fully (no browser work
-// lives here).
+// sessionListArgs is the strict decoding target for session_list arguments.
+type sessionListArgs struct {
+	// Identity optionally narrows the listing to one incognito identity.
+	Identity string `json:"identity"`
+}
+
+// Execute returns every live page of every live browser and identity as a JSON
+// array, narrowed to one identity when requested. It reads the manager only:
+// listing never launches a browser.
 func (t *SessionList) Execute(ctx context.Context, args json.RawMessage) (string, error) {
-	b, err := t.mgr.Open(ctx) // lazily launches (or returns) the single Browser
+	var a sessionListArgs
+	if err := decodeArgs("session_list", args, &a); err != nil {
+		return failResult(err)
+	}
+	pages, err := t.mgr.Sessions(a.Identity)
 	if err != nil {
 		return failResult(fmt.Errorf("session_list: %w", err))
 	}
-	data, err := json.MarshalIndent(b.Pages(), "", "  ")
+	data, err := json.MarshalIndent(pages, "", "  ")
 	if err != nil {
 		return failResult(fmt.Errorf("session_list: %w", err))
 	}

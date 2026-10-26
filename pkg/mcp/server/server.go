@@ -53,6 +53,7 @@ type Server struct {
 	sessionsMu sync.Mutex
 	sessions   map[string]chan []byte
 	labels     map[string]string
+	images     map[string]bool
 }
 
 // New constructs an MCP Server listening on addr (e.g. ":4099") that drives the
@@ -64,6 +65,7 @@ func New(mgr *browsers.Manager, addr string) *Server {
 		registry: registerAll(mgr),
 		sessions: make(map[string]chan []byte),
 		labels:   make(map[string]string),
+		images:   make(map[string]bool),
 	}
 	s.httpSrv = &http.Server{Addr: addr, Handler: s.Handler()}
 	return s
@@ -220,6 +222,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		s.sessionsMu.Lock()
 		delete(s.sessions, sessionID)
 		delete(s.labels, sessionID)
+		delete(s.images, sessionID)
 		s.sessionsMu.Unlock()
 		close(sessionChan)
 		log.Printf("Session %s disconnected", sessionID)
@@ -371,6 +374,34 @@ func (s *Server) clientLabel(sessionID string) string {
 	return "client-" + short
 }
 
+// rememberImageSupport records whether a client can render image content blocks,
+// as advertised at initialize.
+func (s *Server) rememberImageSupport(sessionID string, enabled bool) {
+	if sessionID == "" {
+		return
+	}
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	if s.images == nil {
+		s.images = make(map[string]bool)
+	}
+	s.images[sessionID] = enabled
+}
+
+// imagesEnabled reports whether the client behind sessionID can render image
+// content blocks. Sessions that never advertised a preference default to true;
+// MCP has no standard image capability, so an explicit opt-out is the only
+// signal available.
+func (s *Server) imagesEnabled(sessionID string) bool {
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	enabled, ok := s.images[sessionID]
+	if !ok || sessionID == "" {
+		return true
+	}
+	return enabled
+}
+
 // processRequest runs one JSON-RPC request against the tool registry: it
 // injects the caller's owner identity, handles the MCP handshake (initialize),
 // the tool inventory (tools/list) and tool invocations (tools/call), returning a
@@ -392,10 +423,15 @@ func (s *Server) processRequest(ctx context.Context, req models.JSONRPCRequest) 
 			ClientInfo struct {
 				Name string `json:"name"`
 			} `json:"clientInfo"`
+			Capabilities map[string]json.RawMessage `json:"capabilities"`
 		}
 		if len(req.Params) > 0 {
 			if err := json.Unmarshal(req.Params, &params); err == nil {
 				s.rememberClientLabel(sseSessionFrom(ctx), params.ClientInfo.Name)
+				s.rememberImageSupport(
+					sseSessionFrom(ctx),
+					imageSupport(params.Capabilities),
+				)
 			}
 		}
 		resp.Result = models.InitializeResult{
@@ -428,12 +464,10 @@ func (s *Server) processRequest(ctx context.Context, req models.JSONRPCRequest) 
 			return resp
 		}
 		resp.Result = models.CallToolResult{
-			Content: []models.ContentBlock{
-				{
-					Type: "text",
-					Text: resultText,
-				},
-			},
+			Content: contentBlocks(
+				resultText,
+				s.imagesEnabled(sseSessionFrom(ctx)),
+			),
 		}
 
 	case "prompts/list":
@@ -465,4 +499,103 @@ func (s *Server) processRequest(ctx context.Context, req models.JSONRPCRequest) 
 	}
 
 	return resp
+}
+
+// toolImageResult is the page_fetch image carrier as decoded by the server.
+type toolImageResult struct {
+	OK       bool                 `json:"ok"`
+	Data     json.RawMessage      `json:"data"`
+	Image    *models.ContentBlock `json:"image"`
+	Fallback struct {
+		AsDataURI bool   `json:"as_data_uri"`
+		Field     string `json:"field"`
+	} `json:"fallback"`
+}
+
+// imageSupport reads the client's image preference from its initialize
+// capabilities. Image blocks are enabled unless the client explicitly
+// advertises imageContent=false, either at the top level or under experimental.
+func imageSupport(caps map[string]json.RawMessage) bool {
+	if raw, ok := caps["imageContent"]; ok {
+		return advertisedImageSupport(raw)
+	}
+	var experimental map[string]json.RawMessage
+	if raw, ok := caps["experimental"]; ok {
+		if err := json.Unmarshal(raw, &experimental); err == nil {
+			if raw, ok := experimental["imageContent"]; ok {
+				return advertisedImageSupport(raw)
+			}
+		}
+	}
+	return true
+}
+
+// advertisedImageSupport decodes one imageContent capability value, defaulting
+// to true when it is not a boolean.
+func advertisedImageSupport(raw json.RawMessage) bool {
+	var enabled bool
+	if err := json.Unmarshal(raw, &enabled); err != nil {
+		return true
+	}
+	return enabled
+}
+
+// contentBlocks turns a tool result into MCP content blocks. A plain envelope
+// stays one text block unchanged; an image carrier becomes a text envelope plus
+// the image block, or a text envelope carrying the base64 data URI when the
+// client cannot render images.
+func contentBlocks(result string, images bool) []models.ContentBlock {
+	var r toolImageResult
+	if err := json.Unmarshal([]byte(result), &r); err != nil || !r.OK || r.Image == nil {
+		return []models.ContentBlock{{Type: "text", Text: result}}
+	}
+	data, err := imageEnvelopeData(r, images)
+	if err != nil {
+		return []models.ContentBlock{{Type: "text", Text: result}}
+	}
+	text, err := json.Marshal(struct {
+		OK   bool            `json:"ok"`
+		Data json.RawMessage `json:"data"`
+	}{OK: true, Data: data})
+	if err != nil {
+		return []models.ContentBlock{{Type: "text", Text: result}}
+	}
+	blocks := []models.ContentBlock{{Type: "text", Text: string(text)}}
+	if images {
+		blocks = append(blocks, *r.Image)
+	}
+	return blocks
+}
+
+// imageEnvelopeData returns the data field for an image result: the short
+// metadata when the client renders images, or the data URI reattached to the
+// text envelope for a text-only client.
+func imageEnvelopeData(
+	r toolImageResult,
+	images bool,
+) (json.RawMessage, error) {
+	if images || r.Image == nil {
+		return r.Data, nil
+	}
+	uri, err := json.Marshal("data:" + r.Image.MimeType + ";base64," + r.Image.Data)
+	if err != nil {
+		return nil, fmt.Errorf("encode image data URI: %w", err)
+	}
+	switch {
+	case r.Fallback.AsDataURI:
+		return uri, nil
+	case r.Fallback.Field != "":
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(r.Data, &obj); err != nil {
+			return nil, fmt.Errorf("decode image metadata: %w", err)
+		}
+		obj[r.Fallback.Field] = uri
+		out, err := json.Marshal(obj)
+		if err != nil {
+			return nil, fmt.Errorf("encode image fallback: %w", err)
+		}
+		return out, nil
+	default:
+		return r.Data, nil
+	}
 }

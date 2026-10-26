@@ -1,10 +1,15 @@
 package tools
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/png"
 	"sort"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -27,19 +32,19 @@ const defaultPageTimeout = 30 * time.Second
 // identifies which browser tab to read; what selects the aspect:
 //
 //	html | dom | text | css | js | links | screenshot | meta | interactives | a11y |
-//	network | console | article | marks | security
+//	network | console | article | marks | security | storage
 //
 // The "dom" output is the page's DOM re-nested from the flattened Documents
 // array + Strings table produced by CaptureDOMSnapshot into a compact,
 // LLM-friendly tree (iframes, shadow DOM and all). "css"/"js" enumerate the
 // page's resource tree and fetch the matching resources. "screenshot" returns
-// a base64 PNG data-URI. "interactives" returns a dense action map of every
-// visible, non-inert clickable/typeable element (with stable handles for
-// page_act). "a11y" returns the flattened accessibility tree — computed
-// roles, accessible names, values and state flags — with handles on
-// DOM-backed nodes. "article" returns the readable body as markdown.
-// "marks" returns numbered overlay boxes plus the annotated screenshot.
-// Both bypass max_bytes truncation.
+// the PNG as an image content block plus a metadata text block. "interactives"
+// returns a dense action map of every visible, non-inert clickable/typeable
+// element (with stable handles for page_act). "a11y" returns the flattened
+// accessibility tree — computed roles, accessible names, values and state flags
+// — with handles on DOM-backed nodes. "article" returns the readable body as
+// markdown. "marks" returns the numbered mark table as text plus the annotated
+// screenshot as an image block. Both bypass max_bytes truncation.
 type Page struct {
 	// mgr is the shared browsers.Manager owning the single Browser and its
 	// live pages (sessions).
@@ -60,7 +65,10 @@ func (t *Page) Name() string {
 func (t *Page) Description() string {
 	return "Reads an aspect of a live page that was opened with fetch_page: " +
 		"html, dom (full flattened DOM snapshot, LLM-friendly), text, css, js, " +
-		"links, screenshot (base64 PNG data-URI), interactives (dense action " +
+		"links, screenshot (a metadata text block {mime_type, width, height, " +
+		"bytes, full_page} plus the PNG as a separate image content block with " +
+		"mimeType, or the base64 data URI in data when the client advertises " +
+		"imageContent=false), interactives (dense action " +
 		"map of every visible clickable/typeable element with stable handles " +
 		"for page_act), a11y (flattened accessibility tree: computed " +
 		"role/name/value/state flags plus depth, with handles on DOM-backed " +
@@ -71,11 +79,18 @@ func (t *Page) Description() string {
 		"so filter client-side or call page_act action clear_logs right before " +
 		"the step whose traffic/logs you want to observe), article (the readable " +
 		"article body as markdown with title, byline, excerpt, word count and " +
-		"truncated flag), marks (numbered set-of-marks boxes plus an annotated " +
-		"viewport screenshot whose x/y coordinates feed page_act click_at), " +
+		"truncated flag), marks (the mark table as a text block plus the " +
+		"annotated viewport PNG as an image block, with the data URI returned " +
+		"in screenshot for a text-only client. Its x/y coordinates feed " +
+		"page_act click_at), " +
 		"security (a passive audit of response headers, CSP, cookie flags, mixed " +
 		"content, subresource integrity and form targets, returned as " +
 		"{\"checks\":[{\"id\",\"status\",\"evidence\",\"detail\"}],\"count\":N}), " +
+		"storage (read-only browser-context snapshot: cookies with flags plus " +
+		"local_storage, session_storage, indexed_db and caches. Every section is " +
+		"present even when empty and capped with its own *_truncated counter. " +
+		"Every value is <redacted> unless include_values is true, which exposes " +
+		"live session tokens. It never writes cookies), " +
 		"or meta. Pass the session_id " +
 		"returned by fetch_page plus what=<aspect>; use selector to scope " +
 		"extraction, target to fetch exactly one css/js resource's full content " +
@@ -90,7 +105,8 @@ func (t *Page) Description() string {
 }
 
 // InputSchema returns the JSON Schema for page_fetch's arguments: a required
-// session_id and what, plus optional selector, target, max_bytes and full_page.
+// session_id and what, plus optional selector, target, max_bytes, full_page and
+// include_values.
 func (t *Page) InputSchema() models.InputSchema {
 	return models.InputSchema{
 		Type: "object",
@@ -102,7 +118,7 @@ func (t *Page) InputSchema() models.InputSchema {
 			"what": map[string]any{
 				"type":        "string",
 				"enum":        append([]string(nil), aspectNames...),
-				"description": "The aspect of the page to extract: html (outerHTML), dom (flattened DOM snapshot; every element node carries a g<document>-b<backendNodeId> handle usable as page_act's handle arg; the document token makes handles from a previous document stale after navigation), text (visible text), css (stylesheet resources, including inline <style> blocks reported with type inline-style), js (script resources), links (anchor hrefs, each with a handle where one matched), screenshot (base64 PNG data-URI; full_page captures the whole scrollable page), interactives (dense action map of every visible clickable/typeable element — with stable handles usable as page_act's handle arg; whole-page by design, the selector arg is ignored), a11y (flattened accessibility tree in DFS order: computed role/name/value plus the state flags checked, expanded, selected, disabled, required, pressed, invalid, focused, and depth — e.g. what: \"a11y\" → {\"nodes\":[{\"role\":\"button\",\"name\":\"Sign in\",\"handle\":\"g3k9x2ab-b6\",…}],\"count\":N,\"truncated\":M}; DOM-backed nodes carry a handle usable as page_act's handle arg; root frame only — iframes are separate trees; selector/target/full_page are ignored), network/console (bounded log envelope: what: \"network\" → {\"entries\":[{\"method\":\"GET\",\"url\":\"…\",\"status\":200,…}],\"count\":N,\"dropped\":D,\"truncated\":M}; entries are the newest 100 buffered, oldest first, and dropped counts true ring overflow; capture is cumulative from page creation — filter client-side or call page_act action clear_logs right before the step under observation; selector/target/full_page are ignored), article (the readable article body as markdown: {title, byline?, excerpt?, text, words, truncated, url} — the densest article/main root with page chrome removed and headings, paragraphs, lists, code, quotes, links, images and tables rendered; text is capped at 40000 runes and truncated reports the cut; prefer it over text for prose — selector/target/full_page are ignored; e.g. what: \"article\" → {\"title\":\"Example\",\"byline\":\"Ada\",\"text\":\"# Heading …\",\"words\":812,\"truncated\":false,\"url\":\"https://example.com/a\"}; example: {\"session_id\":\"page-1\",\"what\":\"article\"}), marks (numbered set-of-marks: {marks:[{index, role, text?, x, y, width, height}], screenshot, viewport_width, viewport_height, truncated} — one numbered box per visible interactive element plus the annotated viewport screenshot as a base64 PNG data-URI; x/y/width/height are viewport CSS px and x/y can be passed straight to page_act click_at; capped at the first 60 marks with truncated counting the rest — selector/target/full_page are ignored; e.g. what: \"marks\" → {\"marks\":[{\"index\":1,\"role\":\"a\",\"text\":\"Sign in\",\"x\":120.5,\"y\":48,\"width\":88,\"height\":32}],\"screenshot\":\"data:image/png;base64,…\",\"viewport_width\":1280,\"viewport_height\":800,\"truncated\":0}; example: {\"session_id\":\"page-1\",\"what\":\"marks\"}), security (passive audit: {checks:[{id,status,evidence,detail}],count} covering response headers, CSP (header or meta), cookie flags, mixed content, subresource integrity, form targets and CORS — selector/target/full_page are ignored; e.g. what: \"security\" → {\"checks\":[{\"id\":\"csp\",\"status\":\"warn\",\"evidence\":\"\",\"detail\":\"…\"}],\"count\":12}), meta (title/url/description). article, marks and security bypass max_bytes truncation.",
+				"description": "The aspect of the page to extract: html (outerHTML), dom (flattened DOM snapshot; every element node carries a g<document>-b<backendNodeId> handle usable as page_act's handle arg; the document token makes handles from a previous document stale after navigation), text (visible text), css (stylesheet resources, including inline <style> blocks reported with type inline-style), js (script resources), links (anchor hrefs, each with a handle where one matched), screenshot (a metadata text block {mime_type, width, height, bytes, full_page} plus the PNG as a separate image block with mimeType. full_page captures the whole scrollable page. A client advertising imageContent=false gets the base64 data URI in data instead — e.g. what: \"screenshot\" → {\"ok\":true,\"data\":{\"mime_type\":\"image/png\",\"width\":1280,\"height\":800,\"bytes\":42133,\"full_page\":false}} plus an image block), interactives (dense action map of every visible clickable/typeable element — with stable handles usable as page_act's handle arg; whole-page by design, the selector arg is ignored), a11y (flattened accessibility tree in DFS order: computed role/name/value plus the state flags checked, expanded, selected, disabled, required, pressed, invalid, focused, and depth — e.g. what: \"a11y\" → {\"nodes\":[{\"role\":\"button\",\"name\":\"Sign in\",\"handle\":\"g3k9x2ab-b6\",…}],\"count\":N,\"truncated\":M}; DOM-backed nodes carry a handle usable as page_act's handle arg; root frame only — iframes are separate trees; selector/target/full_page are ignored), network/console (bounded log envelope: what: \"network\" → {\"entries\":[{\"method\":\"GET\",\"url\":\"…\",\"status\":200,…}],\"count\":N,\"dropped\":D,\"truncated\":M}; entries are the newest 100 buffered, oldest first, and dropped counts true ring overflow; capture is cumulative from page creation — filter client-side or call page_act action clear_logs right before the step under observation; selector/target/full_page are ignored), article (the readable article body as markdown: {title, byline?, excerpt?, text, words, truncated, url} — the densest article/main root with page chrome removed and headings, paragraphs, lists, code, quotes, links, images and tables rendered; text is capped at 40000 runes and truncated reports the cut; prefer it over text for prose — selector/target/full_page are ignored; e.g. what: \"article\" → {\"title\":\"Example\",\"byline\":\"Ada\",\"text\":\"# Heading …\",\"words\":812,\"truncated\":false,\"url\":\"https://example.com/a\"}; example: {\"session_id\":\"page-1\",\"what\":\"article\"}), marks (numbered set-of-marks: the text block is {marks:[{index, role, text?, x, y, width, height}], viewport_width, viewport_height, truncated} and the PNG is a separate image block with mimeType — one numbered box per visible interactive element; x/y/width/height are viewport CSS px and x/y can be passed straight to page_act click_at; capped at the first 60 marks with truncated counting the rest — selector/target/full_page are ignored; e.g. what: \"marks\" → text {\"marks\":[{\"index\":1,\"role\":\"a\",\"text\":\"Sign in\",\"x\":120.5,\"y\":48,\"width\":88,\"height\":32}],\"viewport_width\":1280,\"viewport_height\":800,\"truncated\":0} plus the annotated PNG image block. For a text-only client the data URI comes back in screenshot); example: {\"session_id\":\"page-1\",\"what\":\"marks\"}), security (passive audit: {checks:[{id,status,evidence,detail}],count} covering response headers, CSP (header or meta), cookie flags, mixed content, subresource integrity, form targets and CORS — selector/target/full_page are ignored; e.g. what: \"security\" → {\"checks\":[{\"id\":\"csp\",\"status\":\"warn\",\"evidence\":\"\",\"detail\":\"…\"}],\"count\":12}), meta (title/url/description), storage (read-only snapshot of the page's browser context: cookies with name, value, domain, path, secure, http_only, same_site, expires and size, plus local_storage and session_storage [{key, value_length, value}], indexed_db [{name, stores}] and caches [name]. Every section is present even when empty and capped at 200 cookies, 200 keys per store, 20 databases and 40 caches, each with its own *_truncated counter. Values are the literal <redacted> unless include_values=true, which exposes live tokens. It never writes cookies. selector/target/full_page are ignored. e.g. what: \"storage\" → {\"cookies\":[{\"name\":\"sid\",\"value\":\"<redacted>\",\"domain\":\"example.com\",\"path\":\"/\",\"secure\":true,\"http_only\":true,\"same_site\":\"Lax\",\"expires\":-1,\"size\":42}],\"local_storage\":[{\"key\":\"token\",\"value_length\":32,\"value\":\"<redacted>\"}],...}. A page_closed error means the session expired, re-fetch the page). article, marks, security and storage bypass max_bytes truncation.",
 			},
 			"selector": map[string]any{
 				"type":        "string",
@@ -121,6 +137,11 @@ func (t *Page) InputSchema() models.InputSchema {
 			"target": map[string]any{
 				"type":        "string",
 				"description": "Resource URL to fetch exactly one css/js resource (instead of listing). Use with what=css|js.",
+			},
+			"include_values": map[string]any{
+				"type":        "boolean",
+				"default":     false,
+				"description": "With what=storage, return real cookie and local_storage/session_storage values instead of the literal <redacted>. Default false. true exposes live session tokens, so set it only when the values themselves are the question. Example: { \"session_id\": \"page-1\", \"what\": \"storage\", \"include_values\": true }. If the report still shows <redacted>, include_values was not set on this call.",
 			},
 		},
 		Required: []string{"session_id", "what"},
@@ -143,6 +164,9 @@ type pageFetchArgs struct {
 	// Target is a resource URL that, when set, makes what=css|js fetch exactly
 	// that one resource's content instead of listing the page's resources.
 	Target string `json:"target"`
+	// IncludeValues exposes cookie and storage values instead of redacting
+	// them (what=storage only).
+	IncludeValues bool `json:"include_values"`
 }
 
 // Execute parses the page_fetch arguments, resolves the session, dispatches to
@@ -185,6 +209,13 @@ func (t *Page) Execute(ctx context.Context, args json.RawMessage) (string, error
 	out, err := asp.read(ctx, p, a)
 	if err != nil {
 		return failResultForPage(ctx, p, fmt.Errorf("page_fetch: %w", err))
+	}
+
+	switch a.What {
+	case "screenshot":
+		return screenshotCarrier(out, a.FullPage)
+	case "marks":
+		return marksCarrier(out)
 	}
 
 	switch asp.trunc {
@@ -345,6 +376,131 @@ func firstArrayField(obj map[string]any) (string, []any) {
 		}
 	}
 	return "", nil
+}
+
+// imageCarrier is page_fetch's internal success result for a screenshot-bearing
+// aspect: the standard result envelope, the PNG as an MCP image block, and the
+// rule that exposes its data URI to a text-only client. It never reaches the
+// wire; the MCP server lifts Image into a content block and sends one
+// representation of the bytes.
+type imageCarrier struct {
+	resultEnvelope
+	Image    *models.ContentBlock `json:"image,omitempty"`
+	Fallback imageFallback        `json:"fallback,omitempty"`
+}
+
+// imageFallback tells the server how to expose the base64 data URI when the
+// client cannot render image blocks.
+type imageFallback struct {
+	AsDataURI bool   `json:"as_data_uri,omitempty"`
+	Field     string `json:"field,omitempty"`
+}
+
+// screenshotCarrier splits a screenshot data URI into an image block and a
+// compact metadata text envelope (MIME type, bytes, pixel size, full_page). The
+// data URI is removed from the text so an image-capable client receives the
+// bytes exactly once. A non-data-URI capture is returned as plain text.
+func screenshotCarrier(dataURI string, fullPage bool) (string, error) {
+	mime, raw, ok := decodeDataURI(dataURI)
+	if !ok {
+		return okResult(dataURI)
+	}
+	meta := map[string]any{
+		"mime_type": mime,
+		"bytes":     len(raw),
+		"full_page": fullPage,
+	}
+	if w, h, err := imageSize(raw); err == nil {
+		meta["width"] = w
+		meta["height"] = h
+	}
+	data, err := json.Marshal(meta)
+	if err != nil {
+		return "", fmt.Errorf("encode screenshot metadata: %w", err)
+	}
+	return marshalImageCarrier(imageCarrier{
+		resultEnvelope: resultEnvelope{OK: true, Data: data},
+		Image: &models.ContentBlock{
+			Type:     "image",
+			Data:     base64.StdEncoding.EncodeToString(raw),
+			MimeType: mime,
+		},
+		Fallback: imageFallback{AsDataURI: true},
+	})
+}
+
+// marksCarrier splits the annotated screenshot out of the marks JSON into an
+// image block and keeps the mark table in the text envelope. The screenshot
+// field is removed from the text and restored only for a text-only client.
+func marksCarrier(out string) (string, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(out), &fields); err != nil {
+		return okResult(out)
+	}
+	rawURI, ok := fields["screenshot"]
+	if !ok {
+		return okResult(out)
+	}
+	var uri string
+	if err := json.Unmarshal(rawURI, &uri); err != nil {
+		return okResult(out)
+	}
+	mime, raw, ok := decodeDataURI(uri)
+	if !ok {
+		return okResult(out)
+	}
+	delete(fields, "screenshot")
+	data, err := json.Marshal(fields)
+	if err != nil {
+		return "", fmt.Errorf("encode marks table: %w", err)
+	}
+	return marshalImageCarrier(imageCarrier{
+		resultEnvelope: resultEnvelope{OK: true, Data: data},
+		Image: &models.ContentBlock{
+			Type:     "image",
+			Data:     base64.StdEncoding.EncodeToString(raw),
+			MimeType: mime,
+		},
+		Fallback: imageFallback{Field: "screenshot"},
+	})
+}
+
+// marshalImageCarrier encodes one image carrier as its internal JSON transport.
+func marshalImageCarrier(c imageCarrier) (string, error) {
+	out, err := json.Marshal(c)
+	if err != nil {
+		return "", fmt.Errorf("encode image result: %w", err)
+	}
+	return string(out), nil
+}
+
+// decodeDataURI splits a "data:<mime>;base64,<payload>" URI into its MIME type
+// and decoded bytes.
+func decodeDataURI(uri string) (string, []byte, bool) {
+	const prefix = "data:"
+	if !strings.HasPrefix(uri, prefix) {
+		return "", nil, false
+	}
+	rest := uri[len(prefix):]
+	comma := strings.IndexByte(rest, ',')
+	if comma < 0 || !strings.HasSuffix(rest[:comma], ";base64") {
+		return "", nil, false
+	}
+	mime := strings.TrimSuffix(rest[:comma], ";base64")
+	raw, err := base64.StdEncoding.DecodeString(rest[comma+1:])
+	if err != nil {
+		return "", nil, false
+	}
+	return mime, raw, true
+}
+
+// imageSize reads the pixel dimensions from an encoded image header.
+func imageSize(raw []byte) (int, int, error) {
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		return 0, 0, fmt.Errorf("decode image size: %w", err)
+	}
+	return cfg.Width, cfg.Height, nil
 }
 
 // Ensure Page satisfies the Tool interface at compile time.

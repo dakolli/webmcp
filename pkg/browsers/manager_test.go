@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-rod/rod"
+
 	"webmcp/pkg/config"
 )
 
@@ -512,5 +514,89 @@ func TestPruneProfilesLeavesNamedProfile(t *testing.T) {
 	}
 	if len(removed) != 1 {
 		t.Fatalf("PruneProfiles removed %d dirs, want 1", len(removed))
+	}
+}
+
+// TestSessionsListsEveryIdentityWithoutLaunch pins that one read enumerates the
+// pages of the parent and every identity, and that listing creates nothing.
+func TestSessionsListsEveryIdentityWithoutLaunch(t *testing.T) {
+	m := NewManager(WithTTL(0))
+	launches := 0
+	m.launch = func(context.Context, *Browser) error {
+		launches++
+		return nil
+	}
+
+	root := identityTestBrowser(t)
+	root.pages["page-1"] = &Page{ID: "page-1", URL: "https://app.test/orders/1"}
+	victim, err := root.NewIdentity("victim")
+	if err != nil {
+		t.Fatalf("NewIdentity(victim): %v", err)
+	}
+	victim.pages["page-2"] = &Page{ID: "page-2", URL: "https://app.test/orders/2"}
+	m.browsers["browser-1"] = root
+
+	before := len(m.Browsers())
+	pages, err := m.Sessions("")
+	if err != nil {
+		t.Fatalf("Sessions(): %v", err)
+	}
+	if after := len(m.Browsers()); after != before {
+		t.Fatalf("browsers after listing = %d, want %d", after, before)
+	}
+	if launches != 0 {
+		t.Fatalf("listing launched %d browser(s), want 0", launches)
+	}
+
+	want := map[PageID]string{"page-1": "default", "page-2": "victim"}
+	if len(pages) != len(want) {
+		t.Fatalf("Sessions() = %v, want %d pages", pages, len(want))
+	}
+	for _, p := range pages {
+		if p.Context != want[p.ID] {
+			t.Errorf("page %s context = %q, want %q", p.ID, p.Context, want[p.ID])
+		}
+	}
+}
+
+// TestSessionsResolvesIdentityAcrossBrowsers pins that both the filter and its
+// unknown-name error span every live browser, not just one root.
+func TestSessionsResolvesIdentityAcrossBrowsers(t *testing.T) {
+	m := NewManager(WithTTL(0))
+
+	first := identityTestBrowser(t)
+	first.pages["page-1"] = &Page{ID: "page-1", URL: "https://app.test/default"}
+	if _, err := first.NewIdentity("victim"); err != nil {
+		t.Fatalf("NewIdentity(victim): %v", err)
+	}
+	m.browsers["browser-1"] = first
+
+	second := NewBrowser("browser-2", m.baseCtx, false, false, "", "")
+	second.rod = &rod.Browser{}
+	second.incognito = func(*rod.Browser) (*rod.Browser, error) {
+		return &rod.Browser{}, nil
+	}
+	attacker, err := second.NewIdentity("attacker")
+	if err != nil {
+		t.Fatalf("NewIdentity(attacker): %v", err)
+	}
+	attacker.pages["page-2"] = &Page{ID: "page-2", URL: "https://app.test/orders/1"}
+	m.browsers["browser-2"] = second
+
+	pages, err := m.Sessions("attacker")
+	if err != nil {
+		t.Fatalf("Sessions(attacker): %v", err)
+	}
+	if len(pages) != 1 || pages[0].ID != "page-2" || pages[0].Context != "attacker" {
+		t.Fatalf("Sessions(attacker) = %v, want page-2 in attacker", pages)
+	}
+
+	_, err = m.Sessions("ghost")
+	if err == nil {
+		t.Fatal("Sessions(ghost) succeeded, want the live names")
+	}
+	want := `unknown identity "ghost" (known: attacker, default, victim)`
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("Sessions(ghost) error = %q, want it to contain %q", err, want)
 	}
 }

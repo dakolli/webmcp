@@ -341,6 +341,12 @@ func (s *Server) handlePageOpen(ctx context.Context, params json.RawMessage) (an
 	if err != nil {
 		return nil, serverError(err)
 	}
+	if identity := strings.TrimSpace(p.Identity); identity != "" && identity != browsers.DefaultIdentity {
+		b, err = b.NewIdentity(identity)
+		if err != nil {
+			return nil, &Error{Code: CodeInvalidParams, Message: fmt.Sprintf("page.open: %v", err)}
+		}
+	}
 	// NewPage applies the device preset pre-navigation (governs the load
 	// itself); page.open has no user_agent param (MCP-only).
 	page, err := b.NewPage(ctx, p.URL, p.Viewport, p.Device, "")
@@ -372,10 +378,10 @@ func (s *Server) handlePageList(ctx context.Context, params json.RawMessage) (an
 // through the shared pageops aspect registry — html, text, links, meta, dom,
 // css/js (resource list or one target resource), screenshot, interactives, a11y,
 // network/console (bounded log envelopes), body (one stored response body),
-// article, marks and security. The registry owns both the accepted what values
-// and the truncation policy, so this handler mirrors the CLI page fetch command
-// without duplicating either. An unknown extractor is a -32602 invalid-params
-// error.
+// article, marks, security and storage. The registry owns both the accepted
+// what values and the truncation policy, so this handler mirrors the CLI page
+// fetch command without duplicating either. An unknown extractor is a -32602
+// invalid-params error.
 func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (any, *Error) {
 	p, rpcErr := decodeParams[PageFetchParams](params)
 	if rpcErr != nil {
@@ -400,7 +406,14 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 	if maxBytes <= 0 {
 		maxBytes = pageops.DefaultPageMaxBytes
 	}
-	out, err := pageops.PageAspect(ctx, page, p.What, p.Selector, p.Target, p.FullPage, maxBytes)
+	out, err := pageops.PageAspect(ctx, page, pageops.AspectQuery{
+		What:          p.What,
+		Selector:      p.Selector,
+		Target:        p.Target,
+		FullPage:      p.FullPage,
+		IncludeValues: p.IncludeValues,
+		MaxBytes:      maxBytes,
+	})
 	if err != nil {
 		return nil, serverError(err)
 	}

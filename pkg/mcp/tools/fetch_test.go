@@ -56,3 +56,47 @@ func TestFetchArgsWaitForDefault(t *testing.T) {
 		})
 	}
 }
+
+func TestFetchArgsIdentity(t *testing.T) {
+	tests := []struct {
+		name     string
+		identity string
+		want     string
+		wantErr  bool
+	}{
+		{name: "omitted defaults to default", identity: "", want: "default"},
+		{name: "trimmed and preserved", identity: "  victim  ", want: "victim"},
+		{name: "explicit default", identity: "default", want: "default"},
+		{name: "invalid label rejected", identity: "bad name", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := fetchArgs{URL: "https://example.com", Identity: tt.identity}
+			err := a.validate()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("validate() = nil, want an invalid-identity refusal")
+				}
+				if !strings.Contains(err.Error(), "invalid identity") {
+					t.Fatalf("error = %q, want the invalid-identity rule", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validate() error = %v", err)
+			}
+			if a.Identity != tt.want {
+				t.Fatalf("Identity = %q, want %q", a.Identity, tt.want)
+			}
+		})
+	}
+
+	prop, ok := (&Fetch{}).InputSchema().Properties["identity"].(map[string]any)
+	if !ok {
+		t.Fatal("identity schema property is missing")
+	}
+	desc, _ := prop["description"].(string)
+	if !strings.Contains(desc, "default") || !strings.Contains(desc, "context") {
+		t.Errorf("identity description = %q, want the default and incognito-context contract", desc)
+	}
+}

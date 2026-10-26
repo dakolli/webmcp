@@ -247,6 +247,10 @@ type PageOpenParams struct {
 	// IPhoneX, IPadPro) to the new page BEFORE navigation; empty = plain
 	// launch. When both Device and Viewport are given, Device wins.
 	Device string `json:"device,omitempty"`
+	// Identity opens the page in an incognito identity inside the target
+	// browser. "default" (or empty) uses the browser's own cookie jar; a new
+	// name creates an incognito clone in the same Chromium process.
+	Identity string `json:"identity,omitempty"`
 }
 
 // PageOpenResult is the result of page.open, mirroring the CLI fetch command's
@@ -268,7 +272,8 @@ type PageListResult struct {
 // css/js resource's content, or with what=body selects one observed response by
 // seq or URL substring; full_page captures the whole scrollable page in a
 // screenshot; max_bytes caps the returned data (default pageops.DefaultPageMaxBytes),
-// except for the aspects that self-cap. network/console return
+// except for the aspects that self-cap; include_values returns real cookie and
+// storage values with what=storage instead of <redacted>. network/console return
 // {entries,count,dropped,truncated} over the newest 100 buffered entries;
 // capture is cumulative from page creation, so clear with page.act clear_logs
 // before the step under observation.
@@ -287,6 +292,9 @@ type PageFetchParams struct {
 	FullPage bool `json:"full_page,omitempty"`
 	// MaxBytes caps the returned data size (0 → DefaultPageMaxBytes).
 	MaxBytes int `json:"max_bytes,omitempty"`
+	// IncludeValues returns real cookie and storage values with what=storage
+	// instead of the literal <redacted>; it exposes live session tokens.
+	IncludeValues bool `json:"include_values,omitempty"`
 }
 
 // PageFetchResult is the result of page.fetch.
