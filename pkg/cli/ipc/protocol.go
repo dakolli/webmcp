@@ -107,12 +107,10 @@ type PingResult struct {
 	OK bool `json:"ok"`
 }
 
-// BrowserOpenParams carries the optional browser.open parameters. headless and
-// stealth are accepted and validated for wire-contract parity but CANNOT change
-// the running browser — Manager options are construction-time
-// (browsers.NewManager(WithHeadless, WithStealth)); the effective config is
-// fixed by `web-cli serve --headless/--stealth`. The client-side launch flow
-// must pass the flags to serve itself, not rely on these params.
+// BrowserOpenParams carries the optional browser.open parameters. Every field
+// maps to a browsers.Option applied at create time; headless and stealth join
+// the create key, so an explicit value overrides the serve process's manager
+// default for the browser this call creates and never mutates a live one.
 type BrowserOpenParams struct {
 	// Bin is a custom browser executable path or command.
 	Bin string `json:"bin,omitempty"`
@@ -121,7 +119,10 @@ type BrowserOpenParams struct {
 	Profile string `json:"profile,omitempty"`
 	// Position is the window position preset: left, right, max or normal.
 	Position string `json:"position,omitempty"`
-	// Headless requests headless Chromium (accepted for parity only).
+	// Headless requests headless Chromium. It joins the create key, so a
+	// headless create and a headful create are separate browsers. Absent keeps
+	// the serve process's manager default (headful unless serve was started
+	// with --headless).
 	Headless *bool `json:"headless,omitempty"`
 	// Stealth requests go-rod/stealth (accepted for parity only).
 	Stealth *bool `json:"stealth,omitempty"`
@@ -140,6 +141,15 @@ type BrowserOpenParams struct {
 	// IgnoreCerts makes Chromium accept invalid TLS certificates; it is
 	// independent of Proxy.
 	IgnoreCerts *bool `json:"ignore_certs,omitempty"`
+	// Headers are request headers sent with every request from every page of
+	// this browser, the first navigation included.
+	Headers map[string]string `json:"headers,omitempty"`
+	// Scope is the navigation allowlist: bare hosts (which cover subdomains),
+	// leading "*." globs, "host:port" entries, or "*" for all. Empty means no
+	// limit unless ScopeStrict is set.
+	Scope []string `json:"scope,omitempty"`
+	// ScopeStrict makes an empty allowlist deny every navigation.
+	ScopeStrict *bool `json:"scope_strict,omitempty"`
 }
 
 // BrowserOpenResult is the result of browser.open.
@@ -152,6 +162,10 @@ type BrowserOpenResult struct {
 	Persist bool `json:"persist"`
 	// TTL is the idle timeout that closes the browser ("0s" when disabled).
 	TTL string `json:"ttl"`
+	// Scope is the navigation allowlist state ("open" when unrestricted).
+	Scope string `json:"scope"`
+	// ScopeStrict reports whether an empty allowlist denies every navigation.
+	ScopeStrict bool `json:"scope_strict"`
 }
 
 // BrowserCloseParams carries the browser.close parameters. purge deletes the
@@ -176,16 +190,18 @@ type BrowserCloseResult struct {
 }
 
 type BrowserEntry struct {
-	BrowserID  string              `json:"browser_id"`
-	Owner      string              `json:"owner"`
-	Bin        string              `json:"bin,omitempty"`
-	ProfileDir string              `json:"profile_dir,omitempty"`
-	Persist    bool                `json:"persist"`
-	Ephemeral  bool                `json:"ephemeral"`
-	CreatedAt  time.Time           `json:"created_at"`
-	IdleFor    string              `json:"idle_for"`
-	TTL        string              `json:"ttl"`
-	Pages      []browsers.PageInfo `json:"pages"`
+	BrowserID   string              `json:"browser_id"`
+	Owner       string              `json:"owner"`
+	Bin         string              `json:"bin,omitempty"`
+	ProfileDir  string              `json:"profile_dir,omitempty"`
+	Persist     bool                `json:"persist"`
+	Ephemeral   bool                `json:"ephemeral"`
+	CreatedAt   time.Time           `json:"created_at"`
+	IdleFor     string              `json:"idle_for"`
+	TTL         string              `json:"ttl"`
+	Scope       string              `json:"scope"`
+	ScopeStrict bool                `json:"scope_strict"`
+	Pages       []browsers.PageInfo `json:"pages"`
 }
 
 // BrowserListResult is the result of browser.list: the snapshot of open Browsers

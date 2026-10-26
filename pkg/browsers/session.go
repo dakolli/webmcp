@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -17,55 +18,113 @@ import (
 // page_fetch / page_act / session_close call, e.g. "page-1".
 type PageID string
 
-// Page wraps a live *rod.Page (a browser tab) and its own mutex, because rod
-// Pages are NOT thread-safe: all access to the underlying page must be
-// serialized with the per-page mutex. Tools Lock before touching the page and
-// Unlock after the page call completes; the Browser does the same for its own
-// lifecycle operations (ClosePage, Close).
+// Page wraps a live *rod.Page (a browser tab) and its own operation lock,
+// because rod Pages are NOT thread-safe: all access to the underlying page
+// must be serialized. Lock/Unlock exist for callers with no deadline;
+// LockContext is the default so a caller waiting on a busy page fails with an
+// actionable error instead of blocking forever. Lifecycle state that listings
+// read (last access) is atomic and never waits on the operation lock.
 type Page struct {
 	// ID uniquely identifies this page within its Browser.
 	ID PageID
 	// URL is the URL the page was created with (set by NewPage).
 	URL string
 	// Rod is the live go-rod page handle for this tab. Only valid while the
-	// page is open.
+	// page is open. Guarded by the operation lock.
 	Rod *rod.Page
-	// lastAccess is the last time this page was used: set at creation (NewPage)
-	// and refreshed by touch on every successful Browser.Page lookup. The
-	// manager's background sweeper closes pages idle for longer than its TTL.
-	lastAccess time.Time
+	// lastAccessNano is the UnixNano time this page was last used: set at
+	// creation (NewPage) and refreshed by touch on every successful
+	// Browser.Page lookup. Atomic so listings and the sweeper never take the
+	// operation lock (a stuck page must not block them).
+	lastAccessNano atomic.Int64
 	// docMarkerInstalled reports whether the handle-scope marker script has
-	// been installed on this page (see CaptureSnapshot). Guarded by mu.
+	// been installed on this page (see CaptureSnapshot). Guarded by the
+	// operation lock.
 	docMarkerInstalled bool
+	// sinkScriptInstalled reports whether the source-to-sink tracer script
+	// has been registered for later documents (see InstallSinks). Guarded by
+	// the operation lock.
+	sinkScriptInstalled bool
 	// observer holds the page's network/console capture rings. It is assigned
 	// once in the pre-registration window and never replaced, so read methods
-	// may use it without taking mu. Engine-internal: surfaces never touch it.
+	// may use it without taking the operation lock. Engine-internal: surfaces
+	// never touch it.
 	observer *pageObserver
 	// obsCancel disarms the capture subscription. It is set in the same
-	// pre-registration window and cleared by stopObservation. Guarded by mu.
+	// pre-registration window and cleared by stopObservation. Guarded by the
+	// operation lock.
 	obsCancel context.CancelFunc
 
-	// mu serializes access to the underlying rod.Page (rod is not thread-safe).
-	mu sync.Mutex
+	// opMu is the operation lock: a one-slot channel semaphore, lazily
+	// initialized so a zero-value Page stays usable. A channel (rather than
+	// sync.Mutex) lets a caller wait with a context deadline.
+	opMu chan struct{}
+	// opOnce initializes opMu exactly once.
+	opOnce sync.Once
 }
 
 // touch records that the page was just used, resetting its idle clock so the
-// manager's sweeper does not close it. It is safe to call while holding the
-// Browser mutex: the browser lock is always taken before the page lock.
+// manager's sweeper does not close it. It is lock-free: listings and the
+// sweeper must never wait on a page operation.
 func (p *Page) touch() {
-	p.mu.Lock()
-	p.lastAccess = time.Now()
-	p.mu.Unlock()
+	p.lastAccessNano.Store(time.Now().UnixNano())
+}
+
+// idleFor returns how long the page has gone unused without taking the
+// operation lock.
+func (p *Page) idleFor() time.Duration {
+	return time.Since(time.Unix(0, p.lastAccessNano.Load()))
+}
+
+// lockCh returns the operation-lock channel, initializing it on first use.
+func (p *Page) lockCh() chan struct{} {
+	p.opOnce.Do(func() {
+		ch := make(chan struct{}, 1)
+		ch <- struct{}{}
+		p.opMu = ch
+	})
+	return p.opMu
 }
 
 // Lock serializes access to the page's underlying rod page. Pair with Unlock.
+// It waits forever; prefer LockContext so a busy page cannot hang the caller.
 func (p *Page) Lock() {
-	p.mu.Lock()
+	<-p.lockCh()
 }
 
-// Unlock releases the per-page lock taken by Lock.
+// Unlock releases the per-page operation lock taken by Lock or LockContext.
 func (p *Page) Unlock() {
-	p.mu.Unlock()
+	p.lockCh() <- struct{}{}
+}
+
+// TryLock acquires the operation lock without waiting, reporting whether it
+// succeeded. A caller that cannot acquire it must treat the page as busy, not
+// dead: an in-flight operation means the tab is alive.
+func (p *Page) TryLock() (unlock func(), ok bool) {
+	select {
+	case <-p.lockCh():
+		return p.Unlock, true
+	default:
+		return nil, false
+	}
+}
+
+// LockContext acquires the page operation lock, waiting only until ctx is
+// done. It returns one actionable sentence naming op and the time spent
+// waiting when another operation still holds the page.
+func (p *Page) LockContext(ctx context.Context, op string) error {
+	start := time.Now()
+	select {
+	case <-p.lockCh():
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf(
+			"%s: page %s is still busy after %s — a previous operation on this page did not return; retry, or close it with session_close",
+			op,
+			p.ID,
+			time.Since(start).Round(time.Millisecond),
+		)
+	}
 }
 
 // Close closes the underlying rod tab, releasing the browser tab. The page
@@ -76,7 +135,9 @@ func (p *Page) Unlock() {
 // surfaces a ctx-bound error (e.g. context.DeadlineExceeded) instead of
 // blocking the caller past its deadline.
 func (p *Page) Close(ctx context.Context) error {
-	p.Lock()
+	if err := p.LockContext(ctx, "close page"); err != nil {
+		return err
+	}
 	defer p.Unlock()
 	p.stopObservation()
 	if p.Rod == nil {

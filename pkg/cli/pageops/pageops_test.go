@@ -4,12 +4,16 @@ package pageops
 // maxBytes semantics, and rune-safe cutting with the EXACT truncation note.
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/go-rod/rod/lib/proto"
+
+	"webmcp/pkg/browsers"
 )
 
 // truncateNote is the exact suffix PageTruncate appends: a leading newline,
@@ -255,4 +259,48 @@ func TestLinkHandles(t *testing.T) {
 			t.Errorf("linkHandles()[%q] = %q, want %q", href, got[href], handle)
 		}
 	}
+}
+
+// TestStuckPageOperationReleasesLock is the WEB-140 regression test: an
+// operation that hangs until its own context expires must release the page
+// lock, a second caller must fail fast with the actionable timeout sentence,
+// and the page must be usable again once the stuck operation returns.
+func TestStuckPageOperationReleasesLock(t *testing.T) {
+	p := &browsers.Page{ID: "page-1"}
+	stuckCtx, stuckCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer stuckCancel()
+
+	started := make(chan struct{})
+	released := make(chan struct{})
+	go func() {
+		ctx, done, err := beginPage(stuckCtx, p, "stuck")
+		if err != nil {
+			t.Errorf("beginPage(stuck) error = %v", err)
+			close(released)
+			return
+		}
+		close(started)
+		<-ctx.Done()
+		done()
+		close(released)
+	}()
+	<-started
+
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer waitCancel()
+	if _, _, err := beginPage(waitCtx, p, "click"); err == nil {
+		t.Fatal("second call acquired a page held by a stuck operation")
+	} else if !strings.Contains(err.Error(), "click") || !strings.Contains(err.Error(), "busy") {
+		t.Fatalf("beginPage(click) error = %q, want the actionable busy-page sentence", err)
+	}
+
+	<-released
+	ctx, done, err := beginPage(context.Background(), p, "click")
+	if err != nil {
+		t.Fatalf("lock not released after the stuck operation returned: %v", err)
+	}
+	if ctx == nil {
+		t.Fatal("beginPage returned a nil context")
+	}
+	done()
 }

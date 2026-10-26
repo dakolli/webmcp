@@ -43,7 +43,7 @@ resolve only against that browser and an unknown id fails with the live ids.
 
 Subcommands:
   list   List the browser's open pages (id, url)
-  fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, console, body, article, marks); a URL opens a new page first
+  fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, console, body, article, marks, security); a URL opens a new page first
   act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate, clear_logs)
   close  Close an open page
 
@@ -129,8 +129,8 @@ func newPageFetchCmd(mgr *browsers.Manager) *cobra.Command {
 		Use:   "fetch [id|url] [what]",
 		Short: "Extract an aspect of a live page",
 		Long: `Extracts an aspect of a live page (html, text, links, meta, dom, css,
-js, screenshot, interactives, a11y, network, console, body, article, marks) and prints
-it. The page id is optional when
+js, screenshot, interactives, a11y, network, console, body, article, marks,
+security) and prints it. The page id is optional when
 only one page is open; 'last' means the most recently opened page; a bare number
 resolves to page-N. A URL in the [id] slot opens a NEW page for it first —
 creating the browser if needed, exactly like 'web-cli fetch <url>' — and then
@@ -142,8 +142,8 @@ dance).
   [url]   an absolute URL (contains "://") to open in a new page first, then
           extract the aspect — mirrors 'web-cli fetch <url>' (wait: idle)
   [what]  the aspect to extract: html, text, links, meta, dom, css, js,
-          screenshot, interactives, a11y, network, console, body, article, marks
-          (default: text)
+          screenshot, interactives, a11y, network, console, body, article, marks,
+          security (default: text)
 
   --id <session>     the page/session id (the positional [id] wins when both
                      are given; never treated as a URL)
@@ -155,15 +155,18 @@ dance).
                      --what body, select the entry by seq or URL substring
   --full-page        capture the entire scrollable page (screenshot only)
   --max-bytes <n>    cap output size (default 50000; screenshots,
-                     interactives, a11y, network, console, body, article and
-                     marks are never truncated)
+                     interactives, a11y, network, console, body, article,
+                     marks and security are never truncated)
 
-links, meta, dom, interactives, a11y, network, console, body, article and marks
-print JSON, mirroring the MCP page_fetch shapes. article is the readable prose body as
+links, meta, dom, interactives, a11y, network, console, body, article, marks and
+security print JSON, mirroring the MCP page_fetch shapes. article is the readable prose body as
 markdown ({title, byline?, excerpt?, text, words, truncated, url}); prefer it
 over text when you want the article rather than the whole page. marks is the
 numbered overlay ({marks:[{index, role, text?, x, y, width, height}], screenshot,
 viewport_width, viewport_height, truncated}) whose x/y feed 'page act click_at'.
+security is the passive audit ({checks:[{id, status, evidence, detail}], count})
+covering response headers, CSP (header or meta), cookie flags, mixed content,
+subresource integrity, form targets and CORS.
 Screenshots print a data:image/png;base64,... data-URI. network/console emit
 {entries,count,dropped,truncated} over the newest 100 buffered entries; capture is
 cumulative from page creation, so clear with 'page act clear_logs' right before the
@@ -180,6 +183,7 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
   web-cli page fetch last a11y                          # semantic roles + names + handles
   web-cli page fetch last network  # last 100 network requests + dropped count
   web-cli page fetch last body --target /api/orders  # newest matching API body
+  web-cli page fetch last security                      # passive headers/CSP/cookie/mixed-content audit
   web-cli page fetch https://hackernews.com links       # open + extract in one step`,
 		Args: cobra.MaximumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -267,7 +271,7 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to fetch (optional with one page open; 'last'; or a bare number)")
-	cmd.Flags().StringVar(&what, "what", "", "aspect to extract: html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, marks (default text)")
+	cmd.Flags().StringVar(&what, "what", "", "aspect to extract: html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, marks, security (default text)")
 	cmd.Flags().StringVar(&selector, "selector", "", "optional CSS selector scoping html/text extraction")
 	cmd.Flags().StringVar(&target, "target", "", "resource URL for one css/js resource, or seq/URL substring selecting one network body (with --what body)")
 	cmd.Flags().BoolVar(&fullPage, "full-page", false, "capture the entire scrollable page instead of the visible viewport (screenshot only)")

@@ -27,7 +27,7 @@ const defaultPageTimeout = 30 * time.Second
 // identifies which browser tab to read; what selects the aspect:
 //
 //	html | dom | text | css | js | links | screenshot | meta | interactives | a11y |
-//	network | console | article | marks
+//	network | console | article | marks | security
 //
 // The "dom" output is the page's DOM re-nested from the flattened Documents
 // array + Strings table produced by CaptureDOMSnapshot into a compact,
@@ -72,8 +72,11 @@ func (t *Page) Description() string {
 		"the step whose traffic/logs you want to observe), article (the readable " +
 		"article body as markdown with title, byline, excerpt, word count and " +
 		"truncated flag), marks (numbered set-of-marks boxes plus an annotated " +
-		"viewport screenshot whose x/y coordinates feed page_act click_at), or " +
-		"meta. Pass the session_id " +
+		"viewport screenshot whose x/y coordinates feed page_act click_at), " +
+		"security (a passive audit of response headers, CSP, cookie flags, mixed " +
+		"content, subresource integrity and form targets, returned as " +
+		"{\"checks\":[{\"id\",\"status\",\"evidence\",\"detail\"}],\"count\":N}), " +
+		"or meta. Pass the session_id " +
 		"returned by fetch_page plus what=<aspect>; use selector to scope " +
 		"extraction, target to fetch exactly one css/js resource's full content " +
 		"(instead of the resource list), full_page to capture the whole " +
@@ -82,7 +85,8 @@ func (t *Page) Description() string {
 		"and may still time out on extreme pages), and max_bytes to cap the " +
 		"response size. Each aspect is capped at a fixed 30s per-call timeout " +
 		"(full-page screenshots ~90s); timeout_ms is not supported on this tool. " +
-		"Example: { \"session_id\": \"page-1\", \"what\": \"dom\", \"max_bytes\": 8000 }."
+		"Example: { \"session_id\": \"page-1\", \"what\": \"dom\", \"max_bytes\": 8000 }." +
+		resultEnvelopeDoc
 }
 
 // InputSchema returns the JSON Schema for page_fetch's arguments: a required
@@ -98,7 +102,7 @@ func (t *Page) InputSchema() models.InputSchema {
 			"what": map[string]any{
 				"type":        "string",
 				"enum":        append([]string(nil), aspectNames...),
-				"description": "The aspect of the page to extract: html (outerHTML), dom (flattened DOM snapshot; every element node carries a g<document>-b<backendNodeId> handle usable as page_act's handle arg; the document token makes handles from a previous document stale after navigation), text (visible text), css (stylesheet resources, including inline <style> blocks reported with type inline-style), js (script resources), links (anchor hrefs, each with a handle where one matched), screenshot (base64 PNG data-URI; full_page captures the whole scrollable page), interactives (dense action map of every visible clickable/typeable element — with stable handles usable as page_act's handle arg; whole-page by design, the selector arg is ignored), a11y (flattened accessibility tree in DFS order: computed role/name/value plus the state flags checked, expanded, selected, disabled, required, pressed, invalid, focused, and depth — e.g. what: \"a11y\" → {\"nodes\":[{\"role\":\"button\",\"name\":\"Sign in\",\"handle\":\"g3k9x2ab-b6\",…}],\"count\":N,\"truncated\":M}; DOM-backed nodes carry a handle usable as page_act's handle arg; root frame only — iframes are separate trees; selector/target/full_page are ignored), network/console (bounded log envelope: what: \"network\" → {\"entries\":[{\"method\":\"GET\",\"url\":\"…\",\"status\":200,…}],\"count\":N,\"dropped\":D,\"truncated\":M}; entries are the newest 100 buffered, oldest first, and dropped counts true ring overflow; capture is cumulative from page creation — filter client-side or call page_act action clear_logs right before the step under observation; selector/target/full_page are ignored), article (the readable article body as markdown: {title, byline?, excerpt?, text, words, truncated, url} — the densest article/main root with page chrome removed and headings, paragraphs, lists, code, quotes, links, images and tables rendered; text is capped at 40000 runes and truncated reports the cut; prefer it over text for prose — selector/target/full_page are ignored; e.g. what: \"article\" → {\"title\":\"Example\",\"byline\":\"Ada\",\"text\":\"# Heading …\",\"words\":812,\"truncated\":false,\"url\":\"https://example.com/a\"}; example: {\"session_id\":\"page-1\",\"what\":\"article\"}), marks (numbered set-of-marks: {marks:[{index, role, text?, x, y, width, height}], screenshot, viewport_width, viewport_height, truncated} — one numbered box per visible interactive element plus the annotated viewport screenshot as a base64 PNG data-URI; x/y/width/height are viewport CSS px and x/y can be passed straight to page_act click_at; capped at the first 60 marks with truncated counting the rest — selector/target/full_page are ignored; e.g. what: \"marks\" → {\"marks\":[{\"index\":1,\"role\":\"a\",\"text\":\"Sign in\",\"x\":120.5,\"y\":48,\"width\":88,\"height\":32}],\"screenshot\":\"data:image/png;base64,…\",\"viewport_width\":1280,\"viewport_height\":800,\"truncated\":0}; example: {\"session_id\":\"page-1\",\"what\":\"marks\"}), meta (title/url/description). Both article and marks bypass max_bytes truncation.",
+				"description": "The aspect of the page to extract: html (outerHTML), dom (flattened DOM snapshot; every element node carries a g<document>-b<backendNodeId> handle usable as page_act's handle arg; the document token makes handles from a previous document stale after navigation), text (visible text), css (stylesheet resources, including inline <style> blocks reported with type inline-style), js (script resources), links (anchor hrefs, each with a handle where one matched), screenshot (base64 PNG data-URI; full_page captures the whole scrollable page), interactives (dense action map of every visible clickable/typeable element — with stable handles usable as page_act's handle arg; whole-page by design, the selector arg is ignored), a11y (flattened accessibility tree in DFS order: computed role/name/value plus the state flags checked, expanded, selected, disabled, required, pressed, invalid, focused, and depth — e.g. what: \"a11y\" → {\"nodes\":[{\"role\":\"button\",\"name\":\"Sign in\",\"handle\":\"g3k9x2ab-b6\",…}],\"count\":N,\"truncated\":M}; DOM-backed nodes carry a handle usable as page_act's handle arg; root frame only — iframes are separate trees; selector/target/full_page are ignored), network/console (bounded log envelope: what: \"network\" → {\"entries\":[{\"method\":\"GET\",\"url\":\"…\",\"status\":200,…}],\"count\":N,\"dropped\":D,\"truncated\":M}; entries are the newest 100 buffered, oldest first, and dropped counts true ring overflow; capture is cumulative from page creation — filter client-side or call page_act action clear_logs right before the step under observation; selector/target/full_page are ignored), article (the readable article body as markdown: {title, byline?, excerpt?, text, words, truncated, url} — the densest article/main root with page chrome removed and headings, paragraphs, lists, code, quotes, links, images and tables rendered; text is capped at 40000 runes and truncated reports the cut; prefer it over text for prose — selector/target/full_page are ignored; e.g. what: \"article\" → {\"title\":\"Example\",\"byline\":\"Ada\",\"text\":\"# Heading …\",\"words\":812,\"truncated\":false,\"url\":\"https://example.com/a\"}; example: {\"session_id\":\"page-1\",\"what\":\"article\"}), marks (numbered set-of-marks: {marks:[{index, role, text?, x, y, width, height}], screenshot, viewport_width, viewport_height, truncated} — one numbered box per visible interactive element plus the annotated viewport screenshot as a base64 PNG data-URI; x/y/width/height are viewport CSS px and x/y can be passed straight to page_act click_at; capped at the first 60 marks with truncated counting the rest — selector/target/full_page are ignored; e.g. what: \"marks\" → {\"marks\":[{\"index\":1,\"role\":\"a\",\"text\":\"Sign in\",\"x\":120.5,\"y\":48,\"width\":88,\"height\":32}],\"screenshot\":\"data:image/png;base64,…\",\"viewport_width\":1280,\"viewport_height\":800,\"truncated\":0}; example: {\"session_id\":\"page-1\",\"what\":\"marks\"}), security (passive audit: {checks:[{id,status,evidence,detail}],count} covering response headers, CSP (header or meta), cookie flags, mixed content, subresource integrity, form targets and CORS — selector/target/full_page are ignored; e.g. what: \"security\" → {\"checks\":[{\"id\":\"csp\",\"status\":\"warn\",\"evidence\":\"\",\"detail\":\"…\"}],\"count\":12}), meta (title/url/description). article, marks and security bypass max_bytes truncation.",
 			},
 			"selector": map[string]any{
 				"type":        "string",
@@ -148,14 +152,14 @@ type pageFetchArgs struct {
 // on a rune boundary.
 func (t *Page) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var a pageFetchArgs
-	if err := json.Unmarshal(args, &a); err != nil {
-		return "", fmt.Errorf("page_fetch: invalid arguments: %w", err)
+	if err := decodeArgs("page_fetch", args, &a); err != nil {
+		return failResult(err)
 	}
 	if a.SessionID == "" {
-		return "", fmt.Errorf("page_fetch: missing required argument %q", "session_id")
+		return failResult(fmt.Errorf("page_fetch: missing required argument %q", "session_id"))
 	}
 	if a.What == "" {
-		return "", fmt.Errorf("page_fetch: missing required argument %q", "what")
+		return failResult(fmt.Errorf("page_fetch: missing required argument %q", "what"))
 	}
 	if a.MaxBytes <= 0 {
 		a.MaxBytes = defaultMaxBytes
@@ -166,30 +170,30 @@ func (t *Page) Execute(ctx context.Context, args json.RawMessage) (string, error
 
 	p, err := t.mgr.Page(ctx, a.SessionID)
 	if err != nil {
-		return "", fmt.Errorf("page_fetch: %w", err)
+		return failResult(fmt.Errorf("page_fetch: %w", err))
 	}
 
 	asp, ok := aspects[a.What]
 	if !ok {
-		return "", fmt.Errorf(
+		return failResult(fmt.Errorf(
 			"page_fetch: unknown what=%q (must be one of %s)",
 			a.What,
 			validAspects(),
-		)
+		))
 	}
 
 	out, err := asp.read(ctx, p, a)
 	if err != nil {
-		return "", fmt.Errorf("page_fetch: %w", err)
+		return failResultForPage(ctx, p, fmt.Errorf("page_fetch: %w", err))
 	}
 
 	switch asp.trunc {
 	case truncationNone:
-		return out, nil
+		return okResult(out)
 	case truncationJSON:
-		return truncateJSON(out, a.MaxBytes), nil
+		return okResult(truncateJSON(out, a.MaxBytes))
 	default:
-		return t.truncate(out, a.MaxBytes), nil
+		return okResult(t.truncate(out, a.MaxBytes))
 	}
 }
 

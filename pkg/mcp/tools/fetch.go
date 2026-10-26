@@ -47,7 +47,7 @@ func (t *Fetch) Description() string {
 		"falls back to the shared unowned browser. Example: " +
 		"{ \"owner\": \"scraper-a\", \"url\": \"https://example.com\" } and " +
 		"{ \"owner\": \"scraper-b\", \"url\": \"https://example.com\" } open two " +
-		"separate browsers."
+		"separate browsers." + resultEnvelopeDoc
 }
 
 // InputSchema returns the JSON Schema for fetch_page's arguments: a required
@@ -170,11 +170,11 @@ func (a *fetchArgs) validate() error {
 // returns the page summary as a JSON string for the LLM.
 func (t *Fetch) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var a fetchArgs
-	if err := json.Unmarshal(args, &a); err != nil {
-		return "", fmt.Errorf("fetch_page: invalid arguments: %w", err)
+	if err := decodeArgs("fetch_page", args, &a); err != nil {
+		return failResult(err)
 	}
 	if err := a.validate(); err != nil {
-		return "", fmt.Errorf("fetch_page: %w", err)
+		return failResult(fmt.Errorf("fetch_page: %w", err))
 	}
 
 	// Enforce an explicit per-call timeout so a hung page (or a first-run
@@ -196,7 +196,7 @@ func (t *Fetch) Execute(ctx context.Context, args json.RawMessage) (string, erro
 
 	b, err := t.mgr.OpenBrowser(ctx, browsers.BrowserID(a.BrowserID))
 	if err != nil {
-		return "", fmt.Errorf("fetch_page: %w", err)
+		return failResult(fmt.Errorf("fetch_page: %w", err))
 	}
 	// Device wins over a manual viewport when both are given (user decision
 	// 2026-08-14): a device preset is the primary emulation mechanism, so the
@@ -211,7 +211,7 @@ func (t *Fetch) Execute(ctx context.Context, args json.RawMessage) (string, erro
 	// manual viewport only when no device was requested.
 	p, err := b.NewPage(ctx, a.URL, vp, a.Device, a.UserAgent) // new tab; stealth applied by default
 	if err != nil {
-		return "", fmt.Errorf("fetch_page: %w", err)
+		return failResult(fmt.Errorf("fetch_page: %w", err))
 	}
 	if err := pageops.WaitForPage(ctx, p, a.WaitFor); err != nil {
 		// MED-1 (WEB-60): a wait timeout must not leak the loaded tab. NewPage
@@ -224,19 +224,19 @@ func (t *Fetch) Execute(ctx context.Context, args json.RawMessage) (string, erro
 		// session is gone either way); surface that close error truthfully.
 		closeErr := b.ClosePage(ctx, p.ID)
 		if closeErr != nil {
-			return "", fmt.Errorf("fetch_page: %w (session %s closed, but close reported: %v)", err, p.ID, closeErr)
+			return failResultForPage(ctx, p, fmt.Errorf("fetch_page: %w (session %s closed, but close reported: %v)", err, p.ID, closeErr))
 		}
-		return "", fmt.Errorf("fetch_page: %w (session %s closed)", err, p.ID)
+		return failResultForPage(ctx, p, fmt.Errorf("fetch_page: %w (session %s closed)", err, p.ID))
 	}
 	sum, err := pageops.PageSummary(ctx, p, start)
 	if err != nil {
-		return "", fmt.Errorf("fetch_page: %w", err)
+		return failResultForPage(ctx, p, fmt.Errorf("fetch_page: %w", err))
 	}
 	out, err := json.Marshal(sum)
 	if err != nil {
-		return "", fmt.Errorf("fetch_page: marshal summary: %w", err)
+		return failResult(fmt.Errorf("fetch_page: marshal summary: %w", err))
 	}
-	return string(out), nil
+	return okResult(string(out))
 }
 
 // Ensure Fetch satisfies the Tool interface at compile time.

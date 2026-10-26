@@ -67,6 +67,7 @@ non-destructive.
 ```sh
 browser serve mcp --port 4089
 # daemonized: CLI + Unix socket + MCP HTTP/SSE on http://127.0.0.1:4089/sse
+# starts no browser — agents create their own with browser_create (or a first fetch_page)
 ```
 
 ```sh
@@ -83,6 +84,10 @@ The MCP server binds all interfaces and has **no authentication** — keep it lo
 
 - Every profile lives under `~/.config/browser-mcp/profiles/`. A bare profile name resolves to
   `profiles/<name>`; an absolute path is used as given; a relative path with a separator is rejected.
+- **`browser serve mcp` starts no browser.** The daemon binds the IPC socket and the MCP/SSE port
+  and waits; `browser_list` returns `[]` until an agent creates a browser with `browser_create` (or
+  the first `fetch_page` creates one owned by that caller). Close it when done. Plain
+  `browser serve` still pre-launches the persistent `browser-1` for the human CLI path.
 - **Browsers are ephemeral by default.** A browser gets a throwaway profile under
   `profiles/.ephemeral/` that is deleted on close or when the browser expires. The MCP
   (`browser serve mcp`) path and a bare in-process `browser create` are ephemeral.
@@ -96,6 +101,18 @@ The MCP server binds all interfaces and has **no authentication** — keep it lo
 - `--owner <label>` (CLI) / `"owner": "<label>"` (`browser_create`) labels a browser and joins the
   create key: the same owner with the same options reuses one browser, a different owner gets a
   separate one.
+- **Extra headers.** `--header NAME=VALUE` (repeatable) / `"headers": {"NAME": "VALUE"}`
+  (`browser_create`) sends a header with every request from every page of that browser, the first
+  navigation included. Use it for a program identity header, e.g.
+  `browser create --header X-Bug-Bounty=your-handle`.
+- **Scope allowlist.** `--scope HOST` (repeatable) / `"scope": ["HOST", …]` (`browser_create`)
+  confines navigation. A bare host also covers its subdomains, a leading `*.` glob is accepted,
+  `host:port` is accepted, and `*` allows all. **No scope means no limit**; `browser_list` reports
+  the live state as `scope` (`open` when unrestricted) plus `scope_strict`. `--scope-strict` /
+  `"scope_strict": true` is opt-in and makes an empty allowlist deny every navigation. A refusal
+  names the host, the allowed list and the fix (`browser_create scope=[…]`). **The limit is
+  navigation-only:** subresources and redirects are not gated, so a redirect can still land on an
+  out-of-scope host (the final URL in the action result shows where you are).
 - **Idle browsers expire** after 30 minutes by default. Set `browser_ttl` in
   `~/.config/browser-mcp/config.json` as a Go duration (`"15m"`, `"0"` to disable); pages keep their
   separate 15-minute TTL.
@@ -168,14 +185,17 @@ browser page close last
 }
 ```
 
+The agent skill lives at [`.agents/skills/web-mcp/SKILL.md`](.agents/skills/web-mcp/SKILL.md).
+The MCP tool descriptions stay primary. The skill covers cross-cutting rules and exact limits.
+
 ---
 
 ## MCP Tools
 
 | Tool | Purpose |
 | :--- | :--- |
-| `browser_create` | Create or reuse a browser (`bin`, `profile`, `persist`, `owner`, `headless`, `stealth`, `position`, `proxy`, `proxy_bypass`, `ignore_certs`). Ephemeral by default; `persist: true` keeps the profile. Same owner + same options reuses the same id. |
-| `browser_list` | List live browsers with `owner`, `persist`, `ephemeral`, `created_at`, `idle_for`, `ttl`, `profile_dir` and their pages. |
+| `browser_create` | Create or reuse a browser (`bin`, `profile`, `persist`, `owner`, `headless`, `stealth`, `position`, `proxy`, `proxy_bypass`, `ignore_certs`, `headers`, `scope`, `scope_strict`). Ephemeral by default; `persist: true` keeps the profile. Same owner + same options reuses the same id. `headers` applies to every request; `scope` is the navigation allowlist (no scope = no limit; `scope_strict` makes an empty list deny all). Scope does not gate subresources or redirects. |
+| `browser_list` | List live browsers with `owner`, `persist`, `ephemeral`, `created_at`, `idle_for`, `ttl`, `scope`, `scope_strict`, `profile_dir` and their pages. |
 | `browser_close` | Close one browser, or all when `browser_id` is empty. `purge: true` also deletes that profile; `prune: true` (no `browser_id`) closes all and removes orphan `.ephemeral` profiles. An unknown id fails with `browser "browser-42" not found (running: browser-1)`. |
 | `fetch_page` | Open a URL in a new session and return `session_id` + summary. `wait_for` defaults to `idle`. |
 | `page_list` | List the pages of a browser. `browser_id` is required, and an unknown id fails with `browser "browser-42" not found (running: browser-1)`. |
@@ -294,7 +314,7 @@ The CLI exposes the same capabilities with shell conveniences:
 | `browser page fetch [id\|url] [what]` | `page_fetch` |
 | `browser page act [id] [action] [payload...] [--handle g<doc>-b<id>]` | `page_act` |
 | `browser page close [id]` | `session_close` |
-| `browser create [--owner --persist]` / `list` / `close [--purge\|--prune]` | `browser_create` / `browser_list` / `browser_close` |
+| `browser create [--owner --persist --header --scope --scope-strict]` / `list` / `close [--purge\|--prune]` | `browser_create` / `browser_list` / `browser_close` |
 | `browser focus` | — (CLI-only: raise the window) |
 | `browser serve` / `stop` | — (CLI-only: daemon lifecycle) |
 

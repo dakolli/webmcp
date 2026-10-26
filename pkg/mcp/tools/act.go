@@ -45,13 +45,18 @@ func (t *Act) Description() string {
 		"input, type, press_key (send keys/combos like Enter, Escape, Control+A, Meta+C), " +
 		"click_at / hover_at (coordinate-based mouse actions), drag_and_drop (mouse drag), " +
 		"upload_file (set files on <input type='file'>), eval (run JS — the primary escape hatch), " +
-		"navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, or " +
+		"navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, " +
 		"clear_logs (empties the network and console buffers, returning the cleared counts, e.g. " +
-		"page_act { action: \"clear_logs\" } → {\"network\":12,\"console\":5}). " +
+		"page_act { action: \"clear_logs\" } → {\"network\":12,\"console\":5}), or " +
+		"replay (resends one captured network entry through a Go HTTP client — bypasses CORS, " +
+		"carries the page's cookies for the target host without writing any back, follows up to 5 " +
+		"redirects, and returns {status,headers,body,bytes,truncated,ms,request,chain} with " +
+		"sensitive response headers redacted). " +
 		"Pass session_id plus action=... and any required parameters; element actions take a selector " +
 		"or a stable handle from page_fetch (handle wins when both are given). Logs are cumulative " +
 		"from page creation, so call clear_logs right before the step whose traffic/logs you want to " +
-		"observe, then read page_fetch what=network|console and filter client-side."
+		"observe, then read page_fetch what=network|console and filter client-side." +
+		resultEnvelopeDoc
 }
 
 // InputSchema returns the JSON Schema for page_act's arguments.
@@ -69,9 +74,9 @@ func (t *Act) InputSchema() models.InputSchema {
 					"click", "input", "type", "press_key", "click_at", "hover_at",
 					"drag_and_drop", "upload_file", "eval", "navigate",
 					"back", "forward", "reload", "hover", "scroll", "select",
-					"wait", "set_viewport", "emulate", "clear_logs",
+					"wait", "set_viewport", "emulate", "clear_logs", "replay",
 				},
-				"description": "The interaction to perform: click (selector), input (set field text), type (keystrokes), press_key (key/combo e.g. Enter, Escape, Control+A), click_at/hover_at ({x, y} coordinates), drag_and_drop (from {x,y}/selector to {target_x,target_y}/target_selector), upload_file (set file input paths), eval (run JS), navigate (URL), back/forward/reload, hover (selector), scroll (x/y), select (option value), wait (readiness mode), set_viewport (W x H), emulate (device preset), clear_logs (empty both log buffers; no parameters; returns {\"network\":N,\"console\":M} cleared counts). Logs are cumulative from page creation — filter client-side or clear_logs right before the step under observation.",
+				"description": "The interaction to perform: click (selector), input (set field text), type (keystrokes), press_key (key/combo e.g. Enter, Escape, Control+A), click_at/hover_at ({x, y} coordinates), drag_and_drop (from {x,y}/selector to {target_x,target_y}/target_selector), upload_file (set file input paths), eval (run JS), navigate (URL), back/forward/reload, hover (selector), scroll (x/y), select (option value), wait (readiness mode), set_viewport (W x H), emulate (device preset), clear_logs (empty both log buffers; no parameters; returns {\"network\":N,\"console\":M} cleared counts), replay (resend one captured network entry; needs target, optionally method, headers and value; returns {status,headers,body,bytes,truncated,ms,request,chain}). Logs are cumulative from page creation — filter client-side or clear_logs right before the step under observation.",
 			},
 			"selector": map[string]any{
 				"type":        "string",
@@ -83,7 +88,7 @@ func (t *Act) InputSchema() models.InputSchema {
 			},
 			"value": map[string]any{
 				"type":        "string",
-				"description": "Payload value for input/type (text), press_key (key combo fallback), eval (JS source), navigate (URL), select (option value), or upload_file (single path fallback).",
+				"description": "Payload value for input/type (text), press_key (key combo fallback), eval (JS source), navigate (URL), select (option value), or upload_file (single path fallback). For replay it replaces the request body; omit it to send no body.",
 			},
 			"key": map[string]any{
 				"type":        "string",
@@ -119,6 +124,21 @@ func (t *Act) InputSchema() models.InputSchema {
 			"target_selector": map[string]any{
 				"type":        "string",
 				"description": "Target element selector for drag_and_drop action.",
+			},
+			"target": map[string]any{
+				"type": "string",
+				"description": "Network entry to replay: a seq number or a substring of the request URL, resolved against the " +
+					"captured ring read by page_fetch what=network. A substring matching more than one entry is refused " +
+					"with the candidate seq numbers, so pass a longer substring or the seq.",
+			},
+			"method": map[string]any{
+				"type":        "string",
+				"description": "HTTP method override for replay (e.g. PUT, PATCH); omit to keep the captured method.",
+			},
+			"headers": map[string]any{
+				"type":                 "object",
+				"additionalProperties": map[string]any{"type": "string"},
+				"description":          "Header overrides for replay: each named header replaces the captured value; omitted headers keep theirs.",
 			},
 			"paths": map[string]any{
 				"type":        "array",
@@ -167,6 +187,9 @@ type actArgs struct {
 	TargetX        float64            `json:"target_x"`
 	TargetY        float64            `json:"target_y"`
 	TargetSelector string             `json:"target_selector"`
+	Target         string             `json:"target"`
+	Method         string             `json:"method"`
+	Headers        map[string]string  `json:"headers"`
 	Paths          []string           `json:"paths"`
 	TimeoutMS      int                `json:"timeout_ms"`
 	WaitMode       string             `json:"wait_mode"`
@@ -198,6 +221,10 @@ func (a *actArgs) validate(provided map[string]json.RawMessage) error {
 		if a.Value == "" {
 			return fmt.Errorf("navigate requires value (the target URL)")
 		}
+	case "replay":
+		if a.Target == "" {
+			return fmt.Errorf("replay requires target=<seq> or target=<url substring> from page_fetch what=network")
+		}
 	}
 	return nil
 }
@@ -206,35 +233,35 @@ func (a *actArgs) validate(provided map[string]json.RawMessage) error {
 // the shared pageops implementation. It returns a short confirmation string.
 func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var a actArgs
-	if err := json.Unmarshal(args, &a); err != nil {
-		return "", fmt.Errorf("page_act: invalid arguments: %w", err)
+	if err := decodeArgs("page_act", args, &a); err != nil {
+		return failResult(err)
 	}
 	if a.SessionID == "" {
-		return "", fmt.Errorf("page_act: missing required argument %q", "session_id")
+		return failResult(fmt.Errorf("page_act: missing required argument %q", "session_id"))
 	}
 	if a.Action == "" {
-		return "", fmt.Errorf("page_act: missing required argument %q", "action")
+		return failResult(fmt.Errorf("page_act: missing required argument %q", "action"))
 	}
 
 	var provided map[string]json.RawMessage
 	if err := json.Unmarshal(args, &provided); err != nil {
-		return "", fmt.Errorf("page_act: invalid arguments: %w", err)
+		return failResult(fmt.Errorf("page_act: invalid arguments: %w", err))
 	}
 	if err := a.validate(provided); err != nil {
-		return "", fmt.Errorf("page_act: %w", err)
+		return failResult(fmt.Errorf("page_act: %w", err))
 	}
 
 	if a.Action == "set_viewport" {
 		if a.Viewport == nil {
-			return "", fmt.Errorf("page_act: set_viewport requires a viewport")
+			return failResult(fmt.Errorf("page_act: set_viewport requires a viewport"))
 		}
 		if a.Viewport.Width <= 0 || a.Viewport.Height <= 0 {
-			return "", fmt.Errorf("page_act: viewport width and height must be positive")
+			return failResult(fmt.Errorf("page_act: viewport width and height must be positive"))
 		}
 	}
 
 	if a.Action == "emulate" && a.Device == "" {
-		return "", fmt.Errorf("page_act: emulate requires a device")
+		return failResult(fmt.Errorf("page_act: emulate requires a device"))
 	}
 
 	timeout := defaultActTimeout
@@ -250,15 +277,20 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 
 	p, err := t.mgr.Page(ctx, a.SessionID)
 	if err != nil {
-		return "", fmt.Errorf("page_act: %w", err)
+		return failResult(fmt.Errorf("page_act: %w", err))
+	}
+	if a.Action == "navigate" {
+		if err := t.mgr.CheckPageScope(a.SessionID, a.Value); err != nil {
+			return failResultForPage(ctx, p, fmt.Errorf("page_act: %w", err))
+		}
 	}
 
-	before, stateErr := pageops.PageStateOf(ctx, p)
+	before, stateErr := pageops.PageStateIfFree(ctx, p)
 
 	var out string
 	switch a.Action {
 	case "click":
-		out, err = pageops.PageClickOpts(ctx, p, a.Handle, a.Selector, a.Button, a.ClickCount)
+		out, err = pageops.PageClickFrom(ctx, p, a.Handle, a.Selector, a.Button, a.ClickCount, before)
 	case "input":
 		out, err = pageops.PageInput(ctx, p, a.Handle, a.Selector, a.Value)
 	case "type":
@@ -309,17 +341,29 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 		out, err = pageops.PageEmulate(ctx, p, a.Device)
 	case "clear_logs":
 		out, err = pageops.PageClearLogs(p)
+	case "replay":
+		_, bodySet := provided["value"]
+		out, err = pageops.PageReplay(ctx, p, pageops.ReplayRequest{
+			Target:  a.Target,
+			Method:  a.Method,
+			Headers: a.Headers,
+			Body:    a.Value,
+			BodySet: bodySet,
+			CheckScope: func(rawURL string) error {
+				return t.mgr.CheckPageScope(a.SessionID, rawURL)
+			},
+		})
 	default:
-		return "", fmt.Errorf("page_act: unknown action=%q (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs)", a.Action)
+		return failResult(fmt.Errorf("page_act: unknown action=%q (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, replay)", a.Action))
 	}
 	if err != nil {
-		return "", fmt.Errorf("page_act: %w", err)
+		return failResultForPage(ctx, p, fmt.Errorf("page_act: %w", err))
 	}
 	if stateErr == nil {
 		after := pageops.PageStateAfterAct(ctx, p, a.Action, before)
 		out += pageops.ActStateDeltaFor(a.Action, before, after)
 	}
-	return out, nil
+	return okResult(out)
 }
 
 // Ensure Act satisfies the Tool interface at compile time.

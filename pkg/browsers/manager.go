@@ -171,6 +171,37 @@ func WithIgnoreCerts(ignore bool) Option {
 	return func(m *Manager) { m.ignoreCerts = ignore }
 }
 
+// WithExtraHeaders sets request headers sent with every request from every page
+// of a browser created with this option, the first navigation included. The map
+// is copied, so the caller may reuse or mutate its own.
+func WithExtraHeaders(headers map[string]string) Option {
+	return func(m *Manager) { m.extraHeaders = cloneHeaders(headers) }
+}
+
+// WithScope sets the navigation allowlist: bare hosts (which also cover their
+// subdomains), leading "*." globs, "host:port" entries, or "*" for all. An empty
+// list leaves navigation unrestricted unless WithScopeStrict is also set.
+func WithScope(scope []string) Option {
+	return func(m *Manager) { m.scope = normalizeScope(scope) }
+}
+
+// normalizeScope trims allowlist entries and drops blanks.
+func normalizeScope(scope []string) []string {
+	out := make([]string, 0, len(scope))
+	for _, raw := range scope {
+		if pattern := strings.TrimSpace(raw); pattern != "" {
+			out = append(out, pattern)
+		}
+	}
+	return out
+}
+
+// WithScopeStrict controls whether an empty allowlist denies every navigation.
+// The default is false (an empty allowlist means no limit).
+func WithScopeStrict(strict bool) Option {
+	return func(m *Manager) { m.scopeStrict = strict }
+}
+
 // WithBin configures a custom browser binary executable path (e.g. "/usr/bin/brave-browser",
 // "brave", "google-chrome", or "chrome"). When empty, the launcher defaults to the
 // downloaded Chromium binary.
@@ -303,6 +334,12 @@ type Manager struct {
 	proxyBypass string
 	// ignoreCerts makes Chromium accept invalid TLS certificates by default.
 	ignoreCerts bool
+	// extraHeaders are the default request headers for created browsers.
+	extraHeaders map[string]string
+	// scope is the default navigation allowlist for created browsers.
+	scope []string
+	// scopeStrict is the default strict-empty-allowlist behavior.
+	scopeStrict bool
 	// shutdown marks the manager as terminated; Open rejects further calls.
 	shutdown bool
 	// ttl is the per-page idle timeout enforced by the background sweeper
@@ -419,6 +456,9 @@ type launchKey struct {
 	Proxy       string
 	ProxyBypass string
 	IgnoreCerts bool
+	Headers     string
+	Scope       string
+	ScopeStrict bool
 }
 
 // launchKeyOf builds the canonical launch key from a manager's launch fields.
@@ -435,6 +475,9 @@ func launchKeyOf(owner string, m *Manager) launchKey {
 		Proxy:       m.proxy,
 		ProxyBypass: m.proxyBypass,
 		IgnoreCerts: m.ignoreCerts,
+		Headers:     canonicalHeaders(m.extraHeaders),
+		Scope:       canonicalScope(m.scope),
+		ScopeStrict: m.scopeStrict,
 	}
 }
 
@@ -502,16 +545,19 @@ func (m *Manager) Create(ctx context.Context, opts ...Option) (Created, error) {
 	}
 
 	effective := &Manager{
-		headless:    m.headless,
-		stealth:     m.stealth,
-		binPath:     m.binPath,
-		profileName: m.profileName,
-		position:    m.position,
-		proxy:       m.proxy,
-		proxyBypass: m.proxyBypass,
-		ignoreCerts: m.ignoreCerts,
-		owner:       m.owner,
-		browserTTL:  m.browserTTL,
+		headless:     m.headless,
+		stealth:      m.stealth,
+		binPath:      m.binPath,
+		profileName:  m.profileName,
+		position:     m.position,
+		proxy:        m.proxy,
+		proxyBypass:  m.proxyBypass,
+		ignoreCerts:  m.ignoreCerts,
+		extraHeaders: cloneHeaders(m.extraHeaders),
+		scope:        append([]string(nil), m.scope...),
+		scopeStrict:  m.scopeStrict,
+		owner:        m.owner,
+		browserTTL:   m.browserTTL,
 	}
 	defaultProfileDir := m.profileDir
 	defaultPersist := m.persist
@@ -573,6 +619,9 @@ func (m *Manager) Create(ctx context.Context, opts ...Option) (Created, error) {
 	b.proxy = effective.proxy
 	b.proxyBypass = effective.proxyBypass
 	b.ignoreCerts = effective.ignoreCerts
+	b.extraHeaders = cloneHeaders(effective.extraHeaders)
+	b.scope = append([]string(nil), effective.scope...)
+	b.scopeStrict = effective.scopeStrict
 	b.logger = m.logger
 	b.ephemeral = ephemeral
 	b.profileCleanup = func() { m.releaseProfile(profileDir) }
@@ -727,19 +776,25 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 	proxy := m.proxy
 	proxyBypass := m.proxyBypass
 	ignoreCerts := m.ignoreCerts
+	extraHeaders := cloneHeaders(m.extraHeaders)
+	scope := append([]string(nil), m.scope...)
+	scopeStrict := m.scopeStrict
 	browserTTL := m.browserTTL
 	m.mu.Unlock()
 
 	// Mirrors a bare CreateBrowser request so both paths share one launch key.
 	key := launchKeyOf(owner, &Manager{
-		binPath:     binPath,
-		profileName: "",
-		headless:    headless,
-		stealth:     stealth,
-		position:    position,
-		proxy:       proxy,
-		proxyBypass: proxyBypass,
-		ignoreCerts: ignoreCerts,
+		binPath:      binPath,
+		profileName:  "",
+		headless:     headless,
+		stealth:      stealth,
+		position:     position,
+		proxy:        proxy,
+		proxyBypass:  proxyBypass,
+		ignoreCerts:  ignoreCerts,
+		extraHeaders: extraHeaders,
+		scope:        scope,
+		scopeStrict:  scopeStrict,
 	})
 
 	if proxy != "" {
@@ -775,6 +830,9 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 	b.proxy = proxy
 	b.proxyBypass = proxyBypass
 	b.ignoreCerts = ignoreCerts
+	b.extraHeaders = extraHeaders
+	b.scope = scope
+	b.scopeStrict = scopeStrict
 	b.logger = m.logger
 	b.ephemeral = ephemeral
 	b.profileCleanup = func() { m.releaseProfile(profileDir) }
@@ -1283,15 +1341,12 @@ func (m *Manager) sweepIdleBrowser(ctx context.Context, b *Browser, ttl time.Dur
 // Each close is best-effort, bounded by closePageTimeout, and never retried, so
 // a wedged tab cannot stall the sweep loop or resurface.
 func (m *Manager) sweepIdlePages(ctx context.Context, b *Browser, ttl time.Duration) {
-	// Snapshot the idle candidates under the browser mutex.
+	// Snapshot the idle candidates under the browser mutex. Idle time is
+	// atomic, so this never waits on a page operation lock.
 	b.mu.Lock()
 	var idle []PageID
-	now := time.Now()
 	for id, p := range b.pages {
-		p.mu.Lock()
-		idleSince := p.lastAccess
-		p.mu.Unlock()
-		if now.Sub(idleSince) > ttl {
+		if p.idleFor() > ttl {
 			idle = append(idle, id)
 		}
 	}
@@ -1301,15 +1356,18 @@ func (m *Manager) sweepIdlePages(ctx context.Context, b *Browser, ttl time.Durat
 		var handle *rod.Page
 		b.mu.Lock()
 		p, ok := b.pages[id]
+		var unlock func()
 		if ok {
-			p.mu.Lock()
-			if time.Since(p.lastAccess) > ttl {
-				p.stopObservation()
-				handle = p.Rod
-				p.Rod = nil
-				delete(b.pages, id)
-			}
-			p.mu.Unlock()
+			unlock, ok = p.TryLock()
+		}
+		if ok && p.idleFor() > ttl {
+			p.stopObservation()
+			handle = p.Rod
+			p.Rod = nil
+			delete(b.pages, id)
+		}
+		if unlock != nil {
+			unlock()
 		}
 		b.mu.Unlock()
 		if handle == nil {
@@ -1318,6 +1376,7 @@ func (m *Manager) sweepIdlePages(ctx context.Context, b *Browser, ttl time.Durat
 
 		closeCtx, cancel := context.WithTimeout(ctx, closePageTimeout)
 		b.stopProxyAuth(handle)
+		b.stopHeaderCleanup(handle)
 		err := closeRodPage(closeCtx, handle)
 		cancel()
 		if err != nil {

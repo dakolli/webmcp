@@ -51,6 +51,7 @@ type manager interface {
 	Browser(id browsers.BrowserID) (*browsers.Browser, error)
 	Browsers() map[browsers.BrowserID]*browsers.Browser
 	Page(ctx context.Context, id browsers.PageID) (*browsers.Page, error)
+	CheckPageScope(id browsers.PageID, rawURL string) error
 }
 
 // compile-time proof that the concrete Manager satisfies the handler seam.
@@ -126,6 +127,15 @@ func (s *Server) handleBrowserOpen(ctx context.Context, params json.RawMessage) 
 	if p.IgnoreCerts != nil {
 		opts = append(opts, browsers.WithIgnoreCerts(*p.IgnoreCerts))
 	}
+	if len(p.Headers) > 0 {
+		opts = append(opts, browsers.WithExtraHeaders(p.Headers))
+	}
+	if len(p.Scope) > 0 {
+		opts = append(opts, browsers.WithScope(p.Scope))
+	}
+	if p.ScopeStrict != nil {
+		opts = append(opts, browsers.WithScopeStrict(*p.ScopeStrict))
+	}
 	if p.Headless != nil {
 		opts = append(opts, browsers.WithHeadless(*p.Headless))
 	}
@@ -153,10 +163,12 @@ func (s *Server) handleBrowserOpen(ctx context.Context, params json.RawMessage) 
 func browserOpenResult(b *browsers.Browser) BrowserOpenResult {
 	info := b.Info()
 	return BrowserOpenResult{
-		BrowserID: string(info.BrowserID),
-		Owner:     info.Owner,
-		Persist:   info.Persist,
-		TTL:       info.TTL,
+		BrowserID:   string(info.BrowserID),
+		Owner:       info.Owner,
+		Persist:     info.Persist,
+		TTL:         info.TTL,
+		Scope:       info.Scope,
+		ScopeStrict: info.ScopeStrict,
 	}
 }
 
@@ -224,16 +236,18 @@ func (s *Server) handleBrowserList(ctx context.Context, params json.RawMessage) 
 	for id, b := range active {
 		info := b.Info()
 		list = append(list, BrowserEntry{
-			BrowserID:  string(id),
-			Owner:      info.Owner,
-			Bin:        info.Bin,
-			ProfileDir: info.ProfileDir,
-			Persist:    info.Persist,
-			Ephemeral:  info.Ephemeral,
-			CreatedAt:  info.CreatedAt,
-			IdleFor:    info.IdleFor,
-			TTL:        info.TTL,
-			Pages:      b.Pages(),
+			BrowserID:   string(id),
+			Owner:       info.Owner,
+			Bin:         info.Bin,
+			ProfileDir:  info.ProfileDir,
+			Persist:     info.Persist,
+			Ephemeral:   info.Ephemeral,
+			CreatedAt:   info.CreatedAt,
+			IdleFor:     info.IdleFor,
+			TTL:         info.TTL,
+			Scope:       info.Scope,
+			ScopeStrict: info.ScopeStrict,
+			Pages:       b.Pages(),
 		})
 	}
 	res := BrowserListResult{Browsers: list}
@@ -358,9 +372,10 @@ func (s *Server) handlePageList(ctx context.Context, params json.RawMessage) (an
 // through the shared pageops aspect registry — html, text, links, meta, dom,
 // css/js (resource list or one target resource), screenshot, interactives, a11y,
 // network/console (bounded log envelopes), body (one stored response body),
-// article and marks. The registry owns both the accepted what values and the
-// truncation policy, so this handler mirrors the CLI page fetch command without
-// duplicating either. An unknown extractor is a -32602 invalid-params error.
+// article, marks and security. The registry owns both the accepted what values
+// and the truncation policy, so this handler mirrors the CLI page fetch command
+// without duplicating either. An unknown extractor is a -32602 invalid-params
+// error.
 func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (any, *Error) {
 	p, rpcErr := decodeParams[PageFetchParams](params)
 	if rpcErr != nil {
@@ -453,6 +468,11 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 	page, err := s.mgr.Page(ctx, browsers.PageID(p.SessionID)) // opens the Browser if needed; probes for liveness
 	if err != nil {
 		return nil, serverError(err)
+	}
+	if p.Action == "navigate" {
+		if err := s.mgr.CheckPageScope(browsers.PageID(p.SessionID), p.Value); err != nil {
+			return nil, serverError(err)
+		}
 	}
 
 	before, stateErr := pageops.PageStateOf(ctx, page)

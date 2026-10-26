@@ -156,6 +156,30 @@ func TestValidateCloseCleanup(t *testing.T) {
 	}
 }
 
+// TestBrowserCreateHeadlessFlag pins WEB-141: `browser create --headless` is a
+// real flag (not an unknown-flag failure), defaults to headful, is marked
+// changed when set (the trigger that sends the headless param and mints a
+// separate browser), and appears in the help example.
+func TestBrowserCreateHeadlessFlag(t *testing.T) {
+	cmd := NewBrowserCreateCmd(nil)
+	flag := cmd.Flags().Lookup("headless")
+	if flag == nil {
+		t.Fatal("browser create has no --headless flag")
+	}
+	if flag.DefValue != "false" {
+		t.Errorf("--headless default = %q, want false (the CLI stays headful by default)", flag.DefValue)
+	}
+	if err := cmd.Flags().Set("headless", "true"); err != nil {
+		t.Fatalf("set --headless: %v", err)
+	}
+	if !cmd.Flags().Changed("headless") {
+		t.Error("--headless is not marked changed after being set")
+	}
+	if !strings.Contains(cmd.Example, "--headless") {
+		t.Errorf("browser create help example does not show --headless:\n%s", cmd.Example)
+	}
+}
+
 // TestPrintBrowserEntries pins the human list shape: owner, persist, ttl and
 // profile_dir are all present, and pages stay indented under their browser.
 func TestPrintBrowserEntries(t *testing.T) {
@@ -172,7 +196,7 @@ func TestPrintBrowserEntries(t *testing.T) {
 
 	got := buf.String()
 	for _, want := range []string{
-		"browser_id: browser-2 (owner: scraper-a, persist: false, ttl: 30m0s, bin: brave)",
+		"browser_id: browser-2 (owner: scraper-a, persist: false, ttl: 30m0s, scope: open, scope_strict: false, bin: brave)",
 		"  profile_dir: profiles/.ephemeral/browser-2-x",
 		"  page-1\thttps://example.com",
 	} {

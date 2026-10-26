@@ -117,16 +117,22 @@ func TestOwnerValidation(t *testing.T) {
 
 func TestBrowserCreateInvalidOwnerIsActionable(t *testing.T) {
 	tool := NewBrowserCreate(nil)
-	_, err := tool.Execute(context.Background(), json.RawMessage(`{"owner":"scraper/a"}`))
-	if err == nil {
-		t.Fatal("Execute with an invalid owner = nil error, want an actionable refusal")
+	out, err := tool.Execute(context.Background(), json.RawMessage(`{"owner":"scraper/a"}`))
+	if err != nil {
+		t.Fatalf("Execute() error = %v, want an envelope", err)
 	}
-	msg := err.Error()
-	if !strings.Contains(msg, `"scraper/a"`) {
-		t.Errorf("error %q does not name the bad owner", msg)
+	env := mustEnvelope(t, out)
+	if env.OK || env.Error == nil {
+		t.Fatalf("Execute() = %s, want an ok:false envelope", out)
 	}
-	if !strings.Contains(msg, "1 to 64 characters") {
-		t.Errorf("error %q does not state the rule", msg)
+	if env.Error.Type != errInvalidArgs {
+		t.Fatalf("error.type = %q, want %q", env.Error.Type, errInvalidArgs)
+	}
+	if !strings.Contains(env.Error.Message, `"scraper/a"`) {
+		t.Errorf("message %q does not name the bad owner", env.Error.Message)
+	}
+	if !strings.Contains(env.Error.Message, "1 to 64 characters") {
+		t.Errorf("message %q does not state the rule", env.Error.Message)
 	}
 }
 
@@ -142,8 +148,16 @@ func TestBrowserCloseCleanupArgValidation(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := tool.Execute(context.Background(), json.RawMessage(tt.args)); err == nil {
-				t.Fatalf("Execute(%s) = nil error, want an actionable refusal", tt.args)
+			out, err := tool.Execute(context.Background(), json.RawMessage(tt.args))
+			if err != nil {
+				t.Fatalf("Execute(%s) error = %v, want an envelope", tt.args, err)
+			}
+			env := mustEnvelope(t, out)
+			if env.OK || env.Error == nil {
+				t.Fatalf("Execute(%s) = %s, want an ok:false envelope", tt.args, out)
+			}
+			if env.Error.Type != errInvalidArgs {
+				t.Fatalf("Execute(%s) error.type = %q, want %q", tt.args, env.Error.Type, errInvalidArgs)
 			}
 		})
 	}

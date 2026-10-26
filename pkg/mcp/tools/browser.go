@@ -66,8 +66,15 @@ func (t *BrowserCreate) Description() string {
 		"~/.config/browser-mcp/profiles; relative paths are rejected. Proxy: pass a local proxy " +
 		"such as 127.0.0.1:8080 for intercept tools; credentials never go in an argument — put " +
 		"them in ~/.config/browser-mcp/proxy.json (mode 0600). " +
+		"Headers: pass headers to send an identity header on EVERY request from every page of " +
+		"this browser, e.g. {\"X-Bug-Bounty\":\"your-handle\"}. Scope: pass scope as the navigation " +
+		"allowlist (bare hosts also cover their subdomains, '*.example.com' works, 'host:port' is " +
+		"accepted). No scope means no limit; scope_strict=true with an empty scope denies every " +
+		"navigation. Scope applies to navigation, not to subresources or redirects. " +
 		"Example: { \"owner\": \"scraper-a\" } and { \"owner\": \"scraper-b\" } get two browsers; " +
-		"{ \"persist\": true, \"profile\": \"audit\" } keeps a profile."
+		"{ \"persist\": true, \"profile\": \"audit\" } keeps a profile; " +
+		"{ \"headers\": {\"X-Bug-Bounty\":\"me\"}, \"scope\": [\"example.com\", \"*.iana.org\"] } " +
+		"confines navigation." + resultEnvelopeDoc
 }
 
 // InputSchema returns the JSON Schema for browser_create's arguments: optional
@@ -116,6 +123,22 @@ func (t *BrowserCreate) InputSchema() models.InputSchema {
 				"description": "Accept invalid TLS certificates, for example an intercept proxy's MITM CA. " +
 					"Independent of proxy: set it explicitly.",
 			},
+			"headers": map[string]any{
+				"type":                 "object",
+				"additionalProperties": map[string]any{"type": "string"},
+				"description": "Request headers sent with every request from every page of this browser, the first navigation included. " +
+					"Use it for program identity headers, e.g. {\"X-Bug-Bounty\": \"your-handle\"}. " +
+					"Headers are applied at page creation and persist for the life of each page.",
+			},
+			"scope": map[string]any{
+				"type":        "array",
+				"items":       map[string]any{"type": "string"},
+				"description": "Navigation allowlist. A bare host (example.com) also covers its subdomains (www.example.com, api.example.com); a leading '*.example.com' glob is accepted, as is 'host:port' and '*' for all. Omit for no limit. Scope applies to navigation, not to subresources or redirects: a redirect can still land on an out-of-scope host.",
+			},
+			"scope_strict": map[string]any{
+				"type":        "boolean",
+				"description": "Opt-in strict mode: when true and scope is empty, every navigation is refused. Default false: an empty allowlist means no limit. The live state is shown by browser_list as scope and scope_strict.",
+			},
 			"owner": map[string]any{
 				"type": "string",
 				"description": "Optional owner label for your agent (1 to 64 characters from A-Z, a-z, 0-9, '.', '_', '-'). " +
@@ -128,30 +151,31 @@ func (t *BrowserCreate) InputSchema() models.InputSchema {
 
 // browserCreateArgs is the strict decoding target for browser_create arguments.
 type browserCreateArgs struct {
-	Bin         string `json:"bin,omitempty"`
-	Profile     string `json:"profile,omitempty"`
-	Position    string `json:"position,omitempty"`
-	Proxy       string `json:"proxy,omitempty"`
-	ProxyBypass string `json:"proxy_bypass,omitempty"`
-	Owner       string `json:"owner,omitempty"`
-	Headless    *bool  `json:"headless,omitempty"`
-	Stealth     *bool  `json:"stealth,omitempty"`
-	Persist     *bool  `json:"persist,omitempty"`
-	IgnoreCerts *bool  `json:"ignore_certs,omitempty"`
+	Bin         string            `json:"bin,omitempty"`
+	Profile     string            `json:"profile,omitempty"`
+	Position    string            `json:"position,omitempty"`
+	Proxy       string            `json:"proxy,omitempty"`
+	ProxyBypass string            `json:"proxy_bypass,omitempty"`
+	Owner       string            `json:"owner,omitempty"`
+	Headless    *bool             `json:"headless,omitempty"`
+	Stealth     *bool             `json:"stealth,omitempty"`
+	Persist     *bool             `json:"persist,omitempty"`
+	IgnoreCerts *bool             `json:"ignore_certs,omitempty"`
+	ScopeStrict *bool             `json:"scope_strict,omitempty"`
+	Headers     map[string]string `json:"headers,omitempty"`
+	Scope       []string          `json:"scope,omitempty"`
 }
 
 // Execute parses options and creates a new distinct Browser via Manager.CreateBrowser.
 func (t *BrowserCreate) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var a browserCreateArgs
-	if len(args) > 0 && string(args) != "{}" {
-		if err := json.Unmarshal(args, &a); err != nil {
-			return "", fmt.Errorf("browser_create: invalid arguments: %w", err)
-		}
+	if err := decodeArgs("browser_create", args, &a); err != nil {
+		return failResult(err)
 	}
 
 	owner, err := normalizeOwner(a.Owner)
 	if err != nil {
-		return "", fmt.Errorf("browser_create: %w", err)
+		return failResult(fmt.Errorf("browser_create: %w", err))
 	}
 	if owner != "" {
 		ctx = browsers.WithExplicitOwner(ctx, owner)
@@ -179,6 +203,15 @@ func (t *BrowserCreate) Execute(ctx context.Context, args json.RawMessage) (stri
 	if a.IgnoreCerts != nil {
 		opts = append(opts, browsers.WithIgnoreCerts(*a.IgnoreCerts))
 	}
+	if len(a.Headers) > 0 {
+		opts = append(opts, browsers.WithExtraHeaders(a.Headers))
+	}
+	if len(a.Scope) > 0 {
+		opts = append(opts, browsers.WithScope(a.Scope))
+	}
+	if a.ScopeStrict != nil {
+		opts = append(opts, browsers.WithScopeStrict(*a.ScopeStrict))
+	}
 	if a.Headless != nil {
 		opts = append(opts, browsers.WithHeadless(*a.Headless))
 	}
@@ -188,24 +221,26 @@ func (t *BrowserCreate) Execute(ctx context.Context, args json.RawMessage) (stri
 
 	created, err := t.mgr.Create(ctx, opts...)
 	if err != nil {
-		return "", fmt.Errorf("browser_create: %w", err)
+		return failResult(fmt.Errorf("browser_create: %w", err))
 	}
 
 	data, err := json.Marshal(newBrowserCreateResult(created))
 	if err != nil {
-		return "", fmt.Errorf("browser_create: %w", err)
+		return failResult(fmt.Errorf("browser_create: %w", err))
 	}
-	return string(data), nil
+	return okResult(string(data))
 }
 
 // browserCreateResult is the compact create outcome: the browser_id plus the
 // lifecycle facts an agent needs to decide when to close it.
 type browserCreateResult struct {
-	BrowserID string `json:"browser_id"`
-	Owner     string `json:"owner"`
-	Persist   bool   `json:"persist"`
-	TTL       string `json:"ttl"`
-	Reused    bool   `json:"reused"`
+	BrowserID   string `json:"browser_id"`
+	Owner       string `json:"owner"`
+	Persist     bool   `json:"persist"`
+	TTL         string `json:"ttl"`
+	Scope       string `json:"scope"`
+	ScopeStrict bool   `json:"scope_strict"`
+	Reused      bool   `json:"reused"`
 }
 
 // newBrowserCreateResult projects a create outcome into the bounded one-line
@@ -213,11 +248,13 @@ type browserCreateResult struct {
 func newBrowserCreateResult(created browsers.Created) browserCreateResult {
 	info := created.Browser.Info()
 	return browserCreateResult{
-		BrowserID: string(created.ID),
-		Owner:     info.Owner,
-		Persist:   info.Persist,
-		TTL:       info.TTL,
-		Reused:    created.Reused,
+		BrowserID:   string(created.ID),
+		Owner:       info.Owner,
+		Persist:     info.Persist,
+		TTL:         info.TTL,
+		Scope:       info.Scope,
+		ScopeStrict: info.ScopeStrict,
+		Reused:      created.Reused,
 	}
 }
 
@@ -247,9 +284,11 @@ func (t *BrowserList) Name() string {
 func (t *BrowserList) Description() string {
 	return "Lists live browsers with their lifecycle state as compact JSON: browser_id, " +
 		"owner, bin, profile_dir, persist, ephemeral, created_at, idle_for (how long the " +
-		"browser has been unused), ttl (when idle cleanup closes it) and pages (id, url). " +
+		"browser has been unused), ttl (when idle cleanup closes it), scope (the navigation " +
+		"allowlist: \"open\" when unrestricted), scope_strict (whether an empty allowlist " +
+		"denies all navigation) and pages (id, url). " +
 		"Returns [] when none are running. Use it to see what you own and what to close; " +
-		"idle browsers expire automatically. Example: {}."
+		"idle browsers expire automatically. Example: {}." + resultEnvelopeDoc
 }
 
 // InputSchema returns the JSON Schema for browser_list's arguments: none.
@@ -262,16 +301,18 @@ func (t *BrowserList) InputSchema() models.InputSchema {
 
 // browserEntry is the compact lifecycle read-out for one live browser.
 type browserEntry struct {
-	BrowserID  string              `json:"browser_id"`
-	Owner      string              `json:"owner"`
-	Bin        string              `json:"bin,omitempty"`
-	ProfileDir string              `json:"profile_dir,omitempty"`
-	Persist    bool                `json:"persist"`
-	Ephemeral  bool                `json:"ephemeral"`
-	CreatedAt  time.Time           `json:"created_at"`
-	IdleFor    string              `json:"idle_for"`
-	TTL        string              `json:"ttl"`
-	Pages      []browsers.PageInfo `json:"pages"`
+	BrowserID   string              `json:"browser_id"`
+	Owner       string              `json:"owner"`
+	Bin         string              `json:"bin,omitempty"`
+	ProfileDir  string              `json:"profile_dir,omitempty"`
+	Persist     bool                `json:"persist"`
+	Ephemeral   bool                `json:"ephemeral"`
+	CreatedAt   time.Time           `json:"created_at"`
+	IdleFor     string              `json:"idle_for"`
+	TTL         string              `json:"ttl"`
+	Scope       string              `json:"scope"`
+	ScopeStrict bool                `json:"scope_strict"`
+	Pages       []browsers.PageInfo `json:"pages"`
 }
 
 // browserListEntry projects a BrowserInfo snapshot and its pages into the
@@ -281,16 +322,18 @@ func browserListEntry(info browsers.BrowserInfo, pages []browsers.PageInfo) brow
 		pages = []browsers.PageInfo{}
 	}
 	return browserEntry{
-		BrowserID:  string(info.BrowserID),
-		Owner:      info.Owner,
-		Bin:        info.Bin,
-		ProfileDir: info.ProfileDir,
-		Persist:    info.Persist,
-		Ephemeral:  info.Ephemeral,
-		CreatedAt:  info.CreatedAt,
-		IdleFor:    info.IdleFor,
-		TTL:        info.TTL,
-		Pages:      pages,
+		BrowserID:   string(info.BrowserID),
+		Owner:       info.Owner,
+		Bin:         info.Bin,
+		ProfileDir:  info.ProfileDir,
+		Persist:     info.Persist,
+		Ephemeral:   info.Ephemeral,
+		CreatedAt:   info.CreatedAt,
+		IdleFor:     info.IdleFor,
+		TTL:         info.TTL,
+		Scope:       info.Scope,
+		ScopeStrict: info.ScopeStrict,
+		Pages:       pages,
 	}
 }
 
@@ -298,7 +341,7 @@ func browserListEntry(info browsers.BrowserInfo, pages []browsers.PageInfo) brow
 func (t *BrowserList) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	active := t.mgr.Browsers()
 	if len(active) == 0 {
-		return "[]", nil
+		return okResult("[]")
 	}
 
 	ids := make([]string, 0, len(active))
@@ -315,9 +358,9 @@ func (t *BrowserList) Execute(ctx context.Context, args json.RawMessage) (string
 
 	data, err := json.Marshal(result)
 	if err != nil {
-		return "", fmt.Errorf("browser_list: %w", err)
+		return failResult(fmt.Errorf("browser_list: %w", err))
 	}
-	return string(data), nil
+	return okResult(string(data))
 }
 
 // Ensure BrowserList satisfies the Tool interface at compile time.
@@ -351,7 +394,8 @@ func (t *BrowserClose) Description() string {
 		"profiles under profiles/.ephemeral that no live browser owns — named persistent " +
 		"profiles are never deleted by prune. Idle browsers expire on their own, but close " +
 		"explicitly when done; an unknown browser_id returns a not-found error listing live " +
-		"ids and owners. Example: { \"browser_id\": \"browser-2\", \"purge\": true }."
+		"ids and owners. Example: { \"browser_id\": \"browser-2\", \"purge\": true }." +
+		resultEnvelopeDoc
 }
 
 // InputSchema returns the JSON Schema for browser_close's arguments: an optional
@@ -387,40 +431,38 @@ type browserCloseArgs struct {
 // profile or pruning orphan ephemeral profiles.
 func (t *BrowserClose) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var a browserCloseArgs
-	if len(args) > 0 && string(args) != "{}" {
-		if err := json.Unmarshal(args, &a); err != nil {
-			return "", fmt.Errorf("browser_close: invalid arguments: %w", err)
-		}
+	if err := decodeArgs("browser_close", args, &a); err != nil {
+		return failResult(err)
 	}
 	if a.Purge && a.Prune {
-		return "", fmt.Errorf("browser_close: purge and prune are mutually exclusive — pass purge with a browser_id, or prune alone")
+		return failResult(fmt.Errorf("browser_close: purge and prune are mutually exclusive — pass purge with a browser_id, or prune alone"))
 	}
 	if a.Prune {
 		if a.BrowserID != "" {
-			return "", fmt.Errorf("browser_close: prune takes no browser_id — it closes all browsers and cleans orphan ephemeral profiles; use purge with browser_id to delete one profile")
+			return failResult(fmt.Errorf("browser_close: prune takes no browser_id — it closes all browsers and cleans orphan ephemeral profiles; use purge with browser_id to delete one profile"))
 		}
 		removed, err := t.mgr.PruneProfiles(ctx)
 		if err != nil {
-			return "", fmt.Errorf("browser_close: %w", err)
+			return failResult(fmt.Errorf("browser_close: %w", err))
 		}
-		return fmt.Sprintf("all browsers closed; pruned %d orphan ephemeral profile(s)", len(removed)), nil
+		return okResult(fmt.Sprintf("all browsers closed; pruned %d orphan ephemeral profile(s)", len(removed)))
 	}
 	if a.Purge {
 		if a.BrowserID == "" {
-			return "", fmt.Errorf("browser_close: purge requires a browser_id — pass the browser whose profile to delete, or use prune to clean orphan ephemeral profiles")
+			return failResult(fmt.Errorf("browser_close: purge requires a browser_id — pass the browser whose profile to delete, or use prune to clean orphan ephemeral profiles"))
 		}
 		if err := t.mgr.PurgeProfile(ctx, browsers.BrowserID(a.BrowserID)); err != nil {
-			return "", fmt.Errorf("browser_close: %w", err)
+			return failResult(fmt.Errorf("browser_close: %w", err))
 		}
-		return fmt.Sprintf("browser %s closed and its profile deleted", a.BrowserID), nil
+		return okResult(fmt.Sprintf("browser %s closed and its profile deleted", a.BrowserID))
 	}
 	if err := t.mgr.CloseBrowser(ctx, browsers.BrowserID(a.BrowserID)); err != nil {
-		return "", fmt.Errorf("browser_close: %w", err)
+		return failResult(fmt.Errorf("browser_close: %w", err))
 	}
 	if a.BrowserID == "" {
-		return "all browsers closed", nil
+		return okResult("all browsers closed")
 	}
-	return fmt.Sprintf("browser %s closed", a.BrowserID), nil
+	return okResult(fmt.Sprintf("browser %s closed", a.BrowserID))
 }
 
 // Ensure BrowserClose satisfies the Tool interface at compile time.
@@ -451,7 +493,7 @@ func (t *PageList) Description() string {
 		"array. Use it to see which sessions/tabs are still open inside the " +
 		"browser before closing them with session_close. An unknown browser_id " +
 		"returns a not-found error listing the running ids. " +
-		"Example: { \"browser_id\": \"browser-1\" }."
+		"Example: { \"browser_id\": \"browser-1\" }." + resultEnvelopeDoc
 }
 
 // InputSchema returns the JSON Schema for page_list's arguments: a required
@@ -480,21 +522,21 @@ type pageListArgs struct {
 // array via Browser.Pages.
 func (t *PageList) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var a pageListArgs
-	if err := json.Unmarshal(args, &a); err != nil {
-		return "", fmt.Errorf("page_list: invalid arguments: %w", err)
+	if err := decodeArgs("page_list", args, &a); err != nil {
+		return failResult(err)
 	}
 	if a.BrowserID == "" {
-		return "", fmt.Errorf("page_list: missing required argument %q", "browser_id")
+		return failResult(fmt.Errorf("page_list: missing required argument %q", "browser_id"))
 	}
 	b, err := t.mgr.Browser(browsers.BrowserID(a.BrowserID))
 	if err != nil {
-		return "", fmt.Errorf("page_list: %w", err)
+		return failResult(fmt.Errorf("page_list: %w", err))
 	}
 	data, err := json.MarshalIndent(b.Pages(), "", "  ")
 	if err != nil {
-		return "", fmt.Errorf("page_list: %w", err)
+		return failResult(fmt.Errorf("page_list: %w", err))
 	}
-	return string(data), nil
+	return okResult(string(data))
 }
 
 // Ensure PageList satisfies the Tool interface at compile time.

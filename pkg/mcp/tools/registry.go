@@ -7,6 +7,7 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -164,20 +165,114 @@ var toolExamples = map[string]string{
 	"session_list":   `{}`,
 }
 
-// Execute runs a call to the registered tool with the given name. Boolean
-// strings are coerced, argument type mismatches are rewritten into one
-// actionable sentence, and every other error is returned as the tool produced it.
+// Execute runs a call to the registered tool with the given name. Tool
+// failures travel inside the tool's result envelope; an error is returned only
+// when the tool itself is unknown.
 func (r *Registry) Execute(ctx context.Context, name string, args json.RawMessage) (string, error) {
 	t, ok := r.tools[name]
 	if !ok {
 		return "", fmt.Errorf("unsupported tool: %s", name)
 	}
-	normalized := coerceBooleanStrings(args)
-	out, err := t.Execute(ctx, normalized)
-	if err != nil {
-		return "", explainArgTypeError(name, normalized, err)
+	return t.Execute(ctx, args)
+}
+
+// decodeArgs decodes raw tool arguments into dst. Boolean strings and
+// JSON-encoded arrays or objects are coerced, and a type mismatch is rewritten
+// into a sentence naming the field, wanted type, received value and a working
+// retry call.
+func decodeArgs(tool string, args json.RawMessage, dst any) error {
+	if len(bytes.TrimSpace(args)) == 0 {
+		return nil
 	}
-	return out, nil
+	normalized := coerceBooleanStrings(args)
+	if err := json.Unmarshal(normalized, dst); err != nil {
+		if retryArgs, ok := coerceJSONStringArgs(normalized, err); ok {
+			if json.Unmarshal(retryArgs, dst) == nil {
+				return nil
+			}
+		}
+		if explained := explainArgTypeError(tool, normalized, err); explained != err {
+			return explained
+		}
+		return fmt.Errorf("%s: invalid arguments: %w", tool, err)
+	}
+	return nil
+}
+
+// coerceJSONStringArgs rewrites the single argument that failed to decode from a
+// JSON string into the array or object it encodes, so clients that stringify
+// every non-scalar can still fill structured fields. It reports false unless the
+// failure is a type error for a field that wants a slice, array, map or struct
+// and the string decodes to exactly that JSON kind.
+func coerceJSONStringArgs(args json.RawMessage, err error) (json.RawMessage, bool) {
+	var typeErr *json.UnmarshalTypeError
+	if !errors.As(err, &typeErr) || typeErr.Field == "" {
+		return nil, false
+	}
+	want := typeErr.Type
+	for want != nil && want.Kind() == reflect.Pointer {
+		want = want.Elem()
+	}
+	if want == nil {
+		return nil, false
+	}
+	switch want.Kind() {
+	case reflect.Slice, reflect.Array, reflect.Map, reflect.Struct:
+	default:
+		return nil, false
+	}
+
+	raw, ok := fieldValue(args, typeErr.Field)
+	if !ok {
+		return nil, false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return nil, false
+	}
+	var parsed any
+	if err := json.Unmarshal([]byte(s), &parsed); err != nil {
+		return nil, false
+	}
+	switch parsed.(type) {
+	case []any:
+		if want.Kind() != reflect.Slice && want.Kind() != reflect.Array {
+			return nil, false
+		}
+	case map[string]any:
+		if want.Kind() != reflect.Map && want.Kind() != reflect.Struct {
+			return nil, false
+		}
+	default:
+		return nil, false
+	}
+
+	var set func(json.RawMessage, []string, json.RawMessage) (json.RawMessage, bool)
+	set = func(cur json.RawMessage, path []string, val json.RawMessage) (json.RawMessage, bool) {
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(cur, &obj); err != nil {
+			return nil, false
+		}
+		child, ok := obj[path[0]]
+		if !ok {
+			return nil, false
+		}
+		if len(path) == 1 {
+			obj[path[0]] = val
+		} else {
+			child, ok = set(child, path[1:], val)
+			if !ok {
+				return nil, false
+			}
+			obj[path[0]] = child
+		}
+		out, err := json.Marshal(obj)
+		if err != nil {
+			return nil, false
+		}
+		return out, true
+	}
+	return set(args, strings.Split(typeErr.Field, "."), json.RawMessage(strings.TrimSpace(s)))
 }
 
 // coerceBooleanStrings rewrites top-level arguments whose value is the JSON
@@ -216,15 +311,14 @@ func coerceBooleanStrings(args json.RawMessage) json.RawMessage {
 
 // explainArgTypeError replaces a JSON type mismatch in tool arguments with a
 // sentence naming the tool, field, wanted type and received value, followed by
-// a working retry call for that tool.
+// a working retry call for that tool. Non-type errors are returned unchanged.
 func explainArgTypeError(
 	tool string,
 	args json.RawMessage,
 	err error,
 ) error {
 	var typeErr *json.UnmarshalTypeError
-	if !errors.As(err, &typeErr) || typeErr.Field == "" ||
-		!strings.Contains(err.Error(), ": invalid arguments:") {
+	if !errors.As(err, &typeErr) || typeErr.Field == "" {
 		return err
 	}
 	msg := fmt.Sprintf(

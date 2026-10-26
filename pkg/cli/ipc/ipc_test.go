@@ -100,6 +100,9 @@ func (s *stubbedManager) Page(ctx context.Context, id browsers.PageID) (*browser
 	return s.browser.Page(ctx, id)
 }
 
+// CheckPageScope implements manager: the stub has no allowlist.
+func (s *stubbedManager) CheckPageScope(browsers.PageID, string) error { return nil }
+
 // newStubServer returns a Server wired to a stub manager whose Browser is
 // unlaunched and empty (no pages) — safe for any wire-contract test.
 func newStubServer() *Server {

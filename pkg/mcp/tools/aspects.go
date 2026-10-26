@@ -108,4 +108,7 @@ func init() {
 	registerAspect("marks", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
 		return pageops.PageMarks(ctx, p)
 	}, truncationNone)
+	registerAspect("security", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
+		return pageops.PageSecurity(ctx, p)
+	}, truncationNone)
 }

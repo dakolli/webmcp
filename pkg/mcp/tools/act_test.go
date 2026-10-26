@@ -24,6 +24,9 @@ func TestActValidateRequiredArgs(t *testing.T) {
 		{name: "click_at explicit zero coords", args: `{"action":"click_at","x":0,"y":0}`},
 		{name: "eval missing value", args: `{"action":"eval"}`, wantErr: "eval requires value"},
 		{name: "navigate missing value", args: `{"action":"navigate"}`, wantErr: "navigate requires value"},
+		{name: "replay missing target", args: `{"action":"replay"}`, wantErr: "replay requires target"},
+		{name: "replay with URL substring", args: `{"action":"replay","target":"/api/user"}`},
+		{name: "replay with seq and overrides", args: `{"action":"replay","target":"12","method":"PUT","headers":{"X-Test":"1"},"value":"{}"}`},
 		{name: "back needs nothing", args: `{"action":"back"}`},
 	}
 	for _, tt := range tests {

@@ -164,16 +164,18 @@ exits 0, so listing is safe in scripts.`,
 				b := active[browsers.BrowserID(id)]
 				info := b.Info()
 				entries = append(entries, ipc.BrowserEntry{
-					BrowserID:  string(info.BrowserID),
-					Owner:      info.Owner,
-					Bin:        info.Bin,
-					ProfileDir: info.ProfileDir,
-					Persist:    info.Persist,
-					Ephemeral:  info.Ephemeral,
-					CreatedAt:  info.CreatedAt,
-					IdleFor:    info.IdleFor,
-					TTL:        info.TTL,
-					Pages:      b.Pages(),
+					BrowserID:   string(info.BrowserID),
+					Owner:       info.Owner,
+					Bin:         info.Bin,
+					ProfileDir:  info.ProfileDir,
+					Persist:     info.Persist,
+					Ephemeral:   info.Ephemeral,
+					CreatedAt:   info.CreatedAt,
+					IdleFor:     info.IdleFor,
+					TTL:         info.TTL,
+					Scope:       info.Scope,
+					ScopeStrict: info.ScopeStrict,
+					Pages:       b.Pages(),
 				})
 			}
 			printBrowserEntries(cmd.OutOrStdout(), entries)
@@ -435,8 +437,12 @@ func browserListViaIPC(cmd *cobra.Command, cl *ipc.Client) error {
 // row, then its pages.
 func printBrowserEntries(w io.Writer, entries []ipc.BrowserEntry) {
 	for _, b := range entries {
-		fmt.Fprintf(w, "browser_id: %s (owner: %s, persist: %t, ttl: %s",
-			b.BrowserID, b.Owner, b.Persist, b.TTL)
+		scope := b.Scope
+		if scope == "" {
+			scope = browsers.ScopeOpen
+		}
+		fmt.Fprintf(w, "browser_id: %s (owner: %s, persist: %t, ttl: %s, scope: %s, scope_strict: %t",
+			b.BrowserID, b.Owner, b.Persist, b.TTL, scope, b.ScopeStrict)
 		if b.Bin != "" {
 			fmt.Fprintf(w, ", bin: %s", b.Bin)
 		}
@@ -452,11 +458,12 @@ func printBrowserEntries(w io.Writer, entries []ipc.BrowserEntry) {
 
 // NewBrowserCreateCmd constructs the "browser create" command: launches a new
 // browser process with optional custom binary (--bin), profile (--profile),
-// persistence (--persist), owner label (--owner), and window position
-// (--position).
+// persistence (--persist), owner label (--owner), window position
+// (--position), and headless mode (--headless).
 func NewBrowserCreateCmd(mgr *browsers.Manager) *cobra.Command {
 	var bin, profile, position, proxy, proxyBypass, owner string
-	var persist, ignoreCerts bool
+	var headers, scope []string
+	var persist, ignoreCerts, headless, scopeStrict bool
 	cmd := &cobra.Command{
 		Use:   "create",
 		Short: "Create and launch a new browser instance",
@@ -473,16 +480,33 @@ keeps its lazily launched browser-1 persistent.
 --owner labels the browser and joins the create key: the same owner with the
 same options reuses one browser, a different owner gets a separate one.
 
+--headless launches Chromium with no window. It joins the create key too, so
+--headless and a plain create are different browsers. The CLI default stays
+headful; pass --headless explicitly (the serve daemon has its own global
+--headless).
+
 --proxy sends traffic through an intercept proxy such as Burp, Caido or ZAP:
 accept host:port or scheme://host:port, for example 127.0.0.1:8080 or
 http://127.0.0.1:8080. --proxy-bypass lists comma-separated hosts that skip it.
 --ignore-certs accepts the proxy's MITM certificate and is independent of
 --proxy. Proxy credentials never go on the command line: put them in
-~/.config/browser-mcp/proxy.json (mode 0600), keyed by proxy host:port.`,
+~/.config/browser-mcp/proxy.json (mode 0600), keyed by proxy host:port.
+
+--header NAME=VALUE (repeatable) sends an identity header with every request from
+every page of this browser, the first navigation included. Both flags are
+repeatable: --header X-Bug-Bounty=me --header X-Team=red.
+
+--scope HOST (repeatable) sets the navigation allowlist: a bare host covers its
+subdomains, '*.example.com' works, 'host:port' is accepted, and '*' allows all.
+No --scope means no limit; --scope-strict with no --scope denies every
+navigation. Scope applies to navigation, not to subresources or redirects, so a
+redirect can still land on an out-of-scope host.`,
 		Example: `  browser create --owner scraper-a
+  browser create --headless
   browser create --persist --profile audit
   browser create --proxy http://127.0.0.1:8080 --ignore-certs
-  browser create --proxy 127.0.0.1:8080 --proxy-bypass localhost,*.internal`,
+  browser create --proxy 127.0.0.1:8080 --proxy-bypass localhost,*.internal
+  browser create --header X-Bug-Bounty=me --scope example.com --scope '*.iana.org'`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx, cancel := context.WithTimeout(cmdCtx(cmd), 30*time.Second)
 			defer cancel()
@@ -494,6 +518,10 @@ http://127.0.0.1:8080. --proxy-bypass lists comma-separated hosts that skip it.
 			if owner != "" {
 				ctx = browsers.WithExplicitOwner(ctx, owner)
 			}
+			headerMap, err := parseHeaderFlags(headers)
+			if err != nil {
+				return fmt.Errorf("browser create: %w", err)
+			}
 
 			if cl := dialServe(cmd); cl != nil {
 				defer cl.Close()
@@ -504,6 +532,8 @@ http://127.0.0.1:8080. --proxy-bypass lists comma-separated hosts that skip it.
 					Proxy:       proxy,
 					ProxyBypass: proxyBypass,
 					Owner:       owner,
+					Headers:     headerMap,
+					Scope:       scope,
 				}
 				if cmd.Flags().Changed("persist") {
 					params.Persist = &persist
@@ -511,12 +541,18 @@ http://127.0.0.1:8080. --proxy-bypass lists comma-separated hosts that skip it.
 				if cmd.Flags().Changed("ignore-certs") {
 					params.IgnoreCerts = &ignoreCerts
 				}
+				if cmd.Flags().Changed("headless") {
+					params.Headless = &headless
+				}
+				if cmd.Flags().Changed("scope-strict") {
+					params.ScopeStrict = &scopeStrict
+				}
 				var res ipc.BrowserOpenResult
 				if err := cl.Call(ctx, ipc.MethodBrowserOpen, params, &res); err != nil {
 					return fmt.Errorf("browser create: %w", err)
 				}
-				fmt.Printf("browser_id: %s (owner: %s, persist: %t, ttl: %s)\n",
-					res.BrowserID, res.Owner, res.Persist, res.TTL)
+				fmt.Printf("browser_id: %s (owner: %s, persist: %t, ttl: %s, scope: %s, scope_strict: %t)\n",
+					res.BrowserID, res.Owner, res.Persist, res.TTL, res.Scope, res.ScopeStrict)
 				return nil
 			}
 			printServeHint(cmd)
@@ -543,6 +579,18 @@ http://127.0.0.1:8080. --proxy-bypass lists comma-separated hosts that skip it.
 			if cmd.Flags().Changed("ignore-certs") {
 				opts = append(opts, browsers.WithIgnoreCerts(ignoreCerts))
 			}
+			if cmd.Flags().Changed("headless") {
+				opts = append(opts, browsers.WithHeadless(headless))
+			}
+			if len(headerMap) > 0 {
+				opts = append(opts, browsers.WithExtraHeaders(headerMap))
+			}
+			if len(scope) > 0 {
+				opts = append(opts, browsers.WithScope(scope))
+			}
+			if cmd.Flags().Changed("scope-strict") {
+				opts = append(opts, browsers.WithScopeStrict(scopeStrict))
+			}
 			id, b, err := mgr.CreateBrowser(ctx, opts...)
 			if err != nil {
 				return fmt.Errorf("browser create: %w", err)
@@ -552,6 +600,8 @@ http://127.0.0.1:8080. --proxy-bypass lists comma-separated hosts that skip it.
 				fmt.Sprintf("owner: %s", info.Owner),
 				fmt.Sprintf("persist: %t", info.Persist),
 				fmt.Sprintf("ttl: %s", info.TTL),
+				fmt.Sprintf("scope: %s", info.Scope),
+				fmt.Sprintf("scope_strict: %t", info.ScopeStrict),
 			}
 			if info.Bin != "" {
 				details = append(details, "bin: "+info.Bin)
@@ -574,5 +624,27 @@ http://127.0.0.1:8080. --proxy-bypass lists comma-separated hosts that skip it.
 	cmd.Flags().StringVar(&proxy, "proxy", "", "upstream proxy host:port or scheme://host:port (e.g. 127.0.0.1:8080)")
 	cmd.Flags().StringVar(&proxyBypass, "proxy-bypass", "", "comma-separated hosts that skip the proxy (e.g. localhost,*.internal)")
 	cmd.Flags().BoolVar(&ignoreCerts, "ignore-certs", false, "accept invalid TLS certificates (e.g. an intercept proxy's MITM CA); independent of --proxy")
+	cmd.Flags().BoolVar(&headless, "headless", false, "launch Chromium with no window (joins the create key; default is headful)")
+	cmd.Flags().StringArrayVar(&headers, "header", nil, "request header NAME=VALUE sent with every request from every page (repeatable)")
+	cmd.Flags().StringArrayVar(&scope, "scope", nil, "navigation allowlist entry: host (covers subdomains), '*.example.com', 'host:port' or '*' (repeatable; empty = no limit)")
+	cmd.Flags().BoolVar(&scopeStrict, "scope-strict", false, "deny every navigation when --scope is empty")
 	return cmd
+}
+
+// parseHeaderFlags converts repeatable --header NAME=VALUE flags into a header
+// map, rejecting a flag that is not in NAME=VALUE form.
+func parseHeaderFlags(flags []string) (map[string]string, error) {
+	if len(flags) == 0 {
+		return nil, nil
+	}
+	headers := make(map[string]string, len(flags))
+	for _, flag := range flags {
+		name, value, ok := strings.Cut(flag, "=")
+		name = strings.TrimSpace(name)
+		if !ok || name == "" {
+			return nil, fmt.Errorf("invalid --header %q — use NAME=VALUE, e.g. X-Bug-Bounty=your-handle", flag)
+		}
+		headers[name] = value
+	}
+	return headers, nil
 }

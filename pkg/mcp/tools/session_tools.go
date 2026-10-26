@@ -36,7 +36,8 @@ func (t *SessionClose) Description() string {
 		"the session_id becomes invalid afterwards. Use session_list to see " +
 		"which sessions are still open. If no browser is running this may launch " +
 		"one with default options; call browser_create first when you want to " +
-		"control launch options. Example: { \"session_id\": \"page-1\" }."
+		"control launch options. Example: { \"session_id\": \"page-1\" }." +
+		resultEnvelopeDoc
 }
 
 // InputSchema returns the JSON Schema for session_close's arguments: a required
@@ -65,26 +66,26 @@ type sessionCloseArgs struct {
 // fully (no browser work lives here).
 func (t *SessionClose) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var a sessionCloseArgs
-	if err := json.Unmarshal(args, &a); err != nil {
-		return "", fmt.Errorf("session_close: invalid arguments: %w", err)
+	if err := decodeArgs("session_close", args, &a); err != nil {
+		return failResult(err)
 	}
 	if a.SessionID == "" {
-		return "", fmt.Errorf("session_close: missing required argument %q", "session_id")
+		return failResult(fmt.Errorf("session_close: missing required argument %q", "session_id"))
 	}
 	b, err := t.mgr.Open(ctx) // lazily launches (or returns) the single Browser
 	if err != nil {
-		return "", fmt.Errorf("session_close: %w", err)
+		return failResult(fmt.Errorf("session_close: %w", err))
 	}
 	// Resolve the session through the manager so a pre-restart session id
 	// surfaces the explicit "browser was restarted" error instead of a bare
 	// "not found" (or a raw CDP error).
 	if _, err := t.mgr.Page(ctx, a.SessionID); err != nil {
-		return "", fmt.Errorf("session_close: %w", err)
+		return failResult(fmt.Errorf("session_close: %w", err))
 	}
 	if err := b.ClosePage(ctx, a.SessionID); err != nil {
-		return "", fmt.Errorf("session_close: %w", err)
+		return failResult(fmt.Errorf("session_close: %w", err))
 	}
-	return fmt.Sprintf("session %s closed", a.SessionID), nil
+	return okResult(fmt.Sprintf("session %s closed", a.SessionID))
 }
 
 // SessionList implements the "session_list" tool: it lists every live browser
@@ -113,7 +114,7 @@ func (t *SessionList) Description() string {
 		"JSON array. Use it to see which fetch_page sessions are still open " +
 		"before closing them with session_close. If no browser is running this " +
 		"may launch one with default options; call browser_create first when you " +
-		"want to control launch options. Example: {}."
+		"want to control launch options. Example: {}." + resultEnvelopeDoc
 }
 
 // InputSchema returns the JSON Schema for session_list's arguments: none.
@@ -130,13 +131,13 @@ func (t *SessionList) InputSchema() models.InputSchema {
 func (t *SessionList) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	b, err := t.mgr.Open(ctx) // lazily launches (or returns) the single Browser
 	if err != nil {
-		return "", fmt.Errorf("session_list: %w", err)
+		return failResult(fmt.Errorf("session_list: %w", err))
 	}
 	data, err := json.MarshalIndent(b.Pages(), "", "  ")
 	if err != nil {
-		return "", fmt.Errorf("session_list: %w", err)
+		return failResult(fmt.Errorf("session_list: %w", err))
 	}
-	return string(data), nil
+	return okResult(string(data))
 }
 
 // Ensure both session tools satisfy the Tool interface at compile time.

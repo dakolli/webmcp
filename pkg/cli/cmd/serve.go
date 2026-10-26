@@ -333,7 +333,11 @@ func daemonizeServe(cmd *cobra.Command, opts serveRunOptions, childArgs []string
 	if err := waitForServeDaemon(cmdCtx(cmd), opts.socket, logPath); err != nil {
 		return err
 	}
-	cmd.Printf("browser_id: %s\n", singleBrowserID)
+	if serveLaunchesDefaultBrowser(opts) {
+		cmd.Printf("browser_id: %s\n", singleBrowserID)
+	} else {
+		cmd.Printf("browser_id: none (created on demand by browser_create or fetch_page)\n")
+	}
 	cmd.Printf("socket: %s\n", opts.socket)
 	cmd.Printf("daemonized (log: %s); stop with 'web-cli serve stop'\n", logPath)
 	if opts.mcpPort != 0 {
@@ -357,12 +361,20 @@ func daemonizeServe(cmd *cobra.Command, opts serveRunOptions, childArgs []string
 	return nil
 }
 
+// serveLaunchesDefaultBrowser reports whether the serve run should create the
+// persistent default browser up front. Only the plain human daemon does; a
+// `serve mcp` run (opts.mcpPort != 0) starts no browser, headless or otherwise.
+func serveLaunchesDefaultBrowser(opts serveRunOptions) bool {
+	return opts.mcpPort == 0
+}
+
 // runServeForeground runs the long-lived serve loop in this process: it binds
-// the IPC socket (before launching the browser, so a second serve fails cheaply
-// instead of paying for a Chromium launch), optionally starts the MCP HTTP
-// server on opts.mcpPort in-process, opens the browser, and blocks until ctx is
-// cancelled (SIGINT/SIGTERM) or a server.shutdown request arrives — then the
-// loop stops and the process tears the browser down via mgr.Shutdown.
+// the IPC socket, optionally starts the MCP HTTP server on opts.mcpPort
+// in-process, opens the persistent default browser for a plain `serve`, and
+// blocks until ctx is cancelled (SIGINT/SIGTERM) or a server.shutdown request
+// arrives — then the loop stops and the process tears down via mgr.Shutdown.
+// A `serve mcp` run starts no browser at all: its agent callers create their
+// own on demand.
 func runServeForeground(ctx context.Context, opts serveRunOptions) error {
 	// serve mcp drives an agent pool, so its default browser is ephemeral: a
 	// forgotten close must not leak a profile into the config dir. A named
@@ -404,7 +416,7 @@ func runServeForeground(ctx context.Context, opts serveRunOptions) error {
 		return fmt.Errorf("serve: %w", err)
 	}
 	// Close the bound socket on any error path after this point (e.g. a failed
-	// mgr.Open below) so a leak can't leave a stale socket file/listener behind.
+	// browser launch) so a leak can't leave a stale socket file/listener behind.
 	// Close is idempotent, so the normal path is unaffected.
 	defer srv.Close()
 
@@ -414,10 +426,10 @@ func runServeForeground(ctx context.Context, opts serveRunOptions) error {
 	defer cancelServe()
 
 	// serve mcp: host the MCP HTTP/SSE server in-process on the SAME manager,
-	// so MCP tools drive the very browser the IPC layer serves. The port is
-	// bound synchronously here — BEFORE the HTTP goroutine and before mgr.Open
-	// — so a bind failure (e.g. port already occupied) surfaces as a warning
-	// in the output block instead of an async log after the browser launched.
+	// so MCP tools and the IPC layer share one browser map. The port is
+	// bound synchronously here — BEFORE the HTTP goroutine and before any
+	// browser work — so a bind failure (e.g. port already occupied) surfaces
+	// as a warning in the output block instead of an async log.
 	var httpSrv *mcpServer.Server
 	var mcpBindErr error
 	if opts.mcpPort != 0 {
@@ -437,12 +449,23 @@ func runServeForeground(ctx context.Context, opts serveRunOptions) error {
 		}
 	}
 
-	// First run downloads Chromium (~100MB); serveCtx bounds the launch.
-	if _, err := mgr.Open(serveCtx); err != nil {
-		return fmt.Errorf("serve: %w", err)
+	// First run downloads Chromium (~100MB); serveCtx bounds the launch. Only
+	// the plain human daemon pre-launches browser-1: `serve mcp` serves an
+	// agent pool whose callers create their own browsers (browser_create, or
+	// the first fetch_page), so launching one here would spend memory on a
+	// browser nobody asked for.
+	launchDefault := serveLaunchesDefaultBrowser(opts)
+	if launchDefault {
+		if _, err := mgr.Open(serveCtx); err != nil {
+			return fmt.Errorf("serve: %w", err)
+		}
 	}
 
-	fmt.Printf("browser_id: %s\n", singleBrowserID)
+	if launchDefault {
+		fmt.Printf("browser_id: %s\n", singleBrowserID)
+	} else {
+		fmt.Printf("browser_id: none (created on demand by browser_create or fetch_page)\n")
+	}
 	fmt.Printf("socket: %s\n", path)
 	if mcpBindErr != nil {
 		fmt.Printf("mcp: failed to bind :%d: %v\n", opts.mcpPort, mcpBindErr)

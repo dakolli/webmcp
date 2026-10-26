@@ -24,6 +24,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/input"
 	"github.com/go-rod/rod/lib/proto"
 
 	"webmcp/pkg/browsers"
@@ -43,6 +44,68 @@ const DefaultPageMaxBytes = 50_000
 // pkg/mcp/tools/act.go). Callers bound the ctx themselves (defaultCmdTimeout /
 // the IPC per-call timeout); this fallback only sizes the sleep.
 const defaultActTimeout = 30 * time.Second
+
+// defaultPageOpTimeout is the deadline every page operation gets when its
+// caller passes a context with none. No operation may run unbounded: a wedged
+// CDP call would hold the page lock and block the daemon.
+const defaultPageOpTimeout = 30 * time.Second
+
+// inputAckTimeout bounds one mouse or keyboard acknowledgement. Input events
+// are acknowledged in milliseconds; a longer wait means the page navigated (or
+// is wedged), and the click already landed, so the caller must not wait for the
+// whole call budget.
+const inputAckTimeout = 2 * time.Second
+
+// beginPage gives ctx a deadline when it has none, then acquires the page
+// operation lock. The returned release func cancels the derived context and
+// releases the lock; callers defer it immediately. A page already held by
+// another operation returns the actionable lock-wait error naming op and the
+// time spent waiting.
+func beginPage(
+	ctx context.Context,
+	p *browsers.Page,
+	op string,
+) (context.Context, func(), error) {
+	opCtx := ctx
+	cancel := func() {}
+	if _, ok := ctx.Deadline(); !ok {
+		var stop context.CancelFunc
+		opCtx, stop = context.WithTimeout(ctx, defaultPageOpTimeout)
+		cancel = stop
+	}
+	if err := p.LockContext(opCtx, op); err != nil {
+		cancel()
+		return opCtx, nil, err
+	}
+	return opCtx, func() {
+		p.Unlock()
+		cancel()
+	}, nil
+}
+
+// opDeadlineError turns a cancelled or expired operation into one actionable
+// sentence naming the operation and the elapsed time. Other errors pass
+// through unchanged.
+func opDeadlineError(
+	op string,
+	p *browsers.Page,
+	started time.Time,
+	err error,
+) error {
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		return err
+	}
+	return fmt.Errorf(
+		"%s: page %s did not finish within %s — re-read the page with page_fetch what=meta before retrying: %w",
+		op,
+		p.ID,
+		time.Since(started).Round(time.Millisecond),
+		err,
+	)
+}
 
 // ValidateURL checks that s is an absolute http(s) URL the browser can
 // navigate to: it must parse, be absolute and carry a host.
@@ -109,8 +172,11 @@ func ParseViewport(s string) (*browsers.Viewport, error) {
 // page_act-only "interactable" and "ms" modes are handled by PageWait, not
 // here (they need a selector and a timeout respectively).
 func WaitForPage(ctx context.Context, p *browsers.Page, waitFor string) error {
-	p.Lock()
-	defer p.Unlock()
+	ctx, done, err := beginPage(ctx, p, "wait "+waitFor)
+	if err != nil {
+		return err
+	}
+	defer done()
 	if p.Rod == nil {
 		return fmt.Errorf("page session is closed")
 	}
@@ -150,8 +216,11 @@ type FetchSummary struct {
 // loadStarted anchors the load_ms timing (captured around open → navigate →
 // wait).
 func PageSummary(ctx context.Context, p *browsers.Page, loadStarted time.Time) (FetchSummary, error) {
-	p.Lock()
-	defer p.Unlock()
+	ctx, done, err := beginPage(ctx, p, "page summary")
+	if err != nil {
+		return FetchSummary{}, err
+	}
+	defer done()
 	if p.Rod == nil {
 		return FetchSummary{}, fmt.Errorf("page session is closed")
 	}
@@ -185,8 +254,11 @@ func PageSummary(ctx context.Context, p *browsers.Page, loadStarted time.Time) (
 // when one is given. Backed by p.Rod.HTML() / element HTML() — mirrors the MCP
 // extractHTML.
 func PageHTML(ctx context.Context, p *browsers.Page, selector string) (string, error) {
-	p.Lock()
-	defer p.Unlock()
+	ctx, done, err := beginPage(ctx, p, "html")
+	if err != nil {
+		return "", err
+	}
+	defer done()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}
@@ -214,8 +286,11 @@ func PageHTML(ctx context.Context, p *browsers.Page, selector string) (string, e
 // selector). Backed by Eval over document.body.innerText / element.innerText —
 // mirrors the MCP extractText.
 func PageText(ctx context.Context, p *browsers.Page, selector string) (string, error) {
-	p.Lock()
-	defer p.Unlock()
+	ctx, done, err := beginPage(ctx, p, "text")
+	if err != nil {
+		return "", err
+	}
+	defer done()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}
@@ -288,8 +363,11 @@ func PageLinks(ctx context.Context, p *browsers.Page) (string, error) {
 // with no text node. Anchors with no text and no fallback are dropped right
 // here (no "text":"" on the wire, ever).
 func pageAnchorLinks(ctx context.Context, p *browsers.Page) ([]PageLink, error) {
-	p.Lock()
-	defer p.Unlock()
+	ctx, done, err := beginPage(ctx, p, "links")
+	if err != nil {
+		return nil, err
+	}
+	defer done()
 	if p.Rod == nil {
 		return nil, fmt.Errorf("page session is closed")
 	}
@@ -396,8 +474,11 @@ func absoluteHref(base, href string) string {
 // object — mirrors the MCP extractMeta shape. Backed by p.Rod.Info() plus Eval
 // collecting every <meta> tag.
 func PageMeta(ctx context.Context, p *browsers.Page) (string, error) {
-	p.Lock()
-	defer p.Unlock()
+	ctx, done, err := beginPage(ctx, p, "meta")
+	if err != nil {
+		return "", err
+	}
+	defer done()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}
@@ -620,6 +701,9 @@ var aspectEntries = []aspectEntry{
 	{name: "marks", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _, _ string, _ bool) (string, error) {
 		return PageMarks(ctx, p)
 	}},
+	{name: "security", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _, _ string, _ bool) (string, error) {
+		return PageSecurity(ctx, p)
+	}},
 }
 
 // unknownAspectError is the one unknown-what error every surface emits; it names
@@ -656,6 +740,11 @@ func PageAspect(
 	fullPage bool,
 	maxBytes int,
 ) (string, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultPageOpTimeout)
+		defer cancel()
+	}
 	for _, a := range aspectEntries {
 		if a.name != what {
 			continue
@@ -711,12 +800,39 @@ type PageState struct {
 // PageStateOf reads the page's current URL and title via CDP
 // Target.TargetInfo. It is cheap: no page JavaScript runs.
 func PageStateOf(ctx context.Context, p *browsers.Page) (PageState, error) {
-	p.Lock()
-	defer p.Unlock()
+	ctx, done, err := beginPage(ctx, p, "state")
+	if err != nil {
+		return PageState{}, err
+	}
+	defer done()
 	if p.Rod == nil {
 		return PageState{}, fmt.Errorf("page session is closed")
 	}
 
+	info, err := p.Rod.Context(ctx).Info()
+	if err != nil {
+		return PageState{}, fmt.Errorf("read page state: %w", err)
+	}
+	return PageState{URL: info.URL, Title: info.Title}, nil
+}
+
+// PageStateIfFree reads the page state only when the page operation lock is
+// free. A pre-action baseline must never wait for (and consume) the action's
+// own budget, so a busy page returns an error instead.
+func PageStateIfFree(ctx context.Context, p *browsers.Page) (PageState, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultPageOpTimeout)
+		defer cancel()
+	}
+	unlock, ok := p.TryLock()
+	if !ok {
+		return PageState{}, fmt.Errorf("state: page %s is busy", p.ID)
+	}
+	defer unlock()
+	if p.Rod == nil {
+		return PageState{}, fmt.Errorf("page session is closed")
+	}
 	info, err := p.Rod.Context(ctx).Info()
 	if err != nil {
 		return PageState{}, fmt.Errorf("read page state: %w", err)
@@ -742,8 +858,11 @@ func actMayNavigate(action string) bool {
 // navigate, it polls for up to actSettleWindow so a click that starts a
 // navigation reports the new URL instead of the pre-navigation one.
 func PageStateAfterAct(ctx context.Context, p *browsers.Page, action string, before PageState) PageState {
-	after, err := PageStateOf(ctx, p)
-	if err != nil || !actMayNavigate(action) {
+	after, err := PageStateIfFree(ctx, p)
+	if err != nil || after.URL == "" {
+		after = before
+	}
+	if !actMayNavigate(action) {
 		return after
 	}
 	if after.URL != before.URL || after.Title != before.Title {
@@ -756,8 +875,8 @@ func PageStateAfterAct(ctx context.Context, p *browsers.Page, action string, bef
 			return after
 		case <-time.After(50 * time.Millisecond):
 		}
-		next, err := PageStateOf(ctx, p)
-		if err != nil {
+		next, err := PageStateIfFree(ctx, p)
+		if err != nil || next.URL == "" {
 			return after
 		}
 		after = next
@@ -801,8 +920,11 @@ func ActStateDelta(before, after PageState) string {
 // sites: image size scales with the viewport, not max_bytes, and cutting a
 // data-URI mid-stream would corrupt it. Mirrors the MCP extractScreenshot.
 func PageScreenshot(ctx context.Context, p *browsers.Page, fullPage bool) (string, error) {
-	p.Lock()
-	defer p.Unlock()
+	ctx, done, err := beginPage(ctx, p, "screenshot")
+	if err != nil {
+		return "", err
+	}
+	defer done()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}
@@ -846,8 +968,11 @@ func PageJS(ctx context.Context, p *browsers.Page, target string) (string, error
 // The per-page mutex is held for the whole extraction because rod pages are
 // not thread-safe. Mirrors the MCP extractResources.
 func PageResources(ctx context.Context, p *browsers.Page, target, what string, kind proto.NetworkResourceType) (string, error) {
-	p.Lock()
-	defer p.Unlock()
+	ctx, done, err := beginPage(ctx, p, what)
+	if err != nil {
+		return "", err
+	}
+	defer done()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}
@@ -1255,8 +1380,11 @@ func rareString(strs []string, rd *proto.DOMSnapshotRareStringData, i int) strin
 // p.Rod.Context(ctx).Eval(js); js must be a JS function definition, e.g.
 // "() => document.title". Mirrors the Eval pattern proven in extractText.
 func PageEval(ctx context.Context, p *browsers.Page, js string) (string, error) {
-	p.Lock()
-	defer p.Unlock()
+	ctx, done, err := beginPage(ctx, p, "eval")
+	if err != nil {
+		return "", err
+	}
+	defer done()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}
@@ -1385,7 +1513,8 @@ func targetFailure(action, handle, selector string, err error) error {
 }
 
 // PageClickOpts clicks the element targeted by handle or selector with
-// optional button and click count.
+// optional button and click count. It reads the page state first so a click
+// that navigates during the input acknowledgement is still reported as landed.
 func PageClickOpts(
 	ctx context.Context,
 	p *browsers.Page,
@@ -1393,8 +1522,30 @@ func PageClickOpts(
 	button string,
 	clickCount int,
 ) (string, error) {
-	p.Lock()
-	defer p.Unlock()
+	before, _ := PageStateIfFree(ctx, p)
+	return PageClickFrom(ctx, p, handle, selector, button, clickCount, before)
+}
+
+// PageClickFrom is PageClickOpts with the pre-click page state supplied by the
+// caller (page_act already read it). The mouse events run on the ctx-bound page
+// clone with their own short acknowledgement budget, so a submit click that
+// starts a navigation returns as soon as the navigation commits instead of
+// waiting out the whole call deadline. A timeout that did not navigate is
+// returned as one actionable sentence naming the operation and elapsed time.
+func PageClickFrom(
+	ctx context.Context,
+	p *browsers.Page,
+	handle, selector string,
+	button string,
+	clickCount int,
+	before PageState,
+) (string, error) {
+	started := time.Now()
+	ctx, done, err := beginPage(ctx, p, "click")
+	if err != nil {
+		return "", err
+	}
+	defer done()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}
@@ -1407,29 +1558,127 @@ func PageClickOpts(
 		clickCount = 1
 	}
 
-	el, err := actTarget(p.Rod.Context(ctx), handle, selector)
+	page := p.Rod.Context(ctx)
+	el, err := actTarget(page, handle, selector)
 	if err != nil {
-		return "", actionError("click", handle, selector, err)
+		return "", opDeadlineError("click", p, started, actionError("click", handle, selector, err))
 	}
-	if _, err := el.WaitInteractable(); err != nil {
-		return "", targetFailure("click", handle, selector, err)
+	pt, err := el.WaitInteractable()
+	if err != nil {
+		return "", opDeadlineError("click", p, started, targetFailure("click", handle, selector, err))
 	}
-	if err := el.Click(btn, clickCount); err != nil {
-		return "", targetFailure("click", handle, selector, err)
+	if err := el.WaitEnabled(); err != nil {
+		return "", opDeadlineError("click", p, started, targetFailure("click", handle, selector, err))
 	}
 
+	ackCtx, ackCancel := context.WithTimeout(ctx, inputAckTimeout)
+	defer ackCancel()
+	if err := dispatchClick(p.Rod.Context(ackCtx), *pt, btn, clickCount); err != nil {
+		if stateMoved(page, before) {
+			return clickConfirmation(handle, selector, button, clickCount), nil
+		}
+		return "", opDeadlineError("click", p, started, err)
+	}
+	return clickConfirmation(handle, selector, button, clickCount), nil
+}
+
+// stateMoved reports whether the page's address or title differs from before.
+// It is used to recognize a click whose navigation started before the input
+// acknowledgement returned; an empty baseline never counts as a change.
+func stateMoved(page *rod.Page, before PageState) bool {
+	if before.URL == "" && before.Title == "" {
+		return false
+	}
+	info, err := page.Info()
+	if err != nil {
+		return false
+	}
+	return info.URL != before.URL || info.Title != before.Title
+}
+
+// clickConfirmation renders the one-line click result shared by every surface.
+func clickConfirmation(handle, selector, button string, clickCount int) string {
 	ref := fmt.Sprintf("handle=%q", handle)
 	if handle == "" {
 		ref = fmt.Sprintf("selector=%q", selector)
 	}
 	if (button == "" || button == "left") && clickCount == 1 {
-		return fmt.Sprintf("clicked %s", ref), nil
+		return fmt.Sprintf("clicked %s", ref)
 	}
 	btnName := button
 	if btnName == "" {
 		btnName = "left"
 	}
-	return fmt.Sprintf("clicked %s button=%s count=%d", ref, btnName, clickCount), nil
+	return fmt.Sprintf("clicked %s button=%s count=%d", ref, btnName, clickCount)
+}
+
+// dispatchClick sends a real mouse move, press and release at pt through the
+// ctx-bound page clone. It replaces rod's Element.Click, whose Mouse methods
+// keep the placeholder page context and would outlive the call deadline.
+func dispatchClick(
+	page *rod.Page,
+	pt proto.Point,
+	btn proto.InputMouseButton,
+	clickCount int,
+) error {
+	if err := moveMouse(page, pt.X, pt.Y, ""); err != nil {
+		return err
+	}
+	if err := mouseButton(page, proto.InputDispatchMouseEventTypeMousePressed, pt.X, pt.Y, btn, clickCount); err != nil {
+		return err
+	}
+	if err := mouseButton(page, proto.InputDispatchMouseEventTypeMouseReleased, pt.X, pt.Y, btn, clickCount); err != nil {
+		return err
+	}
+	return nil
+}
+
+// moveMouse dispatches one mouse-moved event at (x, y). held is the button
+// already held down during a drag; an empty string means no button.
+func moveMouse(page *rod.Page, x, y float64, held proto.InputMouseButton) error {
+	buttons := 0
+	button := proto.InputMouseButton("none")
+	if held != "" {
+		button = held
+		buttons = input.MouseKeys[held]
+	}
+	ev := proto.InputDispatchMouseEvent{
+		Type:    proto.InputDispatchMouseEventTypeMouseMoved,
+		X:       x,
+		Y:       y,
+		Button:  button,
+		Buttons: &buttons,
+	}
+	if err := ev.Call(page); err != nil {
+		return fmt.Errorf("move mouse to (%.1f, %.1f): %w", x, y, err)
+	}
+	return nil
+}
+
+// mouseButton dispatches a pressed or released event for btn at (x, y).
+func mouseButton(
+	page *rod.Page,
+	typ proto.InputDispatchMouseEventType,
+	x, y float64,
+	btn proto.InputMouseButton,
+	clickCount int,
+) error {
+	buttons := 0
+	if typ == proto.InputDispatchMouseEventTypeMousePressed {
+		buttons = input.MouseKeys[btn]
+	}
+	ev := proto.InputDispatchMouseEvent{
+		Type:       typ,
+		X:          x,
+		Y:          y,
+		Button:     btn,
+		Buttons:    &buttons,
+		ClickCount: clickCount,
+	}
+	if err := ev.Call(page); err != nil {
+		return fmt.Errorf("%s at (%.1f, %.1f): %w", typ, x, y, err)
+	}
+	return nil
 }
 
 // PageClick clicks the element targeted by handle or selector with the left
@@ -1450,8 +1699,11 @@ func PagePressKey(
 	p *browsers.Page,
 	handle, selector, keyStr string,
 ) (string, error) {
-	p.Lock()
-	defer p.Unlock()
+	ctx, done, err := beginPage(ctx, p, "press_key")
+	if err != nil {
+		return "", err
+	}
+	defer done()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}
@@ -1476,17 +1728,7 @@ func PagePressKey(
 		}
 	}
 
-	actions := page.KeyActions()
-	if len(mods) > 0 {
-		actions.Press(mods...)
-	}
-	actions.Press(mainKey)
-	actions.Release(mainKey)
-	if len(mods) > 0 {
-		actions.Release(mods...)
-	}
-
-	if err := actions.Do(); err != nil {
+	if err := pressKeyCombo(page, mods, mainKey); err != nil {
 		return "", fmt.Errorf("press_key %q: %w", keyStr, err)
 	}
 
@@ -1499,11 +1741,50 @@ func PagePressKey(
 	return fmt.Sprintf("pressed key %q", keyStr), nil
 }
 
+// pressKeyCombo presses the modifiers, presses and releases the main key, then
+// releases the modifiers in reverse order. Every event goes through the
+// ctx-bound page clone (rod's KeyActions keeps the placeholder page context and
+// would outlive the call deadline).
+func pressKeyCombo(page *rod.Page, mods []input.Key, key input.Key) error {
+	pressed := make(map[input.Key]struct{}, len(mods)+1)
+	modifiers := func() int {
+		bits := 0
+		for k := range pressed {
+			bits |= k.Modifier()
+		}
+		return bits
+	}
+	for _, mod := range mods {
+		pressed[mod] = struct{}{}
+		if err := mod.Encode(proto.InputDispatchKeyEventTypeKeyDown, modifiers()).Call(page); err != nil {
+			return fmt.Errorf("press modifier %s: %w", mod.Info().Code, err)
+		}
+	}
+	pressed[key] = struct{}{}
+	if err := key.Encode(proto.InputDispatchKeyEventTypeKeyDown, modifiers()).Call(page); err != nil {
+		return fmt.Errorf("press %s: %w", key.Info().Code, err)
+	}
+	delete(pressed, key)
+	if err := key.Encode(proto.InputDispatchKeyEventTypeKeyUp, modifiers()).Call(page); err != nil {
+		return fmt.Errorf("release %s: %w", key.Info().Code, err)
+	}
+	for i := len(mods) - 1; i >= 0; i-- {
+		delete(pressed, mods[i])
+		if err := mods[i].Encode(proto.InputDispatchKeyEventTypeKeyUp, modifiers()).Call(page); err != nil {
+			return fmt.Errorf("release modifier %s: %w", mods[i].Info().Code, err)
+		}
+	}
+	return nil
+}
+
 // PageClickAt moves the mouse cursor to absolute coordinates (x, y) and clicks.
 // button can be "left", "right", or "middle"; clickCount defaults to 1.
 func PageClickAt(ctx context.Context, p *browsers.Page, x, y float64, button string, clickCount int) (string, error) {
-	p.Lock()
-	defer p.Unlock()
+	ctx, done, err := beginPage(ctx, p, "click_at")
+	if err != nil {
+		return "", err
+	}
+	defer done()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}
@@ -1517,11 +1798,8 @@ func PageClickAt(ctx context.Context, p *browsers.Page, x, y float64, button str
 	}
 
 	page := p.Rod.Context(ctx)
-	if err := page.Mouse.MoveTo(proto.Point{X: x, Y: y}); err != nil {
-		return "", fmt.Errorf("click_at move to (%.1f, %.1f): %w", x, y, err)
-	}
-	if err := page.Mouse.Click(btn, clickCount); err != nil {
-		return "", fmt.Errorf("click_at (%.1f, %.1f): %w", x, y, err)
+	if err := dispatchClick(page, proto.Point{X: x, Y: y}, btn, clickCount); err != nil {
+		return "", fmt.Errorf("click_at: %w", err)
 	}
 
 	btnName := button
@@ -1533,23 +1811,28 @@ func PageClickAt(ctx context.Context, p *browsers.Page, x, y float64, button str
 
 // PageHoverAt moves the mouse cursor to absolute coordinates (x, y).
 func PageHoverAt(ctx context.Context, p *browsers.Page, x, y float64) (string, error) {
-	p.Lock()
-	defer p.Unlock()
+	ctx, done, err := beginPage(ctx, p, "hover_at")
+	if err != nil {
+		return "", err
+	}
+	defer done()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}
 
-	page := p.Rod.Context(ctx)
-	if err := page.Mouse.MoveTo(proto.Point{X: x, Y: y}); err != nil {
-		return "", fmt.Errorf("hover_at (%.1f, %.1f): %w", x, y, err)
+	if err := moveMouse(p.Rod.Context(ctx), x, y, ""); err != nil {
+		return "", fmt.Errorf("hover_at: %w", err)
 	}
 	return fmt.Sprintf("hovered at (%.1f, %.1f)", x, y), nil
 }
 
 // PageDragAndDrop performs a mouse drag-and-drop operation from source coordinates/selector to target coordinates/selector.
 func PageDragAndDrop(ctx context.Context, p *browsers.Page, fromX, fromY, toX, toY float64, selector, targetSelector string) (string, error) {
-	p.Lock()
-	defer p.Unlock()
+	ctx, done, err := beginPage(ctx, p, "drag_and_drop")
+	if err != nil {
+		return "", err
+	}
+	defer done()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}
@@ -1582,16 +1865,21 @@ func PageDragAndDrop(ctx context.Context, p *browsers.Page, fromX, fromY, toX, t
 		toX, toY = box.X+box.Width/2, box.Y+box.Height/2
 	}
 
-	if err := page.Mouse.MoveTo(proto.Point{X: fromX, Y: fromY}); err != nil {
-		return "", fmt.Errorf("drag_and_drop: move to source (%.1f, %.1f): %w", fromX, fromY, err)
+	if err := moveMouse(page, fromX, fromY, ""); err != nil {
+		return "", fmt.Errorf("drag_and_drop: source: %w", err)
 	}
-	if err := page.Mouse.Down(proto.InputMouseButtonLeft, 1); err != nil {
+	if err := mouseButton(page, proto.InputDispatchMouseEventTypeMousePressed, fromX, fromY, proto.InputMouseButtonLeft, 1); err != nil {
 		return "", fmt.Errorf("drag_and_drop: mouse down: %w", err)
 	}
-	if err := page.Mouse.MoveLinear(proto.Point{X: toX, Y: toY}, 10); err != nil {
-		return "", fmt.Errorf("drag_and_drop: move to target (%.1f, %.1f): %w", toX, toY, err)
+	const steps = 10
+	for i := 1; i <= steps; i++ {
+		x := fromX + (toX-fromX)*float64(i)/steps
+		y := fromY + (toY-fromY)*float64(i)/steps
+		if err := moveMouse(page, x, y, proto.InputMouseButtonLeft); err != nil {
+			return "", fmt.Errorf("drag_and_drop: target: %w", err)
+		}
 	}
-	if err := page.Mouse.Up(proto.InputMouseButtonLeft, 1); err != nil {
+	if err := mouseButton(page, proto.InputDispatchMouseEventTypeMouseReleased, toX, toY, proto.InputMouseButtonLeft, 1); err != nil {
 		return "", fmt.Errorf("drag_and_drop: mouse up: %w", err)
 	}
 
@@ -1606,8 +1894,11 @@ func PageUploadFile(
 	handle, selector string,
 	paths []string,
 ) (string, error) {
-	p.Lock()
-	defer p.Unlock()
+	ctx, done, err := beginPage(ctx, p, "upload_file")
+	if err != nil {
+		return "", err
+	}
+	defer done()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}
@@ -1637,8 +1928,11 @@ func PageInput(
 	p *browsers.Page,
 	handle, selector, value string,
 ) (string, error) {
-	p.Lock()
-	defer p.Unlock()
+	ctx, done, err := beginPage(ctx, p, "input")
+	if err != nil {
+		return "", err
+	}
+	defer done()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}
@@ -1668,8 +1962,11 @@ func PageType(
 	p *browsers.Page,
 	handle, selector, value string,
 ) (string, error) {
-	p.Lock()
-	defer p.Unlock()
+	ctx, done, err := beginPage(ctx, p, "type")
+	if err != nil {
+		return "", err
+	}
+	defer done()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}
@@ -1699,8 +1996,11 @@ func PageHover(
 	p *browsers.Page,
 	handle, selector string,
 ) (string, error) {
-	p.Lock()
-	defer p.Unlock()
+	ctx, done, err := beginPage(ctx, p, "hover")
+	if err != nil {
+		return "", err
+	}
+	defer done()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}
@@ -1709,7 +2009,11 @@ func PageHover(
 	if err != nil {
 		return "", actionError("hover", handle, selector, err)
 	}
-	if err := el.Hover(); err != nil {
+	pt, err := el.WaitInteractable()
+	if err != nil {
+		return "", targetFailure("hover", handle, selector, err)
+	}
+	if err := moveMouse(p.Rod.Context(ctx), pt.X, pt.Y, ""); err != nil {
 		return "", targetFailure("hover", handle, selector, err)
 	}
 	if handle != "" {
@@ -1722,8 +2026,11 @@ func PageHover(
 // primary path) and returns the resulting scroll position [scrollX, scrollY].
 // Missing x/y are treated as 0. Mirrors the MCP page_act scroll confirmation.
 func PageScroll(ctx context.Context, p *browsers.Page, x, y float64) (string, error) {
-	p.Lock()
-	defer p.Unlock()
+	ctx, done, err := beginPage(ctx, p, "scroll")
+	if err != nil {
+		return "", err
+	}
+	defer done()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}
@@ -1746,8 +2053,11 @@ func PageSelect(
 	p *browsers.Page,
 	handle, selector, value string,
 ) (string, error) {
-	p.Lock()
-	defer p.Unlock()
+	ctx, done, err := beginPage(ctx, p, "select")
+	if err != nil {
+		return "", err
+	}
+	defer done()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}
@@ -1771,8 +2081,11 @@ func PageSelect(
 // mandatory). Returns the final URL and title — the same confirmation shape as
 // the MCP page_act navigate.
 func PageNavigate(ctx context.Context, p *browsers.Page, url string) (string, error) {
-	p.Lock()
-	defer p.Unlock()
+	ctx, done, err := beginPage(ctx, p, "navigate")
+	if err != nil {
+		return "", err
+	}
+	defer done()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}
@@ -1797,8 +2110,11 @@ func PageNavigate(ctx context.Context, p *browsers.Page, url string) (string, er
 // previous page to load (history.back() triggers a fresh navigation). Returns
 // the resulting URL — the same confirmation shape as the MCP page_act back.
 func PageBack(ctx context.Context, p *browsers.Page) (string, error) {
-	p.Lock()
-	defer p.Unlock()
+	ctx, done, err := beginPage(ctx, p, "back")
+	if err != nil {
+		return "", err
+	}
+	defer done()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}
@@ -1823,8 +2139,11 @@ func PageBack(ctx context.Context, p *browsers.Page) (string, error) {
 // the page to load. Returns the resulting URL — the same confirmation shape as
 // the MCP page_act forward.
 func PageForward(ctx context.Context, p *browsers.Page) (string, error) {
-	p.Lock()
-	defer p.Unlock()
+	ctx, done, err := beginPage(ctx, p, "forward")
+	if err != nil {
+		return "", err
+	}
+	defer done()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}
@@ -1846,8 +2165,11 @@ func PageForward(ctx context.Context, p *browsers.Page) (string, error) {
 // PageReload reloads the page and waits for it to load again. Returns the same
 // confirmation string as the MCP page_act reload.
 func PageReload(ctx context.Context, p *browsers.Page) (string, error) {
-	p.Lock()
-	defer p.Unlock()
+	ctx, done, err := beginPage(ctx, p, "reload")
+	if err != nil {
+		return "", err
+	}
+	defer done()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}
@@ -1907,16 +2229,23 @@ func PageWait(
 	mode, handle, selector string,
 	timeout time.Duration,
 ) (string, error) {
-	// Synchronized read (under p.mu, like every other nil guard): the
-	// eviction path can nil p.Rod concurrently, so the check must not run
-	// lock-free. The lock is released before the mode switch — rod-backed
-	// modes re-lock (and re-check) themselves below.
-	p.Lock()
-	if p.Rod == nil {
-		p.Unlock()
+	// Bound the wait when the caller left ctx without a deadline, then check
+	// the page under its operation lock. The lock is released before the mode
+	// switch — the "ms" sleep touches no rod state, and the rod-backed modes
+	// re-lock (and re-check) themselves below.
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultPageOpTimeout)
+		defer cancel()
+	}
+	if err := p.LockContext(ctx, "wait"); err != nil {
+		return "", err
+	}
+	closed := p.Rod == nil
+	p.Unlock()
+	if closed {
 		return "", fmt.Errorf("page session is closed")
 	}
-	p.Unlock()
 
 	switch mode {
 	case "", "ms":
@@ -1944,7 +2273,9 @@ func PageWait(
 		if handle == "" && selector == "" {
 			return "", fmt.Errorf("wait: interactable mode requires a selector or handle")
 		}
-		p.Lock()
+		if err := p.LockContext(ctx, "wait"); err != nil {
+			return "", err
+		}
 		defer p.Unlock()
 		// Re-check under the lock: a concurrent eviction may have nilled p.Rod
 		// since the entry check above released the lock.

@@ -92,6 +92,17 @@ type Browser struct {
 	// ignoreCerts makes Chromium accept invalid TLS certificates (e.g. the
 	// MITM CA of an intercept proxy).
 	ignoreCerts bool
+	// extraHeaders are sent with every request from every page of this browser,
+	// first navigation included. Immutable after creation.
+	extraHeaders map[string]string
+	// scope is the navigation allowlist. Empty means unrestricted unless
+	// scopeStrict is set.
+	scope []string
+	// scopeStrict makes an empty allowlist deny every navigation.
+	scopeStrict bool
+	// headerCleanups holds rod's per-page header cleanup, keyed by the rod page
+	// handle. Guarded by mu; entries are removed on every close path.
+	headerCleanups map[*rod.Page]func()
 	// proxyAuth holds the proxy.json credentials for this browser; nil when no
 	// proxy is configured. Set once at launch, immutable afterwards.
 	proxyAuth *proxyAuth
@@ -122,18 +133,19 @@ func NewBrowser(id BrowserID, baseCtx context.Context, headless, stealth bool, b
 		pos = position[0]
 	}
 	return &Browser{
-		id:         id,
-		pages:      make(map[PageID]*Page),
-		authPages:  make(map[*rod.Page]*proxyAuthPage),
-		headless:   headless,
-		stealth:    stealth,
-		binPath:    binPath,
-		profileDir: profileDir,
-		position:   pos,
-		createdAt:  time.Now(),
-		lastAccess: time.Now(),
-		logger:     slog.New(slog.DiscardHandler),
-		baseCtx:    baseCtx,
+		id:             id,
+		pages:          make(map[PageID]*Page),
+		authPages:      make(map[*rod.Page]*proxyAuthPage),
+		headerCleanups: make(map[*rod.Page]func()),
+		headless:       headless,
+		stealth:        stealth,
+		binPath:        binPath,
+		profileDir:     profileDir,
+		position:       pos,
+		createdAt:      time.Now(),
+		lastAccess:     time.Now(),
+		logger:         slog.New(slog.DiscardHandler),
+		baseCtx:        baseCtx,
 	}
 }
 
@@ -200,6 +212,11 @@ type BrowserInfo struct {
 	IdleFor string `json:"idle_for"`
 	// TTL is the browser idle timeout that closes it ("0s" when disabled).
 	TTL string `json:"ttl"`
+	// Scope is the navigation allowlist: "open" when unrestricted, "strict" for
+	// a strict empty allowlist, else the patterns joined by ", ".
+	Scope string `json:"scope"`
+	// ScopeStrict reports whether an empty allowlist denies every navigation.
+	ScopeStrict bool `json:"scope_strict"`
 	// PageCount is the number of live pages.
 	PageCount int `json:"page_count"`
 	// CreateKey summarizes the launch options this browser was created with.
@@ -215,17 +232,19 @@ func (b *Browser) Info() BrowserInfo {
 		owner = UnownedOwner
 	}
 	return BrowserInfo{
-		BrowserID:  b.id,
-		Owner:      owner,
-		Bin:        b.binPath,
-		ProfileDir: b.profileDir,
-		Persist:    !b.ephemeral,
-		Ephemeral:  b.ephemeral,
-		CreatedAt:  b.createdAt,
-		IdleFor:    time.Since(b.lastAccess).Round(time.Second).String(),
-		TTL:        b.ttl.String(),
-		PageCount:  len(b.pages),
-		CreateKey:  b.key.Summary(),
+		BrowserID:   b.id,
+		Owner:       owner,
+		Bin:         b.binPath,
+		ProfileDir:  b.profileDir,
+		Persist:     !b.ephemeral,
+		Ephemeral:   b.ephemeral,
+		CreatedAt:   b.createdAt,
+		IdleFor:     time.Since(b.lastAccess).Round(time.Second).String(),
+		TTL:         b.ttl.String(),
+		Scope:       scopeState(b.scope, b.scopeStrict),
+		ScopeStrict: b.scopeStrict,
+		PageCount:   len(b.pages),
+		CreateKey:   b.key.Summary(),
 	}
 }
 
@@ -433,6 +452,11 @@ func (b *Browser) NewPage(
 	if rb == nil {
 		return nil, fmt.Errorf("browsers: browser not launched")
 	}
+	if url != "" {
+		if err := b.CheckScope(url); err != nil {
+			return nil, err
+		}
+	}
 
 	// Create the tab with rod's own pipeline (Browser.Page: Target.createTarget
 	// + attach + rod's built-in leak-prevention defer that closes the fresh
@@ -458,6 +482,16 @@ func (b *Browser) NewPage(
 	page := &Page{Rod: p}
 	page.startObservation()
 	b.startProxyAuth(p)
+
+	// Install the browser's extra request headers before stealth and before any
+	// navigation, so the first request already carries them. rod's cleanup
+	// disables the per-page network override and is stored for teardown.
+	cleanup, err := b.applyExtraHeaders(ctx, p)
+	if err != nil {
+		b.closeUnregisteredPage(page)
+		return nil, err
+	}
+	b.trackHeaderCleanup(p, cleanup)
 
 	// Apply the stealth preload script (the same JS stealth.Page injects,
 	// error form; no Must*) immediately after creation — before the
@@ -552,9 +586,8 @@ func (b *Browser) NewPage(
 	b.nextID++
 	page.ID = PageID(fmt.Sprintf("page-%d", b.nextID))
 	page.URL = url
-	now := time.Now()
-	page.lastAccess = now
-	b.lastAccess = now
+	page.touch()
+	b.lastAccess = time.Now()
 	b.pages[page.ID] = page
 	return page, nil
 }
@@ -573,6 +606,7 @@ func (b *Browser) NewPage(
 // Best-effort by design.
 func (b *Browser) closeUnregisteredPage(page *Page) {
 	b.stopProxyAuth(page.Rod)
+	b.stopHeaderCleanup(page.Rod)
 	page.stopObservation()
 	closeCtx, cancel := context.WithTimeout(b.baseCtx, closePageTimeout)
 	defer cancel()
@@ -588,38 +622,39 @@ func (b *Browser) closeUnregisteredPage(page *Page) {
 // use.
 //
 // The liveness probe is a network call (Target.getTargetInfo via p.Rod.Info),
-// so it runs outside b.mu and only under the per-page mutex, bound to a short
-// timeout: a dead websocket fails the probe instead of blocking. On probe
+// so it never runs under b.mu or m.mu. It is non-blocking: a page whose
+// operation lock is held is alive by definition, so a busy page is returned
+// without a probe instead of making every lookup wait behind it. On probe
 // failure the dead entry is evicted race-safely (WEB-39 pattern): the handle
 // is captured and nilled under the locks and closed strictly afterwards, so a
 // concurrent sweepOnce or Page lookup never double-closes or panics.
 func (b *Browser) Page(ctx context.Context, id PageID) (*Page, error) {
 	b.mu.Lock()
 	p, ok := b.pages[id]
-	if ok {
-		b.lastAccess = time.Now()
-		p.touch()
-	}
 	b.mu.Unlock()
 	if !ok {
 		return nil, fmt.Errorf("browsers: page %q not found", id)
 	}
+	p.touch()
+	b.touch()
 
 	if err := probePage(p); err != nil {
 		// The tab is dead: evict it (WEB-39 TOCTOU-safe capture pattern).
 		var handle *rod.Page
-		b.mu.Lock()
-		if cur, ok := b.pages[id]; ok && cur == p {
-			p.mu.Lock()
-			p.stopObservation()
-			handle = p.Rod
-			p.Rod = nil
-			delete(b.pages, id)
-			p.mu.Unlock()
+		if unlock, locked := p.TryLock(); locked {
+			b.mu.Lock()
+			if cur, ok := b.pages[id]; ok && cur == p {
+				p.stopObservation()
+				handle = p.Rod
+				p.Rod = nil
+				delete(b.pages, id)
+			}
+			b.mu.Unlock()
+			unlock()
 		}
-		b.mu.Unlock()
 		if handle != nil {
 			b.stopProxyAuth(handle)
+			b.stopHeaderCleanup(handle)
 			// Close the captured handle outside the locks, via closeRodPage
 			// (the sweeper's path): it honors a bound close ctx and converts a
 			// concurrent-close panic into an error — an in-flight tool call on
@@ -631,24 +666,23 @@ func (b *Browser) Page(ctx context.Context, id PageID) (*Page, error) {
 		}
 		return nil, fmt.Errorf("browsers: page %q not found", id)
 	}
-	p.touch()
 	return p, nil
 }
 
 // probePage verifies the page's CDP target is still alive with an Info() round
 // trip, the call that surfaces -32602 "No target with given id found" when the
-// tab crashed while its rod handle survived. It is a network call, so it must
-// never run under b.mu (or m.mu) — only under the page's own mutex, consistent
-// with the tools holding p.Lock() during their rod calls — and it is bound to
-// a short timeout so a dead websocket fails the probe instead of blocking.
-//
-// The probe is deliberately NOT derived from the caller's ctx (mirroring
-// probeBrowser): rod cannot distinguish a caller-cancelled ctx from a dead
-// websocket, so a caller whose ctx expired would wrongly evict a healthy tab.
-// The probe always runs on a fixed 2s timeout off context.Background.
+// tab crashed while its rod handle survived. A page whose operation lock is
+// busy is alive and needs no probe, so this never waits on an in-flight
+// operation. The probe is bound to a short timeout and is deliberately NOT
+// derived from the caller's ctx (mirroring probeBrowser): rod cannot
+// distinguish a caller-cancelled ctx from a dead websocket, so a caller whose
+// ctx expired would wrongly evict a healthy tab.
 func probePage(p *Page) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	unlock, ok := p.TryLock()
+	if !ok {
+		return nil
+	}
+	defer unlock()
 	if p.Rod == nil {
 		return fmt.Errorf("browsers: page rod handle is nil")
 	}
@@ -702,20 +736,14 @@ func (b *Browser) Focus(ctx context.Context, state WindowState) error {
 		b.mu.Unlock()
 		return fmt.Errorf("browsers: focus: browser not launched")
 	}
-	// Collect EVERY live page handle under the locks: map iteration is
+	// Snapshot EVERY live page while holding only b.mu: map iteration is
 	// unordered, and a crashed tab whose rod handle survived (the WEB-47 case)
-	// would fail GetWindow with "No target with given id found". The
-	// candidates are tried in order below until one resolves the OS window, so
-	// a single dead tab cannot block the focus. Holding a *Page is safe: every
-	// access below happens under the page's own lock, under which the eviction
-	// path nils p.Rod.
-	var pages []*Page
+	// would fail GetWindow with "No target with given id found". The candidates
+	// are tried in order below until one resolves the OS window, so a single
+	// dead or busy tab cannot block the focus.
+	pages := make([]*Page, 0, len(b.pages))
 	for _, p := range b.pages {
-		p.mu.Lock()
-		if p.Rod != nil {
-			pages = append(pages, p)
-		}
-		p.mu.Unlock()
+		pages = append(pages, p)
 	}
 	b.mu.Unlock()
 	if len(pages) == 0 {
@@ -723,21 +751,25 @@ func (b *Browser) Focus(ctx context.Context, state WindowState) error {
 	}
 
 	// Bound to the caller's ctx (rod's ctx-aware form; no Must*). The first
-	// candidate that resolves the OS window wins; a dead target's failure is
+	// candidate that resolves the OS window wins; a dead or busy target is
 	// skipped so a healthy tab still resolves the window (all pages share the
 	// same browser window).
 	var win *Page
 	var winBounds *proto.BrowserBounds
 	var lastErr error
 	for _, p := range pages {
-		p.mu.Lock()
+		unlock, ok := p.TryLock()
+		if !ok {
+			lastErr = fmt.Errorf("browsers: focus: page is busy")
+			continue
+		}
 		if p.Rod == nil {
 			lastErr = fmt.Errorf("browsers: focus: page rod handle is nil")
-			p.mu.Unlock()
+			unlock()
 			continue
 		}
 		bounds, err := p.Rod.Context(ctx).GetWindow()
-		p.mu.Unlock()
+		unlock()
 		if err != nil {
 			lastErr = err
 			continue
@@ -750,8 +782,10 @@ func (b *Browser) Focus(ctx context.Context, state WindowState) error {
 		return fmt.Errorf("browsers: focus: no live page window: %w", lastErr)
 	}
 
-	win.mu.Lock()
-	defer win.mu.Unlock()
+	if err := win.LockContext(ctx, "focus"); err != nil {
+		return err
+	}
+	defer win.Unlock()
 	if win.Rod == nil {
 		return fmt.Errorf("browsers: focus: page rod handle is nil")
 	}
@@ -808,39 +842,40 @@ func (b *Browser) Pages() []PageInfo {
 // and releasing its browser tab. The session is evicted unconditionally — even
 // if the underlying tab close fails — so a wedged/dead CDP connection cannot
 // leave a phantom session that session_list keeps reporting (WEB-60 MED-1).
-// The rod handle is captured and nilled under the locks (mirroring
-// Browser.Close) and closed strictly afterwards, outside any lock, so a slow
-// close cannot block other browser operations. The close runs on a fresh
-// timeout (teardownBudget — the same shared budget Browser.Close uses) derived
-// from the manager-owned baseCtx — never the caller's ctx — so a stuck tab
-// close still completes inside one call deadline (WEB-72) and a mid-close
-// request abort cannot surface "context canceled" for a teardown that already
-// succeeded (the caller's ctx is kept only for API symmetry with the other
-// lifecycle methods).
+// The map entry is dropped under b.mu only, so a busy page can never block
+// other browser operations. The operation lock is then taken with a bounded
+// wait off the manager-owned baseCtx (never the caller's ctx) so a stuck tab
+// cannot wedge the close and a canceled request cannot abort a teardown that
+// already succeeded. When the page is still held by an operation after that
+// wait, its tab is left to Browser.Close: the session is already evicted, so
+// session_list stops reporting it immediately (WEB-60 MED-1).
 func (b *Browser) ClosePage(ctx context.Context, id PageID) error {
 	b.mu.Lock()
 	p, ok := b.pages[id]
+	if ok {
+		delete(b.pages, id)
+		b.lastAccess = time.Now()
+	}
+	b.mu.Unlock()
 	if !ok {
-		b.mu.Unlock()
 		return fmt.Errorf("browsers: page %q not found", id)
 	}
-	// Evict unconditionally: capture the handle and nil p.Rod under the
-	// per-page mutex (Browser.Close pattern), then drop the map entry, all
-	// while holding the browser mutex. A wedged close must not keep the
-	// session visible to session_list; the handle is closed outside, below.
-	p.mu.Lock()
+
+	waitCtx, waitCancel := context.WithTimeout(b.baseCtx, teardownBudget)
+	defer waitCancel()
+	if err := p.LockContext(waitCtx, "close page"); err != nil {
+		return nil
+	}
 	p.stopObservation()
 	handle := p.Rod
 	p.Rod = nil
-	delete(b.pages, id)
-	p.mu.Unlock()
-	b.lastAccess = time.Now()
-	b.mu.Unlock()
+	p.Unlock()
 
 	if handle == nil {
 		return nil
 	}
 	b.stopProxyAuth(handle)
+	b.stopHeaderCleanup(handle)
 	closeCtx, cancel := context.WithTimeout(b.baseCtx, teardownBudget)
 	defer cancel()
 	if err := closeRodPage(closeCtx, handle); err != nil {
@@ -865,26 +900,43 @@ func (b *Browser) ClosePage(ctx context.Context, id PageID) error {
 // longer blow a single call deadline, letting the manager's probe-based
 // self-heal complete inside one request (WEB-72).
 func (b *Browser) Close(ctx context.Context) error {
-	// Capture the live page handles (nil-ing p.Rod so no later close can
-	// double-close) and the rod browser under the locks.
+	// Snapshot the pages and the rod browser under b.mu only, then capture each
+	// handle under its own operation lock. A page held by an in-flight
+	// operation is skipped: closing the browser below tears its renderer down
+	// and unblocks that operation, so teardown never waits on a stuck page.
 	b.mu.Lock()
-	var handles []*rod.Page
+	pages := make([]*Page, 0, len(b.pages))
 	for _, p := range b.pages {
-		p.mu.Lock()
+		pages = append(pages, p)
+	}
+	b.pages = make(map[PageID]*Page)
+	authPages := b.authPages
+	b.authPages = make(map[*rod.Page]*proxyAuthPage)
+	headerCleanups := b.headerCleanups
+	b.headerCleanups = make(map[*rod.Page]func())
+	rb := b.rod
+	b.rod = nil
+	b.mu.Unlock()
+
+	handles := make([]*rod.Page, 0, len(pages))
+	for _, p := range pages {
+		unlock, ok := p.TryLock()
+		if !ok {
+			continue
+		}
 		if p.Rod != nil {
 			p.stopObservation()
 			handles = append(handles, p.Rod)
 			p.Rod = nil
 		}
-		p.mu.Unlock()
+		unlock()
 	}
-	b.pages = make(map[PageID]*Page)
-	authPages := b.authPages
-	b.authPages = make(map[*rod.Page]*proxyAuthPage)
-	rb := b.rod
-	b.rod = nil
-	b.mu.Unlock()
 
+	for _, cleanup := range headerCleanups {
+		if cleanup != nil {
+			cleanup()
+		}
+	}
 	for _, a := range authPages {
 		a.cancel()
 	}

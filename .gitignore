@@ -16,3 +16,4 @@ smoketest.md
 .agents/*
 !.agents/skills/
 .agents/skills/go-rod/
+.opencode/*
