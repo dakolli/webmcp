@@ -102,9 +102,7 @@ no bodies. Read the body on demand with `target`:
 ```
 
 Expect `{"seq":N,"method":"POST","url":"https://httpbin.org/post","status":200,"content_type":"application/json","bytes":1143,"body":"{\"args\":{},…}"}`.
-Live evidence from commit `819ba12`. Binary content returns `base64` instead of `body`.
-Read immediately — the browser evicts bodies quickly and then returns the
-no-longer-available error.
+Binary content returns `base64`. Read at once, because bodies are evicted quickly.
 
 ## 9. Check header redaction
 
@@ -115,12 +113,18 @@ no-longer-available error.
 {"tool":"page_fetch","arguments":{"session_id":"page-4","what":"network"}}
 ```
 
-Expect at least one httpbin entry whose `req_headers` carry `"Cookie":"<redacted>"`.
-`Set-Cookie`, `Authorization`, and `X-CSRF-Token` redact the same way. Header maps hold at
-most 32 headers at 512 bytes per value. A cut set adds `req_headers_truncated` or
-`resp_headers_truncated`.
+Expect one httpbin entry with `"Cookie":"<redacted>"` in `req_headers`. `Set-Cookie`,
+`Authorization`, and `X-CSRF-Token` redact the same way.
 
-## 10. Errors and cleanup
+## 10. Capture a screenshot as two blocks
+
+```json
+{"tool":"page_fetch","arguments":{"session_id":"page-1","what":"screenshot","full_page":false}}
+```
+
+Expect two blocks in `result.content`. The text block is `{"ok":true,"data":{"mime_type":"image/png","bytes":91543,"full_page":false,"width":1280,"height":800}}`. The next block is `{"type":"image","data":"<base64 PNG>","mimeType":"image/png"}`. `marks` returns the mark table as text plus the annotated PNG. A client that sends `capabilities.imageContent:false` at `initialize` gets one text block instead. Then `data` holds the data URI.
+
+## 11. Errors and cleanup
 
 A bad selector on `text` returns `{"ok":false,"error":{"type":"unknown","message":"page_fetch: no element matched selector \"#does-not-exist-xyz\""}}`, tested live on 2026-10-26. `element_not_found` is not assigned yet.
 

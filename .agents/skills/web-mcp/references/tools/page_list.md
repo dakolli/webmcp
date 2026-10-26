@@ -2,12 +2,12 @@
 
 # page_list
 
-List the open pages of one browser. Return the id and creation URL of each page.
+List the open pages of one browser. Return the id, creation URL, and context of each page.
 
 ## What it does
 
 `page_list` reads the live page map of one browser. Its `data` payload is a JSON array.
-Each entry holds an `id` and a `url`.
+Each entry holds an `id`, `url`, and `context`.
 
 Use it to audit tabs before you close them. Use it to recover a page id after a lost
 tool result. Use it to confirm that `fetch_page` created a page.
@@ -38,16 +38,17 @@ Cross-cutting rules.
 On success `data` is an array of page objects. Live result for a two-page browser:
 
 ```json
-{"ok":true,"data":[{"id":"page-1","url":"https://react.dev/learn"},{"id":"page-2","url":"https://news.ycombinator.com/news"}]}
+{"ok":true,"data":[{"id":"page-1","url":"https://example.org","context":"attacker"},{"id":"page-2","url":"https://www.iana.org/help/example-domains","context":"victim"}]}
 ```
 
 | Field | Type | Meaning |
 | :--- | :--- | :--- |
 | `id` | string | The session id. Use it with `page_fetch`, `page_act`, and `session_close`. |
 | `url` | string | The URL that `fetch_page` received at creation. This is not the current URL after navigation. |
+| `context` | string | The incognito identity that owns the page. `default` is the browser's own cookie jar. |
 
-The source type is `PageInfo` at `code://pkg/browsers/session.go#L153-L158`. The browser
-sorts the array by `id` as text at `code://pkg/browsers/browser.go#L830-L838`.
+The source type is `PageInfo` at `code://pkg/browsers/session.go#L153-L161`. The browser
+sorts the array by `id` as text at `code://pkg/browsers/browser.go#L1058-L1073`.
 
 - An empty browser returns `{"ok":true,"data":[]}`. Live test: `page_list` on a browser
   before any page returned exactly that.
@@ -65,7 +66,8 @@ sorts the array by `id` as text at `code://pkg/browsers/browser.go#L830-L838`.
 - Test run: `page_list` with `browser-999` returned the unknown envelope below. It created no browser.
 - A dead Chromium is removed on the probe. The call then returns an `unknown` envelope whose message is `page_list: browsers: browser <id> died`.
 - The tool has no side effects on pages. It does not navigate, reload, or focus.
-- There is no title, status, timestamp, or browser field in an entry.
+- There is no title, status, timestamp, or `browser_id` field in an entry. `context` names
+  the identity that owns the page.
 
 ## Failure modes and recovery
 
@@ -122,17 +124,18 @@ string, or a number.
 
 ## Difference from session_list
 
-`session_list` takes no arguments. It calls `Manager.Open`, so it can launch a browser
-for you. Source: `code://pkg/mcp/tools/session_tools.go#L131-L141`.
+`session_list` takes an optional `identity` filter. It reads every live browser through
+`Manager.Sessions`, so it never launches one. Source:
+`code://pkg/mcp/tools/session_tools.go#L146-L160`.
 
-In this build `session_list` resolves a browser for you instead of reading one fixed id.
-See its reference for the resolution rule.
+In this build `session_list` reads every live browser and identity. See its reference for
+the filter rule.
 
 `page_list` never launches a browser. It reports the browser you name. It is the safe
 choice when several browsers are live.
 
-Both tools return the same page objects under `data`. Neither returns a title or a
-timestamp, although the `session_list` description mentions them.
+Both tools return the same page objects under `data`. Both emit `id`, `url`, and `context`.
+Neither emits a title or a timestamp, although the `session_list` description names both.
 
 ## When to use it
 
@@ -153,6 +156,6 @@ Do not use `page_list` when you do not know the browser id. Use `browser_list` f
 - `fetch_page` — opens a new page in a browser. The page then appears in `page_list`.
 - `page_fetch` — reads one page. Use `what: "meta"` for the current URL and title.
 - `session_close` — closes one page. Confirm the browser first.
-- `session_list` — resolves a browser for you and lists its pages. It may launch one.
+- `session_list` — lists pages across every live browser and identity. It never launches one.
 
 Worked example: `.agents/skills/web-mcp/references/examples/page_list_example.md`.

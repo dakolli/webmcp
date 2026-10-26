@@ -4,7 +4,7 @@
 
 Read one aspect of a live page that `fetch_page` opened. It does not navigate, click, or type. The `session_id` picks the tab, `what` picks the aspect.
 
-The payload rides inside the result envelope, so the full reply is `{"ok":true,"data":<payload>}`. See `SKILL.md` for the envelope rules and the `{"ok":false,"error":…}` shape. The payload is one JSON object or array. `html`, `text`, `css`, `js`, and `screenshot` arrive as JSON strings inside `data` with no further wrapper.
+The payload rides inside the result envelope, so the full reply is `{"ok":true,"data":<payload>}`. See `SKILL.md` for the envelope rules and the `{"ok":false,"error":…}` shape. The payload is one JSON object or array. `html`, `text`, `css`, and `js` arrive as JSON strings inside `data` with no further wrapper. `screenshot` and `marks` return one text block plus one image block. Read the image result rule below.
 
 ## Inputs
 
@@ -33,7 +33,7 @@ The live `what` enum has 16 values, in registration order: `html`, `dom`, `text`
 | `css` | JSON array `[{url,type,size}]`, or one resource's source with `target`. | no | yes, text cut |
 | `js` | JSON array `[{url,type,size}]`, or one resource's source with `target`. | no | yes, text cut |
 | `links` | JSON array `[{text,href,handle?}]`. | no | yes, JSON envelope |
-| `screenshot` | `data:image/png;base64,...` string. | no | **no** |
+| `screenshot` | One text block `{mime_type,bytes,full_page,width?,height?}`, then one PNG image block. | no | **no** |
 | `meta` | JSON object `{title,url,meta:[...]}`. | no | yes, JSON envelope |
 | `interactives` | JSON `{interactives:[...],truncated}`. | no | **no** |
 | `a11y` | JSON `{nodes:[...],count,truncated}`. | no | **no** |
@@ -41,10 +41,48 @@ The live `what` enum has 16 values, in registration order: `html`, `dom`, `text`
 | `body` | JSON `{seq,method,url,status,content_type,bytes,truncated}` plus `body` or `base64`. | no | **no** |
 | `console` | JSON `{entries,count,dropped,truncated}`. | no | **no** |
 | `article` | JSON `{title,byline?,excerpt?,text,words,truncated,url}`. | no | **no** |
-| `marks` | JSON `{marks,screenshot,viewport_width,viewport_height,truncated}`. | no | **no** |
+| `marks` | One text block `{marks,viewport_width,viewport_height,truncated}`, then one PNG image block. | no | **no** |
 | `security` | JSON `{url,checks:[{id,status,evidence,detail}],count,truncated}`. | no | **no** |
 
 `dom`, `meta`, and `links` keep their JSON parseable when cut. `css` and `js` do not. Read the truncation matrix below.
+
+### Image results
+
+`screenshot` and `marks` return two content blocks in `result.content`. The first block is text. It holds the standard envelope inside `data`. The second block is the image. It sits beside the text block, never inside `data`. The `screenshot` text block holds these fields:
+
+| Field | Type | Meaning |
+| :--- | :--- | :--- |
+| `mime_type` | string | Always `image/png`. |
+| `bytes` | integer | PNG size in bytes before base64. |
+| `full_page` | boolean | The `full_page` input you sent. |
+| `width` | integer | Pixel width. Present only when the PNG header decodes. |
+| `height` | integer | Pixel height. Present only when the PNG header decodes. |
+
+A live text block looks like this:
+
+```json
+{"ok":true,"data":{"mime_type":"image/png","bytes":91543,"full_page":false,"width":1280,"height":800}}
+```
+
+The image block is a sibling of that text block. It is not wrapped by `ok` or `data`:
+
+```json
+{"type":"image","data":"<base64 PNG>","mimeType":"image/png"}
+```
+
+The `marks` text block holds the old object minus the `screenshot` field. Its fields are `marks`, `viewport_width`, `viewport_height`, and `truncated`. The annotated PNG is the image block. The mark `x` and `y` values still feed `page_act` `click_at`.
+
+### Text-only clients
+
+Image blocks are on by default. MCP defines no standard image capability. A client opts out at `initialize`. It sends `capabilities.imageContent:false`, or `capabilities.experimental.imageContent:false`. The server then sends one text block.
+
+For `screenshot`, `data` becomes the data URI string:
+
+```json
+{"ok":true,"data":"data:image/png;base64,<payload>"}
+```
+
+For `marks`, `data.screenshot` holds that data URI string. The other mark fields are unchanged. Bytes are sent once in every mode. The opt-out is read per SSE session.
 
 ### Tree, list, and report shapes
 
@@ -55,7 +93,7 @@ The live `what` enum has 16 values, in registration order: `html`, `dom`, `text`
 - **`a11y`** holds `handle`, `depth`, `role`, `name`, `value`, `states`, plus `count` and `truncated`. Names and values are clipped at 200 runes. Root frame only.
 - **`network`** entries hold `method`, `url`, `type`, `status`, `mime`, `bytes`, `ms`, `failed`, `error`, `seq`, `req_headers`, `resp_headers`. Each header map keeps at most 32 headers per direction at 512 bytes per value under a 4 KB name+value budget, and a cut set adds `req_headers_truncated` or `resp_headers_truncated`. No bodies. **`console`** entries hold `level`, `text`, `source`, `line`, `seq`.
 - **`body`** adds `body` for UTF-8 text or `base64` plus `content_type` for binary, both exclusive. `bytes` is the pre-cap payload size. `truncated` marks the 256 KB cut.
-- **`marks`** items hold `index`, `role`, `text`, `x`, `y`, `width`, `height`. Coordinates are viewport CSS pixels and can be negative.
+- **`marks`** items hold `index`, `role`, `text`, `x`, `y`, `width`, `height`. Coordinates are viewport CSS pixels and can be negative. The `screenshot` field appears only for a text-only client.
 
 ## Behavior and limits
 
@@ -108,7 +146,7 @@ Evidence names at most 10 offending values, then `(+N more)`. The script, form, 
 
 ### Screenshots and timeouts
 
-`screenshot` returns PNG only, as `data:image/png;base64,...`. There is no format input. `full_page: false` captures the visible viewport. `full_page: true` captures the whole scrollable page on a 90 second budget that is independent of the 30 second bound, and a very tall page can still time out. Large images are not cut by `max_bytes` — a 400x300 full-page capture produced over 87 KB of base64. Prefer a small viewport for `marks`.
+`screenshot` returns PNG only, as an image block plus a metadata text block. There is no format input. `full_page: false` captures the visible viewport. `full_page: true` captures the whole scrollable page on a 90 second budget that is independent of the 30 second bound, and a very tall page can still time out. Large images are not cut by `max_bytes` — a 400x300 full-page capture produced over 87 KB of base64. Prefer a small viewport for `marks`.
 
 ## Truncation matrix
 

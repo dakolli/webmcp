@@ -2,40 +2,36 @@
 
 # session_list
 
-List the live sessions the manager resolves for you. Return a JSON array of page ids and
-URLs.
+List every live session across every live browser and identity. Return a JSON array of page
+ids, URLs, and contexts.
 
 ## What it does
 
-`session_list` reads the live page map of one browser and returns it under `data`. Each
-entry holds a page `id` and a `url`.
+`session_list` reads the live page maps of every live browser and identity. It returns them
+under `data`. Each entry holds a page `id`, `url`, and `context`.
 
 A session is one browser tab. The id is the address that `page_fetch`, `page_act`, and
 `session_close` use. A session stays live across navigations, redirects, and tool calls.
 
-The tool takes no arguments.
+The tool takes one optional `identity` filter. Send `{}` to list every identity.
 
-**Scope.** The tool does not read one fixed id. The manager resolves a browser for the
-caller: your own browser first, then an unowned default, else it launches one for you.
-Live test: no `browser-1` was running and two unowned browsers were live. `session_list`
-returned the pages of `browser-3`, an unowned browser created by another client. Which
-candidate wins is not deterministic. Use `page_list` with an explicit `browser_id` when
-the answer must be exact.
-
-The tool also has a side effect. It can launch Chromium. See Behavior and limits.
+**Scope.** The tool reads every live browser and every identity in one snapshot. It never
+resolves a single browser and never launches Chromium. With no browser running it returns
+`{"ok":true,"data":[]}`. Use `page_list` with an explicit `browser_id` when you need one
+browser only.
 
 ## Inputs
 
 | Name | Type | Required | Default | Meaning |
 | :--- | :--- | :--- | :--- | :--- |
-| none | — | — | — | The tool declares no properties and no required fields. |
+| `identity` | string | no | none, lists every identity | Optional incognito identity filter. Lookup only. An unknown name fails and is never created. |
 
-Send an empty object as the argument. The schema is `{"type":"object","properties":{}}`
-with no `required` list. The source is `code://pkg/mcp/tools/session_tools.go#L121-L126`.
+Send `{}` as the argument to list every identity. Send `{"identity":"victim"}` for one. The
+schema is `code://pkg/mcp/tools/session_tools.go#L125-L135`. The handler is
+`code://pkg/mcp/tools/session_tools.go#L146-L160`.
 
-The handler does not decode its arguments. The source is
-`code://pkg/mcp/tools/session_tools.go#L131-L141`. A host that forwards an unknown
-property gets the same result. Do not send options. The tool accepts none.
+The handler decodes one optional `identity` string and passes it to `Manager.Sessions`.
+That trims the string, and an empty string lists all.
 
 ## Returns
 
@@ -46,35 +42,33 @@ Cross-cutting rules.
 On success `data` is an array of page objects. Live result:
 
 ```json
-{"ok":true,"data":[{"id":"page-1","url":"https://news.ycombinator.com/news"}]}
+{"ok":true,"data":[{"id":"page-1","url":"https://example.org","context":"attacker"},{"id":"page-1","url":"https://news.ycombinator.com/news","context":"attacker"},{"id":"page-2","url":"https://www.iana.org/help/example-domains","context":"victim"},{"id":"page-2","url":"https://news.ycombinator.com/news?p=2","context":"victim"},{"id":"page-3","url":"https://developer.mozilla.org/en-US/docs/Web/API/Window/localStorage","context":"default"}]}
 ```
 
 | Field | Type | Meaning |
 | :--- | :--- | :--- |
 | `id` | string | The session id. Use it with `page_fetch`, `page_act`, and `session_close`. |
 | `url` | string | The URL that `fetch_page` received when it created the page. It is not the current URL. |
+| `context` | string | The incognito identity that owns the page. `default` is the browser's own cookie jar. |
 
-Two fields exist. The tool description also mentions a title and timestamps. The code
-emits neither. The returned struct holds `id` and `url` only
-(`code://pkg/browsers/session.go#L153-L158`).
+The code emits three fields: `id`, `url`, and `context`. It emits no title and no timestamp.
+Source: `code://pkg/browsers/session.go#L153-L161`. The tool description still names title
+and timestamps, and the code omits them.
 
 The server sorts entries by `id` as text. A browser with more than nine pages lists
-`page-10` before `page-2`.
+`page-10` before `page-2`. Two browsers can both hold a `page-1`, so ids can repeat.
 
-An empty resolution returns `{"ok":true,"data":[]}`. That means the resolved browser holds
-no pages. It does not mean the server has no pages.
+An empty array means no live browser holds a page.
 
 ## Behavior and limits
 
-- **Resolution, not `browser-1`.** The handler calls `Manager.Open`
-  (`code://pkg/mcp/tools/session_tools.go#L132`). `Manager.Open` resolves your own browser
-  first, then an unowned default, else it launches one for you
-  (`code://pkg/browsers/manager.go#L723-L744`). It never returns a browser owned by
-  another client. Live test: see Scope above.
-- **It can launch Chromium.** With nothing to resolve, the call launches a browser keyed
-  to your owner. On `serve mcp` that browser gets an ephemeral profile
-  (`code://pkg/browsers/manager.go#L715-L721`). Call `browser_create` first when you want
-  to control the launch options. This launch path was not observed live.
+- **Aggregation, not one browser.** The handler calls `Manager.Sessions`
+  (`code://pkg/mcp/tools/session_tools.go#L151`). That reads every live browser and every
+  identity, then sorts the pages by `id` (`code://pkg/browsers/manager.go#L1016-L1041`).
+- **It never launches Chromium.** `Manager.Sessions` reads `Manager.Browsers` and never
+  calls `Open` or `OpenBrowser` (`code://pkg/browsers/manager.go#L1016-L1021`).
+- **The identity filter is lookup only.** An unknown name fails with the live names and is
+  never created (`code://pkg/browsers/manager.go#L1029-L1032`).
 - **Read only on pages.** The tool does not navigate, reload, focus, or close. It copies
   the page map under the browser lock.
 - **The URL is stale after navigation.** The `url` field is the creation URL, not the live
@@ -96,28 +90,21 @@ Every failure is one envelope:
 {"ok":false,"error":{"type":<type>,"message":"session_list: …","hint":"<one-line fix>"}}
 ```
 
-The message starts with `session_list: `. The tool decodes no arguments, so there is no
-`invalid_args` path. Failures come from the engine launch or shutdown and are typed
-`unknown`.
+The message starts with `session_list: `. The `invalid_args` paths are a malformed argument
+object and an unknown `identity`. Listing never launches or probes a browser.
 
-**The server is shutting down.** Typed `unknown`, message
-`session_list: browsers: manager has been shut down`. This path was not run live. The
-message comes from `code://pkg/browsers/manager.go#L749`. Recovery: restart the MCP
-server. Do not retry the call.
+**Unknown identity.** `session_list` looks the name up and does not create it. Live result:
 
-**The launch fails.** Typed `unknown`, message
-`session_list: browsers: launch browser <id>: <cause>`
-(`code://pkg/browsers/manager.go#L841`). This path was not run live. Recovery: read the
-cause. A bad binary path or a full disk stops the launch. Fix the server configuration.
+```json
+{"ok":false,"error":{"type":"invalid_args","message":"session_list: browsers: unknown identity \"ghost\" (known: attacker, default, victim)","hint":"fix the arguments per the tool InputSchema (required fields, enum values)"}}
+```
 
-**The profile cannot resolve.** Typed `unknown`, message
-`session_list: browsers: resolve profile for <id>: <cause>`
-(`code://pkg/browsers/manager.go#L809`). This path was not run live. Recovery: fix the
-profile directory in the `browser-mcp` config directory. Then retry.
+The `known:` list holds the live names plus `default`. Recovery: call `session_list` with
+`{}` first, then reuse a name from a `context` value. Never guess a name.
 
 **A session is missing from the array.** A page id from an earlier call does not appear.
-The tab may be closed, swept, or resolved into a different browser this time. Confirm a
-stale id with `page_fetch`. Both stale messages are typed `page_closed`:
+The tab may be closed, swept, or present in another browser. Confirm a stale id with
+`page_fetch`. Both stale messages are typed `page_closed`:
 
 ```
 page_fetch: session "page-2" not found
@@ -127,35 +114,28 @@ page_fetch: session "page-2" not found
 page_fetch: session "page-1" no longer exists: browser was restarted; call fetch_page to re-open URLs
 ```
 
-The second message was not run live. It comes from `code://pkg/browsers/manager.go#L1169`.
+The second message was not run live. It comes from `code://pkg/browsers/manager.go#L1245`.
 Recovery: the tab is gone. Call `fetch_page` and use the new id.
 
 ## How to find stale sessions
 
-1. Call `session_list` and note the resolved browser's pages.
-2. Call `browser_list` and collect every live browser id.
-3. Call `page_list` for each browser id that matters to you.
-4. Mark every id in your transcript that appears in none of the results as stale.
-5. Confirm a stale id with `page_fetch`. Do not close a tab on a guess.
-
-A closed or swept session leaves the map at once. A later call for it fails.
+1. Call `session_list` and `page_list` for every browser that matters.
+2. Mark each id in your transcript that appears in neither result as stale.
+3. Confirm a stale id with `page_fetch` before you close anything.
 
 ## When not to use it
 
-Do not use `session_list` when you need the exact page set of one browser. Its resolution
-is not deterministic with several candidates. Use `page_list` with the id from
-`browser_create`.
+Do not use `session_list` when you need the page set of one browser. It aggregates every
+live browser. Use `page_list` with the id from `browser_create`.
 
 Do not use it to list browsers. Use `browser_list`.
 
-Do not use it to prove that your own tabs are alive if you did not create a browser. The
-resolution can hand you an unowned browser that is not yours. Create a browser first,
-then use `page_list`.
+Do not use it to prove that your own tabs are alive. It includes every live browser, so
+another agent's pages appear too. Create a browser first, then use `page_list`.
 
 Do not use it to get the current URL or title. Use `page_fetch` with `what: "meta"`.
 Do not use it to read page content. Use `page_fetch`.
-Do not call it in a loop to watch for changes. Each call is a snapshot and each call can
-launch Chromium.
+Do not call it in a loop to watch for changes. Each call is a snapshot and nothing launches.
 
 ## Related tools
 

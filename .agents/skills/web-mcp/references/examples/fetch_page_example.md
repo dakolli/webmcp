@@ -64,7 +64,17 @@ rule in [fetch_page.md](../tools/fetch_page.md).
 The tab number depends on your session count. The timeout closes the tab. Do not reuse
 that id.
 
-## 6. Clean up
+## 6. Open a page as a second identity
+
+```json
+{"tool":"fetch_page","arguments":{"url":"https://example.org","identity":"victim","browser_id":"browser-4"}}
+```
+
+Expect a new `data.session_id` on the same `browser_id`. Expect a `page_list` entry with
+`"context":"victim"`. A cookie set under `default` is absent under `victim`. Replace this
+call's expected values with the output of your live run before you mark the file `tested`.
+
+## 7. Clean up
 
 ```json
 {"tool":"browser_close","arguments":{"browser_id":"browser-4"}}

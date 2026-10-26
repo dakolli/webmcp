@@ -15,12 +15,11 @@ branch is in `SKILL.md` under Cross-cutting rules.
 ```
 
 ```json
-{"ok":true,"data":[{"id":"page-1","url":"https://news.ycombinator.com/news"}]}
+{"ok":true,"data":[{"id":"page-1","url":"https://news.ycombinator.com/news","context":"default"}]}
 ```
 
-This run had no `browser-1`. The manager resolved an unowned default browser created by
-another client and returned its pages. Several unowned candidates resolve in an
-unspecified order. Use `page_list` when the answer must be exact.
+This run had one live page. The tool reads every live browser and identity, so a shared
+session can show more. Use `page_list` when the answer must be exact.
 
 ## 2. Create a browser you own
 
@@ -44,32 +43,31 @@ Record the `browser_id` inside `data`. The number varies.
 {"ok":true,"data":{"session_id":"page-1","title":"Quick Start – React","url":"https://react.dev/learn","text_snippet":"React\nv19.3\nSearch\nCtrl\nK\n…","html_bytes":285239,"load_ms":2760}}
 ```
 
-## 4. session_list is not guaranteed to show your page
+## 4. session_list shows every live page
 
-Another unowned browser can win the resolution. The exact answer for your browser is:
+The call aggregates every browser and identity. The exact answer for one browser is:
 
 ```json
 {"tool":"page_list","arguments":{"browser_id":"browser-4"}}
 ```
 
 ```json
-{"ok":true,"data":[{"id":"page-1","url":"https://react.dev/learn"}]}
+{"ok":true,"data":[{"id":"page-1","url":"https://react.dev/learn","context":"default"}]}
 ```
 
-## 5. Failure: unknown id
+## 5. Failure: unknown identity
 
-`session_list` takes no arguments, so it has no argument failure. The failure you will
-meet through its siblings is an unknown id. Live result through `page_list`:
+`session_list` looks the identity up and never creates it. Live result:
 
 ```json
-{"tool":"page_list","arguments":{"browser_id":"browser-999"}}
+{"tool":"session_list","arguments":{"identity":"ghost"}}
 ```
 
 ```json
-{"ok":false,"error":{"type":"unknown","message":"page_list: browser \"browser-999\" not found (running: browser-3 (owner: unowned), browser-4 (owner: unowned)): unknown browser"}}
+{"ok":false,"error":{"type":"invalid_args","message":"session_list: browsers: unknown identity \"ghost\" (known: attacker, default, victim)","hint":"fix the arguments per the tool InputSchema (required fields, enum values)"}}
 ```
 
-Recovery: call `browser_list` and copy a live id from `data`.
+Recovery: call `session_list` with `{}` and copy a live name from a `context` value.
 
 ## 6. Clean up
 
@@ -85,9 +83,9 @@ Recovery: call `browser_list` and copy a live id from `data`.
 
 ## 7. Find stale sessions
 
-1. Call `browser_list` for every live browser id.
-2. Call `page_list` for each of those ids.
-3. Mark every id in your transcript that appears in none of the results as stale.
+1. Call `session_list` with `{}` and note every page.
+2. Call `page_list` for each live browser id that matters.
+3. Mark each id in your transcript that appears in neither result as stale.
 4. Confirm a suspect id with `page_fetch`. Both stale messages are typed `page_closed`:
 
 ```

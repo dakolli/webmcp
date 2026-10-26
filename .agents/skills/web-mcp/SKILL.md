@@ -31,6 +31,8 @@ Do not invent parameters. The Go source in `pkg/mcp/tools/` is the schema source
 
 - **Browser** (`browser_id`, for example `browser-1`). One Chromium process and one profile.
 - **Session** (`session_id`, for example `page-1`). One live tab inside a browser.
+- **Context** (`identity`). One incognito cookie jar inside a browser. `default` is that
+  browser's own jar. Every name dies with its browser.
 - `browser-1` is the first id minted. It is not a shared singleton.
 - The ephemeral profile lives under `~/.config/browser-mcp/profiles/.ephemeral/` and is removed on close.
 - A persistent profile needs `persist:true` and a `profile` name.
@@ -60,7 +62,7 @@ Do not invent parameters. The Go source in `pkg/mcp/tools/` is the schema source
 3. Never close `browser-1` unless the user asks for a full reset. Never call `browser_close` with an empty `browser_id` in a shared session. A misspelled `browser` key is ignored and becomes an empty id. Use the exact key `browser_id`.
 4. Use one browser per agent and task. Page ids collide across browsers, and `page_fetch` and `page_act` resolve an id across live browsers.
 5. `session_close` is not browser-scoped. It closes the tab in the default browser. For a tab in a secondary browser, use `browser_close` with your own id.
-6. `session_list` reports the default browser only. Use `page_list` with a required `browser_id` for any other browser. `page_list` shows the creation URL, not the live URL. Use `page_fetch` with `what:"meta"` for the live URL.
+6. `session_list` reads every live browser and identity. Use `page_list` with a required `browser_id` for one browser. Both show the creation URL, not the live URL. Use `page_fetch` with `what:"meta"` for the live URL.
 7. An unknown `browser_id` can create a new browser. A typo spends a full Chromium process. Verify the id first.
 8. `fetch_page` creates a new session on every call. Close sessions you no longer need.
 9. `page_fetch` network and console capture is cumulative from page creation. Call `page_act` `clear_logs` before the step you want to observe.
@@ -71,6 +73,25 @@ Do not invent parameters. The Go source in `pkg/mcp/tools/` is the schema source
 14. Prefer `article` over `text` for prose pages. Prefer `interactives` or `a11y` before you act.
 15. `browser_close` is not idempotent. A second close returns a not-found error. Check `browser_list` first.
 
+## Incognito identities
+
+One browser can hold several isolated cookie jars. `fetch_page` `identity` picks one. The
+name `default` is the browser's own jar. A new name is created on first use.
+
+**Two-account IDOR recipe.**
+
+1. Call `fetch_page` with `{"url":"<object-url>","identity":"attacker"}`.
+2. Record the object id from `page_fetch` `what:"network"` or `what:"interactives"`.
+3. Call `fetch_page` with `{"url":"<same-object-url>","identity":"victim"}`.
+4. Compare the two responses. A victim response for the attacker's object is an IDOR.
+5. Close the browser. Every identity dies with it.
+
+A second identity is cheaper than a second browser. It shares one Chromium process, so it
+costs one context and no launch time.
+
+`fetch_page` creates a name on first use. `session_list` with `identity` is lookup only and
+refuses an unknown name.
+
 ## Result envelope
 
 Every tool returns one JSON envelope. Success puts the payload inside `data`:
@@ -80,6 +101,8 @@ Every tool returns one JSON envelope. Success puts the payload inside `data`:
 ```
 
 `data` is the JSON object or array shown in each tool reference. Prose results, such as the `browser_close` replies, become a JSON string inside `data`, for example `{"ok":true,"data":"browser browser-2 closed"}`.
+
+An image-bearing result is different. `page_fetch` `screenshot` and `marks` return one text block with `{"ok":true,"data":<metadata>}` and one image block beside it. The image block is `{"type":"image","data":<base64>,"mimeType":"image/png"}`. It is never inside `data`. A client opts out at `initialize` with `capabilities.imageContent:false` or `capabilities.experimental.imageContent:false`. It then gets one text block with the data URI under `data` or `data.screenshot`.
 
 Failure puts the error branch inside `error`:
 

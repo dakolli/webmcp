@@ -60,7 +60,7 @@ The full payloads also hold a `text_snippet` field. `fetch_page` reports the fin
 ```
 
 ```json
-{"ok":true,"data":[{"id":"page-1","url":"https://react.dev/learn"},{"id":"page-2","url":"https://news.ycombinator.com/news"}]}
+{"ok":true,"data":[{"id":"page-1","url":"https://react.dev/learn","context":"default"},{"id":"page-2","url":"https://news.ycombinator.com/news","context":"default"}]}
 ```
 
 Read `id` from `data`. Use it with `page_fetch` and `page_act`.

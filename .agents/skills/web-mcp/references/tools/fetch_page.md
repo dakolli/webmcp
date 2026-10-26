@@ -21,12 +21,13 @@ you want to control the launch options.
 
 ## Inputs
 
-`url` is the only required input. Schema source: `code://pkg/mcp/tools/fetch.go#L55-L102`.
+`url` is the only required input. Schema source: `code://pkg/mcp/tools/fetch.go#L62-L118`.
 
 | Name | Type | Required | Default | Meaning |
 | :--- | :--- | :--- | :--- | :--- |
 | `url` | string | yes | — | Absolute URL. The schema says http or https. The code does not enforce a scheme. |
 | `browser_id` | string | no | default browser | Target browser, for example `browser-16`. A dead id gets relaunched. An **unknown** id gets created. |
+| `identity` | string | no | `default` | Incognito context inside the target browser. A new name is created on first use. Cookies and storage stay separate from `default`. |
 | `wait_for` | string | no | `idle` | Readiness mode: `load`, `idle`, or `stable`. |
 | `timeout_ms` | integer | no | `30000` | Bound for the whole call. `0` means the default. A negative value is rejected. |
 | `viewport` | object | no | none | Manual `{"width":<int>,"height":<int>}` in CSS pixels. Both values must be positive. |
@@ -87,13 +88,12 @@ cold Chromium download and a launch that no live browser can serve.
 expired id returns a `page_closed` envelope. A relaunch after a Chromium death makes old
 session ids fail with a "browser was restarted" error, also typed `page_closed`.
 
-**`browser_id` is not checked.** Live test: `{"browser_id":"browser-999"}` did not fail.
-It launched a browser with the literal id `browser-999` and an ephemeral profile. A typo
-spends a full Chromium process. Confirm the id with `browser_list` first.
+**Identities.** One browser holds several incognito contexts. `identity` picks one. A new
+name is created on first use and reused. Each name keeps its own cookies and storage in the
+same Chromium process. Closing the browser disposes every identity. Engine seam:
+`code://pkg/browsers/browser.go#L239`. Call site: `code://pkg/mcp/tools/fetch.go#L228-L229`. Example call: `{ "url": "https://app.test/orders", "identity": "victim" }`.
 
-**Session ids collide across browsers.** Every browser numbers its tabs from `page-1`.
-The manager resolves a page id by scanning browsers, not by ownership. Keep one browser
-per task to avoid closing or reading the wrong tab.
+**Bad identity name.** Typed `invalid_args`. Exact message: `fetch_page: browsers: invalid identity "bad name" — use 1 to 64 characters from A-Z, a-z, 0-9, '.', '_' and '-' only`. A well-formed unknown name is created, never rejected.
 
 **The summary is small by design.** It never returns the full HTML. Use `page_fetch` with
 `what:"html"` or `max_bytes` to read content. Two calls for one URL make two tabs, so
@@ -171,7 +171,7 @@ Do not close a tab with it. Use `session_close` or `browser_close`.
 - `page_fetch` — read html, dom, text, links, meta, and other aspects of the session.
 - `page_act` — click, type, press keys, evaluate JS, and navigate inside the session.
 - `page_list` — list the pages of one browser. Confirm your new page here.
-- `session_list` — list the live sessions the manager resolves for you.
+- `session_list` — list pages across every live browser and identity.
 - `session_close` — close one page.
 - `browser_create` — create an isolated browser with its own profile.
 - `browser_list` — list live browsers, their absolute `profile_dir`, and their pages.
