@@ -120,7 +120,7 @@ Connect an MCP client:
 - Tracer: `sinks` reports source-to-sink hits. It is read-only. Arm it with `page_act sinks_install`.
 - Export: `har` returns HAR 1.2 for the observed network traffic.
 
-### Actions: `page_act` has 35 actions
+### Actions: `page_act` has 36 actions
 
 - Mouse: `click`, `click_at`, `hover`, `hover_at`, `drag_and_drop`.
 - Keyboard: `input`, `type`, `press_key` with combos such as `Control+a`.
@@ -131,6 +131,11 @@ Connect an MCP client:
 - Tracer: `sinks_install`, `sinks_clear`. Both take no payload.
 - Network: `replay`, `replay_fuzz`, `intercept_add`, `intercept_list`, `intercept_clear`.
 - Auth: `auth_save`, `auth_restore`, `auth_list`. Results carry counts only.
+- Evidence: `poc_bundle` packages one finding into a directory. `value` is the finding title,
+  `paths[0]` is an absolute output directory, and `target` optionally picks the captured request.
+  It writes `meta.json`, `request.http`, `response.http`, `screenshot.png`, `dom.html`,
+  `storage.json`, `README.md`, and `sinks.json` only when the tracer was armed. A relative path or a
+  non-empty directory is refused, and sensitive headers stay `<redacted>` unless secret capture is on.
 
 ### Surfaces
 
@@ -152,6 +157,14 @@ Use these on a target you are authorized to test.
    ```
 3. `page_fetch what=sinks` reports `source`, `sink`, `value`, the call stack, and the selector.
 4. `page_act sinks_clear` empties the ring. `browser_close` ends the test.
+5. `page_act poc_bundle` packages the whole run as evidence for a report:
+   ```sh
+   browser page act last poc_bundle --value "Stored XSS in search" --paths /tmp/poc-1
+   ```
+   It writes the request/response pair, a viewport screenshot, the DOM, storage, the sink ring when
+   armed, `meta.json`, and a `README.md` index into the directory, then prints the directory and one
+   line per file. A relative path or a non-empty directory is refused. Cookies and auth headers stay
+   `<redacted>` unless secret capture is on.
 
 The arm survives a full navigation. The hit ring restarts for each document.
 `page_fetch what=har` exports the observed traffic for Burp, Caido, or ZAP.
@@ -345,6 +358,7 @@ browser page fetch last har --out traffic.har  # write HAR 1.2, print the path +
 browser page fetch https://app.test/login --identity attacker
 browser page act click ".titleline a"
 browser page act replay "api.example.com/session" --method PUT --value '{"role":"admin"}'
+browser page act last poc_bundle --value "Stored XSS" --paths /tmp/poc-1
 browser page act last clear_logs
 browser page close last
 ```

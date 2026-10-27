@@ -65,7 +65,7 @@ Install or refresh this skill with `browser skill <harness|path|.>`. With no arg
 
 1. Call `browser_list` before you use a `browser_id`. Confirm the id and its `profile_dir`.
 2. If your client does not show `persist` or `owner`, reconnect it before you create a browser. Reconnect it when a cached `page_fetch` `what` enum lacks `har`, `postmessage`, `sinks`, `storage`, `tables`, `forms`, or `websocket`, because the live enum has 23 values. A cached client schema can also omit the new `browser_id` and `owner` inputs, so reconnect the client after a server build.
-3. Never close `browser-1` unless the user asks for a full reset. Never call `browser_close` with an empty `browser_id` in a shared session. A misspelled `browser` key is ignored and becomes an empty id. Use the exact key `browser_id`.
+3. Never close a browser you did not create, and close your own by id when done. Never call `browser_close` with an empty `browser_id` in a shared session. A misspelled `browser` key is ignored and becomes an empty id. Use the exact key `browser_id`.
 4. Use one browser per agent and task. Page ids are unique per browser, so two owners can both hold `page-1`. With one live browser a bare id resolves. With two or more live browsers a bare id returns `invalid_args`, and the message names every browser and owner.
 5. `page_fetch`, `page_act`, and `session_close` take optional `browser_id` and `owner`. A session held outside the declared owner returns `not_found`, names the holder, and returns no content. Pass `browser_id` to cross on purpose.
 6. `session_list` reads every live browser and identity. Use `page_list` with a required `browser_id` for one browser. Both report the live URL and title, refreshed after navigation and redirects.
@@ -86,6 +86,20 @@ Install or refresh this skill with `browser skill <harness|path|.>`. With no arg
 21. `browser_create` rate-limits each host with `rps` (default 5) and `burst` (default 10), and both join the create key. A request that cannot get a token before its deadline fails as `timeout` with `the next request slot is … away`. The effective policy rides `limits:{rps,burst,hosts:[{host,throttled}]}` on every create result and every `browser_list` entry.
 22. Scope is not navigation-only. It gates `fetch_page`, `page_act navigate`, `replay` and `replay_fuzz` hops, and intercepted subresources. The engine refuses an out-of-scope request before it is sent. A navigation HTTP redirect is not re-checked, while replay hops and paused subresources are.
 23. Pointer and keyboard actions (`click`, `click_at`, `input`, `hover`, `hover_at`, `press_key`) are humanized by default: stepped, jittered pointer movement and a randomized 100-500 ms pause. A sub-second `timeout_ms` can expire in that pause and leave the action unperformed, so pass at least 1000 ms or `raw:true`. Any one hatch disables it: per-call `raw:true`, `WEB_MCP_RAW_ACTIONS=1` in the server environment, or the server started with raw actions.
+24. `page_act` `poc_bundle` packages one finding as an evidence directory. Inputs: `value` (the finding title), `paths` (an array whose first entry is an absolute output directory), and optional `target` (a `seq` or request-URL substring; omit it for the main document request). It writes `meta.json`, `request.http`, `response.http`, `screenshot.png`, `dom.html` (2 MB cap), `storage.json`, `README.md`, and `sinks.json` only when the tracer is installed. The result is `{directory,files:[{name,bytes}],omitted:[{name,reason}]}`. A relative path or a non-empty directory is refused, and Cookie, Set-Cookie, Authorization and X-CSRF-Token values stay `<redacted>` unless secret capture is on.
+
+## Bounty loop
+
+Use this loop on a target you are authorized to test. Find, confirm, bundle, attach.
+
+1. **Find.** `page_fetch` `what=interactives` or `what=security`, or drive the form with `page_act`. Watch `what=network` and `what=console` after `clear_logs`.
+2. **Confirm.** Reproduce the trigger in a clean page and prove reachability. Arm `sinks_install` before the payload and read `what=sinks`, or use `inject_canary` for a one-shot proof. Re-read `what=storage` to show what the session exposed.
+3. **Bundle.** `page_act` `poc_bundle` with the finding title and an empty absolute directory. It captures the request/response pair, screenshot, DOM, storage and (when armed) the sink ring, and writes a `README.md` index. Pass `target` to pin the one request that proves the finding.
+4. **Attach.** Hand the directory to the report. The request/response pair imports directly into a proxy, and `README.md` lists every artifact with its byte count. `omitted` tells you what was not captured: `not installed`, `no body`, `cap reached` or `secrets hidden`.
+
+```sh
+browser page act last poc_bundle --value "Stored XSS in search" --paths /tmp/poc-1
+```
 
 ## Incognito identities
 
@@ -169,6 +183,7 @@ Keep these shapes in the rotation, with a new host each time:
 ## Maintainer status
 
 - All 9 tools have a tested reference and an example.
+- `poc_bundle` is on the tool surface: one call captures the request/response pair, screenshot, DOM, storage, sink ring (when armed) and a README index for a report.
 - The result envelope is documented once here and referenced from every tool page.
 - Lifecycle, proxy, scope, headers, `what=body`, `what=security` and `page_act replay` are documented.
 - `sinks` is on the tool surface: `sinks_install` → `what=sinks` → `sinks_clear`. `inject_canary` is on the tool surface: `sinks_install` → `inject_canary` → `hits`.

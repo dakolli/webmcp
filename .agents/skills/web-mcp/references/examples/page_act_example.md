@@ -189,6 +189,32 @@ Log in on `www.saucedemo.com`, save the session, close the browser, then restore
 
 Expect the login click to land on `https://www.saucedemo.com/inventory.html` with title `Swag Labs`. `auth_save` returns `{"site":"www.saucedemo.com","name":"main","cookies":N,"origins":1,"user_agent":"…","updated_at":"…","warning":"auth snapshots are stored unencrypted in the local state database (mode 0600) …"}`. `auth_list` needs no session: it answers with a stale `session_id` and with no live browser, returning `{"snapshots":[{"site":"www.saucedemo.com","name":"main","cookie_count":N,"origin_count":1,"user_agent":"…","updated_at":"…"}],"count":1,"warning":"…"}` and never a value. `auth_restore` returns counts plus `forced:false` and the same `warning`, and the new identity renders the inventory page. The host-only `session-username` cookie stays scoped to `www.saucedemo.com` after restore. The store is plaintext with mode 0600, so the `warning` is the only confidentiality signal. Verified live on 2026-10-27.
 
+## 11b. Bundle a finding as a PoC
+
+After you confirm a finding, package it in one call. `value` is the finding title and `paths[0]` is an empty absolute directory:
+
+```json
+{"tool":"page_act","arguments":{"session_id":"page-6","action":"poc_bundle","value":"Stored XSS in search","paths":["/tmp/poc-xss"]}}
+```
+
+Expect a compact JSON result:
+
+```json
+{"directory":"/tmp/poc-xss","files":[{"name":"meta.json","bytes":231},{"name":"request.http","bytes":812},{"name":"response.http","bytes":1044},{"name":"screenshot.png","bytes":48120},{"name":"dom.html","bytes":9321},{"name":"storage.json","bytes":407},{"name":"README.md","bytes":318}],"omitted":[{"name":"sinks.json","reason":"not installed"}]}
+```
+
+The directory holds `meta.json`, `request.http`, `response.http`, `screenshot.png`, `dom.html`, `storage.json` and `README.md`, all mode 0600. Run `sinks_install` before the payload to add `sinks.json` and prove source-to-sink reachability. Pass `target` (a `seq` or URL substring) to pin the request that proves the finding instead of the main document.
+
+A relative path is refused with `poc_bundle: "poc-xss" must be absolute`. A non-empty directory is refused with `poc_bundle: /tmp/poc-xss is not empty — pass a new directory or remove its contents`. Cookie, Set-Cookie, Authorization and X-CSRF-Token header values stay `<redacted>` unless the page opted into secret capture. A redacted header value produces `{"name":"secret values","reason":"secrets hidden"}` in `omitted`; secret capture suppresses that row.
+
+From a shell with the daemon up:
+
+```sh
+browser page act last poc_bundle --value "Stored XSS in search" --paths /tmp/poc-xss
+```
+
+It prints the directory and one line per file.
+
 ## 12. Clean up
 
 ```json

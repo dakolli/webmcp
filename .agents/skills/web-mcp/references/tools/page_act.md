@@ -22,9 +22,9 @@ The schema is `code://pkg/mcp/tools/act.go#L125`. Only `session_id` and `action`
 | `owner` | string | no | — | Optional. Restrict the lookup to browsers with this owner label, 1 to 64 characters of `A-Z`, `a-z`, `0-9`, `.`, `_`, `-`. |
 | `selector` | string | `click`, `input`, `type`, `hover`, `select`, `upload_file` | — | CSS selector or XPath. Optional for `press_key` and the drag source. |
 | `handle` | string | alternative to `selector` | — | Handle from `page_fetch` `what=interactives\|dom\|links`. Wins over `selector`. |
-| `value` | string | `eval`, `navigate`, `input`, `type`, `select`, `replay`, `post_message` | — | Payload text, JavaScript source, URL, option value, or message payload. For `replay` it replaces the request body and is sent only when the field is present. For `inject_canary` it is a custom canary. Omit it to mint `wm-canary-<8 hex>`. |
+| `value` | string | `eval`, `navigate`, `input`, `type`, `select`, `replay`, `post_message`, `poc_bundle` | — | Payload text, JavaScript source, URL, option value, message payload, or the `poc_bundle` finding title. For `replay` it replaces the request body and is sent only when the field is present. For `inject_canary` it is a custom canary. Omit it to mint `wm-canary-<8 hex>`. |
 | `targets` | array | `inject_canary` (optional) | all four | Injection points: `query`, `hash`, `postmessage`, `name`. Each entry may be a comma-separated list. |
-| `target` | string | `replay`, `replay_fuzz` | — | Captured network entry: a `seq` number or a substring of the request URL. |
+| `target` | string | `replay`, `replay_fuzz`, `poc_bundle` | — | Captured network entry: a `seq` number or a substring of the request URL. |
 | `method` | string | `replay` (optional) | — | HTTP method override, for example `PUT`. Omit to keep the captured method. |
 | `headers` | object | `replay` (optional) | — | `replay` only: each named header replaces the captured value on the resent request, others keep theirs. It does not set headers on page requests; use `browser_create` `headers` for browser-wide request headers or `intercept_add` with `action:"rewrite"` for a per-request rewrite. |
 | `max_bytes` | integer | `replay` (optional) | `262144` | Cap on the returned replay body. Larger values are clamped. A cut body returns `truncated:true`. |
@@ -40,7 +40,7 @@ The schema is `code://pkg/mcp/tools/act.go#L125`. Only `session_id` and `action`
 | `target_x`, `target_y` | number | no | `0` | Drag target pixel coordinates. |
 | `target_selector` | string | no | — | Drag target element, or the `post_message` destination: `top` (default), `self`, `parent`, or a CSS selector naming an iframe. Its center overrides `target_x`/`target_y` for a drag. |
 | `origin` | string | no | `*` | Target origin for `post_message`. Pass the receiver's origin, for example `https://widget.example`. |
-| `paths` | array | `upload_file` | — | Absolute local file paths. `value` is the single-path fallback. |
+| `paths` | array | `upload_file`, `poc_bundle` | — | Absolute local file paths. For `poc_bundle`, `paths[0]` is the absolute output directory, created with mode `0700` when absent; a relative path or a non-empty directory is refused. `value` is the single-path fallback for `upload_file`. |
 | `timeout_ms` | integer | no | `30000` | Bound for the whole call. For `wait` `ms` mode it is the sleep time. |
 | `wait_mode` | string | no | `ms` | `load`, `idle`, `stable`, `interactable`, or `ms`. |
 | `viewport` | object | `set_viewport` | — | `{"width":<int>,"height":<int>}` in CSS pixels. Both must be positive. |
@@ -91,8 +91,37 @@ The schema is `code://pkg/mcp/tools/act.go#L125`. Only `session_id` and `action`
 | `auth_save` | `site`, `name` | Captures the page's cookies for `site` plus local storage, session storage, and IndexedDB names. | Compact JSON counts plus `warning`. | No. |
 | `auth_restore` | `site`, `name` | Writes the snapshot into the page's browser context: cookies, then storage for the live origin. | Compact JSON counts plus `warnings` and `warning`. | No. |
 | `auth_list` | `site` (optional) | Lists saved snapshots. Needs no live session. | Compact JSON `{snapshots,count,warning}`. | No. |
+| `poc_bundle` | `value`, `paths`; optional `target` | Packages one finding as an evidence directory: `meta.json`, `request.http`, `response.http`, `screenshot.png`, `dom.html`, `storage.json`, `README.md`, plus `sinks.json` when the tracer is installed. See [PoC bundle](#poc-bundle). | Compact JSON `{directory,files,omitted}`. | Suppressed. |
 
 A non-positive `click_count` becomes `1`. An unknown `button` is rejected before the click. The server rejects a missing `x` or `y` key for `click_at` and `hover_at`, and an explicit `0` is valid.
+
+## PoC bundle
+
+`poc_bundle` turns one live page into a self-contained directory for a report.
+
+```json
+{"tool":"page_act","arguments":{"session_id":"page-6","action":"poc_bundle","value":"Stored XSS in search","paths":["/tmp/poc-xss"]}}
+```
+
+- `value` is the finding title written to `meta.json` and `README.md`.
+- `paths[0]` is the absolute output directory. It is created with mode `0700` when absent. A relative path is refused with `poc_bundle: "…" must be absolute`, and a non-empty directory with `poc_bundle: … is not empty — pass a new directory or remove its contents`.
+- `target` optionally selects the captured request by `seq` or URL substring. Without it the main document request is used.
+
+Every artifact is mode `0600`:
+
+| File | Content |
+| :--- | :--- |
+| `meta.json` | `url`, `title`, RFC 3339 `timestamp`, `finding`, `web_mcp_version`, `session_id`. |
+| `request.http`, `response.http` | Raw HTTP pair: method, path, version, sorted headers, blank line, body. |
+| `screenshot.png` | Viewport capture through the shared screenshot seam. |
+| `dom.html` | Outer HTML, capped at 2 MB with a trailing `<!-- truncated -->`. |
+| `storage.json` | The storage report, values `<redacted>` unless secret capture is on. |
+| `sinks.json` | The sink ring, written only when `sinks_install` was run. |
+| `README.md` | Finding title, URL, timestamp and a file table with byte counts. |
+
+The result is `{"directory":"…","files":[{"name","bytes"}],"omitted":[{"name","reason"}]}`. `omitted` names every artifact or value left out: `not installed` for an unarmed tracer, `no network entry` when the request was not observed, `no body` when a body could not be fetched, `cap reached` for a cut DOM, and `secrets hidden` when a request or response header value was redacted; a redacted `storage.json` value adds no row.
+
+Cookie, Set-Cookie, Authorization and X-CSRF-Token values are `<redacted>` unless the page opted into secret capture. Nothing is overwritten: each file is written with `O_EXCL`, and the page lock is never held across a file write.
 
 ## Returns
 
@@ -206,7 +235,7 @@ An absent selector for `click`, `input`, `hover` or `select` fails immediately w
 | Bad handle format | `page_act: invalid handle "x" (expected g<document>-b<backendNodeId> minted by page_fetch what=interactives\|dom\|links)` | Copy a handle exactly. |
 | Bad device or viewport input | `page_act: unknown device "Nokia3310" (see go-rod lib/devices presets, e.g. IPhoneX, IPadPro, LaptopWithHiDPIScreen)`, `page_act: emulate requires a device`, `page_act: set_viewport requires a viewport`, or `page_act: viewport width and height must be positive` | Use a real preset or `clear`, and send positive width and height. |
 | Unknown session | `page_act: session "page-999" not found` | Use `page_list` or `fetch_page`. |
-| Unknown action | `page_act: unknown action="konami" (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, inject_canary, postmessage_install, postmessage_clear, post_message, wait_open, intercept_add, intercept_list, intercept_clear, auth_save, auth_restore, auth_list, replay_fuzz)` | Use a listed action. |
+| Unknown action | `page_act: unknown action="konami" (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, inject_canary, postmessage_install, postmessage_clear, post_message, wait_open, intercept_add, intercept_list, intercept_clear, auth_save, auth_restore, auth_list, replay_fuzz, poc_bundle)` | Use a listed action. |
 | `upload_file` without paths | `page_act: upload_file: no file paths provided` | Pass `paths` or `value`. |
 | `replay_fuzz` without `target` | `page_act: replay_fuzz requires target=<seq> or target=<url substring> from page_fetch what=network` (`invalid_args`) | Read `what=network` and set `target`. |
 | `replay_fuzz` over a bound | `page_act: replay_fuzz: requests computed 243, over the 100 bound` (`invalid_args`) | Lower the payload or point count, or use `sniper`. |
