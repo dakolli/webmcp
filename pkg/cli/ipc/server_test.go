@@ -269,7 +269,7 @@ func TestServerBadParamsPageFetchUnknownWhat(t *testing.T) {
 	if resp.Error == nil || resp.Error.Code != CodeInvalidParams {
 		t.Fatalf("error = %+v, want code %d (-32602)", resp.Error, CodeInvalidParams)
 	}
-	if want := `page.fetch: unknown what="bogus" (must be one of html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, tables, forms, marks, security, storage, sinks, postmessage, har)`; resp.Error.Message != want {
+	if want := `page.fetch: unknown what="bogus" (must be one of html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, tables, forms, marks, security, storage, sinks, postmessage, har, websocket)`; resp.Error.Message != want {
 		t.Errorf("error message = %q, want %q", resp.Error.Message, want)
 	}
 }
@@ -280,7 +280,7 @@ func TestServerBadParamsPageFetchUnknownWhat(t *testing.T) {
 func TestServerPageFetchAcceptsSharedAspects(t *testing.T) {
 	path := startServer(t, newStubServer())
 
-	for _, what := range []string{"article", "marks", "body", "security", "sinks", "postmessage"} {
+	for _, what := range []string{"article", "marks", "body", "security", "sinks", "postmessage", "websocket"} {
 		t.Run(what, func(t *testing.T) {
 			conn := dialRaw(t, path)
 			r := bufio.NewReader(conn)

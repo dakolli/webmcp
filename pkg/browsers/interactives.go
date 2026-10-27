@@ -2,19 +2,45 @@ package browsers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"net/url"
 	"strings"
 
+	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/proto"
 )
 
-// MaxInteractives caps how many interactive elements a single interactives
-// snapshot returns. Pages with more interactives report the remainder via
-// InteractivesResult.Truncated, so the LLM knows the action map is not
-// complete and can scroll/paginate to reach the rest.
+// MaxInteractives caps how many interactive elements the root document
+// returns. Each child frame has its own MaxFrameInteractives budget and all
+// child frames together share MaxFrameInteractivesTotal, so a busy iframe can
+// no longer consume the root document's budget.
 const MaxInteractives = 200
+
+// Frame budgets: per child frame and across all child frames.
+const (
+	// MaxFrameInteractives caps one child frame's entries.
+	MaxFrameInteractives = 50
+	// MaxFrameInteractivesTotal caps every child frame together.
+	MaxFrameInteractivesTotal = 150
+	// MaxInteractivesTotal is the hard ceiling for one response.
+	MaxInteractivesTotal = MaxInteractives + MaxFrameInteractivesTotal
+)
+
+// InteractiveBox is an element's layout box in page-absolute CSS px: the
+// top-left corner (X, Y) plus the size (W, H). It complements Interactive's
+// centre X/Y so an agent can click an edge or reason about layout directly.
+type InteractiveBox struct {
+	// X is the box's left edge.
+	X float64 `json:"x"`
+	// Y is the box's top edge.
+	Y float64 `json:"y"`
+	// W is the box width.
+	W float64 `json:"w"`
+	// H is the box height.
+	H float64 `json:"h"`
+}
 
 // Interactive is one clickable/typeable element in an interactives snapshot:
 // the dense action-map entry an agent uses to act immediately via
@@ -49,86 +75,497 @@ type Interactive struct {
 	// Height is the height of the element's layout bounds in CSS px (0 for a
 	// zero-size box).
 	Height float64 `json:"height"`
+	// Box is the same layout bounds as left/top plus width/height, so a caller
+	// can act on an edge without recomputing it from the centre and size.
+	// Present on every rendered element (a zero-size box reports 0s).
+	Box *InteractiveBox `json:"box,omitempty"`
+	// FrameURL is the URL of the child frame that owns this element, or empty
+	// for the page's top-level document. Entries are emitted top document
+	// first, then each child frame in snapshot order.
+	FrameURL string `json:"frame_url,omitempty"`
 	// Visible is always true: hidden/inert elements are skipped before the
 	// snapshot is built, so every reported entry is rendered and interactable.
 	Visible bool `json:"visible"`
 }
 
-// InteractivesResult is the wire shape of an interactives snapshot: the
-// ordered list of interactive elements plus how many more were omitted by the
-// MaxInteractives cap.
-type InteractivesResult struct {
-	// Interactives is the page's interactive elements in document order,
-	// never null on the wire ([] on an empty page).
-	Interactives []Interactive `json:"interactives"`
-	// Truncated is the count of interactives beyond MaxInteractives that were
-	// omitted (0 when none).
+// InteractiveFrame reports one child frame in an interactives snapshot: its
+// document URL, how many entries that frame contributed, and how many of its
+// candidates its budget cut.
+type InteractiveFrame struct {
+	// URL is the child document's URL ("about:blank" when it has none).
+	URL string `json:"url"`
+	// Count is the number of entries this frame contributed.
+	Count int `json:"count"`
+	// Truncated is this frame's remaining candidate count.
 	Truncated int `json:"truncated"`
+}
+
+// InteractivesResult is the wire shape of an interactives snapshot: the ordered
+// action map, the root document's remainder, and one row per child frame with
+// its own remainder. Truncated and FramesTruncated are deliberately separate:
+// folding them into one number loses where the cut fell.
+type InteractivesResult struct {
+	// Interactives is the page's interactive elements in document order (root
+	// first, then each child frame), never null on the wire ([] on an empty
+	// page).
+	Interactives []Interactive `json:"interactives"`
+	// Truncated is the ROOT document's remaining count only.
+	Truncated int `json:"truncated"`
+	// Frames has one row per child frame, never null on the wire ([] when the
+	// page has no child frames).
+	Frames []InteractiveFrame `json:"frames"`
+	// FramesTruncated is the total remaining count across every child frame.
+	FramesTruncated int `json:"frames_truncated"`
+}
+
+// interactiveScope narrows an interactives read to the subtree of one resolved
+// element, identified by its renderer-global backend node id.
+type interactiveScope struct {
+	backendNodeID proto.DOMBackendNodeID
 }
 
 // Interactives returns the page's interactive elements as a dense action map:
 // every visible, non-inert clickable/typeable element (anchors, buttons,
 // inputs, selects, textareas, ARIA-role widgets, tabindex/onclick/
 // contenteditable elements) with a WEB-51 handle, role, truncated text, href,
-// input type and the center x/y plus width/height of its layout bounds — the
-// whole-page snapshot an agent uses to act immediately (page_act { handle: ... })
-// without selector guesswork.
+// input type and page-absolute center/box geometry — the snapshot an agent uses
+// to act immediately (page_act { handle: ... }) without selector guesswork.
 //
-// The method takes the page lock itself (via CaptureSnapshot, mirroring
-// Page.Close): callers must NOT pre-lock. The nil-Rod guard runs UNDER the
-// lock and returns the exact pinned "page session is closed" error. The
-// snapshot is ONE CaptureDOMSnapshot round trip plus the document-marker read
-// (the same data source as the dom extractor), then a purpose-built linear
-// walk of the root document's nodes in document order (later snapshot
-// documents are iframes — for a first cut only the root document is walked;
-// the minted handles are renderer-global backendNodeIds, so they remain valid
-// for page_act regardless). No page DOM JS is evaluated: the snapshot's layout
-// tree only contains rendered nodes, so the visibility filter is more accurate
-// than an offsetParent heuristic (it does not wrongly exclude visible
-// position:fixed elements).
+// Budgets are split: the root document returns up to MaxInteractives entries,
+// each child frame up to MaxFrameInteractives, and every child frame together
+// up to MaxFrameInteractivesTotal, so one response never exceeds
+// MaxInteractivesTotal. Truncated is the root remainder only; FramesTruncated is
+// the total across child frames; Frames reports each child frame.
 //
-// The walk applies the candidacy rules (tag/role/tabindex/onclick/
+// selector scopes the read to one element's subtree. It is resolved once in the
+// page (page.Element -> DOM.describeNode backend node id) and then matched
+// against the snapshot's BackendNodeID table, never by matching CSS in Go. A
+// selector on an <iframe> returns that frame's entries with page-absolute
+// coordinates; any other selector returns only root-document entries inside its
+// subtree and no frame rows; a selector that matches nothing fails with the
+// typed element-not-found error naming the selector. A scoped root subtree uses
+// the root budget, a scoped frame uses the frame budget, and truncated reports
+// the cut inside that scope.
+//
+// The method takes the page lock itself (mirroring Page.Close): callers must
+// NOT pre-lock. The nil-Rod guard runs UNDER the lock and returns the exact
+// pinned "page session is closed" error. One lock scope holds the marker read,
+// the optional selector resolution and the ONE CaptureDOMSnapshot round trip,
+// so the selector's backend node id and the snapshot always describe the same
+// document. Child-frame bounds are frame-local in the snapshot, so the walk
+// accumulates each frame's page-absolute origin through the owner nodes'
+// ContentDocumentIndex links (parent origin + owner bounds - child scroll) and
+// applies it before rounding. Backend node ids are renderer-global, so a frame
+// handle minted with the page's top-level document token remains valid for
+// page_act. Cross-origin out-of-process iframes are not part of the snapshot,
+// so their elements are not listed. A frame whose document is missing or empty
+// is skipped, never failing the whole read.
+//
+// No page DOM JS is evaluated: the snapshot's layout tree only contains
+// rendered nodes, so the visibility filter is more accurate than an
+// offsetParent heuristic (it does not wrongly exclude visible position:fixed
+// elements). The walk applies the candidacy rules (tag/role/tabindex/onclick/
 // contenteditable), skips inert elements (disabled, aria-disabled="true",
 // aria-hidden="true" on the node or any ancestor) and unrendered nodes (no
-// layout entry), collapses nested interactives to the outermost, and caps the
-// result at MaxInteractives entries with the remainder reported via
-// InteractivesResult.Truncated. ctx is threaded through to the rod calls so a
-// hung page cannot outlive the caller's deadline.
-func (p *Page) Interactives(ctx context.Context) (InteractivesResult, error) {
-	snap, token, err := p.CaptureSnapshot(ctx)
+// layout entry), and collapses nested interactives to the outermost. ctx is
+// threaded through to the rod calls so a hung page cannot outlive the caller's
+// deadline.
+func (p *Page) Interactives(ctx context.Context, selector string) (InteractivesResult, error) {
+	p.Lock()
+	defer p.Unlock()
+	if p.Rod == nil {
+		return InteractivesResult{}, fmt.Errorf("page session is closed")
+	}
+
+	page := p.Rod.Context(ctx)
+	if !p.docMarkerInstalled {
+		if _, err := page.EvalOnNewDocument(docMarkerScript); err != nil {
+			return InteractivesResult{}, fmt.Errorf("install document marker: %w", err)
+		}
+		p.docMarkerInstalled = true
+	}
+	token, err := documentToken(page)
 	if err != nil {
 		return InteractivesResult{}, err
 	}
-	res, err := decodeInteractives(snap, token)
+	var scope *interactiveScope
+	if selector != "" {
+		scope, err = resolveInteractiveScope(page, selector)
+		if err != nil {
+			return InteractivesResult{}, err
+		}
+	}
+	snap, err := page.CaptureDOMSnapshot()
+	if err != nil {
+		return InteractivesResult{}, fmt.Errorf("capture DOM snapshot: %w", err)
+	}
+	res, err := decodeInteractivesScoped(snap, token, scope)
 	if err != nil {
 		return InteractivesResult{}, fmt.Errorf("decode interactives: %w", err)
 	}
 	return res, nil
 }
 
-// decodeInteractives walks the root document of a DOM snapshot in document
-// order and collects every visible, non-inert interactive element into an
-// InteractivesResult, minting each handle with docToken so the handle is
-// scoped to the document that produced the snapshot. It is a pure function
-// over the snapshot structs (no rod), so it is unit-testable without Chromium:
-// an empty-but-valid document yields the empty result (never nil), while a
-// snapshot with no root document at all is a decode failure.
+// resolveInteractiveScope resolves selector once to the matched element's
+// backend node id. It uses rod's no-retry sleeper, so a selector that matches
+// nothing fails immediately with the typed *rod.ElementNotFoundError instead of
+// burning the call budget.
+func resolveInteractiveScope(page *rod.Page, selector string) (*interactiveScope, error) {
+	el, err := page.Sleeper(rod.NotFoundSleeper).Element(selector)
+	if err != nil {
+		return nil, interactiveSelectorError(selector, err)
+	}
+	node, err := el.Describe(0, false)
+	if err != nil {
+		return nil, fmt.Errorf("resolve selector %q: describe node: %w", selector, err)
+	}
+	if node == nil || node.BackendNodeID == 0 {
+		return nil, fmt.Errorf("resolve selector %q: node has no backend id", selector)
+	}
+	return &interactiveScope{backendNodeID: node.BackendNodeID}, nil
+}
+
+// interactiveSelectorError keeps a typed *rod.ElementNotFoundError in the wrap
+// chain, so surfaces classify the failure as element_not_found while the
+// message names the selector.
+func interactiveSelectorError(selector string, err error) error {
+	var missing *rod.ElementNotFoundError
+	if errors.As(err, &missing) {
+		return fmt.Errorf("no element matched selector %q: %w", selector, err)
+	}
+	return fmt.Errorf("resolve selector %q: %w", selector, err)
+}
+
+// decodeInteractives reads an unscoped snapshot. It is the pure entry point
+// used by the snapshot-level tests.
 func decodeInteractives(snap *proto.DOMSnapshotCaptureSnapshotResult, docToken string) (InteractivesResult, error) {
-	res := InteractivesResult{Interactives: []Interactive{}}
+	return decodeInteractivesScoped(snap, docToken, nil)
+}
+
+// decodeInteractivesScoped walks every document in a DOM snapshot — the top
+// document first, then each child frame in snapshot order — and collects the
+// visible, non-inert interactives within their separate budgets. Each
+// document's frame-local bounds are translated by the page-absolute origin
+// accumulated from the frame-owner chain before rounding. scope, when non-nil,
+// restricts the read to one resolved element's subtree or frame. It is a pure
+// function over the snapshot structs (no rod), so it is unit-testable without
+// Chromium: an empty-but-valid root document yields the empty result (never
+// nil), while a snapshot with no root document at all is a decode failure. A
+// child document that is missing or empty contributes only an empty frame row.
+func decodeInteractivesScoped(
+	snap *proto.DOMSnapshotCaptureSnapshotResult,
+	docToken string,
+	scope *interactiveScope,
+) (InteractivesResult, error) {
+	res := InteractivesResult{
+		Interactives: []Interactive{},
+		Frames:       []InteractiveFrame{},
+	}
 	if snap == nil || len(snap.Documents) == 0 || snap.Documents[0] == nil {
 		return res, fmt.Errorf("snapshot has no root document")
 	}
-	doc := snap.Documents[0]
-	n := doc.Nodes
-	if n == nil || len(n.ParentIndex) == 0 {
+	root := snap.Documents[0]
+	if root.Nodes == nil || len(root.Nodes.ParentIndex) == 0 {
 		return res, nil
 	}
+	origins := frameOrigins(snap)
+	if scope != nil {
+		return decodeScopedInteractives(snap, docToken, scope, origins)
+	}
 
-	strs := snap.Strings
+	res.Truncated = collectDocumentInteractives(
+		snap.Strings, root, docToken, "", origins[0], MaxInteractives, nil, &res.Interactives,
+	)
+	framesAdded := 0
+	for i, doc := range snap.Documents[1:] {
+		frameURL := frameDocumentURL(snap.Strings, doc)
+		row := InteractiveFrame{URL: frameURL}
+		if doc != nil && doc.Nodes != nil && len(doc.Nodes.ParentIndex) > 0 {
+			limit := MaxFrameInteractives
+			if remaining := MaxFrameInteractivesTotal - framesAdded; remaining < limit {
+				limit = remaining
+			}
+			before := len(res.Interactives)
+			row.Truncated = collectDocumentInteractives(
+				snap.Strings, doc, docToken, frameURL, origins[i+1], limit, nil, &res.Interactives,
+			)
+			row.Count = len(res.Interactives) - before
+			framesAdded += row.Count
+		}
+		res.Frames = append(res.Frames, row)
+		res.FramesTruncated += row.Truncated
+	}
+	return res, nil
+}
+
+// decodeScopedInteractives resolves a selector scope against the snapshot. A
+// scope on a frame owner returns that child document's entries with the frame
+// budget; any other scope in the root document returns only entries inside its
+// subtree with the root budget. A scope outside the root document (defensive;
+// page.Element resolves in the top frame) is treated as a frame scope.
+func decodeScopedInteractives(
+	snap *proto.DOMSnapshotCaptureSnapshotResult,
+	docToken string,
+	scope *interactiveScope,
+	origins []frameOrigin,
+) (InteractivesResult, error) {
+	docIdx, nodeIdx, ok := findBackendNode(snap, scope.backendNodeID)
+	if !ok {
+		return InteractivesResult{}, fmt.Errorf(
+			"selector node %d is not in the DOM snapshot (the page changed during the read)",
+			scope.backendNodeID,
+		)
+	}
+	if child, linked := childDocumentOf(snap, docIdx, nodeIdx); linked {
+		return frameScopedInteractives(snap, docToken, origins, child), nil
+	}
+	if docIdx == 0 && isFrameElement(snap.Strings, snap.Documents[docIdx], nodeIdx) {
+		return frameScopedInteractives(snap, docToken, origins, 0), nil
+	}
+	if docIdx != 0 {
+		return frameScopedInteractives(snap, docToken, origins, docIdx), nil
+	}
+
+	res := InteractivesResult{
+		Interactives: []Interactive{},
+		Frames:       []InteractiveFrame{},
+	}
+	root := snap.Documents[0]
+	subtree := subtreeSet(root.Nodes.ParentIndex, nodeIdx)
+	res.Truncated = collectDocumentInteractives(
+		snap.Strings, root, docToken, "", origins[0], MaxInteractives, subtree, &res.Interactives,
+	)
+	return res, nil
+}
+
+// frameScopedInteractives returns one child document's entries under the
+// per-frame budget. docIdx 0 means a frame owner without a snapshot document,
+// which reports an empty about:blank row instead of failing.
+func frameScopedInteractives(
+	snap *proto.DOMSnapshotCaptureSnapshotResult,
+	docToken string,
+	origins []frameOrigin,
+	docIdx int,
+) InteractivesResult {
+	res := InteractivesResult{
+		Interactives: []Interactive{},
+		Frames:       []InteractiveFrame{},
+	}
+	row := InteractiveFrame{URL: "about:blank"}
+	if docIdx > 0 && docIdx < len(snap.Documents) {
+		doc := snap.Documents[docIdx]
+		row.URL = frameDocumentURL(snap.Strings, doc)
+		if doc != nil && doc.Nodes != nil && len(doc.Nodes.ParentIndex) > 0 {
+			row.Truncated = collectDocumentInteractives(
+				snap.Strings, doc, docToken, row.URL, origins[docIdx], MaxFrameInteractives, nil, &res.Interactives,
+			)
+			row.Count = len(res.Interactives)
+		}
+	}
+	res.Frames = append(res.Frames, row)
+	res.FramesTruncated = row.Truncated
+	return res
+}
+
+// findBackendNode returns the snapshot document and node index whose
+// BackendNodeID matches id. Backend node ids are renderer-global, so at most
+// one node matches.
+func findBackendNode(
+	snap *proto.DOMSnapshotCaptureSnapshotResult,
+	id proto.DOMBackendNodeID,
+) (int, int, bool) {
+	for d, doc := range snap.Documents {
+		if doc == nil || doc.Nodes == nil {
+			continue
+		}
+		for i, backend := range doc.Nodes.BackendNodeID {
+			if backend == id {
+				return d, i, true
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+// childDocumentOf returns the child document index linked to nodeIdx by the
+// owning document's ContentDocumentIndex rare data.
+func childDocumentOf(
+	snap *proto.DOMSnapshotCaptureSnapshotResult,
+	docIdx, nodeIdx int,
+) (int, bool) {
+	if docIdx < 0 || docIdx >= len(snap.Documents) {
+		return 0, false
+	}
+	doc := snap.Documents[docIdx]
+	if doc == nil || doc.Nodes == nil || doc.Nodes.ContentDocumentIndex == nil {
+		return 0, false
+	}
+	owners := doc.Nodes.ContentDocumentIndex
+	for k, owner := range owners.Index {
+		if owner != nodeIdx || k >= len(owners.Value) {
+			continue
+		}
+		child := owners.Value[k]
+		if child > 0 && child < len(snap.Documents) {
+			return child, true
+		}
+	}
+	return 0, false
+}
+
+// isFrameElement reports whether nodeIdx names an iframe or frame element in
+// doc, used only for a frame owner with no snapshot child document.
+func isFrameElement(strs []string, doc *proto.DOMSnapshotDocumentSnapshot, nodeIdx int) bool {
+	if doc == nil || doc.Nodes == nil {
+		return false
+	}
+	switch nodeTag(strs, doc.Nodes, nodeIdx) {
+	case "iframe", "frame":
+		return true
+	}
+	return false
+}
+
+// subtreeSet marks nodeIdx and every descendant reachable by walking
+// ParentIndex, so a scoped read can restrict the document walk without
+// matching CSS in Go.
+func subtreeSet(parents []int, nodeIdx int) map[int]bool {
+	set := make(map[int]bool)
+	if nodeIdx < 0 || nodeIdx >= len(parents) {
+		return set
+	}
+	for i := range parents {
+		for a := i; a >= 0 && a < len(parents); {
+			if a == nodeIdx {
+				set[i] = true
+				break
+			}
+			parent := parents[a]
+			if parent == a || parent < 0 || parent >= len(parents) {
+				break
+			}
+			a = parent
+		}
+	}
+	return set
+}
+
+// frameDocumentURL returns a child document's URL, mapping an absent document
+// or an empty URL to about:blank.
+func frameDocumentURL(strs []string, doc *proto.DOMSnapshotDocumentSnapshot) string {
+	if doc == nil {
+		return "about:blank"
+	}
+	url := str(strs, doc.DocumentURL)
+	if url == "" {
+		return "about:blank"
+	}
+	return url
+}
+
+// frameOrigin is a document's page-absolute origin: the offset added to that
+// document's frame-local layout bounds to get page coordinates.
+type frameOrigin struct {
+	x, y float64
+}
+
+// frameOrigins maps each snapshot document index to its page-absolute origin by
+// walking the ContentDocumentIndex links from the top document down. A child's
+// origin is its parent's origin plus the owner iframe's layout bounds, minus the
+// child document's own scroll offset. When an owner node has no layout entry the
+// child keeps the parent origin instead of being dropped, so a frame chain
+// deeper than one level still accumulates correctly. Documents not reachable
+// from the top document keep the zero origin.
+func frameOrigins(snap *proto.DOMSnapshotCaptureSnapshotResult) []frameOrigin {
+	origins := make([]frameOrigin, len(snap.Documents))
+	if len(origins) == 0 {
+		return origins
+	}
+	assigned := make([]bool, len(origins))
+	assigned[0] = true
+	queue := []int{0}
+	for len(queue) > 0 {
+		parent := queue[0]
+		queue = queue[1:]
+		doc := snap.Documents[parent]
+		if doc == nil || doc.Nodes == nil || doc.Nodes.ContentDocumentIndex == nil {
+			continue
+		}
+		owners := doc.Nodes.ContentDocumentIndex
+		for k, owner := range owners.Index {
+			if k >= len(owners.Value) {
+				break
+			}
+			child := owners.Value[k]
+			if child <= 0 || child >= len(origins) || child == parent || assigned[child] {
+				continue
+			}
+			origin := origins[parent]
+			if b, ok := nodeBounds(doc, owner); ok {
+				origin.x += b[0]
+				origin.y += b[1]
+			}
+			if childDoc := snap.Documents[child]; childDoc != nil {
+				if childDoc.ScrollOffsetX != nil {
+					origin.x -= *childDoc.ScrollOffsetX
+				}
+				if childDoc.ScrollOffsetY != nil {
+					origin.y -= *childDoc.ScrollOffsetY
+				}
+			}
+			origins[child] = origin
+			assigned[child] = true
+			queue = append(queue, child)
+		}
+	}
+	return origins
+}
+
+// nodeBounds returns node i's raw layout bounds in doc, or false when the node
+// has no layout entry (an unrendered or detached frame owner).
+func nodeBounds(doc *proto.DOMSnapshotDocumentSnapshot, i int) (proto.DOMSnapshotRectangle, bool) {
+	if doc == nil || doc.Layout == nil {
+		return nil, false
+	}
+	li, ok := layoutIndex(doc.Layout)[i]
+	if !ok || li < 0 || li >= len(doc.Layout.Bounds) {
+		return nil, false
+	}
+	b := doc.Layout.Bounds[li]
+	if len(b) < 4 {
+		return nil, false
+	}
+	return b, true
+}
+
+// collectDocumentInteractives appends up to limit of one document's visible,
+// non-inert interactives to out in document order, and returns the number of
+// remaining candidates that did not fit. origin is the document's page-absolute
+// offset, already accumulated from its frame-owner chain. subtree, when non-nil,
+// restricts the walk to those node indices (a selector scope). Only element
+// nodes that satisfy the candidacy rules qualify; inert nodes (a disabled
+// attribute or aria-disabled="true"), unrendered nodes (no layout entry) and
+// nodes under an aria-hidden="true" ancestor are skipped, and a candidate nested
+// inside an already-accepted interactive collapses to the outermost one.
+// Attribute maps are parsed once so candidacy and the filters are pure lookups
+// afterwards. frameURL is empty for the top document and the child frame's URL
+// otherwise.
+func collectDocumentInteractives(
+	strs []string,
+	doc *proto.DOMSnapshotDocumentSnapshot,
+	docToken, frameURL string,
+	origin frameOrigin,
+	limit int,
+	subtree map[int]bool,
+	out *[]Interactive,
+) int {
+	n := doc.Nodes
+	if n == nil || len(n.ParentIndex) == 0 {
+		return 0
+	}
+
 	layout := layoutIndex(doc.Layout)
 
-	// Pre-parse every element node's attributes once: candidacy, the inert
-	// filters and the aria-hidden walk are pure attr lookups afterwards.
 	attrsByNode := make([]map[string]string, len(n.ParentIndex))
 	for i := range n.ParentIndex {
 		if i < len(n.NodeType) && n.NodeType[i] == 1 {
@@ -136,51 +573,47 @@ func decodeInteractives(snap *proto.DOMSnapshotCaptureSnapshotResult, docToken s
 		}
 	}
 
-	// accepted holds every interactive already accounted for — emitted into
-	// the result OR counted into Truncated — so nested descendants collapse
-	// to the outermost candidate regardless of the cap.
 	accepted := make(map[int]bool, MaxInteractives)
+	added := 0
+	truncated := 0
 	for i := range n.ParentIndex {
+		if subtree != nil && !subtree[i] {
+			continue
+		}
 		if i >= len(n.NodeType) || n.NodeType[i] != 1 {
-			continue // elements only
+			continue
 		}
 		tag := nodeTag(strs, n, i)
 		attrs := attrsByNode[i]
 		if !isInteractiveCandidate(tag, attrs) {
 			continue
 		}
-		// Inert: a disabled attribute (any value) or aria-disabled="true".
 		if _, has := attrs["disabled"]; has {
 			continue
 		}
 		if strings.EqualFold(attrs["aria-disabled"], "true") {
 			continue
 		}
-		// Unrendered nodes (display:none / detached) never appear in the
-		// layout tree — a layout entry is the visibility requirement.
 		li, hasLayout := layout[i]
 		if !hasLayout {
 			continue
 		}
-		// aria-hidden="true" on the node or any ancestor hides the whole
-		// subtree — the action map must not include it.
 		if hiddenOrAncestorHidden(n.ParentIndex, attrsByNode, i) {
 			continue
 		}
-		// Nested collapse: a candidate inside an already-accounted-for
-		// interactive collapses to the outermost (<a><button> yields the <a>).
 		if ancestorAccepted(n.ParentIndex, i, accepted) {
 			continue
 		}
-		if len(res.Interactives) >= MaxInteractives {
+		if added >= limit {
 			accepted[i] = true
-			res.Truncated++
+			truncated++
 			continue
 		}
 		accepted[i] = true
-		res.Interactives = append(res.Interactives, buildInteractive(strs, doc, i, tag, attrs, li, docToken))
+		*out = append(*out, buildInteractive(strs, doc, i, tag, attrs, li, docToken, frameURL, origin))
+		added++
 	}
-	return res, nil
+	return truncated
 }
 
 // isInteractiveCandidate reports whether an element node qualifies as an
@@ -268,9 +701,13 @@ func ancestorAccepted(parents []int, i int, accepted map[int]bool) bool {
 // buildInteractive assembles one Interactive entry from the node's snapshot
 // rows: the WEB-51 handle (guarded parallel-array read), the ARIA-role-else-
 // tag role, the text with its fallback chain, the resolved href (links), the
-// input type and the center plus size of the layout bounds. li is the node's
-// layout-tree entry index (always valid for accepted candidates); a zero-size
-// box reports width/height 0 rather than omitting them.
+// input type, the page-absolute center plus size of the layout bounds and the
+// box's top-left corner. li is the node's layout-tree entry index (always valid
+// for accepted candidates); origin is the document's accumulated frame offset,
+// applied to the raw bounds before the single rounding pass. A zero-size box
+// reports width/height 0 rather than omitting them, and the center is derived
+// from the rounded box so x - width/2 reproduces box.x. frameURL is stamped on
+// framed entries and left empty for the top document.
 func buildInteractive(
 	strs []string,
 	doc *proto.DOMSnapshotDocumentSnapshot,
@@ -278,16 +715,15 @@ func buildInteractive(
 	tag string,
 	attrs map[string]string,
 	li int,
-	docToken string,
+	docToken, frameURL string,
+	origin frameOrigin,
 ) Interactive {
 	it := Interactive{
-		Role:    roleOf(tag, attrs),
-		Text:    textOf(strs, doc, i, li, attrs),
-		Visible: true,
+		Role:     roleOf(tag, attrs),
+		Text:     textOf(strs, doc, i, li, attrs),
+		FrameURL: frameURL,
+		Visible:  true,
 	}
-	// Mirror DOM extraction exactly: the BackendNodeID parallel array is
-	// aligned with the node table — guard the bounds and skip when the id is
-	// absent or zero.
 	n := doc.Nodes
 	if i < len(n.BackendNodeID) && n.BackendNodeID[i] > 0 {
 		it.Handle = MintHandle(docToken, n.BackendNodeID[i])
@@ -300,10 +736,16 @@ func buildInteractive(
 	}
 	if li >= 0 && li < len(doc.Layout.Bounds) && len(doc.Layout.Bounds[li]) >= 4 {
 		b := doc.Layout.Bounds[li]
-		it.X = round10(b[0] + b[2]/2)
-		it.Y = round10(b[1] + b[3]/2)
-		it.Width = round10(b[2])
-		it.Height = round10(b[3])
+		it.Box = &InteractiveBox{
+			X: round10(b[0] + origin.x),
+			Y: round10(b[1] + origin.y),
+			W: round10(b[2]),
+			H: round10(b[3]),
+		}
+		it.Width = it.Box.W
+		it.Height = it.Box.H
+		it.X = it.Box.X + it.Box.W/2
+		it.Y = it.Box.Y + it.Box.H/2
 	}
 	return it
 }

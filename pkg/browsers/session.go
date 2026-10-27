@@ -62,10 +62,10 @@ type Page struct {
 	// re-injects the script and only a page close disarms it (see
 	// InstallPostMessages). Guarded by the operation lock.
 	postMessageScriptInstalled bool
-	// observer holds the page's network/console capture rings. It is assigned
-	// once in the pre-registration window and never replaced, so read methods
-	// may use it without taking the operation lock. Engine-internal: surfaces
-	// never touch it.
+	// observer holds the page's network/console/WebSocket capture rings. It is
+	// assigned once in the pre-registration window and never replaced, so read
+	// methods may use it without taking the operation lock. Engine-internal:
+	// surfaces never touch it.
 	observer *pageObserver
 	// obsCancel disarms the capture subscription. It is set in the same
 	// pre-registration window and cleared by stopObservation. Guarded by the

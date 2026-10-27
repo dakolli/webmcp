@@ -26,7 +26,7 @@ var whatVocab = map[string]bool{
 	"interactives": true, "a11y": true, "network": true,
 	"console": true, "body": true, "article": true, "tables": true,
 	"forms": true, "marks": true, "security": true, "storage": true,
-	"sinks": true, "postmessage": true, "har": true,
+	"sinks": true, "postmessage": true, "har": true, "websocket": true,
 }
 
 // actionVocab is the page-act action vocabulary shared by `page act` parsing

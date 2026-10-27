@@ -58,6 +58,17 @@ func ConfigDir() (string, error) {
 	return dir, nil
 }
 
+// StateDBPath returns the absolute path to the embedded state database,
+// ~/.config/browser-mcp/state.db. The config directory is created with 0700
+// permissions; the database file itself is created by pkg/store.
+func StateDBPath() (string, error) {
+	cfgDir, err := ConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(cfgDir, "state.db"), nil
+}
+
 // ProfilesDir returns the absolute path to ~/.config/browser-mcp/profiles.
 // It creates the directory with 0700 permissions if it does not already exist.
 func ProfilesDir() (string, error) {

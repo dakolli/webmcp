@@ -185,7 +185,7 @@ dance).
                      are given; never treated as a URL)
   --what <what>      the aspect to extract (the positional [what] wins when
                      both are given; default text)
-  --selector <css>   optional CSS selector scoping html/text extraction
+  --selector <css>   optional CSS selector scoping html/text/interactives extraction
   --target <url>     fetch exactly one css/js resource's full content instead
                      of the {url,type,size} list (with --what css|js); with
                      --what body, select the entry by seq or URL substring
@@ -375,7 +375,7 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to fetch (optional with one page open; 'last'; or a bare number)")
 	cmd.Flags().StringVar(&what, "what", "", "aspect to extract: html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, tables, forms, marks, security, storage, sinks, postmessage, har (default text)")
-	cmd.Flags().StringVar(&selector, "selector", "", "optional CSS selector scoping html/text extraction")
+	cmd.Flags().StringVar(&selector, "selector", "", "optional CSS selector scoping html/text/interactives extraction")
 	cmd.Flags().StringVar(&target, "target", "", "resource URL for one css/js resource, or seq/URL substring selecting one network body (with --what body)")
 	cmd.Flags().BoolVar(&fullPage, "full-page", false, "capture the entire scrollable page instead of the visible viewport (screenshot only)")
 	cmd.Flags().BoolVar(&includeValues, "include-values", false, "with --what storage, print real cookie and localStorage/sessionStorage values instead of <redacted> (exposes live tokens)")
@@ -465,9 +465,10 @@ redirect it is rejected as stale, so re-fetch before acting.
   back/forward/reload    (none)
   type         [selector] [text]
 
-clear_logs empties the network and console buffers and prints {"network":N,"console":M}.
+clear_logs empties the network, console and websocket buffers and prints
+{"network":N,"console":M,"websocket":K}.
 Logs are cumulative from page creation: clear right before the step whose traffic/logs
-you want to observe, then run 'page fetch last network|console' and filter client-side.
+you want to observe, then run 'page fetch last network|console|websocket' and filter client-side.
 sinks_install arms the source-to-sink tracer and prints {"installed":true}; it changes
 page behavior, so capture stays opt-in. sinks_clear empties the tracer ring and prints
 {"cleared":N}; read the hits with 'page fetch <id> sinks'. inject_canary injects a
@@ -494,7 +495,7 @@ once.`,
   web-cli page act 12 click_at 100 200                     # click at x=100 y=200
   web-cli page act 12 navigate https://news.ycombinator.com # go somewhere
   web-cli page act last eval '() => document.title'         # run JS on the latest page
-  web-cli page act last clear_logs  # reset both buffers, print {network,console} counts
+  web-cli page act last clear_logs  # reset all three buffers, print {network,console,websocket} counts
   web-cli page act last sinks_install  # arm the source-to-sink tracer
   web-cli page act last sinks_clear    # empty the tracer ring, print {cleared}
   web-cli page act last inject_canary  # inject into all four sources, print sink hits
@@ -653,7 +654,7 @@ once.`,
 			case "emulate":
 				out, err = pageops.PageEmulate(ctx, p, device)
 			case "clear_logs":
-				out, err = pageops.PageClearLogs(p)
+				out, err = pageops.PageClearCapture(p)
 			case "sinks_install":
 				out, err = pageops.PageSinksInstall(ctx, p)
 			case "sinks_clear":

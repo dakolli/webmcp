@@ -535,17 +535,18 @@ func PageMeta(ctx context.Context, p *browsers.Page) (string, error) {
 
 // PageInteractives returns the page's interactive elements as a dense JSON
 // action map: every visible, non-inert clickable/typeable element with a
-// stable handle, role, text, href, input type, center x/y and width/height —
-// the whole-page snapshot used to act immediately (page act { handle: ... })
-// without selector guesswork. Mirrors the MCP page_fetch what=interactives
-// shape exactly.
+// stable handle, role, text, href, input type, page-absolute center/box geometry
+// and the split root/frame budgets — the snapshot used to act immediately
+// (page act { handle: ... }) without selector guesswork. selector, when set,
+// scopes the read to that element's subtree (an iframe selector returns that
+// frame's entries). Mirrors the MCP page_fetch what=interactives shape exactly.
 //
 // Deliberately does NOT lock: the engine method Page.Interactives takes the
 // page lock itself and owns the nil-Rod guard (mirroring PageSetViewport/
 // PageEmulate's engine-seam pattern) — an exception to the pageops
 // self-locking convention, so callers must not pre-lock either.
-func PageInteractives(ctx context.Context, p *browsers.Page) (string, error) {
-	res, err := p.Interactives(ctx)
+func PageInteractives(ctx context.Context, p *browsers.Page, selector string) (string, error) {
+	res, err := p.Interactives(ctx, selector)
 	if err != nil {
 		return "", err
 	}
@@ -594,15 +595,6 @@ type logsEnvelope[T any] struct {
 	Dropped int `json:"dropped"`
 	// Truncated counts buffered entries omitted by the emit cap.
 	Truncated int `json:"truncated"`
-}
-
-// logsCleared is the JSON shape returned by PageClearLogs: the number of
-// network and console entries emptied from both capture rings.
-type logsCleared struct {
-	// Network is the number of network entries cleared.
-	Network int `json:"network"`
-	// Console is the number of console entries cleared.
-	Console int `json:"console"`
 }
 
 // PageNetwork returns the newest buffered network entries, capped at MaxLogEmit
@@ -672,7 +664,9 @@ func PageBody(ctx context.Context, p *browsers.Page, target string) (string, err
 type AspectQuery struct {
 	// What is the aspect name.
 	What string
-	// Selector optionally scopes html/text extraction to a CSS match.
+	// Selector optionally scopes html/text/interactives extraction to a CSS
+	// match; on interactives it scopes to that element's subtree, or to a child
+	// frame when the match is an iframe.
 	Selector string
 	// Target selects one css/js resource, or with body one observed response.
 	Target string
@@ -720,8 +714,8 @@ var aspectEntries = []aspectEntry{
 	{name: "screenshot", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, q AspectQuery) (string, error) {
 		return PageScreenshot(ctx, p, q.FullPage)
 	}},
-	{name: "interactives", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
-		return PageInteractives(ctx, p)
+	{name: "interactives", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, q AspectQuery) (string, error) {
+		return PageInteractives(ctx, p, q.Selector)
 	}},
 	{name: "a11y", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
 		return PageA11y(ctx, p)
@@ -811,18 +805,6 @@ func PageAspect(
 		return PageTruncate(out, q.MaxBytes), nil
 	}
 	return "", unknownAspectError(q.What)
-}
-
-// PageClearLogs empties both capture rings, resets their dropped counters and
-// returns the cleared counts as {"network":N,"console":M}. It needs no context:
-// the call touches only the observer's in-memory state.
-func PageClearLogs(p *browsers.Page) (string, error) {
-	network, console := p.ClearLogs()
-	b, err := json.Marshal(logsCleared{Network: network, Console: console})
-	if err != nil {
-		return "", fmt.Errorf("encode cleared logs: %w", err)
-	}
-	return string(b), nil
 }
 
 // encodeLogs keeps the newest MaxLogEmit entries in chronological order and

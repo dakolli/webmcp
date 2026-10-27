@@ -428,8 +428,8 @@ func (s *Server) handlePageList(ctx context.Context, params json.RawMessage) (an
 // handlePageFetch implements page.fetch: it reads any aspect of a live page
 // through the shared pageops aspect registry — html, text, links, meta, dom,
 // css/js (resource list or one target resource), screenshot, interactives, a11y,
-// network/console (bounded log envelopes), body (one stored response body),
-// article, marks, security, storage and sinks. The registry owns both the
+// network/console/websocket (bounded log envelopes), body (one stored response
+// body), article, marks, security, storage and sinks. The registry owns both the
 // accepted what values and the truncation policy, so this handler mirrors the
 // CLI page fetch command without duplicating either. An unknown extractor is a
 // -32602 invalid-params error.
@@ -617,7 +617,7 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 	case "emulate":
 		out, err = pageops.PageEmulate(ctx, page, p.Device)
 	case "clear_logs":
-		out, err = pageops.PageClearLogs(page)
+		out, err = pageops.PageClearCapture(page)
 	case "sinks_install":
 		out, err = pageops.PageSinksInstall(ctx, page)
 	case "sinks_clear":

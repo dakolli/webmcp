@@ -87,8 +87,8 @@ func init() {
 	registerAspect("meta", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
 		return pageops.PageMeta(ctx, p)
 	}, truncationJSON)
-	registerAspect("interactives", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
-		return pageops.PageInteractives(ctx, p)
+	registerAspect("interactives", func(ctx context.Context, p *browsers.Page, a pageFetchArgs) (string, error) {
+		return pageops.PageInteractives(ctx, p, a.Selector)
 	}, truncationNone)
 	registerAspect("a11y", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
 		return pageops.PageA11y(ctx, p)
@@ -101,6 +101,9 @@ func init() {
 	}, truncationNone)
 	registerAspect("console", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
 		return pageops.PageConsole(ctx, p)
+	}, truncationNone)
+	registerAspect("websocket", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
+		return pageops.PageWebsocket(ctx, p)
 	}, truncationNone)
 	registerAspect("article", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
 		return pageops.PageArticle(ctx, p)

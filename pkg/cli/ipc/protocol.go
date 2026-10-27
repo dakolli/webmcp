@@ -302,7 +302,9 @@ type PageListResult struct {
 // PageFetchParams carries the page.fetch parameters. what is any aspect in the
 // shared pageops registry (ValidateAspect is the allow-list); dom element nodes,
 // matched links and DOM-backed a11y nodes carry a g<document>-b<backendNodeId>
-// handle for page.act; selector scopes html/text; target fetches exactly one
+// handle for page.act; selector scopes html/text/interactives (on interactives
+// it selects a subtree, or a child frame when it matches an iframe); target
+// fetches exactly one
 // css/js resource's content, or with what=body selects one observed response by
 // seq or URL substring; full_page captures the whole scrollable page in a
 // screenshot; max_bytes caps the returned data (default pageops.DefaultPageMaxBytes),
@@ -325,7 +327,9 @@ type PageFetchParams struct {
 	Owner string `json:"owner,omitempty"`
 	// What is the aspect to extract; see pageops.ValidateAspect for the values.
 	What string `json:"what"`
-	// Selector optionally scopes html/text extraction to a CSS match.
+	// Selector optionally scopes html/text/interactives extraction to a CSS
+	// match; on interactives it scopes to that element's subtree, or to a child
+	// frame when the match is an iframe.
 	Selector string `json:"selector,omitempty"`
 	// Target is a css/js resource URL, or with what=body a seq number or URL
 	// substring selecting one observed response body.
@@ -379,7 +383,7 @@ type PageActParams struct {
 	Owner string `json:"owner,omitempty"`
 	// Action is the action to perform (including clear_logs, sinks_install,
 	// sinks_clear and wait_open, which take no payload; clear_logs returns
-	// {"network":N,"console":M}, sinks_install {"installed":true}, sinks_clear
+	// {"network":N,"console":M,"websocket":K}, sinks_install {"installed":true}, sinks_clear
 	// {"cleared":N} and wait_open {session_id,url,opener}).
 	Action string `json:"action"`
 	// Value is the payload: a JS function for eval, text for input/type, URL for

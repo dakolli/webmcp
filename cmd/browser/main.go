@@ -29,14 +29,19 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+
+	"github.com/spf13/cobra"
 
 	"webmcp/pkg/browsers"
 	"webmcp/pkg/cli/cmd"
 	"webmcp/pkg/config"
+	"webmcp/pkg/store"
 )
 
 func main() {
@@ -61,7 +66,62 @@ func main() {
 	)
 	defer mgr.Shutdown(context.Background()) // graceful teardown (best-effort)
 
-	if err := cmd.NewRootCmd(mgr).ExecuteContext(ctx); err != nil {
+	root := cmd.NewRootCmd(mgr)
+	root.AddCommand(newStoreCmd())
+	if err := root.ExecuteContext(ctx); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// newStoreCmd builds the "store" command tree. It is the only CLI surface over
+// the embedded state database; MCP gets no store tool.
+func newStoreCmd() *cobra.Command {
+	storeCmd := &cobra.Command{
+		Use:   "store",
+		Short: "Inspect the embedded state database",
+		Long: `Inspect the embedded SQLite state database at <config dir>/state.db.
+Opening it creates the file (mode 0600) and applies pending migrations.`,
+	}
+	storeCmd.AddCommand(&cobra.Command{
+		Use:   "info",
+		Short: "Print the state database path, journal mode, schema version and tables",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) (err error) {
+			ctx := cmd.Context()
+			path, err := config.StateDBPath()
+			if err != nil {
+				return err
+			}
+			s, err := store.Open(ctx, path)
+			if err != nil {
+				return err
+			}
+			defer func() {
+				if cerr := s.Close(); cerr != nil && err == nil {
+					err = cerr
+				}
+			}()
+
+			mode, err := s.JournalMode(ctx)
+			if err != nil {
+				return err
+			}
+			version, err := s.Version(ctx)
+			if err != nil {
+				return err
+			}
+			tables, err := s.Tables(ctx)
+			if err != nil {
+				return err
+			}
+
+			out := cmd.OutOrStdout()
+			fmt.Fprintf(out, "path: %s\n", path)
+			fmt.Fprintf(out, "journal_mode: %s\n", mode)
+			fmt.Fprintf(out, "schema_version: %d\n", version)
+			fmt.Fprintf(out, "tables: %s\n", strings.Join(tables, ", "))
+			return nil
+		},
+	})
+	return storeCmd
 }

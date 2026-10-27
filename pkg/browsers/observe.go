@@ -121,14 +121,18 @@ func (r *ringBuffer[T]) len() int {
 	return len(r.items)
 }
 
-// pageObserver captures CDP Network/Runtime/Log truth for one Page into two
+// pageObserver captures CDP Network/Runtime/Log truth for one Page into three
 // bounded rings. It has its own mutex; its handlers never touch Page.mu.
 type pageObserver struct {
 	mu     sync.Mutex
 	net    ringBuffer[NetworkEntry]
 	con    ringBuffer[ConsoleEntry]
+	ws     ringBuffer[WebSocketEntry]
 	netSeq int64
 	conSeq int64
+	wsSeq  int64
+	// sockets names the live WebSocket connections their frames belong to.
+	sockets map[proto.NetworkRequestID]*webSocketSocket
 	// secrets keeps sensitive header values instead of redacting them.
 	secrets bool
 }
@@ -136,8 +140,10 @@ type pageObserver struct {
 // newPageObserver returns an observer whose rings are bounded to the capture caps.
 func newPageObserver() *pageObserver {
 	return &pageObserver{
-		net: ringBuffer[NetworkEntry]{cap: networkRingCap},
-		con: ringBuffer[ConsoleEntry]{cap: consoleRingCap},
+		net:     ringBuffer[NetworkEntry]{cap: networkRingCap},
+		con:     ringBuffer[ConsoleEntry]{cap: consoleRingCap},
+		ws:      ringBuffer[WebSocketEntry]{cap: websocketRingCap},
+		sockets: make(map[proto.NetworkRequestID]*webSocketSocket),
 	}
 }
 
@@ -544,22 +550,43 @@ func (p *Page) ConsoleEntries() ([]ConsoleEntry, int) {
 	return o.con.take(), int(o.con.dropped)
 }
 
-// ClearLogs empties both capture rings and resets their dropped counters,
-// returning the number of network and console entries cleared.
+// CaptureCounts reports how many entries each capture ring emptied.
+type CaptureCounts struct {
+	// Network is the number of network entries cleared.
+	Network int
+	// Console is the number of console entries cleared.
+	Console int
+	// WebSocket is the number of WebSocket frames cleared.
+	WebSocket int
+}
+
+// ClearLogs empties the network, console and WebSocket capture rings and resets
+// their dropped counters, returning the network and console counts. Call
+// ClearCapture for the complete counts.
 func (p *Page) ClearLogs() (int, int) {
+	c := p.ClearCapture()
+	return c.Network, c.Console
+}
+
+// ClearCapture empties every capture ring and resets their dropped counters.
+func (p *Page) ClearCapture() CaptureCounts {
 	o := p.observer
 	if o == nil {
-		return 0, 0
+		return CaptureCounts{}
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	return o.net.clear(), o.con.clear()
+	return CaptureCounts{
+		Network:   o.net.clear(),
+		Console:   o.con.clear(),
+		WebSocket: o.ws.clear(),
+	}
 }
 
-// startObservation arms network and console capture on the page's own context.
-// It runs in the pre-registration window, so no page lock is needed. Capture is
-// strictly best-effort: a failed enable silences one stream but never fails page
-// creation.
+// startObservation arms network, console and WebSocket capture on the page's
+// own context. It runs in the pre-registration window, so no page lock is
+// needed. Capture is strictly best-effort: a failed enable silences one stream
+// but never fails page creation.
 func (p *Page) startObservation() {
 	if p.Rod == nil {
 		return
@@ -582,6 +609,11 @@ func (p *Page) startObservation() {
 		func(e *proto.RuntimeConsoleAPICalled) { o.recordConsole(e, capturePage) },
 		func(e *proto.RuntimeExceptionThrown) { o.recordException(e) },
 		func(e *proto.LogEntryAdded) { o.recordLogEntry(e) },
+		func(e *proto.NetworkWebSocketCreated) { o.recordWebSocketCreated(e) },
+		func(e *proto.NetworkWebSocketHandshakeResponseReceived) { o.recordWebSocketHandshake(e) },
+		func(e *proto.NetworkWebSocketFrameSent) { o.recordWebSocketFrameSent(e) },
+		func(e *proto.NetworkWebSocketFrameReceived) { o.recordWebSocketFrameReceived(e) },
+		func(e *proto.NetworkWebSocketClosed) { o.recordWebSocketClosed(e) },
 	)
 	go stop()
 }
