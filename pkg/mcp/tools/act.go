@@ -32,7 +32,7 @@ var actActionNames = []string{
 	"sinks_install", "sinks_clear", "replay", "inject_canary",
 	"postmessage_install", "postmessage_clear", "post_message",
 	"wait_open", "intercept_add", "intercept_list", "intercept_clear",
-	"auth_save", "auth_restore", "auth_list",
+	"auth_save", "auth_restore", "auth_list", "replay_fuzz",
 }
 
 // actActionList renders actActionNames for an error message.
@@ -92,6 +92,22 @@ func (t *Act) Description() string {
 		"with sensitive response headers and text-body secrets (cookies, authorization, session ids, " +
 		"bearer tokens) replaced by <redacted>; body_redactions counts them, max_bytes caps the body " +
 		"at a 256 KB ceiling, and truncated/chain are always present), or " +
+		"replay_fuzz (run a bounded matrix of variants over one captured network entry: target uses " +
+		"replay's seq-or-URL-substring rule, points is an array of {param, location} with location " +
+		"query, body, header or cookie, payloads is the value list, and strategy is sniper (one " +
+		"point at a time, points*payloads requests; default), pitchfork (nth point with nth payload) " +
+		"or clusterbomb (every combination, payloads^points). The size is computed and refused BEFORE " +
+		"any request: at most 100 matrix requests (the baseline probe is extra), 20 points, 50 " +
+		"payloads and 200 runes per payload, with 5 requests in flight and 10s each. It sends one " +
+		"unmodified baseline first and returns {runs:[{seq, payload, point, status, ms, bytes, " +
+		"body_cut, body_redactions}], summary:{baseline:{status,bytes,ms}, anomalies:[{seq, rule, why}]}}; " +
+		"the rules are status_changed, size_delta (>10% either way) and time_delta (>3x either way), " +
+		"bytes is the true response size measured before max_bytes, and every run body is redacted " +
+		"like replay. Example: target=/api/search, " +
+		"points=[{param:\"q\",location:\"query\"}], payloads=[\"a\",\"b\"] with sniper sends 2 " +
+		"requests; 3 points with 4 payloads sends 12. An over-bound matrix is refused before any " +
+		"request, e.g. 5 points with 3 payloads on clusterbomb returns \"replay_fuzz: requests " +
+		"computed 243, over the 100 bound\" — lower the payloads or use sniper), or " +
 		"inject_canary (proves sink reachability: injects a unique wm-canary-<8 hex> value into " +
 		"query, hash, postmessage and name — the default set, or pass targets to narrow it — and " +
 		"returns {canary, injected:[{target, where}], hits:[{sink, context, selector, value, stack}], " +
@@ -145,6 +161,12 @@ func (t *Act) Description() string {
 		"matches nothing returns error.type=element_not_found and does not wait for timeout_ms. " +
 		"input and type never echo the value: the result reports the target and the value's rune " +
 		"length, plus value_redacted=true for a password or hidden field. " +
+		"Pointer and keyboard actions (click, click_at, input, hover, hover_at, press_key) are " +
+		"humanized by default: the pointer steps to the target with small jitter and a randomized " +
+		"100-500 ms pause precedes and follows the action. A sub-second timeout_ms can expire during " +
+		"that pause and leave the action unperformed, so allow at least 1000 ms or use an instant hatch. " +
+		"Pass raw=true, set WEB_MCP_RAW_ACTIONS=1 in the server environment, or start the server " +
+		"with raw actions enabled to make them instant. " +
 		"Logs are cumulative " +
 		"from page creation, so call clear_logs right before the step whose traffic/logs you want to " +
 		"observe, then read page_fetch what=network|console and filter client-side." +
@@ -171,7 +193,7 @@ func (t *Act) InputSchema() models.InputSchema {
 			"action": map[string]any{
 				"type":        "string",
 				"enum":        append([]string(nil), actActionNames...),
-				"description": "The interaction to perform: click (selector), input (set field text; the result reports the target and rune length, never the value, plus value_redacted=true for a password or hidden field), type (keystrokes, same result rule as input), press_key (key/combo e.g. Enter, Escape, Control+A), click_at/hover_at ({x, y} coordinates), drag_and_drop (from {x,y}/selector to {target_x,target_y}/target_selector), upload_file (set file input paths), eval (run JS), navigate (URL), back/forward/reload, hover (selector), scroll (x/y), select (option value), wait (readiness mode), set_viewport (W x H), emulate (device preset), clear_logs (empty the network, console and websocket buffers; no parameters; returns {\"network\":N,\"console\":M,\"websocket\":K} cleared counts), sinks_install (arm the source-to-sink tracer; no parameters; returns {\"installed\":true}; capture is opt-in, changes page behavior, survives client-side route changes and full navigations while its per-document ring resets on a full navigation; read it with page_fetch what=sinks, which is read-only and never arms capture), sinks_clear (empty the tracer ring; no parameters; returns {\"cleared\":N}), replay (resend one captured network entry; needs target, optionally method, headers, value and max_bytes; returns {status,headers,body,bytes,truncated,body_redactions,ms,request,chain} with sensitive headers and text-body secrets redacted and truncated/chain always present), inject_canary (inject a canary into query/hash/postmessage/name — default all four, narrow with targets — and return {canary, injected:[{target, where}], hits:[{sink, context, selector, value, stack}], installed}; requires sinks_install first; query reloads, hash does not; capped at 20 frames), postmessage_install (arm the postMessage recorder: one capture-phase listener per window and iframe without wrapping addEventListener, so page listeners keep their identity; no parameters; returns {\"installed\":true}; read it with page_fetch what=postmessage), postmessage_clear (empty every recorder ring; no parameters; returns {\"cleared\":N}), post_message (deliver value to window.top/self/parent when target_selector is \"top\", \"self\", \"parent\" or omitted, or to the contentWindow of the <iframe>/<frame> matched by any other target_selector; a selector that is not a frame errors instead of falling back to top; origin is the target origin, default \"*\"; arms the recorder first and returns {origin,target}), wait_open (block until this page opens a popup or new tab — target=\"_blank\" or window.open — and return {session_id,url,opener}; timeout_ms bounds the wait; a popup opened before the call is returned immediately), intercept_add (arm a page-scoped in-flight request interceptor with rules=[{id,url_pattern,method,action,headers,rewrite_method,status,body,delay_ms}]; action is block|allow|rewrite|fulfill, url_pattern is a wildcard glob (default *), rewrite continues with headers/body/rewrite_method, a miss continues immediately, and the page holds at most 50 rules across calls (page-wide, not per call); opt-in, changes page behaviour and disables the page HTTP cache while armed so cached subresources still match; returns {rules,count,remaining,active}), intercept_list (return the page's rules with sensitive header values redacted and the remaining rule budget; returns {rules,count,remaining,active}), intercept_clear (remove every rule, continue any paused request, disable interception and restore the cache; returns {rules_removed,active:false}). Rules are per session and never outlive the page. Logs are cumulative from page creation — filter client-side or clear_logs right before the step under observation.",
+				"description": "The interaction to perform: click (selector), input (set field text; the result reports the target and rune length, never the value, plus value_redacted=true for a password or hidden field), type (keystrokes, same result rule as input), press_key (key/combo e.g. Enter, Escape, Control+A), click_at/hover_at ({x, y} coordinates), drag_and_drop (from {x,y}/selector to {target_x,target_y}/target_selector), upload_file (set file input paths), eval (run JS), navigate (URL), back/forward/reload, hover (selector), scroll (x/y), select (option value), wait (readiness mode), set_viewport (W x H), emulate (device preset), clear_logs (empty the network, console and websocket buffers; no parameters; returns {\"network\":N,\"console\":M,\"websocket\":K} cleared counts), sinks_install (arm the source-to-sink tracer; no parameters; returns {\"installed\":true}; capture is opt-in, changes page behavior, survives client-side route changes and full navigations while its per-document ring resets on a full navigation; read it with page_fetch what=sinks, which is read-only and never arms capture), sinks_clear (empty the tracer ring; no parameters; returns {\"cleared\":N}), replay (resend one captured network entry; needs target, optionally method, headers, value and max_bytes; returns {status,headers,body,bytes,truncated,body_redactions,ms,request,chain} with sensitive headers and text-body secrets redacted and truncated/chain always present), replay_fuzz (bounded matrix over one captured entry; needs target, points:[{param,location}] and payloads (each also accepted as a stringified JSON array), optional strategy sniper|pitchfork|clusterbomb (default sniper) and max_bytes; computes and refuses the size before any request (max 100 matrix requests, 20 points, 50 payloads, 200 runes each; 5 in flight, 10s each); returns {runs:[{seq,payload,point,status,ms,bytes,body_cut,body_redactions}],summary:{baseline,anomalies}}), inject_canary (inject a canary into query/hash/postmessage/name — default all four, narrow with targets — and return {canary, injected:[{target, where}], hits:[{sink, context, selector, value, stack}], installed}; requires sinks_install first; query reloads, hash does not; capped at 20 frames), postmessage_install (arm the postMessage recorder: one capture-phase listener per window and iframe without wrapping addEventListener, so page listeners keep their identity; no parameters; returns {\"installed\":true}; read it with page_fetch what=postmessage), postmessage_clear (empty every recorder ring; no parameters; returns {\"cleared\":N}), post_message (deliver value to window.top/self/parent when target_selector is \"top\", \"self\", \"parent\" or omitted, or to the contentWindow of the <iframe>/<frame> matched by any other target_selector; a selector that is not a frame errors instead of falling back to top; origin is the target origin, default \"*\"; arms the recorder first and returns {origin,target}), wait_open (block until this page opens a popup or new tab — target=\"_blank\" or window.open — and return {session_id,url,opener}; timeout_ms bounds the wait; a popup opened before the call is returned immediately), intercept_add (arm a page-scoped in-flight request interceptor with rules=[{id,url_pattern,method,action,headers,rewrite_method,status,body,delay_ms}]; action is block|allow|rewrite|fulfill, url_pattern is a wildcard glob (default *), rewrite continues with headers/body/rewrite_method, a miss continues immediately, and the page holds at most 50 rules across calls (page-wide, not per call); opt-in, changes page behaviour and disables the page HTTP cache while armed so cached subresources still match; returns {rules,count,remaining,active}), intercept_list (return the page's rules with sensitive header values redacted and the remaining rule budget; returns {rules,count,remaining,active}), intercept_clear (remove every rule, continue any paused request, disable interception and restore the cache; returns {rules_removed,active:false}). Rules are per session and never outlive the page. Logs are cumulative from page creation — filter client-side or clear_logs right before the step under observation.",
 			},
 			"selector": map[string]any{
 				"type":        "string",
@@ -239,9 +261,9 @@ func (t *Act) InputSchema() models.InputSchema {
 			},
 			"target": map[string]any{
 				"type": "string",
-				"description": "Network entry to replay: a seq number or a substring of the request URL, resolved against the " +
-					"captured ring read by page_fetch what=network. A substring matching more than one entry is refused " +
-					"with the candidate seq numbers, so pass a longer substring or the seq.",
+				"description": "Network entry to replay or replay_fuzz: a seq number or a substring of the request URL, " +
+					"resolved against the captured ring read by page_fetch what=network. A substring matching more than " +
+					"one entry is refused with the candidate seq numbers, so pass a longer substring or the seq.",
 			},
 			"method": map[string]any{
 				"type":        "string",
@@ -254,9 +276,46 @@ func (t *Act) InputSchema() models.InputSchema {
 			},
 			"max_bytes": map[string]any{
 				"type": "integer",
-				"description": "Optional cap on the returned replay body in bytes; the ceiling is 262144 (256 KB) " +
+				"description": "Optional cap on the returned body in bytes; the ceiling is 262144 (256 KB) " +
 					"and larger requests are clamped. A body over the cap returns truncated:true with bytes " +
-					"still reporting the returned size. Ignored by actions other than replay.",
+					"reporting the returned size. With replay_fuzz the cap bounds each returned variant body " +
+					"only: the run still measures the true response size before the cap, so bytes and the " +
+					"size_delta rule stay accurate. Ignored by other actions.",
+			},
+			"points": map[string]any{
+				"type": "array",
+				"description": "replay_fuzz only: injection points over the captured request. Each entry is " +
+					"{param, location}; param is the query parameter, body field, header name or cookie name, " +
+					"and location is query, body, header or cookie. Max 20 points. A body point needs a " +
+					"captured request body. A stringified JSON array is accepted.",
+				"items": map[string]any{
+					"type":     "object",
+					"required": []string{"param", "location"},
+					"properties": map[string]any{
+						"param": map[string]any{
+							"type":        "string",
+							"description": "Query parameter, body field, header name or cookie name to inject into.",
+						},
+						"location": map[string]any{
+							"type":        "string",
+							"enum":        []string{"query", "body", "header", "cookie"},
+							"description": "Where param lives in the captured request.",
+						},
+					},
+				},
+			},
+			"payloads": map[string]any{
+				"type":  "array",
+				"items": map[string]any{"type": "string"},
+				"description": "replay_fuzz only: values injected at each point, in plan order. Max 50 payloads " +
+					"of 200 runes each. The matrix size is computed and refused before any request. " +
+					"A stringified JSON array is accepted.",
+			},
+			"strategy": map[string]any{
+				"type":        "string",
+				"enum":        []string{"sniper", "pitchfork", "clusterbomb"},
+				"default":     "sniper",
+				"description": "replay_fuzz only: sniper injects one point at a time (points*payloads requests), pitchfork pairs the nth point with the nth payload, clusterbomb covers every combination (payloads^points). Default sniper. The 100-request bound is checked before the run.",
 			},
 			"paths": map[string]any{
 				"type":        "array",
@@ -264,8 +323,25 @@ func (t *Act) InputSchema() models.InputSchema {
 				"description": "Array of local file paths for upload_file action.",
 			},
 			"timeout_ms": map[string]any{
-				"type":        "integer",
-				"description": "Optional per-call timeout in milliseconds (default 30000); wait action sleeps for this long in ms mode.",
+				"type": "integer",
+				"description": "Optional per-call timeout in milliseconds (default 30000); the wait action " +
+					"sleeps for this long in ms mode. A sub-second timeout can expire during the humanized " +
+					"pre-action pause and leave the click unperformed — pass raw:true or at least 1000 ms " +
+					"when the action must land.",
+			},
+			"raw": map[string]any{
+				"type":    "boolean",
+				"default": false,
+				"description": "Disable the humanized timing for this call: one instant pointer move, no " +
+					"pre/post action pause, and no post-action settle poll — the page state is read once " +
+					"and the action returns, so the delta reflects that single read rather than a polled " +
+					"settle. The default humanizes click, click_at, input, hover, hover_at and press_key " +
+					"with stepped, jittered pointer movement and a randomized 100-500 ms pause, then polls " +
+					"up to 900 ms for a click-driven navigation so the state delta is reliable; a short " +
+					"timeout can be spent in that pause. Three hatches disable it and any one is enough: " +
+					"this per-call raw flag, WEB_MCP_RAW_ACTIONS=1 in the server environment, or the " +
+					"server started with browsers.WithRawActions(true). eval, navigate and other " +
+					"non-pointer actions never pause.",
 			},
 			"wait_mode": map[string]any{
 				"type":        "string",
@@ -388,8 +464,12 @@ type actArgs struct {
 	Method         string                   `json:"method"`
 	Headers        map[string]string        `json:"headers"`
 	MaxBytes       int64                    `json:"max_bytes"`
+	Points         []browsers.FuzzPoint     `json:"points"`
+	Payloads       []string                 `json:"payloads"`
+	Strategy       string                   `json:"strategy"`
 	Paths          []string                 `json:"paths"`
 	TimeoutMS      int                      `json:"timeout_ms"`
+	Raw            bool                     `json:"raw"`
 	WaitMode       string                   `json:"wait_mode"`
 	Viewport       *browsers.Viewport       `json:"viewport"`
 	Device         string                   `json:"device"`
@@ -433,6 +513,13 @@ func (a *actArgs) validate(provided map[string]json.RawMessage) error {
 		}
 		if a.MaxBytes < 0 {
 			return fmt.Errorf("replay max_bytes must be >= 0")
+		}
+	case "replay_fuzz":
+		if a.Target == "" {
+			return fmt.Errorf("replay_fuzz requires target=<seq> or target=<url substring> from page_fetch what=network")
+		}
+		if a.MaxBytes < 0 {
+			return fmt.Errorf("replay_fuzz max_bytes must be >= 0")
 		}
 	case "intercept_add":
 		if len(a.Rules) == 0 {
@@ -501,6 +588,9 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	if a.Raw {
+		ctx = browsers.WithRawCall(ctx)
+	}
 
 	p, err := t.mgr.Page(ctx, a.SessionID, browsers.BrowserID(a.BrowserID), a.Owner)
 	if err != nil {
@@ -585,6 +675,23 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 				return t.mgr.CheckPageScope(a.SessionID, rawURL)
 			},
 		})
+	case "replay_fuzz":
+		var fuzz browsers.FuzzResult
+		fuzz, err = p.ReplayFuzz(ctx, browsers.FuzzSpec{
+			Target:   a.Target,
+			Strategy: browsers.FuzzStrategy(a.Strategy),
+			Points:   a.Points,
+			Payloads: a.Payloads,
+			MaxBytes: a.MaxBytes,
+			CheckScope: func(rawURL string) error {
+				return t.mgr.CheckPageScope(a.SessionID, rawURL)
+			},
+		})
+		if err == nil {
+			var data []byte
+			data, err = json.Marshal(fuzz)
+			out = string(data)
+		}
 	case "inject_canary":
 		out, err = pageops.PageCanaryInject(ctx, p, a.Targets, a.Value)
 	case "postmessage_install":

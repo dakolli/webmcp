@@ -90,6 +90,48 @@ func (e *RateLimitError) Error() string {
 // Unwrap exposes the context cause.
 func (e *RateLimitError) Unwrap() error { return e.Err }
 
+// Hint is the one-line remediation for a rate refusal: the two knobs that fit
+// the wait, or a longer call budget. The arguments sent to the tool are valid.
+func (e *RateLimitError) Hint() string {
+	return "the per-host rate limiter held the call past its deadline — lower rps, raise burst, or retry with a longer timeout_ms"
+}
+
+// ScopeError reports a navigation or engine-issued request the browser's
+// allowlist does not permit. The call arguments may be correct; the browser's
+// scope must change.
+type ScopeError struct {
+	// Host is the host the allowlist does not cover.
+	Host string
+	// Allowed is the rendered allowlist, or "none" for a strict empty list.
+	Allowed string
+	// Scope is the live scope state.
+	Scope string
+	// Strict reports whether an empty allowlist denies every navigation.
+	Strict bool
+}
+
+// Error names the host, the live scope state, the allowed hosts and the fix.
+func (e *ScopeError) Error() string {
+	return fmt.Sprintf(
+		"web-mcp: invalid arguments: host %q is outside the scope allowlist (allowed: %s; scope=%s, scope_strict=%t) — add it with browser_create scope=[%q]",
+		e.Host,
+		e.Allowed,
+		e.Scope,
+		e.Strict,
+		e.Host,
+	)
+}
+
+// Hint is the one-line remediation for a scope refusal: the arguments are
+// valid, so change the browser's allowlist instead of retrying the same call.
+func (e *ScopeError) Hint() string {
+	return fmt.Sprintf(
+		"the arguments are valid — the browser's scope refuses host %q; call browser_create with scope including %q, or reuse a browser whose scope already allows it",
+		e.Host,
+		e.Host,
+	)
+}
+
 // tokenBucket is one host's token count and the virtual time of its last
 // reservation. A last time in the future queues further requests behind it.
 type tokenBucket struct {
@@ -376,14 +418,12 @@ func scopeRefusal(host string, scope []string, strict bool) error {
 	if len(scope) == 0 && strict {
 		allowed = "none"
 	}
-	return fmt.Errorf(
-		"web-mcp: invalid arguments: host %q is outside the scope allowlist (allowed: %s; scope=%s, scope_strict=%t) — add it with browser_create scope=[%q]",
-		host,
-		allowed,
-		state,
-		strict,
-		host,
-	)
+	return &ScopeError{
+		Host:    host,
+		Allowed: allowed,
+		Scope:   state,
+		Strict:  strict,
+	}
 }
 
 // scopeState renders the scope state for listings and errors.

@@ -226,6 +226,59 @@ func TestClassifyError(t *testing.T) {
 			want: errNavFailed,
 		},
 		{
+			name: "over-bound fuzz matrix is invalid args",
+			err: fmt.Errorf("page_act: %w", &browsers.FuzzBoundsError{
+				Unit:     "requests",
+				Computed: "243",
+				Bound:    "100",
+			}),
+			want: errInvalidArgs,
+		},
+		{
+			name: "rate-limited call is a timeout",
+			err: fmt.Errorf("page_act: %w", &browsers.RateLimitError{
+				Host: "site.test",
+				Wait: time.Second,
+				Err:  context.DeadlineExceeded,
+			}),
+			want: errTimeout,
+		},
+		{
+			name: "stale handle is invalid args",
+			err:  errors.New(`page_act: click: handle "g1-b7" is stale — minted for a previous document (re-run page_fetch what=interactives to re-mint handles)`),
+			want: errInvalidArgs,
+		},
+		{
+			name: "unknown mouse button is invalid args",
+			err:  errors.New(`page_act: click: unknown mouse button "side" (must be left, right, or middle)`),
+			want: errInvalidArgs,
+		},
+		{
+			name: "canary without the tracer is invalid args",
+			err:  fmt.Errorf("page_act: %w", browsers.ErrCanaryNeedsTracer),
+			want: errInvalidArgs,
+		},
+		{
+			name: "intercept rule validation is invalid args",
+			err:  errors.New(`page_act: intercept: rule "r1" has status 700 (must be 100-599)`),
+			want: errInvalidArgs,
+		},
+		{
+			name: "auth user-agent mismatch is invalid args",
+			err:  errors.New(`page_act: auth_restore: stored user agent "Chrome/1" does not match the live page user agent "Chrome/2" — re-capture on this browser, or pass force=true to restore anyway`),
+			want: errInvalidArgs,
+		},
+		{
+			name: "missing auth snapshot is not found",
+			err:  errors.New("page_act: auth_restore: store: auth snapshot not found: example.org/main"),
+			want: errNotFound,
+		},
+		{
+			name: "wait_open on a closed browser is page closed",
+			err:  errors.New("page_act: browsers: wait_open: browser browser-1 is closed"),
+			want: errPageClosed,
+		},
+		{
 			name: "unknown eval error stays verbatim",
 			err:  errors.New("page_act: eval js error: TypeError: boom"),
 			want: errUnknown,
@@ -242,6 +295,65 @@ func TestClassifyError(t *testing.T) {
 			}
 			if got != errUnknown && hint == "" {
 				t.Fatalf("%s hint = empty, want a remediation", got)
+			}
+		})
+	}
+}
+
+// TestPolicyRefusalHints pins the WEB-226 contract: a scope or rate refusal is
+// a policy decision, so its hint names the real fix and never the schema
+// remediation that sends an agent to retry the same call.
+func TestPolicyRefusalHints(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		wantType string
+		wantHint []string
+	}{
+		{
+			name: "scope refusal",
+			err: fmt.Errorf("page_act: replay_fuzz: %w", &browsers.ScopeError{
+				Host:    "fonts.googleapis.com",
+				Allowed: "developer.android.com",
+				Scope:   "developer.android.com",
+			}),
+			wantType: errInvalidArgs,
+			wantHint: []string{"browser_create", "scope"},
+		},
+		{
+			name: "rate refusal",
+			err: fmt.Errorf("page_act: %w", &browsers.RateLimitError{
+				Host: "site.test",
+				Wait: time.Second,
+				Err:  context.DeadlineExceeded,
+			}),
+			wantType: errTimeout,
+			wantHint: []string{"rps", "burst"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, err := failResult(tt.err)
+			if err != nil {
+				t.Fatalf("failResult() error = %v", err)
+			}
+			env := mustEnvelope(t, out)
+			if env.Error == nil {
+				t.Fatal("envelope has no error branch")
+			}
+			if env.Error.Type != tt.wantType {
+				t.Fatalf("type = %q, want %q", env.Error.Type, tt.wantType)
+			}
+			for _, want := range tt.wantHint {
+				if !strings.Contains(env.Error.Hint, want) {
+					t.Fatalf("hint = %q, want it to name %q", env.Error.Hint, want)
+				}
+			}
+			if strings.Contains(env.Error.Hint, "InputSchema") {
+				t.Fatalf("hint = %q, want the policy fix, not the schema remediation", env.Error.Hint)
+			}
+			if env.Error.Hint == hintFor(errInvalidArgs) {
+				t.Fatalf("hint = %q, want the policy hint, not the schema hint", env.Error.Hint)
 			}
 		})
 	}
@@ -497,6 +609,98 @@ func TestPageLimitEnvelopeIsInvalidArgs(t *testing.T) {
 	}
 	if strings.Contains(env.Error.Hint, "fetch_page") {
 		t.Fatalf("hint = %q, want no fetch_page reopen advice", env.Error.Hint)
+	}
+}
+
+// TestOverBoundFuzzEnvelopeIsInvalidArgs pins the WEB-219 contract: the live
+// refusal keeps its sentence, the type is invalid_args, and the hint names both
+// knobs that fit the matrix.
+func TestOverBoundFuzzEnvelopeIsInvalidArgs(t *testing.T) {
+	err := fmt.Errorf("page_act: %w", &browsers.FuzzBoundsError{
+		Unit:     "requests",
+		Computed: "243",
+		Bound:    "100",
+	})
+	out, marshalErr := failResult(err)
+	if marshalErr != nil {
+		t.Fatalf("failResult() error = %v", marshalErr)
+	}
+	env := mustEnvelope(t, out)
+	if env.Error == nil {
+		t.Fatal("envelope has no error branch")
+	}
+	if env.Error.Type != errInvalidArgs {
+		t.Fatalf("type = %q, want %q", env.Error.Type, errInvalidArgs)
+	}
+	if want := "page_act: replay_fuzz: requests computed 243, over the 100 bound"; env.Error.Message != want {
+		t.Fatalf("message = %q, want %q", env.Error.Message, want)
+	}
+	for _, want := range []string{"payload", "sniper"} {
+		if !strings.Contains(env.Error.Hint, want) {
+			t.Fatalf("hint = %q, want it to name %q", env.Error.Hint, want)
+		}
+	}
+}
+
+// TestActionTimeoutEnvelopeNamesBothEscapes pins that a humanized timeout
+// carries its own raw:true / timeout_ms hint rather than the generic one.
+func TestActionTimeoutEnvelopeNamesBothEscapes(t *testing.T) {
+	err := fmt.Errorf("page_act: %w", &browsers.ActionTimeoutError{
+		Op:   "click",
+		Page: "page-1",
+		Err:  context.DeadlineExceeded,
+	})
+	out, marshalErr := failResult(err)
+	if marshalErr != nil {
+		t.Fatalf("failResult() error = %v", marshalErr)
+	}
+	env := mustEnvelope(t, out)
+	if env.Error == nil {
+		t.Fatal("envelope has no error branch")
+	}
+	if env.Error.Type != errTimeout {
+		t.Fatalf("type = %q, want %q", env.Error.Type, errTimeout)
+	}
+	for _, want := range []string{"raw:true", "timeout_ms"} {
+		if !strings.Contains(env.Error.Hint, want) {
+			t.Fatalf("hint = %q, want it to name %q", env.Error.Hint, want)
+		}
+	}
+}
+
+// TestSpecificHintBeatsGenericHint pins that an error's own Hint() replaces the
+// generic per-type remediation instead of sitting beside it.
+func TestSpecificHintBeatsGenericHint(t *testing.T) {
+	timeoutErr := fmt.Errorf("page_act: %w", &browsers.ActionTimeoutError{
+		Op:   "click",
+		Page: "page-1",
+		Err:  context.DeadlineExceeded,
+	})
+	gotType, gotHint := classifyError(timeoutErr, challengeState{})
+	if gotType != errTimeout {
+		t.Fatalf("type = %q, want %q", gotType, errTimeout)
+	}
+	if gotHint == hintFor(errTimeout) {
+		t.Fatalf("hint = %q, want the typed hint, not the generic one", gotHint)
+	}
+	if !strings.Contains(gotHint, "raw:true") {
+		t.Fatalf("hint = %q, want raw:true", gotHint)
+	}
+
+	fuzzErr := fmt.Errorf("page_act: %w", &browsers.FuzzBoundsError{
+		Unit:     "payloads",
+		Computed: "60",
+		Bound:    "50",
+	})
+	gotType, gotHint = classifyError(fuzzErr, challengeState{})
+	if gotType != errInvalidArgs {
+		t.Fatalf("type = %q, want %q", gotType, errInvalidArgs)
+	}
+	if gotHint == hintFor(errInvalidArgs) {
+		t.Fatalf("hint = %q, want the typed hint, not the generic one", gotHint)
+	}
+	if !strings.Contains(gotHint, "50") {
+		t.Fatalf("hint = %q, want the payload bound", gotHint)
 	}
 }
 

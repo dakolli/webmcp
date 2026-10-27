@@ -82,12 +82,64 @@ var invalidArgsMarkers = []string{
 	"requires a viewport",
 	"requires a device",
 	"requires selector",
+	"requires a selector",
 	"requires value",
 	"requires target",
 	"requires x and y",
 	"unknown device",
 	"unknown identity",
 	"invalid identity",
+	"either selector or handle is required",
+	"unknown mouse button",
+	"unknown key name",
+	"unknown key modifier",
+	"empty key token",
+	"key specification cannot be empty",
+	"no file paths provided",
+	"invalid url",
+	"invalid --wait",
+	"invalid wait option",
+	"invalid viewport",
+	"invalid canary target",
+	"auth: invalid site",
+	"auth: empty site",
+	"auth: empty name",
+	"method override is blank",
+	"no network entry matches target",
+	"unknown strategy",
+	"replay_fuzz: unknown location",
+	"at least one injection point",
+	"at least one payload",
+	"has an empty param",
+	"intercept: no rules supplied",
+	"intercept: duplicate rule id",
+	"intercept: rule id is required",
+	"intercept: rule",
+}
+
+// handleArgsMarkers identify a handle that this document did not mint. Both
+// fixes are the same: re-read the page for a fresh handle, or use a selector.
+var handleArgsMarkers = []string{
+	"minted for a previous document",
+	"element detached from the document",
+	"invalid handle",
+}
+
+// userAgentMismatchMarkers identify an auth_restore refused because the live
+// page agent differs from the stored one.
+var userAgentMismatchMarkers = []string{
+	"does not match the live page user agent",
+}
+
+// notFoundMarkers identify a named resource missing from a local store.
+var notFoundMarkers = []string{
+	"auth snapshot not found",
+}
+
+// hintedError is an error that carries its own one-line remediation. The
+// envelope prefers it over the generic per-type hint.
+type hintedError interface {
+	Hint() string
 }
 
 // elementNotFoundMarkers identify a selector that matched nothing.
@@ -135,6 +187,7 @@ var pageClosedMarkers = []string{
 	"inspected target navigated or closed",
 	"no target with given id found",
 	"page close canceled",
+	"wait_open: browser",
 }
 
 // navFailedMarkers identify a failed navigation.
@@ -196,10 +249,24 @@ func marshalEnvelope(env resultEnvelope) (string, error) {
 }
 
 // classifyError maps a wrapped tool error to a stable type and an actionable
-// hint. The order is deliberate: invalid_args first, page_closed before
-// timeout (reopening is the fix), anti_bot before nav_failed (the navigation
-// failed because of the challenge), and timeout before nav_failed.
+// hint. An error that carries Hint() supplies its own remediation, which always
+// beats the generic per-type hint.
 func classifyError(err error, ch challengeState) (string, string) {
+	errType, hint := classifyErrorType(err, ch)
+	var hinted hintedError
+	if errors.As(err, &hinted) {
+		if specific := hinted.Hint(); specific != "" {
+			return errType, specific
+		}
+	}
+	return errType, hint
+}
+
+// classifyErrorType resolves the type and the generic hint. The order is
+// deliberate: invalid_args first, page_closed before timeout (reopening is the
+// fix), anti_bot before nav_failed (the navigation failed because of the
+// challenge), and timeout before nav_failed.
+func classifyErrorType(err error, ch challengeState) (string, string) {
 	if err == nil {
 		return errUnknown, ""
 	}
@@ -213,6 +280,9 @@ func classifyError(err error, ch challengeState) (string, string) {
 		lookup         *browsers.PageLookupError
 		replay         *browsers.ReplayTransportError
 		pageLimit      *browsers.PageLimitError
+		fuzzBounds     *browsers.FuzzBoundsError
+		rateLimit      *browsers.RateLimitError
+		scopeRefused   *browsers.ScopeError
 	)
 
 	switch {
@@ -222,11 +292,25 @@ func classifyError(err error, ch challengeState) (string, string) {
 		return errNotFound, "the session is not in that browser or owner — call session_list for the live ids, or pass the matching browser_id or owner"
 	case errors.As(err, &pageLimit):
 		return errInvalidArgs, "the browser is at its page cap — call session_close on a session you no longer need, then retry"
+	case errors.As(err, &fuzzBounds):
+		return errInvalidArgs, hintFor(errInvalidArgs)
+	case errors.Is(err, browsers.ErrCanaryNeedsTracer):
+		return errInvalidArgs, "arm the tracer first with page_act action=sinks_install, then retry inject_canary"
 	case errors.Is(err, browsers.ErrUnknownBrowser):
 		return errInvalidArgs, "that browser_id is not live — call browser_list for the running ids and pass one of them"
 	case errors.Is(err, browsers.ErrReplayTargetAmbiguous),
 		errors.Is(err, browsers.ErrReplayTargetNotFound):
 		return errInvalidArgs, hintFor(errInvalidArgs)
+	case containsAny(msg, notFoundMarkers):
+		return errNotFound, "no snapshot is stored for that site and name — call page_act action=auth_list to see the saved names, or auth_save first"
+	case containsAny(msg, handleArgsMarkers):
+		return errInvalidArgs, "the handle was not minted by this document — re-read page_fetch what=interactives and pass a fresh handle, or use a selector"
+	case containsAny(msg, userAgentMismatchMarkers):
+		return errInvalidArgs, "pass force=true to restore anyway, or re-save the snapshot on this browser with auth_save"
+	case errors.As(err, &scopeRefused):
+		return errInvalidArgs, scopeRefused.Hint()
+	case errors.As(err, &rateLimit):
+		return errTimeout, rateLimit.Hint()
 	case errors.As(err, &replay):
 		if replay.TimedOut() {
 			return errTimeout, "the replay exceeded its fixed 30s budget — the target is slow or wedged; retry or replay a lighter entry"

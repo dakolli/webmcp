@@ -91,8 +91,8 @@ func TestDecodeArgsExplainsTypeMismatch(t *testing.T) {
 		if got := firstLine(err.Error()); got != want {
 			t.Fatalf("decodeArgs() first line = %q, want %q", got, want)
 		}
-		if !strings.Contains(err.Error(), "\nRetry with: ") {
-			t.Fatalf("decodeArgs() = %q, want a Retry with hint", err)
+		if strings.Contains(err.Error(), "Retry with") {
+			t.Fatalf("decodeArgs() = %q, want no fixed retry call", err)
 		}
 	})
 
@@ -108,8 +108,8 @@ func TestDecodeArgsExplainsTypeMismatch(t *testing.T) {
 		if got := firstLine(err.Error()); got != want {
 			t.Fatalf("decodeArgs() first line = %q, want %q", got, want)
 		}
-		if !strings.Contains(err.Error(), "\nRetry with: ") {
-			t.Fatalf("decodeArgs() = %q, want a Retry with hint", err)
+		if strings.Contains(err.Error(), "Retry with") {
+			t.Fatalf("decodeArgs() = %q, want no fixed retry call", err)
 		}
 	})
 
@@ -124,8 +124,8 @@ func TestDecodeArgsExplainsTypeMismatch(t *testing.T) {
 		if !strings.Contains(err.Error(), `"scope" must be an array`) {
 			t.Fatalf("decodeArgs() = %q, want the field and wanted type", err)
 		}
-		if !strings.Contains(err.Error(), "\nRetry with: ") {
-			t.Fatalf("decodeArgs() = %q, want a Retry with hint", err)
+		if strings.Contains(err.Error(), "Retry with") {
+			t.Fatalf("decodeArgs() = %q, want no fixed retry call", err)
 		}
 	})
 

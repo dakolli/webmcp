@@ -151,20 +151,6 @@ func (r *Registry) GetPrompt(name string, args map[string]string) (*models.GetPr
 	}, nil
 }
 
-// toolExamples maps each tool to its shortest valid retry call. It is shown
-// alongside an argument type mismatch so the agent can copy a working call.
-var toolExamples = map[string]string{
-	"browser_create": `{"proxy":"127.0.0.1:8080","ignore_certs":true}`,
-	"browser_close":  `{"browser_id":"browser-1"}`,
-	"page_list":      `{"browser_id":"browser-1"}`,
-	"fetch_page":     `{"url":"https://example.com"}`,
-	"page_fetch":     `{"session_id":"page-1","what":"text"}`,
-	"page_act":       `{"session_id":"page-1","action":"reload"}`,
-	"session_close":  `{"session_id":"page-1"}`,
-	"browser_list":   `{}`,
-	"session_list":   `{}`,
-}
-
 // Execute runs a call to the registered tool with the given name. Tool
 // failures travel inside the tool's result envelope; an error is returned only
 // when the tool itself is unknown.
@@ -177,33 +163,36 @@ func (r *Registry) Execute(ctx context.Context, name string, args json.RawMessag
 }
 
 // decodeArgs decodes raw tool arguments into dst. Boolean strings and
-// JSON-encoded arrays or objects are coerced, and a type mismatch is rewritten
-// into a sentence naming the field, wanted type, received value and a working
-// retry call.
+// JSON-encoded arrays or objects are coerced, one failing field per pass, until
+// the arguments decode or no further coercion applies; a remaining type
+// mismatch is rewritten into a sentence naming the field and the wanted type.
 func decodeArgs(tool string, args json.RawMessage, dst any) error {
 	if len(bytes.TrimSpace(args)) == 0 {
 		return nil
 	}
 	normalized := coerceBooleanStrings(args)
-	if err := json.Unmarshal(normalized, dst); err != nil {
-		if retryArgs, ok := coerceJSONStringArgs(normalized, err); ok {
-			if json.Unmarshal(retryArgs, dst) == nil {
-				return nil
+	for {
+		err := json.Unmarshal(normalized, dst)
+		if err == nil {
+			return nil
+		}
+		coerced, ok := coerceJSONStringArgs(normalized, err)
+		if !ok || bytes.Equal(coerced, normalized) {
+			if explained := explainArgTypeError(tool, normalized, err); explained != err {
+				return explained
 			}
+			return fmt.Errorf("%s: invalid arguments: %w", tool, err)
 		}
-		if explained := explainArgTypeError(tool, normalized, err); explained != err {
-			return explained
-		}
-		return fmt.Errorf("%s: invalid arguments: %w", tool, err)
+		normalized = coerced
 	}
-	return nil
 }
 
-// coerceJSONStringArgs rewrites the single argument that failed to decode from a
-// JSON string into the array or object it encodes, so clients that stringify
-// every non-scalar can still fill structured fields. It reports false unless the
-// failure is a type error for a field that wants a slice, array, map or struct
-// and the string decodes to exactly that JSON kind.
+// coerceJSONStringArgs rewrites the argument that failed to decode from a JSON
+// string into the array or object it encodes, so clients that stringify every
+// non-scalar can still fill structured fields. decodeArgs calls it once per
+// failing field, so every stringified array or object in a call is coerced. It
+// reports false unless the failure is a type error for a field that wants a
+// slice, array, map or struct and the string decodes to exactly that JSON kind.
 func coerceJSONStringArgs(args json.RawMessage, err error) (json.RawMessage, bool) {
 	var typeErr *json.UnmarshalTypeError
 	if !errors.As(err, &typeErr) || typeErr.Field == "" {
@@ -310,8 +299,8 @@ func coerceBooleanStrings(args json.RawMessage) json.RawMessage {
 }
 
 // explainArgTypeError replaces a JSON type mismatch in tool arguments with a
-// sentence naming the tool, field, wanted type and received value, followed by
-// a working retry call for that tool. Non-type errors are returned unchanged.
+// sentence naming the tool, field and wanted type, plus the value that was sent.
+// Non-type errors are returned unchanged.
 func explainArgTypeError(
 	tool string,
 	args json.RawMessage,
@@ -321,17 +310,13 @@ func explainArgTypeError(
 	if !errors.As(err, &typeErr) || typeErr.Field == "" {
 		return err
 	}
-	msg := fmt.Sprintf(
+	return fmt.Errorf(
 		"%s: %q must be %s, but the request sent %s.",
 		tool,
 		typeErr.Field,
 		wantedType(typeErr.Type),
 		sentValue(args, typeErr.Field),
 	)
-	if example, ok := toolExamples[tool]; ok {
-		msg += "\nRetry with: " + example
-	}
-	return errors.New(msg)
 }
 
 // wantedType renders a JSON field's expected type in plain words.

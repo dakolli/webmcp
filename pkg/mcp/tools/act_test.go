@@ -285,3 +285,100 @@ func TestInjectCanaryAction(t *testing.T) {
 		t.Fatalf("guard error = %q, want %q", got, want)
 	}
 }
+
+// TestActDecodeCoercesEveryStructuredField pins that a call carrying two
+// stringified structured fields decodes both, in one decodeArgs pass chain.
+func TestActDecodeCoercesEveryStructuredField(t *testing.T) {
+	args := json.RawMessage(`{
+		"action":"replay_fuzz",
+		"target":"12",
+		"points":"[{\"param\":\"q\",\"location\":\"query\"}]",
+		"payloads":"[\"a\",\"b\"]"
+	}`)
+	var a actArgs
+	if err := decodeArgs("page_act", args, &a); err != nil {
+		t.Fatalf("decodeArgs() error = %v", err)
+	}
+	if len(a.Points) != 1 || a.Points[0].Param != "q" || a.Points[0].Location != browsers.FuzzQuery {
+		t.Fatalf("points = %+v, want one query point for q", a.Points)
+	}
+	if !slices.Equal(a.Payloads, []string{"a", "b"}) {
+		t.Fatalf("payloads = %v, want [a b]", a.Payloads)
+	}
+}
+
+// TestActDecodeTypeErrorNamesField pins that a real type mismatch names the
+// offending field and the type the schema wants, with no fixed retry example.
+func TestActDecodeTypeErrorNamesField(t *testing.T) {
+	var a actArgs
+	err := decodeArgs("page_act", json.RawMessage(`{"action":"wait","timeout_ms":"soon"}`), &a)
+	if err == nil {
+		t.Fatal("decodeArgs() = nil, want a type error")
+	}
+	if got, want := err.Error(), `page_act: "timeout_ms" must be a number`; !strings.Contains(got, want) {
+		t.Fatalf("decodeArgs() = %q, want it to name %q", got, want)
+	}
+	if strings.Contains(err.Error(), "Retry with") {
+		t.Fatalf("decodeArgs() = %q, want no fixed retry call", err)
+	}
+}
+
+// TestActDecodeUncoercibleFieldHasNoExampleHint pins that a structured field
+// holding text that is not JSON fails actionably and carries no example call.
+func TestActDecodeUncoercibleFieldHasNoExampleHint(t *testing.T) {
+	var a actArgs
+	err := decodeArgs("page_act", json.RawMessage(`{"action":"reload","points":"not-json"}`), &a)
+	if err == nil {
+		t.Fatal("decodeArgs() = nil, want a type error")
+	}
+	if !strings.Contains(err.Error(), `"points" must be an array`) {
+		t.Fatalf("decodeArgs() = %q, want it to name points and the array type", err)
+	}
+	for _, banned := range []string{"Retry with", "page-1", "reload"} {
+		if strings.Contains(err.Error(), banned) {
+			t.Fatalf("decodeArgs() = %q, want no %q hint", err, banned)
+		}
+	}
+}
+
+// TestActSchemaDocumentsCoercionAndTiming pins the audit wording: stringified
+// arrays are advertised, a sub-second timeout is warned about, raw disables the
+// pause for that call, and the over-bound example quotes the engine message.
+func TestActSchemaDocumentsCoercionAndTiming(t *testing.T) {
+	schema := (&Act{}).InputSchema()
+	tests := []struct {
+		field  string
+		phrase string
+	}{
+		{"points", "stringified JSON array"},
+		{"payloads", "stringified JSON array"},
+		{"timeout_ms", "raw:true"},
+		{"timeout_ms", "1000 ms"},
+		{"raw", "for this call"},
+		{"raw", "no pre/post action pause"},
+	}
+	for _, tt := range tests {
+		prop, ok := schema.Properties[tt.field].(map[string]any)
+		if !ok {
+			t.Fatalf("%s schema property is missing", tt.field)
+		}
+		desc, _ := prop["description"].(string)
+		if !strings.Contains(desc, tt.phrase) {
+			t.Errorf("%s description is missing %q: %q", tt.field, tt.phrase, desc)
+		}
+	}
+	for _, desc := range []string{(&Act{}).Description(), schemaDesc(schema.Properties["raw"])} {
+		if strings.Contains(desc, "never overruns") {
+			t.Errorf("description still promises a pause never overruns the call")
+		}
+	}
+	if want := "replay_fuzz: requests computed 243, over the 100 bound"; !strings.Contains((&Act{}).Description(), want) {
+		t.Errorf("page_act description does not quote the engine message %q", want)
+	}
+}
+
+func schemaDesc(prop any) string {
+	m, _ := prop.(map[string]any)
+	desc, _ := m["description"].(string)
+	return desc
+}

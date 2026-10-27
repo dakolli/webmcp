@@ -69,6 +69,42 @@ func TestScopeRefusalNamesHostStateAndFix(t *testing.T) {
 	}
 }
 
+// TestScopeErrorHintNamesThePolicy pins the WEB-226 rule: a scope refusal is a
+// policy decision, so its hint names browser_create and scope instead of the
+// schema remediation that sends the agent to retry the same call.
+func TestScopeErrorHintNamesThePolicy(t *testing.T) {
+	b := &Browser{scope: []string{"example.com"}, scopeStrict: false}
+	err := b.CheckScope("https://evil.test/x")
+	var refused *ScopeError
+	if !errors.As(err, &refused) {
+		t.Fatalf("CheckScope() error = %v, want *ScopeError", err)
+	}
+	hint := refused.Hint()
+	for _, want := range []string{"browser_create", "scope"} {
+		if !strings.Contains(hint, want) {
+			t.Errorf("hint %q missing %q", hint, want)
+		}
+	}
+	if strings.Contains(hint, "InputSchema") {
+		t.Errorf("hint %q carries the schema remediation, want the policy fix", hint)
+	}
+}
+
+// TestRateLimitErrorHintNamesTheKnobs pins the other per-browser policy refusal:
+// the hint names rps and burst, never the schema remediation.
+func TestRateLimitErrorHintNamesTheKnobs(t *testing.T) {
+	err := &RateLimitError{Host: "example.test", Wait: time.Second, Err: context.DeadlineExceeded}
+	hint := err.Hint()
+	for _, want := range []string{"rps", "burst"} {
+		if !strings.Contains(hint, want) {
+			t.Errorf("hint %q missing %q", hint, want)
+		}
+	}
+	if strings.Contains(hint, "InputSchema") {
+		t.Errorf("hint %q carries the schema remediation, want the policy fix", hint)
+	}
+}
+
 func TestCheckScopeAllowsRelativeNavigation(t *testing.T) {
 	b := &Browser{scope: []string{"example.com"}}
 	if err := b.CheckScope("/account"); err != nil {
