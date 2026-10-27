@@ -943,7 +943,7 @@ func settleAfterAction(
 // ActStateDeltaFor formats the state change for one action. Navigation actions
 // already report their destination, so they produce no suffix.
 func ActStateDeltaFor(action string, before, after PageState) string {
-	if action == "navigate" {
+	if action == "navigate" || action == "poc_bundle" {
 		return ""
 	}
 	return ActStateDelta(before, after)

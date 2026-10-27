@@ -32,7 +32,7 @@ var actActionNames = []string{
 	"sinks_install", "sinks_clear", "replay", "inject_canary",
 	"postmessage_install", "postmessage_clear", "post_message",
 	"wait_open", "intercept_add", "intercept_list", "intercept_clear",
-	"auth_save", "auth_restore", "auth_list", "replay_fuzz",
+	"auth_save", "auth_restore", "auth_list", "replay_fuzz", "poc_bundle",
 }
 
 // actActionList renders actActionNames for an error message.
@@ -152,7 +152,15 @@ func (t *Act) Description() string {
 		"restoring into a fresh identity writes only that identity's browser context), or " +
 		"auth_list (list saved snapshots as {site,name,cookie_count,origin_count,user_agent," +
 		"updated_at} with no values; site is an optional filter and the call does not use " +
-		"session_id, so a stale id is harmless). " +
+		"session_id, so a stale id is harmless), or " +
+		"poc_bundle (package one finding as a self-contained evidence directory; pass value=<finding title>, " +
+		"paths=[<absolute output directory>] and optionally target=<seq or URL substring> to select the captured " +
+		"request, otherwise the main document request is used. It writes meta.json, request.http, response.http, " +
+		"screenshot.png, dom.html, storage.json and README.md, plus sinks.json only when the tracer was installed, " +
+		"returns {directory,files:[{name,bytes}],omitted:[{name,reason}]} where reason is one of not installed, " +
+		"no body, no network entry, cap reached or secrets hidden; it refuses a relative path or a non-empty " +
+		"directory, and keeps Cookie, Set-Cookie, Authorization and X-CSRF-Token values redacted unless the page " +
+		"opted into secret capture). " +
 		"Pass session_id plus action=... and any required parameters. When more than " +
 		"one browser is live, pass browser_id or owner to declare which browser holds " +
 		"the session; with one live browser both may be omitted, and a session held " +
@@ -193,7 +201,7 @@ func (t *Act) InputSchema() models.InputSchema {
 			"action": map[string]any{
 				"type":        "string",
 				"enum":        append([]string(nil), actActionNames...),
-				"description": "The interaction to perform: click (selector), input (set field text; the result reports the target and rune length, never the value, plus value_redacted=true for a password or hidden field), type (keystrokes, same result rule as input), press_key (key/combo e.g. Enter, Escape, Control+A), click_at/hover_at ({x, y} coordinates), drag_and_drop (from {x,y}/selector to {target_x,target_y}/target_selector), upload_file (set file input paths), eval (run JS), navigate (URL), back/forward/reload, hover (selector), scroll (x/y), select (option value), wait (readiness mode), set_viewport (W x H), emulate (device preset), clear_logs (empty the network, console and websocket buffers; no parameters; returns {\"network\":N,\"console\":M,\"websocket\":K} cleared counts), sinks_install (arm the source-to-sink tracer; no parameters; returns {\"installed\":true}; capture is opt-in, changes page behavior, survives client-side route changes and full navigations while its per-document ring resets on a full navigation; read it with page_fetch what=sinks, which is read-only and never arms capture), sinks_clear (empty the tracer ring; no parameters; returns {\"cleared\":N}), replay (resend one captured network entry; needs target, optionally method, headers, value and max_bytes; returns {status,headers,body,bytes,truncated,body_redactions,ms,request,chain} with sensitive headers and text-body secrets redacted and truncated/chain always present), replay_fuzz (bounded matrix over one captured entry; needs target, points:[{param,location}] and payloads (each also accepted as a stringified JSON array), optional strategy sniper|pitchfork|clusterbomb (default sniper) and max_bytes; computes and refuses the size before any request (max 100 matrix requests, 20 points, 50 payloads, 200 runes each; 5 in flight, 10s each); returns {runs:[{seq,payload,point,status,ms,bytes,body_cut,body_redactions}],summary:{baseline,anomalies}}), inject_canary (inject a canary into query/hash/postmessage/name — default all four, narrow with targets — and return {canary, injected:[{target, where}], hits:[{sink, context, selector, value, stack}], installed}; requires sinks_install first; query reloads, hash does not; capped at 20 frames), postmessage_install (arm the postMessage recorder: one capture-phase listener per window and iframe without wrapping addEventListener, so page listeners keep their identity; no parameters; returns {\"installed\":true}; read it with page_fetch what=postmessage), postmessage_clear (empty every recorder ring; no parameters; returns {\"cleared\":N}), post_message (deliver value to window.top/self/parent when target_selector is \"top\", \"self\", \"parent\" or omitted, or to the contentWindow of the <iframe>/<frame> matched by any other target_selector; a selector that is not a frame errors instead of falling back to top; origin is the target origin, default \"*\"; arms the recorder first and returns {origin,target}), wait_open (block until this page opens a popup or new tab — target=\"_blank\" or window.open — and return {session_id,url,opener}; timeout_ms bounds the wait; a popup opened before the call is returned immediately), intercept_add (arm a page-scoped in-flight request interceptor with rules=[{id,url_pattern,method,action,headers,rewrite_method,status,body,delay_ms}]; action is block|allow|rewrite|fulfill, url_pattern is a wildcard glob (default *), rewrite continues with headers/body/rewrite_method, a miss continues immediately, and the page holds at most 50 rules across calls (page-wide, not per call); opt-in, changes page behaviour and disables the page HTTP cache while armed so cached subresources still match; returns {rules,count,remaining,active}), intercept_list (return the page's rules with sensitive header values redacted and the remaining rule budget; returns {rules,count,remaining,active}), intercept_clear (remove every rule, continue any paused request, disable interception and restore the cache; returns {rules_removed,active:false}). Rules are per session and never outlive the page. Logs are cumulative from page creation — filter client-side or clear_logs right before the step under observation.",
+				"description": "The interaction to perform: click (selector), input (set field text; the result reports the target and rune length, never the value, plus value_redacted=true for a password or hidden field), type (keystrokes, same result rule as input), press_key (key/combo e.g. Enter, Escape, Control+A), click_at/hover_at ({x, y} coordinates), drag_and_drop (from {x,y}/selector to {target_x,target_y}/target_selector), upload_file (set file input paths), eval (run JS), navigate (URL), back/forward/reload, hover (selector), scroll (x/y), select (option value), wait (readiness mode), set_viewport (W x H), emulate (device preset), clear_logs (empty the network, console and websocket buffers; no parameters; returns {\"network\":N,\"console\":M,\"websocket\":K} cleared counts), sinks_install (arm the source-to-sink tracer; no parameters; returns {\"installed\":true}; capture is opt-in, changes page behavior, survives client-side route changes and full navigations while its per-document ring resets on a full navigation; read it with page_fetch what=sinks, which is read-only and never arms capture), sinks_clear (empty the tracer ring; no parameters; returns {\"cleared\":N}), replay (resend one captured network entry; needs target, optionally method, headers, value and max_bytes; returns {status,headers,body,bytes,truncated,body_redactions,ms,request,chain} with sensitive headers and text-body secrets redacted and truncated/chain always present), replay_fuzz (bounded matrix over one captured entry; needs target, points:[{param,location}] and payloads (each also accepted as a stringified JSON array), optional strategy sniper|pitchfork|clusterbomb (default sniper) and max_bytes; computes and refuses the size before any request (max 100 matrix requests, 20 points, 50 payloads, 200 runes each; 5 in flight, 10s each); returns {runs:[{seq,payload,point,status,ms,bytes,body_cut,body_redactions}],summary:{baseline,anomalies}}), inject_canary (inject a canary into query/hash/postmessage/name — default all four, narrow with targets — and return {canary, injected:[{target, where}], hits:[{sink, context, selector, value, stack}], installed}; requires sinks_install first; query reloads, hash does not; capped at 20 frames), postmessage_install (arm the postMessage recorder: one capture-phase listener per window and iframe without wrapping addEventListener, so page listeners keep their identity; no parameters; returns {\"installed\":true}; read it with page_fetch what=postmessage), postmessage_clear (empty every recorder ring; no parameters; returns {\"cleared\":N}), post_message (deliver value to window.top/self/parent when target_selector is \"top\", \"self\", \"parent\" or omitted, or to the contentWindow of the <iframe>/<frame> matched by any other target_selector; a selector that is not a frame errors instead of falling back to top; origin is the target origin, default \"*\"; arms the recorder first and returns {origin,target}), wait_open (block until this page opens a popup or new tab — target=\"_blank\" or window.open — and return {session_id,url,opener}; timeout_ms bounds the wait; a popup opened before the call is returned immediately), intercept_add (arm a page-scoped in-flight request interceptor with rules=[{id,url_pattern,method,action,headers,rewrite_method,status,body,delay_ms}]; action is block|allow|rewrite|fulfill, url_pattern is a wildcard glob (default *), rewrite continues with headers/body/rewrite_method, a miss continues immediately, and the page holds at most 50 rules across calls (page-wide, not per call); opt-in, changes page behaviour and disables the page HTTP cache while armed so cached subresources still match; returns {rules,count,remaining,active}), intercept_list (return the page's rules with sensitive header values redacted and the remaining rule budget; returns {rules,count,remaining,active}), intercept_clear (remove every rule, continue any paused request, disable interception and restore the cache; returns {rules_removed,active:false}). Rules are per session and never outlive the page. poc_bundle (package one finding as a self-contained evidence directory: value is the finding title, paths[0] is the absolute output directory, and optional target selects the captured request by seq or URL substring; writes meta.json, request.http, response.http, screenshot.png, dom.html, storage.json and README.md, plus sinks.json only when the tracer was installed, and returns {directory,files,omitted}). Logs are cumulative from page creation — filter client-side or clear_logs right before the step under observation.",
 			},
 			"selector": map[string]any{
 				"type":        "string",
@@ -205,7 +213,7 @@ func (t *Act) InputSchema() models.InputSchema {
 			},
 			"value": map[string]any{
 				"type":        "string",
-				"description": "Payload value for input/type (text; the result never echoes it), press_key (key combo fallback), eval (JS source), navigate (URL), select (option value), or upload_file (single path fallback). For replay it replaces the request body; omit it to send no body. For inject_canary it is the custom canary value; omit it to mint wm-canary-<8 hex>.",
+				"description": "Payload value for input/type (text; the result never echoes it), press_key (key combo fallback), eval (JS source), navigate (URL), select (option value), upload_file (single path fallback), or poc_bundle (the finding title). For replay it replaces the request body; omit it to send no body. For inject_canary it is the custom canary value; omit it to mint wm-canary-<8 hex>.",
 			},
 			"targets": map[string]any{
 				"type":  "array",
@@ -261,9 +269,10 @@ func (t *Act) InputSchema() models.InputSchema {
 			},
 			"target": map[string]any{
 				"type": "string",
-				"description": "Network entry to replay or replay_fuzz: a seq number or a substring of the request URL, " +
-					"resolved against the captured ring read by page_fetch what=network. A substring matching more than " +
-					"one entry is refused with the candidate seq numbers, so pass a longer substring or the seq.",
+				"description": "Network entry for replay, replay_fuzz or poc_bundle: a seq number or a substring of " +
+					"the request URL, resolved against the captured ring read by page_fetch what=network. A substring " +
+					"matching more than one entry is refused with the candidate seq numbers, so pass a longer substring " +
+					"or the seq. Omit it to select the main document request.",
 			},
 			"method": map[string]any{
 				"type":        "string",
@@ -323,7 +332,7 @@ func (t *Act) InputSchema() models.InputSchema {
 			"paths": map[string]any{
 				"type":        "array",
 				"items":       map[string]any{"type": "string"},
-				"description": "Array of local file paths for upload_file action.",
+				"description": "Array of local file paths for upload_file action, or for poc_bundle the single absolute output directory in paths[0] (created with mode 0700 when absent; a relative path or a non-empty directory is refused).",
 			},
 			"timeout_ms": map[string]any{
 				"type": "integer",
@@ -535,6 +544,13 @@ func (a *actArgs) validate(provided map[string]json.RawMessage) error {
 		if a.Name == "" {
 			return fmt.Errorf("%s requires name (the snapshot name, e.g. main)", a.Action)
 		}
+	case "poc_bundle":
+		if a.Value == "" {
+			return fmt.Errorf("poc_bundle requires value=<finding title>")
+		}
+		if len(a.Paths) == 0 || strings.TrimSpace(a.Paths[0]) == "" {
+			return fmt.Errorf("poc_bundle requires paths=[<absolute output directory>]")
+		}
 	}
 	return nil
 }
@@ -732,6 +748,8 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 		out, err = pageops.PageAuthSave(ctx, p, a.Site, a.Name)
 	case "auth_restore":
 		out, err = pageops.PageAuthRestore(ctx, p, a.Site, a.Name, a.Force)
+	case "poc_bundle":
+		out, err = pageops.PagePocBundle(ctx, p, a.Value, a.Paths, a.Target)
 	default:
 		return failResult(fmt.Errorf("page_act: unknown action=%q (must be one of %s)", a.Action, actActionList()))
 	}

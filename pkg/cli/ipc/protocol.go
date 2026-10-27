@@ -40,7 +40,7 @@ const (
 	MethodPageList = "page.list"
 	// MethodPageFetch extracts any aspect in the shared pageops registry from a live page.
 	MethodPageFetch = "page.fetch"
-	// MethodPageAct performs an action on a live page (click/input/hover/scroll/select/eval/navigate/back/forward/reload/wait/set_viewport/emulate/clear_logs/sinks_install/sinks_clear/replay/replay_fuzz/inject_canary/postmessage_install/postmessage_clear/post_message/wait_open/intercept_add/intercept_list/intercept_clear).
+	// MethodPageAct performs an action on a live page (click/input/hover/scroll/select/eval/navigate/back/forward/reload/wait/set_viewport/emulate/clear_logs/sinks_install/sinks_clear/replay/replay_fuzz/inject_canary/postmessage_install/postmessage_clear/post_message/wait_open/intercept_add/intercept_list/intercept_clear/poc_bundle).
 	MethodPageAct = "page.act"
 	// MethodPageClose closes an open page.
 	MethodPageClose = "page.close"
@@ -76,7 +76,7 @@ var pageActActions = []string{
 	"sinks_install", "sinks_clear", "replay", "inject_canary",
 	"postmessage_install", "postmessage_clear", "post_message",
 	"wait_open", "intercept_add", "intercept_list", "intercept_clear",
-	"auth_save", "auth_restore", "auth_list", "replay_fuzz",
+	"auth_save", "auth_restore", "auth_list", "replay_fuzz", "poc_bundle",
 }
 
 // ValidPageActAction reports whether action is a supported page.act action.
@@ -368,7 +368,7 @@ type PageFetchResult struct {
 // press_key|click_at|hover_at|drag_and_drop|upload_file|eval|navigate|back|
 // forward|reload|hover|scroll|select|wait|set_viewport|emulate|clear_logs|
 // sinks_install|sinks_clear|replay|replay_fuzz|inject_canary|postmessage_install|postmessage_clear|
-// post_message|intercept_add|intercept_list|intercept_clear|auth_save|auth_restore|auth_list; selector/handle/value/key/button/click_count/x/y/
+// post_message|intercept_add|intercept_list|intercept_clear|auth_save|auth_restore|auth_list|poc_bundle; selector/handle/value/key/button/click_count/x/y/
 // target_x/target_y/target_selector/origin/paths/targets are the per-action
 // payloads (handle wins over selector for element actions); viewport carries the
 // target size for set_viewport and device the preset for emulate; timeout_ms

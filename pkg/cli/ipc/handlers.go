@@ -673,6 +673,20 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 			Message: `page.act: intercept_add requires rules (e.g. [{"url_pattern":"*api*","action":"block"}])`,
 		}
 	}
+	if p.Action == "poc_bundle" {
+		if p.Value == "" {
+			return nil, &Error{
+				Code:    CodeInvalidParams,
+				Message: "page.act: poc_bundle requires value=<finding title>",
+			}
+		}
+		if len(p.Paths) == 0 || strings.TrimSpace(p.Paths[0]) == "" {
+			return nil, &Error{
+				Code:    CodeInvalidParams,
+				Message: "page.act: poc_bundle requires paths=[<absolute output directory>]",
+			}
+		}
+	}
 
 	actionTimeout := PageActTimeout(p.TimeoutMS)
 	actionCtx, cancel := context.WithTimeout(ctx, PageActBudget(p.Action, p.WaitMode, p.TimeoutMS))
@@ -802,6 +816,8 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		out, err = pageops.PageInterceptList(ctx, page)
 	case "intercept_clear":
 		out, err = pageops.PageInterceptClear(ctx, page)
+	case "poc_bundle":
+		out, err = pageops.PagePocBundle(ctx, page, p.Value, p.Paths, p.Target)
 	}
 	if err != nil {
 		return nil, serverError(err)

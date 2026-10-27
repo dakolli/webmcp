@@ -81,7 +81,7 @@ resolve only against that browser and an unknown id fails with the live ids.
 Subcommands:
   list   List the browser's open pages (id, url)
   fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, console, body, article, tables, forms, marks, security, storage, sinks, postmessage, har); a URL opens a new page first
-  act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, replay_fuzz, inject_canary, wait_open, auth_save, auth_restore, auth_list)
+  act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, replay_fuzz, inject_canary, wait_open, auth_save, auth_restore, auth_list, poc_bundle)
   auth   Save, restore or list named auth snapshots (counts only, never values)
   close  Close an open page
 
@@ -459,8 +459,8 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 // click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file,
 // hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport,
 // emulate, clear_logs, sinks_install, sinks_clear, replay, replay_fuzz,
-// inject_canary, postmessage_install, postmessage_clear, post_message and
-// wait_open (mirroring the MCP page_act surface).
+// inject_canary, postmessage_install, postmessage_clear, post_message,
+// wait_open and poc_bundle (mirroring the MCP page_act surface).
 func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 	var (
 		id             string
@@ -506,8 +506,8 @@ func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 hover_at, drag_and_drop, upload_file, hover, scroll, select, eval, navigate, back,
 forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install,
 sinks_clear, replay, replay_fuzz, inject_canary, postmessage_install, postmessage_clear,
-post_message, wait_open, intercept_add, intercept_list, intercept_clear) and
-prints the confirmation. The page id
+post_message, wait_open, intercept_add, intercept_list, intercept_clear,
+auth_save, auth_restore, auth_list, poc_bundle) and prints the confirmation. The page id
 is optional when only one page is open; 'last' means the most recently opened page;
 a bare number resolves to page-N.
 Positional payloads fill each action's fields — flags remain as fallbacks.
@@ -739,6 +739,14 @@ needs no page.`,
 			if action == "intercept_add" && len(rules) == 0 {
 				return fmt.Errorf(`page act: intercept_add requires rules (e.g. [{"url_pattern":"*api*","action":"block"}])`)
 			}
+			if action == "poc_bundle" {
+				if value == "" {
+					return fmt.Errorf("page act: poc_bundle requires value=<finding title>")
+				}
+				if len(paths) == 0 || strings.TrimSpace(paths[0]) == "" {
+					return fmt.Errorf("page act: poc_bundle requires paths=[<absolute output directory>]")
+				}
+			}
 			headerMap, err := parseHeaderFlags(headers)
 			if err != nil {
 				return fmt.Errorf("page act: %w", err)
@@ -940,6 +948,8 @@ needs no page.`,
 				out, err = pageops.PageInterceptList(ctx, p)
 			case "intercept_clear":
 				out, err = pageops.PageInterceptClear(ctx, p)
+			case "poc_bundle":
+				out, err = pageops.PagePocBundle(ctx, p, value, paths, target)
 			}
 			if err != nil {
 				return fmt.Errorf("page act: %w", err)
@@ -948,12 +958,12 @@ needs no page.`,
 				after := pageops.PageStateAfterAct(ctx, p, action, before)
 				out += pageops.ActStateDeltaFor(action, before, after)
 			}
-			fmt.Println(out)
+			emitActOutput(action, out)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to act on (optional with one page open; 'last'; or a bare number)")
-	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, replay_fuzz, inject_canary, postmessage_install, postmessage_clear, post_message, wait_open, intercept_add, intercept_list, intercept_clear, auth_save, auth_restore, auth_list")
+	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, replay_fuzz, inject_canary, postmessage_install, postmessage_clear, post_message, wait_open, intercept_add, intercept_list, intercept_clear, auth_save, auth_restore, auth_list, poc_bundle")
 	cmd.Flags().StringVar(&selector, "selector", "", "CSS selector targeting the element (element actions)")
 	cmd.Flags().StringVar(&handle, "handle", "", "element handle from page fetch (g<document>-b<backendNodeId>, scoped to its document); wins over --selector (element actions)")
 	cmd.Flags().StringVar(&value, "value", "", "value for eval (JS function), input (text), type (text), navigate (URL), select (option value), or inject_canary (custom canary)")
@@ -967,6 +977,7 @@ needs no page.`,
 	cmd.Flags().StringVar(&targetSelector, "target-selector", "", "target element selector (drag_and_drop), or destination frame for post_message: \"top\" (default) or a CSS selector naming an iframe")
 	cmd.Flags().StringVar(&origin, "origin", "*", "target origin for post_message (default \"*\"); pass the receiver's origin to restrict delivery")
 	cmd.Flags().StringArrayVar(&paths, "path", nil, "file paths for upload_file action")
+	cmd.Flags().StringArrayVar(&paths, "paths", nil, "absolute output directory for poc_bundle (paths[0]); also accepted as an alias for upload_file paths")
 	cmd.Flags().StringArrayVar(&targets, "targets", nil, "canary injection points for inject_canary: query, hash, postmessage, name (repeatable or comma-separated; default all four)")
 	cmd.Flags().StringVar(&target, "target", "", "replay target: a seq number or a substring of the captured request URL (read the ring with 'page fetch <id> network')")
 	cmd.Flags().StringVar(&method, "method", "", "HTTP method override for replay (e.g. PUT, PATCH); omit to keep the captured method")
@@ -1374,8 +1385,30 @@ func pageActViaIPC(
 	if err := cl.Call(ctx, ipc.MethodPageAct, params, &res); err != nil {
 		return fmt.Errorf("page act: %w", err)
 	}
-	fmt.Println(res.Data)
+	emitActOutput(params.Action, res.Data)
 	return nil
+}
+
+// emitActOutput prints an action's result. poc_bundle renders its directory and
+// one line per file instead of the raw JSON envelope; every other action keeps
+// the plain result line.
+func emitActOutput(action, out string) {
+	if action != "poc_bundle" {
+		fmt.Println(out)
+		return
+	}
+	var res pageops.PocBundleResult
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		fmt.Println(out)
+		return
+	}
+	fmt.Println(res.Directory)
+	for _, f := range res.Files {
+		fmt.Printf("%s\t%d bytes\n", f.Name, f.Bytes)
+	}
+	for _, o := range res.Omitted {
+		fmt.Printf("omitted\t%s\t%s\n", o.Name, o.Reason)
+	}
 }
 
 // pageCloseViaIPC implements `page close` against a live serve process: it

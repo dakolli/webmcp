@@ -44,7 +44,7 @@ var actionVocab = map[string]bool{
 	"postmessage_clear": true, "post_message": true, "wait_open": true,
 	"intercept_add": true, "intercept_list": true, "intercept_clear": true,
 	"auth_save": true, "auth_restore": true, "auth_list": true,
-	"replay_fuzz": true,
+	"replay_fuzz": true, "poc_bundle": true,
 }
 
 // actPayloadSpecs maps each page act action to its positional payload slots,
@@ -90,6 +90,7 @@ var actPayloadSpecs = map[string][]string{
 	"auth_restore":        {"site", "name"},
 	"auth_list":           {"site"},
 	"replay_fuzz":         {"target"},
+	"poc_bundle":          {"title"},
 }
 
 // resolvePageID resolves a user-supplied page id (possibly empty) to a live
@@ -731,6 +732,10 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 	case "auth_list":
 		if len(payload) >= 1 {
 			a.site = payload[0]
+		}
+	case "poc_bundle":
+		if len(payload) >= 1 {
+			a.value = payload[0]
 		}
 	}
 
