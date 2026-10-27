@@ -12,14 +12,50 @@ console. An agent can build a scraper or an automation for a site without a gues
 
 ## Install
 
-Go 1.26 or later is necessary. The first run downloads Chromium (~100 MB) unless Brave, Chrome or
-Chromium is on `PATH`. The probe order is `brave-browser`, `brave`, `google-chrome`, `chrome`,
-`chromium`.
+The first run downloads Chromium (~100 MB) unless Brave, Chrome or Chromium is already on `PATH`.
+The probe order is `brave-browser`, `brave`, `google-chrome`, `chrome`, `chromium`.
+
+### From a release binary
+
+Linux amd64 is shown; use the `darwin` or `arm64` artifact that matches your machine.
 
 ```sh
-go install ./cmd/browser     # installs the browser binary
-make install                 # same, and it stops a running daemon first
+VERSION=v0.1.0
+gh release download "$VERSION" --repo dakolli/webmcp \
+  --pattern 'browser_*_linux_amd64.tar.gz' --pattern checksums.txt
+sha256sum -c --ignore-missing checksums.txt
+tar -xzf browser_*_linux_amd64.tar.gz
+install -m 0755 browser ~/.local/bin/browser   # any directory on PATH
+browser --version
 ```
+
+### From source
+
+Go 1.26 or later is necessary.
+
+```sh
+git clone https://github.com/dakolli/webmcp.git
+cd webmcp
+go build ./cmd/browser        # ./browser in the current directory
+make install                  # shortcut: installs to GOPATH/bin and stops a running daemon
+```
+
+The module path is `webmcp`, not a hosting path, so `go install example.com/...` cannot work from
+outside a clone.
+
+## Releasing
+
+The full operating manual is [RELEASING.md](RELEASING.md). The short loop:
+
+```sh
+make notes          # group commits since the last tag into .release/notes.md (all history on the first release)
+make release-dry    # build every artifact locally (snapshot, no upload)
+make bump PART=minor
+make release VERSION=v0.2.0
+```
+
+A tag push runs the release workflow, which opens a **draft** GitHub release for a human to review
+and publish.
 
 ## Add the agent skill
 
