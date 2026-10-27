@@ -72,7 +72,7 @@ session held outside the declared `owner` is refused as `not_found`. Actions ign
 | `wait` | `wait_mode` | Waits for a readiness level or sleeps. | `waited 250ms`, `waited for "load"`, or `element "…" is interactable` | No. |
 | `set_viewport` | `viewport` | Applies a manual width and height override. | `set viewport to 800x600` | No. |
 | `emulate` | `device` | Applies a device preset, or clears it. | `emulated device: IPhoneX` | No. |
-| `clear_logs` | — | Empties the network and console rings. | `{"network":132,"console":1}` | No. |
+| `clear_logs` | — | Empties the network, console, and websocket rings. | `{"network":132,"console":1,"websocket":0}` | No. |
 | `sinks_install` | — | Arms the source-to-sink tracer. Idempotent. | `{"installed":true}` | No. |
 | `sinks_clear` | — | Empties the tracer ring and resets `dropped`. | `{"cleared":N}` | No. |
 | `replay` | `target` | Resends one captured network entry. See below. | Compact JSON result. | No. |
@@ -98,6 +98,7 @@ The delta starts on a new line and lists only changed fields. `navigate` never a
 A handle has the form `g<document>-b<backendNodeId>`, for example `gcq7sm3ng-b165`. Get handles from `page_fetch` with `what=interactives`, `dom`, or `links`. A handle wins over `selector`.
 A live `input` with a text-field handle and a password-field selector wrote to the text field, and the password field stayed empty.
 The `g` token names the document that minted the handle. Any navigation, reload, redirect, or document replacement changes that token, and the old handle then fails as stale. A stale handle never acts on a reused backend node id. Re-read `interactives` after every navigation.
+An `interactives` entry from a same-process child iframe works the same way: its `frame_url` names the frame, the backend node id is renderer-global, and its `handle` still acts through `page_act`.
 
 ### Element actions
 
@@ -142,17 +143,19 @@ The source takes a `selector` (element center) or `x`/`y`, the target takes `tar
 
 ### Logs
 
-Network and console capture is cumulative from page creation. `clear_logs` empties both
-rings, resets `dropped`, and returns the cleared counts. The `seq` counter does not reset.
-The recipe is `clear_logs`, then one action, then `page_fetch` `network` or `console`.
+Network, console, and websocket capture is cumulative from page creation. `clear_logs` empties
+all three rings, resets `dropped`, and returns `{"network":N,"console":M,"websocket":K}`. The `seq` counter does not reset.
+The recipe is `clear_logs`, then one action, then `page_fetch` `network`, `console`, or `websocket`.
 
 ### Sinks tracer and canary injection
 
-`sinks_install` arms the tracer and returns `{"installed":true}`. `inject_canary` requires it first and otherwise returns `page_act: inject_canary needs the sink tracer — run action "sinks_install" first` (type `unknown`). Payloads, caps, and the unarmed shape are in [page_fetch.md](page_fetch.md), and the cross-cutting rule is in `SKILL.md`.
+`sinks_install` arms the tracer and returns `{"installed":true}`. `inject_canary` requires it first and otherwise returns `page_act: inject_canary needs the sink tracer — run action "sinks_install" first` (type `unknown`). `query` appends `wmcanary` and reloads the document. `hash` does not reload. Payloads, caps, and the unarmed shape are in [page_fetch.md](page_fetch.md), and the cross-cutting rule is in `SKILL.md`.
 
 ### postMessage recorder
 
-`postmessage_install`, `postmessage_clear`, and `post_message` are described in [page_fetch.md](page_fetch.md), with the cross-cutting rule in `SKILL.md`.
+`postmessage_install` arms one capture-phase `message` listener per window and iframe. It also re-arms before each later document, so the arm survives a full navigation. It never wraps `addEventListener`, so page listeners keep their identity. The action takes no payload and returns `{"installed":true}`. A second call is a no-op.
+
+`postmessage_clear` empties every ring, resets `dropped`, and returns `{"cleared":N}`. An unarmed page returns `{"cleared":0}`. `post_message` arms the recorder first, then delivers `value` to `window.top`, `window.self`, or `window.parent` when `target_selector` is `top`, `self`, `parent`, or omitted. Any other value is a CSS selector for an `<iframe>` or `<frame>`, and only its `contentWindow` receives the message. A complete JSON object or array in `value` is delivered as that structure. Anything else is delivered as a string. `origin` is the target origin and defaults to `*`. The action returns `{origin,target}`. Read the log with `page_fetch what=postmessage`. The cross-cutting rule is in `SKILL.md`.
 
 ### Replay with what=network as the source
 
@@ -208,7 +211,7 @@ An absent selector for `click`, `input`, `hover` or `select` fails immediately w
 | Replay outside the scope | `page_act: replay: <url> refused: <scope reason>` | Pick an entry inside the browser's scope allowlist. |
 | `inject_canary` before `sinks_install` | `page_act: inject_canary needs the sink tracer — run action "sinks_install" first` (`unknown`) | Run `sinks_install`, then retry. |
 | `post_message` without `value` | `page_act: post_message requires value (the message payload, e.g. {"t":"wm"})` | Add `value`. |
-| `post_message` bad target | `page_act: send postMessage: no element matched selector iframe#missing` or `page_act: send postMessage: element div#x is not a frame` | Pass a CSS selector for a live iframe, or `top`. |
+| `post_message` bad target | `page_act: post_message target "iframe#missing": cannot find element` or `page_act: post_message target "div#x" is not a frame — pass "top", "self", "parent", or a CSS selector for an <iframe> or <frame>` | Pass a CSS selector for a live iframe, or `top`. |
 | `wait_open` timeout | The message names the opener session and the wait budget. | Click the link first, then raise `timeout_ms`. |
 | Closed page | `page_act: page session is closed` | Open a new session. |
 | `select` with an unknown value | `MCP error -32001: Request timed out` at the transport, not the envelope | Use an exact option `value`. A live test wedged the whole server until its browser was terminated. Treat as a defect. |

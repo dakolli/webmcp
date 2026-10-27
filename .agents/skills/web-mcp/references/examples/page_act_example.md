@@ -78,7 +78,7 @@ Expect `navigated to "https://react.dev/learn/describing-the-ui" (title "Describ
 (`navigate` never appends a delta), `navigated back to "https://react.dev/learn"`,
 `navigated forward to "https://react.dev/learn/describing-the-ui"`, `reloaded page`,
 `{"ready":"complete","title":"Describing the UI – React"}` (a DOM node returns `{}`),
-`{"network":132,"console":1}`, `set viewport to 1024x768`, and `emulated device: IPadPro`.
+`{"network":132,"console":1,"websocket":0}`, `set viewport to 1024x768`, and `emulated device: IPadPro`.
 The page then reports `1024x1366` at DPR 2. `emulate` wins. `{"device":"clear"}` resets both.
 
 ## 6. Drag and drop

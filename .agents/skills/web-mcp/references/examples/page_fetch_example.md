@@ -33,10 +33,10 @@ A bare `what=dom` here knows only whole-document cuts and returns `{"items":[],"
 {"tool":"page_fetch","arguments":{"session_id":"page-1","what":"text","selector":"h1#firstHeading"}}
 ```
 
-Expect the heading text only. An unknown value fails the same way, tested live on 2026-10-26 (`what=sinks` was the probe then):
+Expect the heading text only. An unknown value fails the same way. The list below was read from the binary on 2026-10-27:
 
 ```json
-{"ok":false,"error":{"type":"invalid_args","message":"page_fetch: unknown what=\"sinks\" (must be one of html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, body, console, article, marks, security)","hint":"fix the arguments per the tool InputSchema (required fields, enum values)"}}
+{"ok":false,"error":{"type":"invalid_args","message":"page_fetch: unknown what=\"bogus\" (must be one of html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, body, console, websocket, article, tables, forms, marks, security, sinks, postmessage, storage, har)","hint":"fix the arguments per the tool InputSchema (required fields, enum values)"}}
 ```
 
 ## 4. Fetch one CSS file with target
@@ -55,7 +55,7 @@ Expect a `// url=` line, a `// bytes=6881` line, then raw CSS. `js` works the sa
 {"tool":"page_fetch","arguments":{"session_id":"page-1","what":"interactives"}}
 ```
 
-Expect `{"interactives":[{"handle":"gy1g0vstq-b49","role":"button","text":"Main menu","type":"checkbox","x":34,"y":33,"visible":true}],"truncated":335}`. Feed a mark's `x` and `y` from `marks` to `page_act` `click_at`.
+Expect `{"interactives":[{"handle":"gy1g0vstq-b49","role":"button","text":"Main menu","type":"checkbox","x":34,"y":33,"width":68,"height":26,"box":{"x":0,"y":20,"w":68,"h":26},"visible":true}],"truncated":335,"frames":[],"frames_truncated":0}`. Every coordinate is page-absolute CSS px. `box.x + width/2 == x` exactly. A child-frame entry also carries `frame_url`. The root returns up to 200 entries, each child frame up to 50, and all child frames together up to 150. `frames` reports each child frame's `{url,count,truncated}`. `truncated` is the root remainder only. Feed a mark's `x` and `y` from `marks` to `page_act` `click_at`.
 
 ## 6. Audit the page with what=security
 
@@ -68,7 +68,7 @@ Expect `data` to hold `{"url":…,"checks":[…],"count":N,"truncated":0}`, each
 ## 7. Attribute traffic to one action
 
 Open `https://react.dev/learn` as `page-3`, call `page_act` `clear_logs` (expect
-`{"network":39,"console":0}`), act once, then read:
+`{"network":39,"console":0,"websocket":0}`), act once, then read:
 
 ```json
 {"tool":"page_fetch","arguments":{"session_id":"page-3","what":"network"}}

@@ -16,14 +16,14 @@ The live schema is `code://pkg/mcp/tools/page.go#L90`. The aspect registry is `c
 | `browser_id` | string | no | — | Optional. Resolve the session inside this browser only, for example `browser-2`. Omit it when exactly one live browser holds the id. |
 | `owner` | string | no | — | Optional. Restrict the lookup to browsers with this owner label, 1 to 64 characters of `A-Z`, `a-z`, `0-9`, `.`, `_`, `-`. |
 | `what` | string | yes | — | Aspect name. See the list below. |
-| `selector` | string | no | — | CSS selector. Only `html` and `text` use it. |
+| `selector` | string | no | — | CSS selector. `html`, `text`, and `interactives` use it. On `interactives`, a container scopes the map to that subtree, and an `<iframe>` selector returns that frame's entries with page-absolute coordinates. |
 | `max_bytes` | integer | no | `50000` | Output cap. A value of `0` or less means `50000`, not unbounded. |
 | `target` | string | no | — | Resource URL for `css`/`js`. For `body`: a `seq` number or a substring of the request URL, newest match wins. |
 | `full_page` | boolean | no | `false` | Capture the whole scrollable page. Only `screenshot` uses it. |
 | `include_values` | boolean | no | `false` | With `what=storage`, return real cookie and storage values instead of `<redacted>`. `true` exposes live session tokens. |
 | `timeout_ms` | integer | no | `30000` | Bound for the whole call. Clamped to 1..120000. A full-page screenshot keeps its 90 s floor unless you pass a larger value. |
 
-The live `what` enum has 22 values, in registration order: `html`, `dom`, `text`, `css`, `js`, `links`, `screenshot`, `meta`, `interactives`, `a11y`, `network`, `body`, `console`, `article`, `tables`, `forms`, `marks`, `security`, `sinks`, `postmessage`, `storage`, `har`. `timeout_ms` defaults to 30000 and clamps to 1..120000.
+The live `what` enum has 23 values, in registration order: `html`, `dom`, `text`, `css`, `js`, `links`, `screenshot`, `meta`, `interactives`, `a11y`, `network`, `body`, `console`, `websocket`, `article`, `tables`, `forms`, `marks`, `security`, `sinks`, `postmessage`, `storage`, `har`. `timeout_ms` defaults to 30000 and clamps to 1..120000.
 
 ## Returns
 
@@ -39,11 +39,12 @@ The live `what` enum has 22 values, in registration order: `html`, `dom`, `text`
 | `links` | JSON array `[{text,href,handle?}]`. | no | yes, JSON envelope |
 | `screenshot` | One text block `{mime_type,bytes,full_page,width?,height?}`, then one PNG image block. | no | **no** |
 | `meta` | JSON object `{title,url,meta:[...]}`. | no | yes, JSON envelope |
-| `interactives` | JSON `{interactives:[...],truncated}`, each item with `x`, `y`, `width`, `height`. `x`/`y` are the element centre and `left = x - width/2`. Whole values serialize without a decimal. `marks` reports top-left instead. | no | **no** |
+| `interactives` | JSON `{interactives:[...],truncated,frames:[{url,count,truncated}],frames_truncated}`, each item with `x`, `y`, `width`, `height`, `box {x,y,w,h}`, and `frame_url`. `box` is the layout bounds as top-left plus size, `frame_url` names the same-process child frame that owns a framed entry, and every coordinate is page-absolute, so `box.x + width/2 == x` exactly. Whole values serialize without a decimal. `marks` reports viewport top-left instead. | yes | **no** |
 | `a11y` | JSON `{nodes:[...],count,truncated}`. | no | **no** |
 | `network` | JSON `{entries,count,dropped,truncated}`. | no | **no** |
 | `body` | JSON `{seq,method,url,status,content_type,bytes,truncated}` plus `body` or `base64`. | no | **no** |
 | `console` | JSON `{entries,count,dropped,truncated}`. | no | **no** |
+| `websocket` | JSON `{entries,count,dropped,truncated}`; each entry `{seq,socket_id,url,direction,opcode,payload,payload_bytes,payload_cut,status,ms}`. | no | **no** |
 | `article` | JSON `{title,byline?,excerpt?,text,words,truncated,url}`. | no | **no** |
 | `tables` | JSON `{tables:[{index,caption,headers,rows,span_info,selector}],count,truncated}`. `rows` is a list of string lists. `span_info` lists `{row,col,colspan,rowspan}`. Caps are 20 tables, 500 rows and 50 columns. | no | **no** |
 | `forms` | JSON `{forms:[{index,action,method,enctype,fields,submits,csrf_candidates}],count,truncated}`. A field holds `name`, `type`, `label`, `required`, `has_value`, `options[]`, `selector`. A control value never appears. A submit holds `name`, `type`, `label`, `selector`. A CSRF candidate holds `name`, `selector`, `match`. | no | **no** |
@@ -62,11 +63,7 @@ The live `what` enum has 22 values, in registration order: `html`, `dom`, `text`
 {"ok":true,"data":{"mime_type":"image/png","bytes":91543,"full_page":false,"width":1280,"height":800}}
 ```
 
-The image block is a sibling, not wrapped by `ok` or `data`:
-
-```json
-{"type":"image","data":"<base64 PNG>","mimeType":"image/png"}
-```
+The image block is a sibling, not wrapped by `ok` or `data`: `{"type":"image","data":"<base64 PNG>","mimeType":"image/png"}`.
 
 ### Text-only clients
 
@@ -77,7 +74,7 @@ Image blocks are on by default. A client opts out at `initialize` with `capabili
 - **`dom`** returns one entry per document with `title`, `url`, `frame_id`, and `root`. A node has `tag`, `id`, `class`, `attrs`, `text`, `handle`, `visible`, `bounds`, `frame_url`, and `children`. A node without `handle` is structural.
 - **`links`** is deduplicated by `href`, first wins. It drops `javascript:`, `mailto:`, `data:`, `tel:`, empty hrefs, exactly `#`, and anchors with no text. `text` falls back to `aria-label`, `title`, then `img[alt]`.
 - **`meta`** holds `title`, `url`, and a `meta` array with any of `name`, `property`, `http-equiv`, `content`, `charset`. **`css`** and **`js`** list resources, with inline `<style>`/`<script>` blocks appearing as `inline-style[1]`. Both lists end with a hint naming `what=<css|js>&target=<url>`.
-- **`interactives`** holds `handle`, `role`, `text`, `href`, `type`, `x`, `y`, `width`, `height`, `visible`. `visible: true` means the node has a layout box, not that it is in the viewport.
+- **`interactives`** holds `handle`, `role`, `text`, `href`, `type`, `x`, `y`, `width`, `height`, `box {x,y,w,h}`, `frame_url`, `visible`. `box` is the layout bounds as top-left plus size, `frame_url` names the same-process child frame that owns a framed entry (absent on the top document), and every x/y/box value is page-absolute CSS px, so `box.x + box.w/2 == x`. `visible: true` means the node has a layout box, not that it is in the viewport. The payload also carries `frames`, one row per child frame and `[]` on a frameless page, and `frames_truncated`, the child-frame remainder, which is `0` on a frameless page. `truncated` is the root remainder only.
 - **`a11y`** holds `handle`, `depth`, `role`, `name`, `value`, `states`, plus `count` and `truncated`. Names and values are clipped at 200 runes. Root frame only.
 - **`network`** entries hold `method`, `url`, `type`, `status`, `mime`, `bytes`, `ms`, `failed`, `error`, `seq`, `req_headers`, `resp_headers`. Each header map keeps at most 32 headers per direction at 512 bytes per value under a 4 KB name+value budget, and a cut set adds `req_headers_truncated` or `resp_headers_truncated`. No bodies. **`console`** entries hold `level`, `text`, `source`, `line`, `seq`.
 - **`body`** adds `body` for UTF-8 text or `base64` plus `content_type` for binary, both exclusive, with `bytes` as the pre-cap size and `truncated` on the 256 KB cut. **`marks`** items hold `index`, `role`, `text`, `x`, `y`, `width`, `height` in viewport CSS pixels that can be negative, and the top-left `x`/`y` feed `page_act` `click_at` directly. The `screenshot` field appears only for a text-only client.
@@ -90,10 +87,10 @@ Every handle has the form `g<document>-b<backendNodeId>`, for example `gy1g0vstq
 
 ### Caps
 
-- Caps: `interactives` 200 entries, `a11y` 400 nodes, `article` 40000 runes, `marks` 60 viewport boxes, `tables` 20 tables/500 rows/50 columns, `forms` 20 forms/500 fields/100 options/50 submits/50 CSRF candidates, and `network`/`console` 200-entry rings that emit the newest 100. A `truncated` count reports the rest, and `dropped` counts true ring loss.
-### Network and console capture
+- Caps: `interactives` returns up to 200 root entries, 50 per child frame, and 150 across all child frames, for a 350 ceiling. `truncated` is the root remainder only. `frames_truncated` is the child-frame remainder. A frame-scoped read returns only that frame's row. `a11y` caps at 400 nodes, `article` at 40000 runes, `marks` at 60 viewport boxes, `tables` at 20 tables/500 rows/50 columns, `forms` at 20 forms/500 fields/100 options/50 submits/50 CSRF candidates, and `network`/`console`/`websocket` at 200-entry rings that emit the newest 100. A `truncated` count reports the rest, and `dropped` counts true ring loss.
+### Network, console, and websocket capture
 
-Capture starts before the first document loads. Both rings are cumulative from page creation. `clear_logs` (a `page_act` action) empties both rings and resets `dropped`, for example `{"network":39,"console":0}`. The `seq` counter does not reset. The recipe is `clear_logs`, then one action, then read.
+Capture starts before the first document loads. All three rings are cumulative from page creation. `clear_logs` (a `page_act` action) empties all three rings and resets `dropped`, for example `{"network":39,"console":0,"websocket":0}`. The `seq` counter does not reset. The recipe is `clear_logs`, then one action, then read.
 
 #### Header redaction
 
@@ -126,6 +123,10 @@ The report holds `url`, `checks`, `count`, and `truncated`. Each check holds `id
 | `cors` | `warn` for an observed response pairing `Access-Control-Allow-Origin: *` with credentials, `info` before any response is observed. |
 
 Evidence names at most 10 offending values, then `(+N more)`. The script, form, password, and cookie lists are each cut at 200 entries and every omission is reported in `truncated`. Live run on 2026-10-26 against `https://go.dev/`: `count: 20` (6 cookie checks, 2 `csp_unsafe_*`, 14 header/content/cors checks), `truncated: 0`.
+
+### WebSocket frames with what=websocket
+
+`websocket` reads the WebSocket frame ring (`code://pkg/browsers/websocket.go#L26-L51`). The payload is `{entries,count,dropped,truncated}`. Each entry holds `seq`, `socket_id`, `url`, `direction` (`sent` or `received`), `opcode`, `payload`, `payload_bytes`, `payload_cut`, `status`, and `ms`. The ring holds 200 frames and one read emits the newest 100, oldest first, so `dropped` counts ring eviction and `truncated` counts buffered frames above the emit cap. A text payload clips at 2000 runes and sets `payload_cut`; secret-like values show `<redacted>` before the clip. A non-text frame (opcode 2 or a control frame) carries an empty `payload` and its true size in `payload_bytes`. `status` and `ms` come from the socket handshake and are 0 when the open event was missed. `clear_logs` empties this ring with the network and console rings. `max_bytes` does not apply.
 
 ### Sinks tracer with what=sinks
 
@@ -164,7 +165,7 @@ The ring holds 100 messages per window. One read emits the newest 100 across the
 | `html`, `text`, `css`, `js` | Cut on a rune boundary. A note is appended. | No. A `css`/`js` list is cut inside its JSON. | Text note |
 | `dom`, `links` | Array root becomes an envelope object. | Yes | `truncated: true`, `omitted` |
 | `meta` | Object keeps its fields, its first array field shrinks. | Yes | `truncated: true`, `omitted` |
-| `screenshot`, `interactives`, `a11y`, `network`, `body`, `console`, `article`, `tables`, `forms`, `marks`, `security`, `sinks`, `postmessage`, `storage`, `har` | Not cut. | Yes | Shape's own `truncated` or `count` |
+| `screenshot`, `interactives`, `a11y`, `network`, `body`, `console`, `websocket`, `article`, `tables`, `forms`, `marks`, `security`, `sinks`, `postmessage`, `storage`, `har` | Not cut. | Yes | Shape's own `truncated` or `count` |
 
 The text note is exact: `… (truncated at max_bytes=600 bytes; raise max_bytes — dom/links/meta do not use selector)`. The array envelope is `{"items":[...],"max_bytes":N,"omitted":N,"truncated":true}`.
 
@@ -209,7 +210,7 @@ Recovery: re-read `what=network` for the current `seq` values, then read the bod
 
 ## When not to use it
 
-Do not use `page_fetch` to open a page. Use `fetch_page`. Do not use it to click, type, scroll, or navigate. Use `page_act`. Do not use `dom` for prose on a large page. Use `article` or `text`. Do not use `interactives` to test whether an element is on screen — use `marks` for viewport boxes. Do not expect `selector` to scope `dom`, `meta`, `links`, or `security`. They ignore it. `security` is a passive audit of what the browser already holds, not an exploit scanner.
+Do not use `page_fetch` to open a page. Use `fetch_page`. Do not use it to click, type, scroll, or navigate. Use `page_act`. Do not use `dom` for prose on a large page. Use `article` or `text`. Do not use `interactives` to test whether an element is on screen — use `marks` for viewport boxes. Do not expect `selector` to scope `dom`, `meta`, `links`, `a11y`, `marks`, or `security`. They ignore it. `interactives` is scoped by it. `security` is a passive audit of what the browser already holds, not an exploit scanner.
 
 ## Related tools
 

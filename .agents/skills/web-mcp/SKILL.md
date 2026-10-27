@@ -62,14 +62,14 @@ Install or refresh this skill with `browser skill <harness|path|.>`. With no arg
 ## Cross-cutting rules
 
 1. Call `browser_list` before you use a `browser_id`. Confirm the id and its `profile_dir`.
-2. If your client does not show `persist` or `owner`, reconnect it before you create a browser. Reconnect it when a cached `page_fetch` `what` enum lacks `har`, `postmessage`, `sinks`, `storage`, `tables`, or `forms`, because the live enum has 22 values. A cached client schema can also omit the new `browser_id` and `owner` inputs, so reconnect the client after a server build.
+2. If your client does not show `persist` or `owner`, reconnect it before you create a browser. Reconnect it when a cached `page_fetch` `what` enum lacks `har`, `postmessage`, `sinks`, `storage`, `tables`, `forms`, or `websocket`, because the live enum has 23 values. A cached client schema can also omit the new `browser_id` and `owner` inputs, so reconnect the client after a server build.
 3. Never close `browser-1` unless the user asks for a full reset. Never call `browser_close` with an empty `browser_id` in a shared session. A misspelled `browser` key is ignored and becomes an empty id. Use the exact key `browser_id`.
 4. Use one browser per agent and task. Page ids are unique per browser, so two owners can both hold `page-1`. With one live browser a bare id resolves. With two or more live browsers a bare id returns `invalid_args`, and the message names every browser and owner.
 5. `page_fetch`, `page_act`, and `session_close` take optional `browser_id` and `owner`. A session held outside the declared owner returns `not_found`, names the holder, and returns no content. Pass `browser_id` to cross on purpose.
 6. `session_list` reads every live browser and identity. Use `page_list` with a required `browser_id` for one browser. Both report the live URL and title, refreshed after navigation and redirects.
 7. An unknown `browser_id` can create a new browser. A typo spends a full Chromium process. Verify the id first.
 8. `fetch_page` creates a new session on every call. Close sessions you no longer need.
-9. `page_fetch` network and console capture is cumulative from page creation. Call `page_act` `clear_logs` before the step you want to observe.
+9. `page_fetch` network, console, and websocket capture is cumulative from page creation. Call `page_act` `clear_logs` before the step you want to observe.
 10. `page_act` `eval` needs a JavaScript function expression, for example `() => document.title`. A bare expression can fail.
 11. `page_act` `select` matches the option `value`, not its text. An invalid value can block the server. Use a value you read with `eval`, or use `eval` to set the field.
 12. `page_act` `drag_and_drop` uses mouse events. It does not fire native HTML5 drag events. Use `eval` for HTML5 drag handlers.
@@ -123,7 +123,7 @@ Each tool reference states only its own payload and its failure types, and links
 
 ## Known live-server limits
 
-- `page_fetch` large aspects bypass `max_bytes`: `interactives`, `a11y`, `network`, `console`, `article`, `marks`, `screenshot`, `sinks`, `postmessage`, `storage`, and `har`. The client can cut the response.
+- `page_fetch` large aspects bypass `max_bytes`: `interactives`, `a11y`, `network`, `console`, `websocket`, `article`, `marks`, `screenshot`, `sinks`, `postmessage`, `storage`, and `har`. The client can cut the response.
 - `page_fetch` `dom` truncation can return an empty `items` array for one huge document. A larger `max_bytes` does not always help.
 - `page_fetch` `css` and `js` lists are cut as plain text. A cut list is not valid JSON.
 - `fetch_page` `browser_id` is not checked. It can launch a new browser with a literal unknown id.
@@ -159,4 +159,5 @@ Keep these shapes in the rotation, with a new host each time:
 - Lifecycle, proxy, scope, headers, `what=body`, `what=security` and `page_act replay` are documented.
 - `sinks` is on the tool surface: `sinks_install` → `what=sinks` → `sinks_clear`. `inject_canary` is on the tool surface: `sinks_install` → `inject_canary` → `hits`.
 - `postmessage` is on the tool surface: `postmessage_install` → `what=postmessage` → `post_message` → `postmessage_clear`.
+- `websocket` is on the tool surface: `what=websocket` reads the frame ring, and `clear_logs` returns its cleared count beside network and console.
 - `tables`, `forms`, popups, `page_fetch` `timeout_ms`, and replay `body_redactions` are on the documented surface.
