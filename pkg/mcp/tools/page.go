@@ -19,11 +19,6 @@ import (
 	"webmcp/pkg/mcp/models"
 )
 
-// defaultMaxBytes caps how much of any extraction is returned to the LLM in one
-// call. Huge pages are dehydrated to a first slice; the agent can re-request
-// with a narrower selector or a higher max_bytes.
-const defaultMaxBytes = 50_000
-
 const (
 	// defaultPageTimeout bounds the whole page_fetch call when the caller does
 	// not provide one: a hung page (or a wedged CDP connection) must not block
@@ -202,7 +197,7 @@ func (t *Page) InputSchema() models.InputSchema {
 			},
 			"max_bytes": map[string]any{
 				"type":        "integer",
-				"default":     defaultMaxBytes,
+				"default":     pageops.DefaultPageMaxBytes,
 				"description": "Maximum response size in bytes (default 50000).",
 			},
 			"timeout_ms": map[string]any{
@@ -241,7 +236,7 @@ type pageFetchArgs struct {
 	What string `json:"what"`
 	// Selector optionally scopes the extraction to a matching element.
 	Selector string `json:"selector"`
-	// MaxBytes caps the response size (default defaultMaxBytes).
+	// MaxBytes caps the response size (default pageops.DefaultPageMaxBytes).
 	MaxBytes int `json:"max_bytes"`
 	// TimeoutMS bounds the whole extraction in milliseconds (absent or
 	// non-positive → 30000, clamped to 1..120000).
@@ -274,7 +269,7 @@ func (t *Page) Execute(ctx context.Context, args json.RawMessage) (string, error
 		return failResult(fmt.Errorf("page_fetch: missing required argument %q", "what"))
 	}
 	if a.MaxBytes <= 0 {
-		a.MaxBytes = defaultMaxBytes
+		a.MaxBytes = pageops.DefaultPageMaxBytes
 	}
 	a.TimeoutMS = clampTimeoutMS(a.TimeoutMS)
 	timeout := time.Duration(a.TimeoutMS) * time.Millisecond
