@@ -133,7 +133,7 @@ func (b *Browser) registerPopup(rb *rod.Browser, info *proto.TargetTargetInfo) {
 		return
 	}
 
-	p := &Page{ID: root.mintPageID(), Rod: rodPage, URL: info.URL}
+	p := &Page{ID: root.mintPageID(), Rod: rodPage, URL: info.URL, browser: root}
 	p.startObservation()
 
 	registered, err := root.registerPage(info, p)

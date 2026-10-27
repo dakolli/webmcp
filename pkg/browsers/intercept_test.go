@@ -308,3 +308,43 @@ func TestObserverRecordIntercept(t *testing.T) {
 		}
 	})
 }
+
+func TestInterceptorScopeDenied(t *testing.T) {
+	scoped := &interceptor{browser: &Browser{scope: []string{"example.com"}}}
+	if scoped.scopeDenied("https://api.example.com/v1") {
+		t.Fatal("in-scope subresource was denied")
+	}
+	if !scoped.scopeDenied("https://evil.test/collect") {
+		t.Fatal("out-of-scope subresource was allowed")
+	}
+
+	open := &interceptor{browser: &Browser{}}
+	if open.scopeDenied("https://evil.test/collect") {
+		t.Fatal("open allowlist denied a request")
+	}
+
+	unbound := &interceptor{}
+	if unbound.scopeDenied("https://evil.test/collect") {
+		t.Fatal("an interceptor with no browser denied a request")
+	}
+}
+
+func TestObserverRecordsScopeBlock(t *testing.T) {
+	page := &Page{observer: newPageObserver()}
+	page.observer.recordIntercept(&proto.FetchRequestPaused{
+		NetworkID:    proto.NetworkRequestID("req-scope"),
+		ResourceType: proto.NetworkResourceTypeImage,
+		Request: &proto.NetworkRequest{
+			Method: "GET",
+			URL:    "https://evil.test/pixel.gif",
+		},
+	}, InterceptRule{ID: InterceptScope, Action: InterceptScope})
+
+	entries, _ := page.NetworkEntries()
+	if len(entries) != 1 {
+		t.Fatalf("entries: got %d, want 1", len(entries))
+	}
+	if got := entries[0].Intercepted; got != InterceptScope {
+		t.Fatalf("intercepted = %q, want %q", got, InterceptScope)
+	}
+}

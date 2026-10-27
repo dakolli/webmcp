@@ -67,14 +67,17 @@ func (t *BrowserCreate) Description() string {
 		"such as 127.0.0.1:8080 for intercept tools; credentials never go in an argument — put " +
 		"them in ~/.config/browser-mcp/proxy.json (mode 0600). " +
 		"Headers: pass headers to send an identity header on EVERY request from every page of " +
-		"this browser, e.g. {\"X-Bug-Bounty\":\"your-handle\"}. Scope: pass scope as the navigation " +
+		"this browser, e.g. {\"X-Bug-Bounty\":\"your-handle\"}. Scope: pass scope as the request " +
 		"allowlist (bare hosts also cover their subdomains, '*.example.com' works, 'host:port' is " +
 		"accepted). No scope means no limit; scope_strict=true with an empty scope denies every " +
-		"navigation. Scope applies to navigation, not to subresources or redirects. " +
+		"request. Scope now governs navigation, replay, redirect hops and intercepted subresources: " +
+		"an out-of-scope request is refused before it is sent. Rate limit: pass rps and burst to cap " +
+		"requests per host (default 5/s with a burst of 10); a throttled request waits, and one whose " +
+		"deadline cannot fit the wait fails as timeout. The effective policy is reported as limits. " +
 		"Example: { \"owner\": \"scraper-a\" } and { \"owner\": \"scraper-b\" } get two browsers; " +
 		"{ \"persist\": true, \"profile\": \"audit\" } keeps a profile; " +
-		"{ \"headers\": {\"X-Bug-Bounty\":\"me\"}, \"scope\": [\"example.com\", \"*.iana.org\"] } " +
-		"confines navigation." + resultEnvelopeDoc
+		"{ \"headers\": {\"X-Bug-Bounty\":\"me\"}, \"scope\": [\"example.com\", \"*.iana.org\"], " +
+		"\"rps\": 2, \"burst\": 4 } confines navigation and spaces requests." + resultEnvelopeDoc
 }
 
 // InputSchema returns the JSON Schema for browser_create's arguments: optional
@@ -133,11 +136,19 @@ func (t *BrowserCreate) InputSchema() models.InputSchema {
 			"scope": map[string]any{
 				"type":        "array",
 				"items":       map[string]any{"type": "string"},
-				"description": "Navigation allowlist. A bare host (example.com) also covers its subdomains (www.example.com, api.example.com); a leading '*.example.com' glob is accepted, as is 'host:port' and '*' for all. Omit for no limit. Scope applies to navigation, not to subresources or redirects: a redirect can still land on an out-of-scope host.",
+				"description": "Request allowlist. A bare host (example.com) also covers its subdomains (www.example.com, api.example.com); a leading '*.example.com' glob is accepted, as is 'host:port' and '*' for all. Omit for no limit. Applies to navigation, replay, every redirect hop and intercepted subresources: an out-of-scope request is refused before it is sent.",
 			},
 			"scope_strict": map[string]any{
 				"type":        "boolean",
-				"description": "Opt-in strict mode: when true and scope is empty, every navigation is refused. Default false: an empty allowlist means no limit. The live state is shown by browser_list as scope and scope_strict.",
+				"description": "Opt-in strict mode: when true and scope is empty, every request is refused. Default false: an empty allowlist means no limit. The live state is shown by browser_list as scope and scope_strict.",
+			},
+			"rps": map[string]any{
+				"type":        "number",
+				"description": "Per-host sustained request rate in requests per second. Default 5. Every engine-issued request waits for a token; a request whose deadline cannot fit the wait fails as timeout naming the host and the remaining wait.",
+			},
+			"burst": map[string]any{
+				"type":        "integer",
+				"description": "Per-host token bucket depth, i.e. how many requests may go out at once before the rps pace applies. Default 10.",
 			},
 			"owner": map[string]any{
 				"type": "string",
@@ -164,6 +175,8 @@ type browserCreateArgs struct {
 	ScopeStrict *bool             `json:"scope_strict,omitempty"`
 	Headers     map[string]string `json:"headers,omitempty"`
 	Scope       []string          `json:"scope,omitempty"`
+	RPS         *float64          `json:"rps,omitempty"`
+	Burst       *int              `json:"burst,omitempty"`
 }
 
 // Execute parses options and creates a new distinct Browser via Manager.CreateBrowser.
@@ -212,6 +225,22 @@ func (t *BrowserCreate) Execute(ctx context.Context, args json.RawMessage) (stri
 	if a.ScopeStrict != nil {
 		opts = append(opts, browsers.WithScopeStrict(*a.ScopeStrict))
 	}
+	if a.RPS != nil || a.Burst != nil {
+		limit := browsers.RateLimit{
+			RPS:   browsers.DefaultRateRPS,
+			Burst: browsers.DefaultRateBurst,
+		}
+		if a.RPS != nil {
+			limit.RPS = *a.RPS
+		}
+		if a.Burst != nil {
+			limit.Burst = *a.Burst
+		}
+		if err := limit.Validate(); err != nil {
+			return failResult(fmt.Errorf("browser_create: %w", err))
+		}
+		opts = append(opts, browsers.WithRateLimit(limit))
+	}
 	if a.Headless != nil {
 		opts = append(opts, browsers.WithHeadless(*a.Headless))
 	}
@@ -234,13 +263,14 @@ func (t *BrowserCreate) Execute(ctx context.Context, args json.RawMessage) (stri
 // browserCreateResult is the compact create outcome: the browser_id plus the
 // lifecycle facts an agent needs to decide when to close it.
 type browserCreateResult struct {
-	BrowserID   string `json:"browser_id"`
-	Owner       string `json:"owner"`
-	Persist     bool   `json:"persist"`
-	TTL         string `json:"ttl"`
-	Scope       string `json:"scope"`
-	ScopeStrict bool   `json:"scope_strict"`
-	Reused      bool   `json:"reused"`
+	BrowserID   string               `json:"browser_id"`
+	Owner       string               `json:"owner"`
+	Persist     bool                 `json:"persist"`
+	TTL         string               `json:"ttl"`
+	Scope       string               `json:"scope"`
+	ScopeStrict bool                 `json:"scope_strict"`
+	Limits      browsers.LimitReport `json:"limits"`
+	Reused      bool                 `json:"reused"`
 }
 
 // newBrowserCreateResult projects a create outcome into the bounded one-line
@@ -254,6 +284,7 @@ func newBrowserCreateResult(created browsers.Created) browserCreateResult {
 		TTL:         info.TTL,
 		Scope:       info.Scope,
 		ScopeStrict: info.ScopeStrict,
+		Limits:      info.Limits,
 		Reused:      created.Reused,
 	}
 }
@@ -284,9 +315,10 @@ func (t *BrowserList) Name() string {
 func (t *BrowserList) Description() string {
 	return "Lists live browsers with their lifecycle state as compact JSON: browser_id, " +
 		"owner, bin, profile_dir, persist, ephemeral, created_at, idle_for (how long the " +
-		"browser has been unused), ttl (when idle cleanup closes it), scope (the navigation " +
+		"browser has been unused), ttl (when idle cleanup closes it), scope (the request " +
 		"allowlist: \"open\" when unrestricted), scope_strict (whether an empty allowlist " +
-		"denies all navigation) and pages, each {id, url, title?, context?, stale?}. " +
+		"denies all requests), limits (the effective per-host budget: {rps, burst, hosts:[{host, " +
+		"throttled}]}) and pages, each {id, url, title?, context?, stale?}. " +
 		"Returns [] when none are running. Use it to see what you own and what to close; " +
 		"idle browsers expire automatically. Example: {}." + resultEnvelopeDoc
 }
@@ -301,18 +333,19 @@ func (t *BrowserList) InputSchema() models.InputSchema {
 
 // browserEntry is the compact lifecycle read-out for one live browser.
 type browserEntry struct {
-	BrowserID   string              `json:"browser_id"`
-	Owner       string              `json:"owner"`
-	Bin         string              `json:"bin,omitempty"`
-	ProfileDir  string              `json:"profile_dir,omitempty"`
-	Persist     bool                `json:"persist"`
-	Ephemeral   bool                `json:"ephemeral"`
-	CreatedAt   time.Time           `json:"created_at"`
-	IdleFor     string              `json:"idle_for"`
-	TTL         string              `json:"ttl"`
-	Scope       string              `json:"scope"`
-	ScopeStrict bool                `json:"scope_strict"`
-	Pages       []browsers.PageInfo `json:"pages"`
+	BrowserID   string               `json:"browser_id"`
+	Owner       string               `json:"owner"`
+	Bin         string               `json:"bin,omitempty"`
+	ProfileDir  string               `json:"profile_dir,omitempty"`
+	Persist     bool                 `json:"persist"`
+	Ephemeral   bool                 `json:"ephemeral"`
+	CreatedAt   time.Time            `json:"created_at"`
+	IdleFor     string               `json:"idle_for"`
+	TTL         string               `json:"ttl"`
+	Scope       string               `json:"scope"`
+	ScopeStrict bool                 `json:"scope_strict"`
+	Limits      browsers.LimitReport `json:"limits"`
+	Pages       []browsers.PageInfo  `json:"pages"`
 }
 
 // browserListEntry projects a BrowserInfo snapshot and its pages into the
@@ -333,6 +366,7 @@ func browserListEntry(info browsers.BrowserInfo, pages []browsers.PageInfo) brow
 		TTL:         info.TTL,
 		Scope:       info.Scope,
 		ScopeStrict: info.ScopeStrict,
+		Limits:      info.Limits,
 		Pages:       pages,
 	}
 }

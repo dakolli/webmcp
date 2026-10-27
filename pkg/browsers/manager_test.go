@@ -115,10 +115,12 @@ func TestCreateBrowserKeyIdempotent(t *testing.T) {
 	existing := NewBrowser("browser-4", m.baseCtx, false, true, "/usr/bin/brave", "/profiles/brave")
 	existing.owner = UnownedOwner
 	existing.key = launchKey{
-		Owner:    UnownedOwner,
-		Bin:      "/usr/bin/brave",
-		Stealth:  true,
-		Headless: false,
+		Owner:     UnownedOwner,
+		Bin:       "/usr/bin/brave",
+		Stealth:   true,
+		Headless:  false,
+		RateRPS:   DefaultRateRPS,
+		RateBurst: DefaultRateBurst,
 	}
 	m.browsers["browser-4"] = existing
 
@@ -150,6 +152,8 @@ func TestCreateBrowserKeyCoversLaunchOptions(t *testing.T) {
 		Proxy:       "127.0.0.1:8080",
 		ProxyBypass: "localhost",
 		IgnoreCerts: true,
+		RateRPS:     DefaultRateRPS,
+		RateBurst:   DefaultRateBurst,
 	}
 
 	cases := []struct {
@@ -167,6 +171,8 @@ func TestCreateBrowserKeyCoversLaunchOptions(t *testing.T) {
 		{"proxy", func(k *launchKey) { k.Proxy = "127.0.0.1:9090" }},
 		{"proxy bypass", func(k *launchKey) { k.ProxyBypass = "example.com" }},
 		{"ignore certs", func(k *launchKey) { k.IgnoreCerts = false }},
+		{"rate rps", func(k *launchKey) { k.RateRPS = 1 }},
+		{"rate burst", func(k *launchKey) { k.RateBurst = 1 }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

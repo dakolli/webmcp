@@ -17,8 +17,9 @@ import (
 const (
 	// defaultLanguage is the browser locale the launch defaults install.
 	defaultLanguage = "en-US"
-	// defaultAcceptLanguage is the Accept-Language header and client-hint
-	// language list the launch defaults install.
+	// defaultAcceptLanguage is the Accept-Language header the default identity
+	// sends. The per-page User-Agent override is given acceptLanguageList of it,
+	// because Chromium standardizes that list into this exact header itself.
 	defaultAcceptLanguage = "en-US,en;q=0.9"
 	// fallbackChromeMajor is the User-Agent major used when the launch-time
 	// version probe fails; a launch must never depend on that round trip.
@@ -243,6 +244,21 @@ func buildUserAgentMetadata(major int, platform browserPlatform) *proto.Emulatio
 	}
 }
 
+// acceptLanguageList strips the quality values from an Accept-Language header,
+// leaving the bare language list. Network.setUserAgentOverride re-standardizes
+// that list into the header and appends its own q ladder, so a q value handed
+// back to it is duplicated into the fingerprintable "en-US,en;q=0.9;q=0.9"
+// (crbug.com/40853228).
+func acceptLanguageList(header string) string {
+	ranges := strings.Split(header, ",")
+	list := make([]string, 0, len(ranges))
+	for _, r := range ranges {
+		lang, _, _ := strings.Cut(strings.TrimSpace(r), ";")
+		list = append(list, lang)
+	}
+	return strings.Join(list, ",")
+}
+
 // applyDefaultUserAgent installs the coherent default User-Agent, language and
 // client hints on a page before it navigates.
 func applyDefaultUserAgent(
@@ -253,7 +269,7 @@ func applyDefaultUserAgent(
 	platform := defaultPlatform()
 	req := &proto.NetworkSetUserAgentOverride{
 		UserAgent:         buildUserAgent(major, platform),
-		AcceptLanguage:    defaultAcceptLanguage,
+		AcceptLanguage:    acceptLanguageList(defaultAcceptLanguage),
 		Platform:          platform.navigator,
 		UserAgentMetadata: buildUserAgentMetadata(major, platform),
 	}

@@ -40,6 +40,11 @@ type Page struct {
 	// Rod is the live go-rod page handle for this tab. Only valid while the
 	// page is open. Guarded by the operation lock.
 	Rod *rod.Page
+	// browser is the engine Browser that owns this page, used to enforce the
+	// browser's request policy (scope and per-host rate limit) on outbound
+	// tool requests and intercepted subresources. Nil for a page built outside
+	// the engine (tests); enforcement is skipped then.
+	browser *Browser
 	// info reads the tab's live URL and title. It is a field so tests can stub
 	// the CDP round trip; nil reads through rod's Page.Info.
 	info func(context.Context) (url, title string, err error)

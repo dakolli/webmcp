@@ -3,10 +3,13 @@ package browsers
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/go-rod/rod"
 )
@@ -14,6 +17,197 @@ import (
 // ScopeOpen is the browser_list scope value for a browser with no allowlist:
 // navigation is unrestricted.
 const ScopeOpen = "open"
+
+// DefaultRateRPS is the sustained per-host request rate a browser gets when no
+// rate limit is configured.
+const DefaultRateRPS = 5.0
+
+// DefaultRateBurst is the per-host token bucket depth a browser gets when no
+// rate limit is configured.
+const DefaultRateBurst = 10
+
+// RateLimit is a browser's per-host request budget: RPS is the sustained
+// requests per second and Burst is how many requests may go out at once.
+type RateLimit struct {
+	// RPS is the sustained requests per second allowed to one host.
+	RPS float64 `json:"rps"`
+	// Burst is the token bucket depth, i.e. the simultaneous request allowance.
+	Burst int `json:"burst"`
+}
+
+// Validate reports whether the limit can be enforced.
+func (l RateLimit) Validate() error {
+	if !(l.RPS > 0) || math.IsInf(l.RPS, 0) || math.IsNaN(l.RPS) {
+		return fmt.Errorf("invalid arguments: rps must be a finite number greater than 0 (got %v)", l.RPS)
+	}
+	if l.Burst < 1 {
+		return fmt.Errorf("invalid arguments: burst must be at least 1 (got %d)", l.Burst)
+	}
+	return nil
+}
+
+// HostLimit is one host's observed limit state in a browser listing.
+type HostLimit struct {
+	// Host is the host whose bucket has been used.
+	Host string `json:"host"`
+	// Throttled counts the requests to Host that had to wait for a token.
+	Throttled int64 `json:"throttled"`
+}
+
+// LimitReport is the effective request policy of a browser: the configured
+// budget plus the hosts whose buckets have seen traffic.
+type LimitReport struct {
+	// RPS is the sustained requests per second allowed to one host.
+	RPS float64 `json:"rps"`
+	// Burst is the token bucket depth.
+	Burst int `json:"burst"`
+	// Hosts lists the hosts with a live bucket, sorted by host.
+	Hosts []HostLimit `json:"hosts"`
+}
+
+// RateLimitError reports a request the per-host token bucket could not admit
+// before the caller's context expired.
+type RateLimitError struct {
+	// Host is the host that had no token available.
+	Host string
+	// Wait is how long the next token needed.
+	Wait time.Duration
+	// Err is the context cause.
+	Err error
+}
+
+// Error names the host, the remaining wait and the fix. It wraps the context
+// cause so callers can classify the failure as a timeout.
+func (e *RateLimitError) Error() string {
+	return fmt.Sprintf(
+		"web-mcp: host %q is rate limited: the next request slot is %s away, beyond this call's deadline — lower rps, raise burst, or retry with a longer timeout: %v",
+		e.Host,
+		e.Wait.Round(time.Millisecond),
+		e.Err,
+	)
+}
+
+// Unwrap exposes the context cause.
+func (e *RateLimitError) Unwrap() error { return e.Err }
+
+// tokenBucket is one host's token count and the virtual time of its last
+// reservation. A last time in the future queues further requests behind it.
+type tokenBucket struct {
+	tokens    float64
+	last      time.Time
+	throttled int64
+}
+
+// hostLimiter is a per-host token bucket shared by every page of one browser.
+// now is a field so tests can drive the clock without sleeping.
+type hostLimiter struct {
+	mu    sync.Mutex
+	rps   float64
+	burst float64
+	now   func() time.Time
+	hosts map[string]*tokenBucket
+}
+
+// newHostLimiter builds a limiter for limit. A non-positive rps or burst
+// disables enforcement.
+func newHostLimiter(limit RateLimit) *hostLimiter {
+	return &hostLimiter{
+		rps:   limit.RPS,
+		burst: float64(limit.Burst),
+		now:   time.Now,
+		hosts: make(map[string]*tokenBucket),
+	}
+}
+
+// wait blocks until host has a token or ctx ends. It returns a RateLimitError
+// naming the host and the remaining wait when the deadline cannot fit the wait.
+func (l *hostLimiter) wait(ctx context.Context, host string) error {
+	if l == nil || l.rps <= 0 || l.burst <= 0 {
+		return nil
+	}
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" {
+		return nil
+	}
+	delay, err := l.reserve(ctx, host)
+	if err != nil || delay <= 0 {
+		return err
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return &RateLimitError{Host: host, Wait: delay, Err: ctx.Err()}
+	}
+}
+
+// reserve claims the next slot for host, reporting how long the caller must
+// wait. A wait the deadline cannot fit is refused before the slot is claimed.
+func (l *hostLimiter) reserve(ctx context.Context, host string) (time.Duration, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	b := l.hosts[host]
+	if b == nil {
+		b = &tokenBucket{tokens: l.burst, last: now}
+		l.hosts[host] = b
+	}
+	delay := l.pendingLocked(b, now)
+	if delay > 0 {
+		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < delay {
+			return 0, &RateLimitError{Host: host, Wait: delay, Err: context.DeadlineExceeded}
+		}
+		b.throttled++
+	}
+	l.commitLocked(b, delay)
+	return delay, nil
+}
+
+// pendingLocked refills the bucket up to now (or its queued reservation time)
+// and returns the delay the next request needs without consuming a token.
+func (l *hostLimiter) pendingLocked(b *tokenBucket, now time.Time) time.Duration {
+	base := now
+	if b.last.After(base) {
+		base = b.last
+	}
+	if b.tokens < l.burst {
+		b.tokens = math.Min(l.burst, b.tokens+base.Sub(b.last).Seconds()*l.rps)
+		b.last = base
+	}
+	if b.tokens >= 1 {
+		return 0
+	}
+	seconds := (1 - b.tokens) / l.rps
+	return time.Duration(seconds * float64(time.Second))
+}
+
+// commitLocked consumes one token for an immediate request, or reserves the
+// queued slot at the end of the bucket for a delayed one.
+func (l *hostLimiter) commitLocked(b *tokenBucket, delay time.Duration) {
+	if delay <= 0 {
+		b.tokens--
+		return
+	}
+	b.tokens = 0
+	b.last = b.last.Add(delay)
+}
+
+// report renders the effective policy and the hosts that have seen traffic.
+func (l *hostLimiter) report() LimitReport {
+	if l == nil {
+		return LimitReport{}
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	hosts := make([]HostLimit, 0, len(l.hosts))
+	for host, b := range l.hosts {
+		hosts = append(hosts, HostLimit{Host: host, Throttled: b.throttled})
+	}
+	sort.Slice(hosts, func(i, j int) bool { return hosts[i].Host < hosts[j].Host })
+	return LimitReport{RPS: l.rps, Burst: int(l.burst), Hosts: hosts}
+}
 
 // ScopeStrictNone is the browser_list scope value for a strict browser whose
 // allowlist is empty: every navigation is refused.
@@ -48,6 +242,48 @@ func (b *Browser) CheckScope(rawURL string) error {
 		return nil
 	}
 	return b.inScope(u)
+}
+
+// Limits returns the browser's effective request policy and the hosts whose
+// buckets have seen traffic, so an operator can read the limit before a sweep.
+func (b *Browser) Limits() LimitReport {
+	b.mu.Lock()
+	l := b.limits
+	b.mu.Unlock()
+	return l.report()
+}
+
+// CheckRequestScope reports whether an engine-issued request may reach rawURL.
+// It applies the same allowlist as navigation, and is the gate every outbound
+// tool request passes before it is sent.
+func (b *Browser) CheckRequestScope(rawURL string) error {
+	if b == nil {
+		return nil
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid arguments: request URL %q is not parseable: %w", rawURL, err)
+	}
+	if u.Hostname() == "" {
+		return nil
+	}
+	return b.inScope(u)
+}
+
+// awaitRequest enforces the allowlist and waits for a per-host token before an
+// engine-issued request is sent. It never sends first and checks after.
+func (b *Browser) awaitRequest(ctx context.Context, rawURL string) error {
+	if err := b.CheckRequestScope(rawURL); err != nil {
+		return err
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Hostname() == "" {
+		return nil
+	}
+	b.mu.Lock()
+	limits := b.limits
+	b.mu.Unlock()
+	return limits.wait(ctx, u.Hostname())
 }
 
 // CheckPageScope verifies the browser that owns pageID allows navigating to
@@ -141,7 +377,7 @@ func scopeRefusal(host string, scope []string, strict bool) error {
 		allowed = "none"
 	}
 	return fmt.Errorf(
-		"web-mcp: host %q is outside the scope allowlist (allowed: %s; scope=%s, scope_strict=%t) — add it with browser_create scope=[%q]",
+		"web-mcp: invalid arguments: host %q is outside the scope allowlist (allowed: %s; scope=%s, scope_strict=%t) — add it with browser_create scope=[%q]",
 		host,
 		allowed,
 		state,

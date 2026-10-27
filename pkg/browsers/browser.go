@@ -139,6 +139,9 @@ type Browser struct {
 	scope []string
 	// scopeStrict makes an empty allowlist deny every navigation.
 	scopeStrict bool
+	// limits is the per-host token bucket shared by every page of this browser
+	// and its incognito clones. It is immutable after creation.
+	limits *hostLimiter
 	// headerCleanups holds rod's per-page header cleanup, keyed by the rod page
 	// handle. Guarded by mu; entries are removed on every close path.
 	headerCleanups map[*rod.Page]func()
@@ -185,6 +188,7 @@ func NewBrowser(id BrowserID, baseCtx context.Context, headless, stealth bool, b
 		position:       pos,
 		createdAt:      time.Now(),
 		lastAccess:     time.Now(),
+		limits:         newHostLimiter(RateLimit{RPS: DefaultRateRPS, Burst: DefaultRateBurst}),
 		logger:         slog.New(slog.DiscardHandler),
 		baseCtx:        baseCtx,
 	}
@@ -386,6 +390,7 @@ func (b *Browser) newIdentity(name string, clone *rod.Browser) *Browser {
 		extraHeaders:   cloneHeaders(b.extraHeaders),
 		scope:          append([]string(nil), b.scope...),
 		scopeStrict:    b.scopeStrict,
+		limits:         b.limits,
 		headerCleanups: make(map[*rod.Page]func()),
 		proxyAuth:      b.proxyAuth,
 		authPages:      make(map[*rod.Page]*proxyAuthPage),
@@ -458,6 +463,8 @@ type BrowserInfo struct {
 	Scope string `json:"scope"`
 	// ScopeStrict reports whether an empty allowlist denies every navigation.
 	ScopeStrict bool `json:"scope_strict"`
+	// Limits is the effective per-host request policy and host state.
+	Limits LimitReport `json:"limits"`
 	// PageCount is the number of live pages.
 	PageCount int `json:"page_count"`
 	// CreateKey summarizes the launch options this browser was created with.
@@ -490,6 +497,7 @@ func (b *Browser) Info() BrowserInfo {
 		TTL:         b.ttl.String(),
 		Scope:       scopeState(b.scope, b.scopeStrict),
 		ScopeStrict: b.scopeStrict,
+		Limits:      b.limits.report(),
 		PageCount:   pageCount,
 		CreateKey:   b.key.Summary(),
 	}
@@ -520,10 +528,12 @@ func (b *Browser) IsAlive(ctx context.Context) bool {
 // containers. Launch is idempotent: it is a no-op once the browser is up.
 //
 // Launch installs the coherent realism defaults: the AutomationControlled
-// feature is disabled, the browser locale and Accept-Language are en-US, and
-// the launched Chromium's major version is probed ONCE and cached for the
-// per-page default User-Agent and client hints. A failed version probe degrades
-// to fallbackChromeMajor and never fails the launch.
+// feature is disabled, the browser locale is en-US, and the launched
+// Chromium's major version is probed ONCE and cached for the per-page default
+// User-Agent and client hints. A failed version probe degrades to
+// fallbackChromeMajor and never fails the launch. The Accept-Language header is
+// owned entirely by the per-page User-Agent override; no launcher flag writes
+// it, so the two sources can never combine into a duplicated quality value.
 //
 // The rod browser's DEFAULT ctx is bound to the manager-owned baseCtx the
 // Browser was constructed with — never to the caller's ctx — so a transient
@@ -551,9 +561,9 @@ func (b *Browser) Launch(ctx context.Context) error {
 	// window-size / device-scale / emulation launcher flags here. Screen-size
 	// emulation is page-scoped and opt-in — a caller passes an explicit
 	// viewport to NewPage, or applies a go-rod devices.X preset via
-	// Page.Emulate after creation. The launcher only carries the coherent
-	// realism defaults below (locale and Accept-Language); the UA and its
-	// client hints are applied per page before navigation.
+	// Page.Emulate after creation. The launcher only carries the browser
+	// locale; the User-Agent, Accept-Language and their client hints are
+	// applied per page before navigation, so the header has a single writer.
 	// The launcher is ctx-bound (l.Context) so a hung first-run Chromium
 	// download honors the caller's deadline instead of running on a background
 	// ctx.
@@ -564,7 +574,6 @@ func (b *Browser) Launch(ctx context.Context) error {
 	l.Set("disable-infobars")                               // suppress warning infobars
 	l.Set("no-default-browser-check")                       // suppress "Chromium isn't your default browser" prompt
 	l.Set("lang", defaultLanguage)
-	l.Set("accept-lang", defaultAcceptLanguage)
 	if b.proxy != "" {
 		server, host, err := parseProxy(b.proxy)
 		if err != nil {
@@ -748,7 +757,7 @@ func (b *Browser) NewPage(
 	// nil-Rod guard and the "browsers: set viewport" error wrap). The page is
 	// not yet registered in the pages map, so no other goroutine can see it;
 	// ID, URL and lastAccess are filled at registration below.
-	page := &Page{Rod: p}
+	page := &Page{Rod: p, browser: b}
 	page.startObservation()
 	b.startProxyAuth(p)
 

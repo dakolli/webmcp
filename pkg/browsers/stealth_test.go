@@ -37,6 +37,74 @@ func TestBuildUserAgent(t *testing.T) {
 	}
 }
 
+// TestDefaultAcceptLanguage pins the default Accept-Language header and the bare
+// language list handed to Network.setUserAgentOverride: every range carries at
+// most one quality value, no range repeats, and the list matches
+// navigator.languages.
+func TestDefaultAcceptLanguage(t *testing.T) {
+	t.Parallel()
+	if want := "en-US,en;q=0.9"; defaultAcceptLanguage != want {
+		t.Fatalf("defaultAcceptLanguage = %q, want %q", defaultAcceptLanguage, want)
+	}
+	ranges := strings.Split(defaultAcceptLanguage, ",")
+	if len(ranges) != len(defaultLanguages) {
+		t.Fatalf("defaultAcceptLanguage has %d ranges, want %d to match navigator.languages", len(ranges), len(defaultLanguages))
+	}
+	seen := make(map[string]bool, len(ranges))
+	for _, r := range ranges {
+		lang, _, _ := strings.Cut(r, ";")
+		if seen[lang] {
+			t.Fatalf("defaultAcceptLanguage repeats the range %q", lang)
+		}
+		seen[lang] = true
+		if got := strings.Count(r, ";q="); got > 1 {
+			t.Fatalf("defaultAcceptLanguage range %q carries %d quality values, want at most one", r, got)
+		}
+	}
+	list := acceptLanguageList(defaultAcceptLanguage)
+	if want := strings.Join(defaultLanguages, ","); list != want {
+		t.Fatalf("acceptLanguageList(defaultAcceptLanguage) = %q, want %q", list, want)
+	}
+	if strings.Contains(list, "q=") {
+		t.Fatalf("acceptLanguageList(defaultAcceptLanguage) = %q, want no quality values", list)
+	}
+}
+
+// TestAcceptLanguageList pins the quality-value stripping on the list handed to
+// Network.setUserAgentOverride, which re-adds the q ladder itself.
+func TestAcceptLanguageList(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		header string
+		want   string
+	}{
+		{
+			name:   "standard ladder",
+			header: "en-US,en;q=0.9",
+			want:   "en-US,en",
+		},
+		{
+			name:   "quality on the first range",
+			header: "en-US;q=0.6,en;q=0.4",
+			want:   "en-US,en",
+		},
+		{
+			name:   "bare list",
+			header: "en-US,en",
+			want:   "en-US,en",
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := acceptLanguageList(tt.header); got != tt.want {
+				t.Fatalf("acceptLanguageList(%q) = %q, want %q", tt.header, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestAssertStealthProbe pins every fingerprint check: the coherent probe
 // passes, and each automation or incoherence tell fails with its own reason.
 func TestAssertStealthProbe(t *testing.T) {

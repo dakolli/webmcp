@@ -1,6 +1,7 @@
 package browsers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -328,5 +329,58 @@ func TestRedactBody(t *testing.T) {
 				t.Fatalf("redactBody() count = %d, want %d", count, tt.wantCount)
 			}
 		})
+	}
+}
+
+func TestReplayAuthorizeScope(t *testing.T) {
+	p := &Page{browser: &Browser{scope: []string{"example.com"}}}
+	if err := replayAuthorize(context.Background(), p, ReplaySpec{}, "https://api.example.com/x"); err != nil {
+		t.Fatalf("in-scope authorize error = %v, want nil", err)
+	}
+	err := replayAuthorize(context.Background(), p, ReplaySpec{}, "https://evil.test/x")
+	if err == nil {
+		t.Fatal("out-of-scope replay authorize = nil, want a refusal")
+	}
+	for _, want := range []string{"evil.test", "outside the scope allowlist"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q missing %q", err.Error(), want)
+		}
+	}
+	if err := replayAuthorize(context.Background(), nil, ReplaySpec{}, "https://evil.test/x"); err != nil {
+		t.Fatalf("authorize with no page = %v, want nil", err)
+	}
+}
+
+func TestReplayHopAuthorizeStopsRedirect(t *testing.T) {
+	p := &Page{browser: &Browser{scope: []string{"example.com"}}}
+	err := replayHopAuthorize(context.Background(), p, ReplaySpec{}, "https://evil.test/next", 2)
+	if err == nil {
+		t.Fatal("out-of-scope redirect = nil, want a refusal")
+	}
+	for _, want := range []string{"redirect hop 2", "evil.test", "stopped"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("redirect refusal %q missing %q", err.Error(), want)
+		}
+	}
+}
+
+func TestReplayAuthorizeRateLimit(t *testing.T) {
+	b := &Browser{limits: newHostLimiter(RateLimit{RPS: 1, Burst: 1})}
+	p := &Page{browser: b}
+	if err := replayAuthorize(context.Background(), p, ReplaySpec{}, "https://example.test/a"); err != nil {
+		t.Fatalf("first authorize: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	err := replayAuthorize(ctx, p, ReplaySpec{}, "https://example.test/b")
+	if err == nil {
+		t.Fatal("second authorize = nil, want a rate-limit refusal")
+	}
+	var limited *RateLimitError
+	if !errors.As(err, &limited) {
+		t.Fatalf("authorize error = %v, want it to wrap *RateLimitError", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("authorize error = %v, want it to wrap context.DeadlineExceeded", err)
 	}
 }

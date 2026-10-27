@@ -267,6 +267,13 @@ func WithScopeStrict(strict bool) Option {
 	return func(m *Manager) { m.scopeStrict = strict }
 }
 
+// WithRateLimit sets the per-host request budget for browsers created with this
+// option: RPS is the sustained requests per second and Burst is the token
+// bucket depth. The default is DefaultRateRPS/DefaultRateBurst.
+func WithRateLimit(limit RateLimit) Option {
+	return func(m *Manager) { m.rateLimit = limit }
+}
+
 // WithBin configures a custom browser binary executable path (e.g. "/usr/bin/brave-browser",
 // "brave", "google-chrome", or "chrome"). When empty, the launcher defaults to the
 // downloaded Chromium binary.
@@ -428,6 +435,8 @@ type Manager struct {
 	scope []string
 	// scopeStrict is the default strict-empty-allowlist behavior.
 	scopeStrict bool
+	// rateLimit is the default per-host request budget for created browsers.
+	rateLimit RateLimit
 	// shutdown marks the manager as terminated; Open rejects further calls.
 	shutdown bool
 	// ttl is the per-page idle timeout enforced by the background sweeper
@@ -489,6 +498,7 @@ func NewManager(opts ...Option) *Manager {
 		launch:        func(ctx context.Context, b *Browser) error { return b.Launch(ctx) },
 		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 		profileRefs:   make(map[string]*profileRef),
+		rateLimit:     RateLimit{RPS: DefaultRateRPS, Burst: DefaultRateBurst},
 		baseCtx:       baseCtx,
 		cancelBase:    cancelBase,
 	}
@@ -548,6 +558,8 @@ type launchKey struct {
 	Headers     string
 	Scope       string
 	ScopeStrict bool
+	RateRPS     float64
+	RateBurst   int
 }
 
 // launchKeyOf builds the canonical launch key from a manager's launch fields.
@@ -567,6 +579,8 @@ func launchKeyOf(owner string, m *Manager) launchKey {
 		Headers:     canonicalHeaders(m.extraHeaders),
 		Scope:       canonicalScope(m.scope),
 		ScopeStrict: m.scopeStrict,
+		RateRPS:     m.rateLimit.RPS,
+		RateBurst:   m.rateLimit.Burst,
 	}
 }
 
@@ -711,6 +725,7 @@ func (m *Manager) createOptions(opts []Option) (*Manager, string, bool, error) {
 		extraHeaders: cloneHeaders(m.extraHeaders),
 		scope:        append([]string(nil), m.scope...),
 		scopeStrict:  m.scopeStrict,
+		rateLimit:    m.rateLimit,
 		owner:        m.owner,
 		browserTTL:   m.browserTTL,
 	}
@@ -812,6 +827,7 @@ func (m *Manager) launchCreatedBrowser(
 	b.extraHeaders = cloneHeaders(effective.extraHeaders)
 	b.scope = append([]string(nil), effective.scope...)
 	b.scopeStrict = effective.scopeStrict
+	b.limits = newHostLimiter(effective.rateLimit)
 	b.logger = m.logger
 	b.ephemeral = ephemeral
 	b.profileCleanup = func() { m.releaseProfile(profileDir) }
@@ -972,6 +988,7 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 	extraHeaders := cloneHeaders(m.extraHeaders)
 	scope := append([]string(nil), m.scope...)
 	scopeStrict := m.scopeStrict
+	rateLimit := m.rateLimit
 	browserTTL := m.browserTTL
 	m.mu.Unlock()
 
@@ -988,6 +1005,7 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 		extraHeaders: extraHeaders,
 		scope:        scope,
 		scopeStrict:  scopeStrict,
+		rateLimit:    rateLimit,
 	})
 
 	if proxy != "" {
@@ -1027,6 +1045,7 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 	b.extraHeaders = extraHeaders
 	b.scope = scope
 	b.scopeStrict = scopeStrict
+	b.limits = newHostLimiter(rateLimit)
 	b.logger = m.logger
 	b.ephemeral = ephemeral
 	b.profileCleanup = func() { m.releaseProfile(profileDir) }

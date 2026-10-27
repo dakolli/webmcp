@@ -22,6 +22,9 @@ const (
 	InterceptRewrite = "rewrite"
 	// InterceptFulfill answers a matching request with a synthetic response.
 	InterceptFulfill = "fulfill"
+	// InterceptScope marks a request blocked because its host is outside the
+	// browser's scope allowlist rather than by a user rule.
+	InterceptScope = "scope"
 
 	// interceptRuleCap bounds how many rules one page may hold.
 	interceptRuleCap = 50
@@ -85,20 +88,23 @@ type interceptor struct {
 	nextID  int
 	page    *rod.Page
 	obs     *pageObserver
+	browser *Browser
 	sem     chan struct{}
 	done    chan struct{}
 	cancel  context.CancelFunc
 	stopDo  sync.Once
 }
 
-// newInterceptor returns an unarmed interceptor for page.
-func newInterceptor(page *rod.Page, obs *pageObserver) *interceptor {
+// newInterceptor returns an unarmed interceptor for page, enforcing browser's
+// request scope on every paused request.
+func newInterceptor(page *rod.Page, obs *pageObserver, browser *Browser) *interceptor {
 	return &interceptor{
-		paused: make(map[proto.FetchRequestID]struct{}),
-		page:   page,
-		obs:    obs,
-		sem:    make(chan struct{}, interceptConcurrency),
-		done:   make(chan struct{}),
+		paused:  make(map[proto.FetchRequestID]struct{}),
+		page:    page,
+		obs:     obs,
+		browser: browser,
+		sem:     make(chan struct{}, interceptConcurrency),
+		done:    make(chan struct{}),
 	}
 }
 
@@ -182,10 +188,15 @@ func (i *interceptor) resolveSafely(e *proto.FetchRequestPaused) {
 	i.resolve(e)
 }
 
-// resolve applies the first matching rule, or continues the request when none
-// matches. A resolution failure on a document request disables interception, so
-// a broken rule can never leave a navigation paused.
+// resolve applies the browser's request scope, then the first matching rule, or
+// continues the request when neither refuses it. A resolution failure on a
+// document request disables interception, so a broken rule can never leave a
+// navigation paused.
 func (i *interceptor) resolve(e *proto.FetchRequestPaused) {
+	if i.scopeDenied(e.Request.URL) {
+		i.blockOutOfScope(e)
+		return
+	}
 	rule, hit := i.match(e.Request.Method, e.Request.URL)
 	if !hit {
 		_ = i.call(proto.FetchContinueRequest{RequestID: e.RequestID})
@@ -208,6 +219,28 @@ func (i *interceptor) resolve(e *proto.FetchRequestPaused) {
 	}
 	if i.obs != nil {
 		i.obs.recordIntercept(e, rule)
+	}
+}
+
+// scopeDenied reports whether a paused request is outside the browser's request
+// allowlist. A page with no browser or an open allowlist denies nothing.
+func (i *interceptor) scopeDenied(rawURL string) bool {
+	if i.browser == nil || rawURL == "" {
+		return false
+	}
+	return i.browser.CheckRequestScope(rawURL) != nil
+}
+
+// blockOutOfScope fails a paused request whose host is outside the browser's
+// allowlist and records it as intercepted by "scope" rather than silently
+// dropping it.
+func (i *interceptor) blockOutOfScope(e *proto.FetchRequestPaused) {
+	_ = i.call(proto.FetchFailRequest{
+		RequestID:   e.RequestID,
+		ErrorReason: proto.NetworkErrorReasonBlockedByClient,
+	})
+	if i.obs != nil {
+		i.obs.recordIntercept(e, InterceptRule{ID: InterceptScope, Action: InterceptScope})
 	}
 }
 
@@ -419,7 +452,7 @@ func (p *Page) interceptor(ctx context.Context) (*interceptor, error) {
 	if it := p.intercept; it != nil && !it.isStopped() {
 		return it, nil
 	}
-	fresh := newInterceptor(rodPage, p.observer)
+	fresh := newInterceptor(rodPage, p.observer, p.browser)
 	if err := fresh.start(ctx); err != nil {
 		return nil, err
 	}

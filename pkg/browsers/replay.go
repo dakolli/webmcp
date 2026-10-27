@@ -174,11 +174,12 @@ func (e *ReplayTransportError) TimedOut() bool {
 // sequence. Method and headers override the captured values, and Body replaces
 // the captured request body when BodySet is set; otherwise the body is fetched
 // from the browser, and a body it no longer retains is reported in
-// BodyUncaptured rather than sent empty. CheckScope authorizes the target and
-// every redirect before it is requested. Up to five redirects are followed and
-// reported in Chain. The response body is capped at MaxBytes (256 KB ceiling)
-// and both sensitive headers and text bodies are redacted unless the page
-// enabled secrets capture.
+// BodyUncaptured rather than sent empty. CheckScope authorizes the target, and
+// the browser's own policy authorizes it again and waits for a per-host token;
+// every redirect hop is checked the same way before it is requested. Up to five
+// redirects are followed and reported in Chain. The response body is capped at
+// MaxBytes (256 KB ceiling) and both sensitive headers and text bodies are
+// redacted unless the page enabled secrets capture.
 func (p *Page) Replay(ctx context.Context, spec ReplaySpec) (ReplayResult, error) {
 	entries, _ := p.NetworkEntries()
 	entry, err := matchReplayEntry(entries, spec.Target)
@@ -200,7 +201,7 @@ func (p *Page) Replay(ctx context.Context, spec ReplaySpec) (ReplayResult, error
 	if err != nil {
 		return ReplayResult{}, err
 	}
-	if err := replayScope(spec, target.String()); err != nil {
+	if err := replayAuthorize(ctx, p, spec, target.String()); err != nil {
 		return ReplayResult{}, err
 	}
 	body, hasBody, bodyUncaptured, err := p.replayBody(ctx, entry, method, spec)
@@ -235,7 +236,7 @@ func (p *Page) Replay(ctx context.Context, spec ReplaySpec) (ReplayResult, error
 	curURL, curMethod, curBody, curHasBody := target.String(), method, body, hasBody
 	for hop := 0; ; hop++ {
 		if hop > 0 {
-			if err := replayScope(spec, curURL); err != nil {
+			if err := replayHopAuthorize(ctx, p, spec, curURL, hop); err != nil {
 				return ReplayResult{}, err
 			}
 		}
@@ -424,6 +425,47 @@ func replayScope(spec ReplaySpec, rawURL string) error {
 	}
 	if err := spec.CheckScope(rawURL); err != nil {
 		return fmt.Errorf("replay: %s refused: %w", rawURL, err)
+	}
+	return nil
+}
+
+// replayAuthorize authorizes one replay hop before it is sent: the surface's
+// scope check, then the browser's own request policy (scope plus the per-host
+// token bucket). Either gate refuses before any network call.
+func replayAuthorize(
+	ctx context.Context,
+	p *Page,
+	spec ReplaySpec,
+	rawURL string,
+) error {
+	if err := replayScope(spec, rawURL); err != nil {
+		return err
+	}
+	if p == nil || p.browser == nil {
+		return nil
+	}
+	if err := p.browser.awaitRequest(ctx, rawURL); err != nil {
+		return fmt.Errorf("replay: %s: %w", rawURL, err)
+	}
+	return nil
+}
+
+// replayHopAuthorize authorizes one hop of the chain. A refused redirect stops
+// the chain and says which hop refused it.
+func replayHopAuthorize(
+	ctx context.Context,
+	p *Page,
+	spec ReplaySpec,
+	rawURL string,
+	hop int,
+) error {
+	if err := replayAuthorize(ctx, p, spec, rawURL); err != nil {
+		return fmt.Errorf(
+			"replay: redirect hop %d to %s stopped: %w",
+			hop,
+			rawURL,
+			err,
+		)
 	}
 	return nil
 }
