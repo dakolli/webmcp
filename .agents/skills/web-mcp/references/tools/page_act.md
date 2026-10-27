@@ -6,9 +6,9 @@ Interact with a live page that `fetch_page` opened.
 
 ## What it does
 
-`page_act` performs one action in an open session. The `session_id` picks the tab and the `action` field picks the operation. Actions cover clicking, typing, keys, mouse coordinates, drag, upload, JavaScript, navigation, waiting, waiting for a popup, emulation, log clearing, replaying a captured network request, in-flight request interception, sink control, canary injection, postMessage capture and sending, and auth snapshots.
+`page_act` performs one action in an open session. The `session_id` picks the tab and the `action` field picks the operation. Actions cover clicking, typing, keys, mouse coordinates, drag, upload, JavaScript, navigation, waiting, waiting for a popup, emulation, log clearing, replaying and fuzzing a captured network request, in-flight request interception, sink control, canary injection, postMessage capture and sending, and auth snapshots.
 
-The confirmation rides the result envelope: the full reply is `{"ok":true,"data":<payload>}`. See `SKILL.md` for the envelope rules and the `{"ok":false,"error":…}` shape. The payload is one short prose string plus a state delta line. `eval` and `replay` return compact JSON instead.
+The confirmation rides the result envelope: the full reply is `{"ok":true,"data":<payload>}`. See `SKILL.md` for the envelope rules and the `{"ok":false,"error":…}` shape. The payload is one short prose string plus a state delta line. `eval`, `replay`, and `replay_fuzz` return compact JSON instead.
 
 ## Inputs
 
@@ -24,17 +24,21 @@ The schema is `code://pkg/mcp/tools/act.go#L125`. Only `session_id` and `action`
 | `handle` | string | alternative to `selector` | — | Handle from `page_fetch` `what=interactives\|dom\|links`. Wins over `selector`. |
 | `value` | string | `eval`, `navigate`, `input`, `type`, `select`, `replay`, `post_message` | — | Payload text, JavaScript source, URL, option value, or message payload. For `replay` it replaces the request body and is sent only when the field is present. For `inject_canary` it is a custom canary. Omit it to mint `wm-canary-<8 hex>`. |
 | `targets` | array | `inject_canary` (optional) | all four | Injection points: `query`, `hash`, `postmessage`, `name`. Each entry may be a comma-separated list. |
-| `target` | string | `replay` | — | Captured network entry: a `seq` number or a substring of the request URL. |
+| `target` | string | `replay`, `replay_fuzz` | — | Captured network entry: a `seq` number or a substring of the request URL. |
 | `method` | string | `replay` (optional) | — | HTTP method override, for example `PUT`. Omit to keep the captured method. |
 | `headers` | object | `replay` (optional) | — | Per-header overrides. Each named header replaces the captured value, others keep theirs. |
 | `max_bytes` | integer | `replay` (optional) | `262144` | Cap on the returned replay body. Larger values are clamped. A cut body returns `truncated:true`. |
+| `raw` | boolean | no | `false` | Disable humanized timing for this call: one instant pointer move and no pre/post pause. Applies to `click`, `click_at`, `input`, `hover`, `hover_at`, and `press_key`. |
+| `points` | array | `replay_fuzz` | — | Injection points, each `{param,location}` with `location` one of `query`, `body`, `header`, `cookie`. At most 20. A stringified JSON array is accepted. |
+| `payloads` | array | `replay_fuzz` | — | Values injected at each point, in plan order. At most 50 of 200 runes each. A stringified JSON array is accepted. |
+| `strategy` | string | no | `sniper` | `replay_fuzz` plan: `sniper` (points × payloads), `pitchfork` (nth point with nth payload), or `clusterbomb` (payloads ^ points). |
 | `key` | string | `press_key` | — | Key or combo, for example `Enter` or `Control+A`. `value` is a fallback. |
 | `button` | string | no | `left` | `left`, `right`, or `middle` for `click` and `click_at`. |
 | `click_count` | integer | no | `1` | Click count for `click` and `click_at`. `2` is a double click. |
 | `x` | number | `click_at`, `hover_at` | `0` | Horizontal pixel coordinate. Also the drag source and `scroll` amount. |
 | `y` | number | `click_at`, `hover_at` | `0` | Vertical pixel coordinate. Also the drag source and `scroll` amount. |
 | `target_x`, `target_y` | number | no | `0` | Drag target pixel coordinates. |
-| `target_selector` | string | no | — | Drag target element, or the `post_message` destination: `top` (default) sends to `window.top`, and a CSS selector names an iframe. Its center overrides `target_x`/`target_y` for a drag. |
+| `target_selector` | string | no | — | Drag target element, or the `post_message` destination: `top` (default), `self`, `parent`, or a CSS selector naming an iframe. Its center overrides `target_x`/`target_y` for a drag. |
 | `origin` | string | no | `*` | Target origin for `post_message`. Pass the receiver's origin, for example `https://widget.example`. |
 | `paths` | array | `upload_file` | — | Absolute local file paths. `value` is the single-path fallback. |
 | `timeout_ms` | integer | no | `30000` | Bound for the whole call. For `wait` `ms` mode it is the sleep time. |
@@ -75,6 +79,7 @@ The schema is `code://pkg/mcp/tools/act.go#L125`. Only `session_id` and `action`
 | `sinks_install` | — | Arms the source-to-sink tracer. Idempotent. | `{"installed":true}` | No. |
 | `sinks_clear` | — | Empties the tracer ring and resets `dropped`. | `{"cleared":N}` | No. |
 | `replay` | `target` | Resends one captured network entry. See below. | Compact JSON result. | No. |
+| `replay_fuzz` | `target`, `points`, `payloads` | Runs a bounded matrix of variants over one captured entry. See [Replay fuzz](#replay-fuzz). | Compact JSON `{runs,summary}`. | No. |
 | `inject_canary` | `targets` (optional) | Injects a canary into client sources and reads the sink hits. Run `sinks_install` first. | Compact JSON: `{canary, injected, hits, installed}`. | No. |
 | `postmessage_install` | — | Arms the postMessage recorder on every reachable window. | `{"installed":true}` | No. |
 | `postmessage_clear` | — | Empties every recorder ring and resets `dropped`. | `{"cleared":N}` | No. |
@@ -91,7 +96,7 @@ A non-positive `click_count` becomes `1`. An unknown `button` is rejected before
 
 ## Returns
 
-The confirmation and the state delta arrive as one JSON string inside `data`. A live form submit on 2026-10-26 returned `{"ok":true,"data":"clicked selector=\"form button\"\n→ url=https://httpbin.org/post title=\"httpbin.org/post\""}`. The delta starts on a new line and lists only changed fields. `navigate` never appends one, and `back` and `forward` do. `eval`, `clear_logs`, `replay`, the three `intercept_*` actions, and `wait_open` return compact JSON in `data` instead of prose. A DOM node from `eval` comes back as `{}`. `click`, `click_at`, `press_key`, `upload_file`, `eval`, and `select` poll up to 900 ms for a navigation.
+The confirmation and the state delta arrive as one JSON string inside `data`. A live form submit on 2026-10-26 returned `{"ok":true,"data":"clicked selector=\"form button\"\n→ url=https://httpbin.org/post title=\"httpbin.org/post\""}`. The delta starts on a new line and lists only changed fields. `navigate` never appends one, and `back` and `forward` do. `eval`, `clear_logs`, `replay`, `replay_fuzz`, the three `intercept_*` actions, and `wait_open` return compact JSON in `data` instead of prose. A DOM node from `eval` comes back as `{}`. `click`, `click_at`, `press_key`, `upload_file`, `eval`, and `select` poll up to 900 ms for a navigation.
 
 ## Behavior and limits
 
@@ -100,6 +105,8 @@ The confirmation and the state delta arrive as one JSON string inside `data`. A 
 A handle has the form `g<document>-b<backendNodeId>`, for example `gcq7sm3ng-b165`. Get handles from `page_fetch` with `what=interactives`, `dom`, or `links`. A handle wins over `selector`. A live `input` with a text-field handle and a password-field selector wrote to the text field, and the password field stayed empty. The `g` token names the document that minted the handle: any navigation, reload, redirect, or document replacement changes it, and the old handle then fails as stale, so re-read `interactives` after every navigation. An `interactives` entry from a same-process child iframe works the same way: its `frame_url` names the frame, the backend node id is renderer-global, and its `handle` still acts through `page_act`.
 
 ### Element actions
+
+`click`, `click_at`, `input`, `hover`, `hover_at`, and `press_key` are humanized by default: the pointer steps to the target with small jitter, and a randomized 100-500 ms pause precedes and follows the action. Measured on vuejs.org on 2026-10-27, the default mean was 1.908 s and `--raw` 0.946 s. Any one hatch disables it: per-call `raw:true`, `WEB_MCP_RAW_ACTIONS=1` in the server environment, or a server started with `browsers.WithRawActions(true)`. The pause is skipped when it does not fit the remaining budget, never clipped, and a budget that expires first returns `timeout` with the action unperformed.
 
 `input` replaces the field contents: it selects all text first, then types `value`. `type` does not clear, it focuses the element and inserts at the caret. A live `input` of `555-0100` then a `type` of `" EXT"` left the field at `555-0100 EXT`, confirmed by `eval`. Some controls reject synthetic text — a live `input` on `<input type="time">` left the value empty, so use `eval` to set those values. `click` and `wait` `interactable` check interactability, and `input` and `type` do not, so a hidden element can still receive text.
 
@@ -123,9 +130,7 @@ The source takes a `selector` (element center) or `x`/`y`, the target takes `tar
 
 `timeout_ms` defaults to `30000` and bounds the whole call. For `ms` mode the server adds a 5 second margin. If you omit `timeout_ms`, an `ms` wait sleeps 30 seconds, so always set it.
 
-### Popups
-
-`wait_open` blocks until the page opens a popup or new tab through a `target="_blank"` link or `window.open`. It returns `{session_id,url,opener}`. A popup opened before the call is returned once. `timeout_ms` bounds the wait. Closing the opener closes its popups. A browser holds at most 20 pages, popups included.
+**CLI and IPC.** `--timeout-ms` no longer bounds the CLI socket read. The daemon allows the action 5 s of grace inside its 30 s transport budget, and the client reads for 15 s beyond the deadline, so a completed action returns its result with a trailing `(completed after its deadline: … elapsed, deadline …)` note instead of an i/o timeout. Live: a 200 ms click completed at 0.65-1.78 s.
 
 ### Emulation and viewport
 
@@ -134,14 +139,6 @@ The source takes a `selector` (element center) or `x`/`y`, the target takes `tar
 ### Logs
 
 Network, console, and websocket capture is cumulative from page creation. `clear_logs` empties all three rings, resets `dropped`, and returns `{"network":N,"console":M,"websocket":K}`. The `seq` counter does not reset. The recipe is `clear_logs`, then one action, then `page_fetch` `network`, `console`, or `websocket`.
-
-### Sinks tracer and canary injection
-
-`sinks_install` arms the tracer and returns `{"installed":true}`. `inject_canary` requires it first and otherwise returns `page_act: inject_canary needs the sink tracer — run action "sinks_install" first` (type `unknown`). `query` appends `wmcanary` and reloads the document. `hash` does not reload. Payloads, caps, and the unarmed shape are in [page_fetch.md](page_fetch.md), and the cross-cutting rule is in `SKILL.md`.
-
-### postMessage recorder
-
-`postmessage_install` arms one capture-phase `message` listener per window and iframe, re-arms before each later document, and never wraps `addEventListener`, so page listeners keep their identity. It takes no payload, returns `{"installed":true}`, and a second call is a no-op. `postmessage_clear` empties every ring, resets `dropped`, and returns `{"cleared":N}`. An unarmed page returns `{"cleared":0}`. `post_message` arms the recorder first, then delivers `value` to `window.top`, `window.self`, or `window.parent` when `target_selector` is `top`, `self`, `parent`, or omitted. Any other value is a CSS selector for an `<iframe>` or `<frame>`, and only its `contentWindow` receives the message. A complete JSON object or array in `value` is delivered as that structure, anything else as a string. `origin` is the target origin and defaults to `*`. The action returns `{origin,target}`. Read the log with `page_fetch what=postmessage`. The cross-cutting rule is in `SKILL.md`.
 
 ### Request interception
 
@@ -160,7 +157,7 @@ Interception is opt-in per session and changes page behaviour, so clear it when 
 
 Three limits apply. A response served from the HTTP cache bypasses the hook entirely, so a rule for a cached CSS file has no effect. Use a fresh context or clear the cache before arming rules, and expect WEB-212 to change this. `rewrite` cannot change the HTTP method, because `method` is a match filter only. A header set by `rewrite` does not appear in the ring's `req_headers`, so the ring is not proof of what was sent.
 
-**MCP only.** The CLI and IPC action vocabulary has no `intercept_*` member. `browser page act last intercept_add …` fails before any daemon call with `page act: unknown action="intercept_add" (must be one of click, …, wait_open)`, and a raw IPC `page.act` returns code `-32602` with `page.act: unknown action="intercept_add" (…)`. Use the MCP tool instead.
+**Every surface.** `intercept_add`, `intercept_list`, and `intercept_clear` work on MCP, CLI, and IPC. `browser page act last intercept_add --rules '<json>'` reaches the same engine, and IPC `page.act` carries `action` plus `rules`. The same rule is installed whichever surface you use.
 
 ### Auth snapshots
 
@@ -170,16 +167,25 @@ Three limits apply. A response served from the HTTP cache bypasses the hook enti
 
 `replay` resends one captured network entry through a real Go HTTP client, outside the browser (`code://pkg/browsers/replay.go#L112-L235`). It bypasses CORS, carries the page's cookies for the target host in a private jar without writing anything back, and never touches the live page. Recipe: read `page_fetch` `what=network`, pick one entry, then replay it.
 
-- `target` picks the entry: a `seq` number or a unique substring of the request URL. An ambiguous substring is refused as `invalid_args` with every candidate listed as `seq=N METHOD url`.
-- `method` overrides the captured method when given. `headers` replaces captured headers per name, others keep theirs. Framing headers (`Host`, `Cookie`, `Connection`, `Accept-Encoding`, `Content-Length`, and kin) are never copied because the client owns them and the cookie jar owns `Cookie`.
+- `target` picks the entry: a `seq` number or a unique substring of the request URL, and an ambiguous substring is refused as `invalid_args` with every candidate listed as `seq=N METHOD url`. `method` overrides the captured method, `headers` replaces captured headers per name, and framing headers (`Host`, `Cookie`, `Connection`, `Accept-Encoding`, `Content-Length`, and kin) are never copied because the client owns them and the cookie jar owns `Cookie`.
 - `value` replaces the request body, but it is sent only when the `value` field itself is present. Without it the captured body is fetched from the browser, and a body the browser no longer retains reports `body_uncaptured: true` instead of being sent empty. `GET` and `HEAD` never send a body.
 - Each URL, redirects included, is checked against the browser's scope allowlist before any request runs (`code://pkg/mcp/tools/act.go#L504-L516`, `code://pkg/browsers/replay.go#L453`). Up to 5 redirects are followed and reported in `chain`, and a 301, 302, or 303 switches the next hop to `GET` and drops the body.
 
 The result is compact JSON inside `data` (`code://pkg/browsers/replay.go#L86-L110`). See [page_act_example.md](../examples/page_act_example.md) §7 for the live replay result. **CLI and IPC.** `browser page act [id] replay <target>` reaches the same engine and prints the same JSON. The first positional slot is the target, and `--target` is the flag fallback. `--method` overrides the method, `--header NAME=VALUE` is repeatable, `--max-bytes` caps the body (0 means the 256 KB ceiling), and the body rides `--value` (omit it to keep the captured body, pass `--value ''` for an empty one). A malformed header fails with `page act: invalid --header "X" — use NAME=VALUE, e.g. X-Bug-Bounty=your-handle`. IPC `page.act` carries `target`, `method`, `headers`, `value` with `value_set`, and `max_bytes`. Without `value_set`, a non-empty `value` still sets the body. A missing target fails with `page act: replay requires target=<seq> or target=<url substring> from page_fetch what=network`, and a negative cap with `page act: replay max_bytes must be >= 0` (the IPC copies say `page.act:`). Fields: `status`, `headers` (final response headers as string arrays), `body` for UTF-8 text or `base64` for binary, `bytes`, `truncated`, `body_redactions`, `body_uncaptured`, `ms`, `request` (first-hop method, url, and echoed headers), and `chain` (each hop's `status` and `url`, always present and `[]` for a single hop). `truncated` and `chain` are always present. The response body is capped at 256 KB on a rune boundary, and `truncated: true` marks the cut. Sensitive request and response header values (`Cookie`, `Set-Cookie`, `Authorization`, and kin) show `<redacted>` unless the page opted into secrets capture, and no surface exposes that switch. Text-body secrets are replaced with `<redacted>` and counted in `body_redactions`. Binary bodies are not scanned. The whole replay is bounded by the call's `timeout_ms` deadline (engine cap 30 seconds).
 
-### Session lifetime
+### Replay fuzz
 
-Pages expire after the idle TTL, a dead Chromium relaunches under the same browser id, and older session ids then fail. Confirm the page with `page_list`.
+`replay_fuzz` runs a bounded matrix of variants over one captured network entry, reusing `replay`'s `target` rule (`seq` or a unique URL substring). `points` names what to inject: each `{param,location}`, where `location` is `query`, `body`, `header`, or `cookie`, and a `body` point needs a captured request body. `payloads` is the value list. Both also accept a stringified JSON array.
+
+| `strategy` | Requests | Plan |
+| :--- | :--- | :--- |
+| `sniper` (default) | points × payloads | One point at a time, every payload. |
+| `pitchfork` | min(points, payloads) | The nth point with the nth payload. |
+| `clusterbomb` | payloads ^ points | Every combination. |
+
+The size is computed and refused before any request: at most 100 matrix requests, 20 points, 50 payloads, and 200 runes per payload. The baseline probe is extra. Runs execute 5 in flight with 10 s each. A refusal is `invalid_args`, for example live on 2026-10-27: `page_act: replay_fuzz: requests computed 243, over the 100 bound`.
+
+One unmodified baseline request is sent first. The payload is `{runs:[{seq,payload,point,status,ms,bytes,body_cut,body_redactions}],summary:{baseline:{status,bytes,ms},anomalies:[{seq,rule,why}]}}`, and every run body is redacted like `replay`. Three rules compare each run with the baseline: `status_changed` (a different status), `size_delta` (over 10% either way), and `time_delta` (over 3× either way).
 
 ## Failure modes and recovery
 
@@ -198,17 +204,13 @@ An absent selector for `click`, `input`, `hover` or `select` fails immediately w
 | Bad JavaScript | `page_act: evaluate js: eval js error: SyntaxError: Unexpected token ')' <nil>` | Fix the syntax. |
 | Stale handle after reload | `page_act: handle "gzlaqy9xe-b10" is stale — element no longer in the document (re-run page_fetch what=interactives to re-mint handles): {-32000 Node with given id does not belong to the document }` | Re-read `interactives`. |
 | Bad handle format | `page_act: invalid handle "x" (expected g<document>-b<backendNodeId> minted by page_fetch what=interactives\|dom\|links)` | Copy a handle exactly. |
-| Unknown device | `page_act: unknown device "Nokia3310" (see go-rod lib/devices presets, e.g. IPhoneX, IPadPro, LaptopWithHiDPIScreen)` | Use a real preset or `clear`. |
-| `emulate` without `device` | `page_act: emulate requires a device` | Pass a preset name. |
-| `set_viewport` without `viewport` | `page_act: set_viewport requires a viewport` | Pass `width` and `height`. |
-| Non-positive viewport | `page_act: viewport width and height must be positive` | Send positive integers. |
+| Bad device or viewport input | `page_act: unknown device "Nokia3310" (see go-rod lib/devices presets, e.g. IPhoneX, IPadPro, LaptopWithHiDPIScreen)`, `page_act: emulate requires a device`, `page_act: set_viewport requires a viewport`, or `page_act: viewport width and height must be positive` | Use a real preset or `clear`, and send positive width and height. |
 | Unknown session | `page_act: session "page-999" not found` | Use `page_list` or `fetch_page`. |
-| Unknown action | `page_act: unknown action="konami" (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, inject_canary, postmessage_install, postmessage_clear, post_message, wait_open, intercept_add, intercept_list, intercept_clear, auth_save, auth_restore, auth_list)` | Use a listed action. |
-| Unknown button | `page_act: click: unknown mouse button "back" (must be left, right, or middle)` | Use `left`, `right`, or `middle`. |
+| Unknown action | `page_act: unknown action="konami" (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, inject_canary, postmessage_install, postmessage_clear, post_message, wait_open, intercept_add, intercept_list, intercept_clear, auth_save, auth_restore, auth_list, replay_fuzz)` | Use a listed action. |
 | `upload_file` without paths | `page_act: upload_file: no file paths provided` | Pass `paths` or `value`. |
-| `interactable` without a target | `page_act: wait: interactable mode requires a selector or handle` | Add a target. |
-| Unknown wait mode | `page_act: wait: unknown wait_mode "forever" (must be one of load, idle, stable, interactable, ms)` | Use a listed mode. |
-| Missing action | `page_act: missing required argument "action"` | Send `action`. |
+| `replay_fuzz` without `target` | `page_act: replay_fuzz requires target=<seq> or target=<url substring> from page_fetch what=network` (`invalid_args`) | Read `what=network` and set `target`. |
+| `replay_fuzz` over a bound | `page_act: replay_fuzz: requests computed 243, over the 100 bound` (`invalid_args`) | Lower the payload or point count, or use `sniper`. |
+| `replay_fuzz` unknown strategy | `page_act: replay_fuzz: unknown strategy "spray" — use sniper, pitchfork or clusterbomb` (`invalid_args`) | Use a listed strategy. |
 | `replay` without `target` | `page_act: replay requires target=<seq> or target=<url substring> from page_fetch what=network` (`invalid_args`) | Read `what=network` and set `target`. |
 | `replay` with an unknown seq | `page_act: replay: no network entry with seq %d (read page_fetch what=network for the current seq values)` | Re-read `network` for live `seq` values. |
 | `replay` with an unmatched substring | `page_act: replay: no network entry matches target %q (target is a seq number or a substring of the request URL; read page_fetch what=network first)` | Pass a seq or a different substring. |
@@ -234,10 +236,10 @@ Do not use `page_act` to open a URL in a new tab, use `fetch_page`. Do not use i
 ## Tested calls
 
 - 2026-10-25 — input, type, press_key, select, upload, clicks, hover, scroll, keyboard combo, drag, navigate, back/forward/reload, eval, clear_logs, viewport, emulate, and miss-path errors.
-- 2026-10-26 — replay ambiguity failure on `https://news.ycombinator.com/news`, submit-click with a state delta in `data`, and `wait_open` returning `{session_id,url,opener}` after a `target="_blank"` click, where closing the opener closed the popup.
-- 2026-10-26 — `sinks_install`, a payload, and `page_fetch what=sinks` on `https://www.postgresql.org/`. The arm survived a full navigation and `sinks_clear` returned `{"cleared":N}`. `inject_canary` on `https://www.sqlite.org/index.html` returned the four-key result and `hits:[]`.
+- 2026-10-26 — replay ambiguity failure, submit-click with a state delta, and `wait_open` returning `{session_id,url,opener}` after a `target="_blank"` click, where closing the opener closed the popup. Also `sinks_install`, a payload, and `what=sinks` on `https://www.postgresql.org/`: the arm survived a full navigation and `sinks_clear` returned `{"cleared":N}`.
 - 2026-10-26 — `postmessage_install`, `post_message` to `top` and to an iframe, and `page_fetch what=postmessage` on https://www.python.org/. The read returned both messages with `origin` and `frames[].probed:true`.
 - 2026-10-27 — source-verified against the shipped code and its tests: `intercept_add`/`list`/`clear` and the `intercepted` network tag (commit `037138c`), and replay over CLI and IPC (commit `ee64f65`). The running daemon predated `037138c` and rejected `intercept_add`, so these two paths have no live call yet.
+- 2026-10-27 — `replay_fuzz` live on `https://www.debian.org/`: sniper over one `query` point with two payloads returned two runs plus the baseline and `anomalies:[]`, and a five-point `clusterbomb` with three payloads was refused before any request with `page_act: replay_fuzz: requests computed 243, over the 100 bound`. The live MCP enum lists all 35 actions, `intercept_*` included, and the CLI/IPC vocabularies carry the same `intercept_*` names. Humanized timing and `raw` were read from the live schema.
 - 2026-10-27 — `auth_save`, `auth_list`, and `auth_restore` on `www.saucedemo.com`: the snapshot restored a login into a new browser and a new identity, `auth_list` answered with no live browser and a stale `session_id`, and a host-only `session-username` cookie stayed scoped to `www.saucedemo.com`.
 
 ## Related tools

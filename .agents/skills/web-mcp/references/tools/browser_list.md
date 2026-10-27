@@ -54,7 +54,7 @@ Rendered by `scopeState` at `code://pkg/browsers/policy.go#L157-L165`:
 | `strict` | The allowlist is empty and `scope_strict` is true. Every request is refused. |
 | joined patterns | The allowlist entries joined with `, `, for example `wikipedia.org, example.org`. A bare host covers its subdomains. `*` allows all. |
 
-Read `scope` before you send traffic to a new host. `scope=open` means no limit. A value that names hosts means a request outside them is refused before it is sent. Scope covers navigation, replay, every redirect hop, and intercepted subresources. Scope and the `limits` budget are fixed at creation and join the reuse key, so a reuse with a different scope or rate gets a separate browser. Creation options live in [browser_create.md](browser_create.md).
+Read `scope` before you send traffic to a new host. `scope=open` means no limit. A value that names hosts means a request outside them is refused before it is sent. Scope covers navigation, replay and `replay_fuzz` hops, and intercepted subresources. A navigation HTTP redirect is not re-checked. Scope and the `limits` budget are fixed at creation and join the reuse key, so a reuse with a different scope or rate gets a separate browser. Creation options live in [browser_create.md](browser_create.md).
 
 In the examples, `<profiles-dir>` is the absolute ~/.config/browser-mcp/profiles directory.
 

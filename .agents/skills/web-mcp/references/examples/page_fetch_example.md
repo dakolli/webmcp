@@ -74,7 +74,7 @@ Open `https://react.dev/learn` as `page-3`, call `page_act` `clear_logs` (expect
 {"tool":"page_fetch","arguments":{"session_id":"page-3","what":"network"}}
 ```
 
-Expect one entry with `"seq":40` and `"url":"https://react.dev/_next/static/chunks/616.bd871377a76d946f.js"`. `seq` keeps counting after `clear_logs`, so it proves the action caused the request.
+Expect one entry with `"seq":40` and `"url":"https://react.dev/_next/static/chunks/616.bd871377a76d946f.js"`. Each entry also carries `frame_id` and `loader_id`, and only the page's document request sets `"top_document":true`, which marks the current top-level document. `seq` keeps counting after `clear_logs`, so it proves the action caused the request.
 
 ## 8. Read headers, one body, and redaction
 

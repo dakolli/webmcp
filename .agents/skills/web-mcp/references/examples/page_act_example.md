@@ -98,6 +98,24 @@ The second `target` is the seq of this run's `news.css` request. Success rides `
 {"ok":true,"data":{"status":200,"headers":{"Content-Type":["text/css; charset=utf-8"],"Server":["nginx"],"Vary":["Accept-Encoding"]},"body":"body  { font-family:Verdana, Geneva, sans-serif; … }","bytes":7418,"ms":63,"request":{"method":"GET","url":"https://news.ycombinator.com/news.css?EieZrD3Ae1qf3cIQQaRb","headers":{"Accept-Language":"en","Referer":"https://news.ycombinator.com/","User-Agent":"Mozilla/5.0 …"}}}}
 ```
 
+Then fuzz one query parameter over the same entry:
+
+```json
+{"tool":"page_act","arguments":{"session_id":"page-6","action":"replay_fuzz","target":"2","points":[{"param":"q","location":"query"}],"payloads":["a","b"],"strategy":"sniper","max_bytes":2000}}
+```
+
+Live on 2026-10-27 against `https://www.debian.org/`, sniper with one point and two payloads returned two runs plus the baseline:
+
+```json
+{"ok":true,"data":{"runs":[{"seq":1,"payload":"a","point":"q","status":200,"ms":105,"bytes":2000,"body_cut":true,"body_redactions":0},{"seq":2,"payload":"b","point":"q","status":200,"ms":93,"bytes":2000,"body_cut":true,"body_redactions":0}],"summary":{"baseline":{"status":200,"bytes":2000,"ms":271},"anomalies":[]}}}
+```
+
+`anomalies` is `[]` when no run differs from the baseline by status, by more than 10% in size, or by more than 3× in time. An over-bound matrix is refused before any request:
+
+```json
+{"ok":false,"error":{"type":"invalid_args","message":"page_act: replay_fuzz: requests computed 243, over the 100 bound","hint":"lower the payload count or the point count, or use strategy sniper (points*payloads) to stay under the 100-request bound"}}
+```
+
 Replay re-reads the request and carries the page's cookies for the target host, and it never writes to the page. Pass `method` to override the method, `headers` to replace captured headers, or `value` to replace the request body. From a shell with the daemon up, the same replay is `browser page act last replay 2`, or `browser page act last replay /news.css --method GET --max-bytes 4000 --value ''`. The first positional is the target, and `--value` (not a positional) carries the replacement body.
 
 ## 8. Intercept and rewrite requests
@@ -112,7 +130,7 @@ Reuse `page-6` from §7: fulfill its `news.css`, reload, then read the tag and c
 {"tool":"page_act","arguments":{"session_id":"page-6","action":"intercept_clear"}}
 ```
 
-Expect `{"rules":[{"id":"css","url_pattern":"*news.css*","action":"fulfill","headers":{"Content-Type":"text/css"},"status":200,"body":"body{background:#fff}"}],"count":1,"active":true}`, then `reloaded page`, then a `news.css` entry carrying `"intercepted":"fulfill"`, `"intercept_rule_id":"css"`, `"status":200`, and `"mime":"text/css"`. `intercept_list` repeats the rule, and `intercept_clear` returns `{"rules_removed":1,"active":false}`. `block`, `allow`, and `rewrite` rules work the same way, and every match is tagged on the ring. The three actions are MCP-only. `browser page act … intercept_add` returns `page act: unknown action="intercept_add"`. This block is source-verified: the daemon running on 2026-10-27 predated `intercept_add`. Three limits apply. A response served from cache bypasses the rules, so a rule for a cached CSS file does nothing until you use a fresh context or clear the cache. `rewrite` cannot change the HTTP method, because `method` is a match filter only. A rewritten header does not appear in the network ring's `req_headers`.
+Expect `{"rules":[{"id":"css","url_pattern":"*news.css*","action":"fulfill","headers":{"Content-Type":"text/css"},"status":200,"body":"body{background:#fff}"}],"count":1,"active":true}`, then `reloaded page`, then a `news.css` entry carrying `"intercepted":"fulfill"`, `"intercept_rule_id":"css"`, `"status":200`, and `"mime":"text/css"`. `intercept_list` repeats the rule, and `intercept_clear` returns `{"rules_removed":1,"active":false}`. `block`, `allow`, and `rewrite` rules work the same way, and every match is tagged on the ring. The three actions work on MCP, CLI, and IPC: `browser page act last intercept_add --rules '<json>'` reaches the same engine. Three limits apply. A response served from cache bypasses the rules, so a rule for a cached CSS file does nothing until you use a fresh context or clear the cache. `rewrite` cannot change the HTTP method, because `method` is a match filter only. A rewritten header does not appear in the network ring's `req_headers`.
 
 ## 9. Arm the sink tracer and inject a canary
 

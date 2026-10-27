@@ -98,7 +98,7 @@ Connect an MCP client:
 
 - Named incognito identities share one Chromium process. Each identity keeps its own cookies and
   storage.
-- A scope allowlist bounds navigation, replay, every redirect hop, and intercepted subresources. The engine refuses an off-scope request before it is sent.
+- A scope allowlist bounds navigation, replay and `replay_fuzz` hops, and intercepted subresources. A navigation HTTP redirect is not re-checked. The engine refuses an off-scope request before it is sent.
 - A per-host rate limit (`rps` 5, `burst` 10 by default) spaces requests. A request that cannot get a token before its deadline fails as `timeout`.
 - Auth snapshots save and restore a login across browsers and identities. Results carry counts only, never a cookie or storage value.
 - Extra headers go on every request of a browser.
@@ -120,7 +120,7 @@ Connect an MCP client:
 - Tracer: `sinks` reports source-to-sink hits. It is read-only. Arm it with `page_act sinks_install`.
 - Export: `har` returns HAR 1.2 for the observed network traffic.
 
-### Actions: `page_act` has 34 actions
+### Actions: `page_act` has 35 actions
 
 - Mouse: `click`, `click_at`, `hover`, `hover_at`, `drag_and_drop`.
 - Keyboard: `input`, `type`, `press_key` with combos such as `Control+a`.
@@ -129,7 +129,7 @@ Connect an MCP client:
 - View and time: `scroll`, `wait`, `set_viewport`, `emulate`.
 - Code and logs: `eval`, `clear_logs`.
 - Tracer: `sinks_install`, `sinks_clear`. Both take no payload.
-- Network: `replay`, `intercept_add`, `intercept_list`, `intercept_clear`.
+- Network: `replay`, `replay_fuzz`, `intercept_add`, `intercept_list`, `intercept_clear`.
 - Auth: `auth_save`, `auth_restore`, `auth_list`. Results carry counts only.
 
 ### Surfaces
@@ -183,8 +183,9 @@ The arm survives a full navigation. The hit ring restarts for each document.
 - No scope means no limit. `browser_list` reports the live state as `scope` plus `scope_strict`.
 - `--scope-strict` is opt-in. It makes an empty allowlist deny every request.
 - A refusal names the host, the allowed list, and the fix.
-- The limit covers navigation, replay, every redirect hop, and intercepted subresources. An off-scope
-  request is refused before it is sent, and a refused replay redirect names the hop and the host.
+- The limit covers navigation, replay and `replay_fuzz` hops, and intercepted subresources. An
+  off-scope request is refused before it is sent, and a refused replay redirect names the hop and the
+  host. A navigation HTTP redirect is not re-checked.
 - `rps` and `burst` are MCP create inputs only: the CLI has no flags for them. The default is 5/s with
   a burst of 10 per host, and the effective policy appears as `limits` on `browser_list`.
 
@@ -243,13 +244,13 @@ clamped to 1..120000. A full-page screenshot keeps a 90s floor unless `timeout_m
 | `dom` | The DOM tree with frames and shadow roots. Each element has `tag`, `id`, `class`, `attrs`, `text`, `handle`, `visible`, `bounds`, `frame_url`, and `children`. |
 | `interactives` | `{interactives:[{handle, role, text, href, type, x, y, width, height, visible}], truncated}`. Capped at 200 visible elements. `x`/`y` are the element centre, so `left = x - width/2`. `marks` reports the top-left instead. |
 | `a11y` | `{nodes:[{handle?, depth, role, name?, value?, states?}], count, truncated}`. DFS order, capped at 400. Root frame only. |
-| `network` | `{entries:[{method, url, type?, status?, mime?, bytes?, ms?, failed?, error?, seq}], count, dropped, truncated}`. Headers included. One entry per redirect hop. Newest 100 of a 200-entry ring. |
+| `network` | `{entries:[{method, url, type?, status?, mime?, bytes?, ms?, failed?, error?, seq, frame_id?, loader_id?, top_document?}], count, dropped, truncated}`. Headers included. `top_document:true` marks the current top-level document request. One entry per redirect hop. Newest 100 of a 200-entry ring. |
 | `console` | The same envelope over `{level, text, source?, line?, seq}`. |
 | `article` | `{title, byline?, excerpt?, text, words, truncated, url}` as markdown. Capped at 40000 runes. |
 | `tables` | `{tables:[{index, caption?, headers, rows, span_info, selector}], count, truncated}`. Capped at 20 tables and 500 rows per table. |
 | `forms` | `{forms:[{index, action, method, enctype, fields, submits, csrf_candidates}], count, truncated}`. Field values are never returned; only `has_value` and a hidden-token signal. |
 | `marks` | `{marks:[{index, role, text?, x, y, width, height}], viewport_width, viewport_height, truncated}` plus an annotated PNG. `x`/`y` are the top-left. Capped at 60 marks. |
-| `security` | `{checks:[{id, status, evidence, detail}], count}`. A passive audit. |
+| `security` | `{checks:[{id, status, evidence, detail}], count}`. A passive audit scoped to the current top-level document, so an earlier navigation's evidence is excluded. A `header_conflict` finding names a response header that arrived with different values. |
 | `sinks` | `{installed, hits:[{source, sink, context, value, stack, selector, ts}], dropped, truncated}`. Read-only. Capped at 100 hits from a 200-hit ring. |
 | `har` | HAR 1.2 `{log:{version, creator, pages, entries[]}}` for the observed traffic. Capped at 512 KiB. `Authorization` and `X-CSRF-Token` read `<redacted>`. |
 | `storage` | `{cookies, local_storage, session_storage, indexed_db, caches}`. Values are `<redacted>` unless `include_values` is true. |
@@ -276,6 +277,12 @@ report their own `truncated` flag and are never cut mid-value.
 `Meta+c`, `Shift+Tab`. `input` replaces the value. `type` inserts at the caret. `wait_mode` is one of
 `load`, `idle`, `stable`, `interactable`, and `ms`.
 
+Pointer and keyboard actions (`click`, `click_at`, `input`, `hover`, `hover_at`, `press_key`) are
+humanized by default: stepped, jittered pointer movement and a randomized 100-500 ms pause. The pause
+is skipped when it does not fit the remaining budget, never clipped. Any one hatch makes them instant:
+`raw:true` on the call, `WEB_MCP_RAW_ACTIONS=1` in the server environment, or a server started with
+raw actions. Pass at least 1000 ms of `timeout_ms` for a humanized action.
+
 Element actions accept a `handle` from `page_fetch` instead of a selector. The handle wins when both
 are given. A handle looks like `g<document>-b<backendNodeId>`. It goes stale when the element leaves
 the page or the page navigates. Re-run the fetch for a new handle.
@@ -294,10 +301,18 @@ then the action, then `page_fetch` with `network` or `console`.
 target host and follows up to 5 redirects. It returns `{status, headers, body, bytes, truncated, ms,
 request, chain}`. Sensitive response headers are redacted.
 
+`replay_fuzz` runs a bounded matrix over one captured request: `sniper` (one point at a time,
+points × payloads; default), `pitchfork` (nth point with nth payload), or `clusterbomb` (every
+combination). It caps at 100 matrix requests, 20 points, 50 payloads and 200 runes per payload, sends one
+unmodified baseline first, and reports anomalies as `status_changed`, `size_delta` (over 10% either
+way) and `time_delta` (over 3× either way). An over-bound matrix is refused before any request with
+`replay_fuzz: requests computed 243, over the 100 bound`.
+
 `page_act` can also intercept requests in flight with `intercept_add`, `intercept_list`, and
 `intercept_clear`. A URL-matched rule blocks, allows, rewrites, or fulfills a request, and every match
 is tagged on the `network` ring. Rules are per page, capped at 50, and must not run beside proxy
-authentication. The CLI and IPC have no `intercept_*` action yet. A response served from the HTTP
+authentication. The CLI and IPC carry the same actions, for example
+`browser page act last intercept_add --rules '<json>'`. A response served from the HTTP
 cache bypasses the rules, `rewrite` cannot change the HTTP method, and a rewritten header does not
 appear in the ring's `req_headers`.
 
@@ -356,6 +371,9 @@ output.
 - `page_fetch` and `browser page fetch` accept `timeout_ms` / `--timeout-ms` (default 30000, clamped
   to 1..120000). The daemon gives `page.fetch` a 180s transport budget, so a raised value is not cut
   at 30s; every other IPC method keeps the 30s cap.
+- `page_act` `--timeout-ms` no longer bounds the CLI socket read. The daemon allows the action 5s of
+  grace inside its 30s transport budget and the client reads for 15s beyond the deadline, so a
+  completed action returns `(completed after its deadline: …)` instead of an i/o timeout.
 - The server has no authentication, permissive CORS, and `eval` plus arbitrary `upload_file` paths.
   Treat the port as local-only.
 
