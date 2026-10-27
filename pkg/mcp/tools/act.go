@@ -272,7 +272,10 @@ func (t *Act) InputSchema() models.InputSchema {
 			"headers": map[string]any{
 				"type":                 "object",
 				"additionalProperties": map[string]any{"type": "string"},
-				"description":          "Header overrides for replay: each named header replaces the captured value; omitted headers keep theirs.",
+				"description": "replay only: each named header replaces the captured value on the resent request; " +
+					"omitted headers keep theirs. It does not set headers on page requests — use " +
+					"browser_create.headers for browser-wide request headers, or intercept_add with " +
+					"action:\"rewrite\" for a per-request rewrite.",
 			},
 			"max_bytes": map[string]any{
 				"type": "integer",

@@ -155,6 +155,12 @@ Use these on a target you are authorized to test.
 
 The arm survives a full navigation. The hit ring restarts for each document.
 `page_fetch what=har` exports the observed traffic for Burp, Caido, or ZAP.
+`browser page fetch <id> har --out traffic.har` writes that document to disk
+without printing it, so hand the file over directly: in Caido choose
+Import → HTTP → HAR and select `traffic.har`. The parent directory must already
+exist, the file is mode 0600, and without `--max-bytes` the CLI asks for the
+uncapped export; pass `--max-bytes N` to cap it. The MCP `page_fetch` export
+defaults to a 512 KiB cap; the `--out` file does not.
 `page_fetch what=security` audits the response headers and the cookies.
 
 ---
@@ -252,7 +258,7 @@ clamped to 1..120000. A full-page screenshot keeps a 90s floor unless `timeout_m
 | `marks` | `{marks:[{index, role, text?, x, y, width, height}], viewport_width, viewport_height, truncated}` plus an annotated PNG. `x`/`y` are the top-left. Capped at 60 marks. |
 | `security` | `{checks:[{id, status, evidence, detail}], count}`. A passive audit scoped to the current top-level document, so an earlier navigation's evidence is excluded. A `header_conflict` finding names a response header that arrived with different values. |
 | `sinks` | `{installed, hits:[{source, sink, context, value, stack, selector, ts}], dropped, truncated}`. Read-only. Capped at 100 hits from a 200-hit ring. |
-| `har` | HAR 1.2 `{log:{version, creator, pages, entries[]}}` for the observed traffic. Capped at 512 KiB. `Authorization` and `X-CSRF-Token` read `<redacted>`. |
+| `har` | HAR 1.2 `{log:{version, creator, pages, entries[]}}` for the observed traffic: response and request bodies, `httpVersion`, and `serverIPAddress`. `request.cookies` is redacted and `response.cookies` is always empty because Chrome omits `Set-Cookie`; `Authorization` and `X-CSRF-Token` read `<redacted>`, and bodies stay verbatim. The MCP export is capped at 512 KiB; the CLI writes it uncapped with `browser page fetch <id> har --out <path>` (mode 0600). |
 | `storage` | `{cookies, local_storage, session_storage, indexed_db, caches}`. Values are `<redacted>` unless `include_values` is true. |
 | `links` | `[{text, href, handle?}]`. Deduped, non-navigable schemes removed. |
 | `meta` | `{title, url, meta:[{name/property/http-equiv/content/charset}]}`. |
@@ -335,6 +341,7 @@ browser page fetch last interactives            # handles, roles, text, x/y
 browser page fetch last storage --include-values
 browser page fetch last security
 browser page fetch last screenshot --full-page --timeout-ms 60000
+browser page fetch last har --out traffic.har  # write HAR 1.2, print the path + entry count
 browser page fetch https://app.test/login --identity attacker
 browser page act click ".titleline a"
 browser page act replay "api.example.com/session" --method PUT --value '{"role":"admin"}'

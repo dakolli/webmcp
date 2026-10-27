@@ -26,7 +26,7 @@ The schema is `code://pkg/mcp/tools/act.go#L125`. Only `session_id` and `action`
 | `targets` | array | `inject_canary` (optional) | all four | Injection points: `query`, `hash`, `postmessage`, `name`. Each entry may be a comma-separated list. |
 | `target` | string | `replay`, `replay_fuzz` | — | Captured network entry: a `seq` number or a substring of the request URL. |
 | `method` | string | `replay` (optional) | — | HTTP method override, for example `PUT`. Omit to keep the captured method. |
-| `headers` | object | `replay` (optional) | — | Per-header overrides. Each named header replaces the captured value, others keep theirs. |
+| `headers` | object | `replay` (optional) | — | `replay` only: each named header replaces the captured value on the resent request, others keep theirs. It does not set headers on page requests; use `browser_create` `headers` for browser-wide request headers or `intercept_add` with `action:"rewrite"` for a per-request rewrite. |
 | `max_bytes` | integer | `replay` (optional) | `262144` | Cap on the returned replay body. Larger values are clamped. A cut body returns `truncated:true`. |
 | `raw` | boolean | no | `false` | Disable humanized timing for this call: one instant pointer move and no pre/post pause. Applies to `click`, `click_at`, `input`, `hover`, `hover_at`, and `press_key`. |
 | `points` | array | `replay_fuzz` | — | Injection points, each `{param,location}` with `location` one of `query`, `body`, `header`, `cookie`. At most 20. A stringified JSON array is accepted. |

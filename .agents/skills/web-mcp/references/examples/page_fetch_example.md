@@ -125,7 +125,23 @@ Open a new page with a hash, arm, load the hash into `innerHTML`, read, clear:
 
 Expect `{"installed":true}`, then `data` as `{"installed":true,"hits":[{"source":"location.hash","sink":"innerHTML","context":"html","value":"#wm-canary-160","stack":[…],"selector":"…","ts":…}],"dropped":0,"truncated":0}`, then `{"cleared":1}`. A read after the clear returns `hits:[]`.
 
-## 12. Errors and cleanup
+## 12. Export HAR
+
+```json
+{"tool":"page_fetch","arguments":{"session_id":"page-1","what":"har"}}
+```
+
+Expect `data` as `{"log":{"version":"1.2","creator":{"name":"web-mcp","version":"1.0"},"pages":[{"startedDateTime":"…","id":"page_1","title":"…","pageTimings":{"onContentLoad":-1,"onLoad":-1}}],"entries":[{"request":{"method":"GET","url":"https://…","httpVersion":"http/1.1","headers":[…],"cookies":[…]},"response":{"status":200,"httpVersion":"http/1.1","content":{"size":1256,"mimeType":"text/html","text":"<!doctype html>…"},"cookies":[]},"serverIPAddress":"203.0.113.7",…}],"comment":"web-mcp HAR 1.2 export. … Cap 524288 bytes. …","truncated":0,"bodies_skipped":0}}`. `response.cookies` is always `[]`, a binary body sets `content.encoding:"base64"`, and header and cookie values read `<redacted>` while bodies stay verbatim.
+
+The CLI writes the same document uncapped and prints one line, never the body:
+
+```sh
+browser page fetch page-1 har --out traffic.har
+```
+
+Expect `wrote traffic.har (42 entries)`. The file is mode 0600 and its `log.comment` says `Cap: none`.
+
+## 13. Errors and cleanup
 
 A bad selector on `text` returns `{"ok":false,"error":{"type":"element_not_found","message":"page_fetch: no element matched selector \"#does-not-exist-xyz\": cannot find element"}}`, tested live on 2026-10-26.
 

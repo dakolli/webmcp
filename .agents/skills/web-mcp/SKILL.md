@@ -141,6 +141,8 @@ Each tool reference states only its own payload and its failure types, and links
 - `intercept_*` `rewrite` cannot change the HTTP method. `method` is a match filter only.
 - A header set by `intercept_*` `rewrite` does not appear in the `network` ring `req_headers`. The ring is not proof of what was sent.
 - A humanized pre/post pause that does not fit the remaining budget is skipped, not clipped. A budget that expires first returns `timeout` and performs no action.
+- `page_fetch` `har` always returns an empty `response.cookies`, because Chrome omits `Set-Cookie` from CDP events. `request.cookies` is populated from the browser jar and redacted.
+- `page_fetch` `har` reports `headersSize` and `bodySize` as `-1` when the size was not measured (`code://pkg/har/har.go#L764-L776`).
 
 ## Isolated test recipe
 
