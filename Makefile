@@ -14,7 +14,7 @@
 # version     — print the latest release tag and the next patch/minor/major
 # notes       — group the commits since the last tag (or the whole history when
 #               there is none) into .release/notes.md
-# changelog   — append the same grouped content to .release/CHANGELOG-fragment.md
+# changelog   — write a dated, grouped section into CHANGELOG.md (newest first)
 # release-dry — build every release artifact locally (snapshot, no upload)
 # bump        — create the next annotated tag locally and print the push command
 # release     — build a DRAFT GitHub release; never pushes, never publishes
@@ -149,15 +149,97 @@ notes:
 	} > .release/notes.md; \
 	printf 'wrote %s\n' .release/notes.md
 
-# changelog — append the same grouped content to .release/CHANGELOG-fragment.md.
-changelog: notes
-	@cat .release/notes.md >> .release/CHANGELOG-fragment.md
-	@printf 'appended to %s\n' .release/CHANGELOG-fragment.md
+# changelog — write a dated, grouped section into CHANGELOG.md at the repo root.
+# The newest section sits directly under the title; an existing section for the
+# same version is replaced, never duplicated. VERSION defaults to the next patch
+# after the latest tag.
+changelog:
+	@set -eu; \
+	version="$(VERSION)"; \
+	if [ -z "$$version" ]; then \
+		tag="$$(git describe --tags --abbrev=0 2>/dev/null || printf 'v0.0.0')"; \
+		rest="$${tag#v}"; \
+		major="$${rest%%.*}"; \
+		rest="$${rest#*.}"; \
+		minor="$${rest%%.*}"; \
+		patch="$${rest#*.}"; \
+		version="$$major.$$minor.$$((patch + 1))"; \
+	fi; \
+	version="$${version#v}"; \
+	tag="$$(git describe --tags --abbrev=0 2>/dev/null || true)"; \
+	if [ -n "$$tag" ]; then range="$$tag..HEAD"; else range="HEAD"; fi; \
+	body="$$(git log --no-merges --pretty=format:'%s' "$$range" | awk ' \
+		BEGIN { split("Features|Bug fixes|Performance|Refactoring|Documentation|Other", names, "|"); for (i = 1; i <= 6; i++) rank[names[i]] = i } \
+		{ \
+			subject = $$0; \
+			prefix = subject; \
+			sub(/[(!:].*/, "", prefix); \
+			if (prefix == "docs" && subject ~ /^docs\(skill\)/) next; \
+			if (prefix == "feat") group = "Features"; \
+			else if (prefix == "fix") group = "Bug fixes"; \
+			else if (prefix == "perf") group = "Performance"; \
+			else if (prefix == "refactor") group = "Refactoring"; \
+			else if (prefix == "docs") group = "Documentation"; \
+			else group = "Other"; \
+			r = rank[group]; \
+			items[r] = items[r] "- " subject "\n"; \
+			seen[r] = 1; \
+		} \
+		END { \
+			for (i = 1; i <= 6; i++) { \
+				if (!(i in seen)) continue; \
+				if (printed) print ""; \
+				print "## " names[i]; \
+				printf "%s", items[i]; \
+				printed = 1; \
+			} \
+		}')"; \
+	section="$$(printf '## %s - %s\n\n%s' "$$version" "$$(date +%F)" "$$body")"; \
+	if [ ! -f CHANGELOG.md ]; then \
+		printf '# Changelog\n\n%s\n' "$$section" > CHANGELOG.md; \
+	else \
+		sec="$$(mktemp)"; \
+		tmp="$$(mktemp)"; \
+		trap 'rm -f "$$sec" "$$tmp"' EXIT; \
+		printf '%s\n' "$$section" > "$$sec"; \
+		awk -v target="$$version" -v secfile="$$sec" ' \
+			BEGIN { while ((getline line < secfile) > 0) section[++s] = line; close(secfile) } \
+			{ lines[NR] = $$0 } \
+			END { \
+				n = NR; \
+				title = 0; \
+				for (i = 1; i <= n; i++) if (lines[i] == "# Changelog") { title = i; break } \
+				for (i = 1; i <= n; i++) { \
+					if (index(lines[i], "## " target " - ") != 1) continue; \
+					for (j = i; j <= n; j++) { \
+						if (j > i && lines[j] ~ /^## [0-9]/) break; \
+						drop[j] = 1; \
+					} \
+				} \
+				m = 0; \
+				out[++m] = "# Changelog"; \
+				out[++m] = ""; \
+				for (i = 1; i <= s; i++) out[++m] = section[i]; \
+				for (i = 1; i <= n; i++) { \
+					if (i == title || (i in drop)) continue; \
+					out[++m] = lines[i]; \
+				} \
+				while (m > 0 && out[m] == "") m--; \
+				blank = 0; \
+				for (i = 1; i <= m; i++) { \
+					if (out[i] == "") { if (blank) continue; blank = 1 } else blank = 0; \
+					print out[i]; \
+				} \
+			}' CHANGELOG.md > "$$tmp"; \
+		mv "$$tmp" CHANGELOG.md; \
+		trap - EXIT; \
+	fi; \
+	printf 'wrote %s\n' CHANGELOG.md
 
 # release-dry — build every artifact locally with goreleaser --snapshot; uploads nothing.
 release-dry:
 	@if ! command -v goreleaser >/dev/null 2>&1; then \
-		echo "release-dry: goreleaser not found — install it with: go install github.com/goreleaser/goreleaser/v2@v2.19.0" >&2; \
+		echo "release-dry: goreleaser not found — install it with: go install github.com/goreleaser/goreleaser/v2@v2.17.0" >&2; \
 		exit 1; \
 	fi
 	goreleaser release --snapshot --clean
@@ -186,12 +268,12 @@ release:
 		exit 1; \
 	fi
 	@if ! command -v goreleaser >/dev/null 2>&1; then \
-		echo "release: goreleaser not found — install it with: go install github.com/goreleaser/goreleaser/v2@v2.19.0" >&2; \
+		echo "release: goreleaser not found — install it with: go install github.com/goreleaser/goreleaser/v2@v2.17.0" >&2; \
 		exit 1; \
 	fi
 	goreleaser release --clean --release-notes .release/notes.md
 
 # tools — print the install commands for the release tools; installs nothing.
 tools:
-	@printf '%s\n' 'go install github.com/goreleaser/goreleaser/v2@v2.19.0'
+	@printf '%s\n' 'go install github.com/goreleaser/goreleaser/v2@v2.17.0'
 	@printf '%s\n' 'cargo install git-cliff --locked   # git-cliff is Rust: no go install line exists'

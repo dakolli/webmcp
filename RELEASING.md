@@ -20,9 +20,12 @@ git remote -v                 # confirm origin points at the repository you expe
 Install the release tools. `make tools` prints these lines and installs nothing:
 
 ```sh
-go install github.com/goreleaser/goreleaser/v2@v2.19.0
+go install github.com/goreleaser/goreleaser/v2@v2.17.0
 cargo install git-cliff --locked      # optional; git-cliff is Rust, there is no go install
 ```
+
+GoReleaser is pinned to `v2.17.0` because `v2.18.0` and later need Go 1.27, while this module builds
+with Go 1.26.
 
 `make notes` and `make changelog` use plain `git log`, so git-cliff is not required for a release.
 Install it only if you want its richer changelog rendering.
@@ -42,9 +45,11 @@ export GH_TOKEN="$(gh auth token)"
 ## 2. The release loop
 
 1. **Work lands.** Merge the changes you want in this release onto the default branch.
-2. **Generate notes.** `make notes` writes `.release/notes.md` (grouped commits since the last tag,
-   with empty `## Summary` and `## Highlights` sections). With no tag yet it covers the whole
-   history and prints `no previous tag: this covers the whole history`.
+2. **Generate notes and the changelog.** `make notes` writes `.release/notes.md` (grouped commits
+   since the last tag, with empty `## Summary` and `## Highlights` sections). With no tag yet it
+   covers the whole history and prints `no previous tag: this covers the whole history`.
+   `make changelog` writes a dated section into `CHANGELOG.md` at the repo root, newest first,
+   grouped by commit prefix; an existing section for the same version is replaced.
 3. **Ask an LLM for prose.** Open `.release/notes.md`, paste it into your model with the prompt in
    section 3, then save the model's answer over the `## Summary` and `## Highlights` sections.
    Leave the grouped commit list intact.
@@ -122,10 +127,10 @@ leading `v`, so a `v0.1.0` tag prints `0.1.0`. A plain `go build` prints
 | `bump: dirty working tree` or `release: dirty working tree` | uncommitted changes | commit or `git stash`, then rerun |
 | `bump: tag vX.Y.Z already exists` | the next version is already tagged | delete the wrong local tag or bump a different part |
 | `release: tag vX.Y.Z does not exist` | `VERSION` was mistyped or the tag was never created | `make bump PART=…` first |
-| `release-dry: goreleaser not found` | tool not installed | `go install github.com/goreleaser/goreleaser/v2@v2.19.0` then ensure `$(go env GOPATH)/bin` is on `PATH` |
+| `release-dry: goreleaser not found` | tool not installed | `go install github.com/goreleaser/goreleaser/v2@v2.17.0` then ensure `$(go env GOPATH)/bin` is on `PATH` |
 | `gh: not logged in` / `gh auth status` fails | no GitHub credential | `gh auth login`, then `export GH_TOKEN="$(gh auth token)"` |
 | `notes` prints `no previous tag: this covers the whole history` | this is the first release | expected; the notes cover every commit |
-| `goreleaser check` warns about `snapshot.name_template` | newer GoReleaser renamed it to `snapshot.version_template` | harmless for now; rename when moving past v2.19.x |
+| `goreleaser check` warns about `snapshot.name_template` | newer GoReleaser renamed it to `snapshot.version_template` | harmless for now; rename when moving past v2.17.x |
 
 ---
 
@@ -134,5 +139,6 @@ leading `v`, so a `v0.1.0` tag prints `0.1.0`. A plain `go build` prints
 - `make notes`, `make changelog`, `make release-dry`, `make bump` and `make release` never run
   `git push`, never publish a release and never create a GitHub release that is visible to users.
 - Only the human-run `git push origin <tag>` starts CI, and CI only creates a **draft**.
-- `.release/` is gitignored: notes and changelog fragments stay local until you paste them into the
-  GitHub release description.
+- `.release/` is gitignored: `make notes` keeps release notes local until you paste them into the
+  GitHub release description. `CHANGELOG.md` is a tracked file at the repo root and is meant to be
+  committed with each release.

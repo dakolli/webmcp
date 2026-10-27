@@ -49,10 +49,15 @@ The full operating manual is [RELEASING.md](RELEASING.md). The short loop:
 
 ```sh
 make notes          # group commits since the last tag into .release/notes.md (all history on the first release)
+make changelog      # insert a dated section into CHANGELOG.md (newest first)
 make release-dry    # build every artifact locally (snapshot, no upload)
 make bump PART=minor
 make release VERSION=v0.2.0
 ```
+
+`make changelog` maintains [`CHANGELOG.md`](CHANGELOG.md) at the repository root: it inserts a
+dated section for the next version directly under the title, grouped by commit prefix, and replaces
+an existing section for the same version instead of duplicating it.
 
 A tag push runs the release workflow, which opens a **draft** GitHub release for a human to review
 and publish.
