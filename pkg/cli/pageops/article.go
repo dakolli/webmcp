@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
 // PageArticle returns the page's readable body as markdown with its title,

@@ -27,7 +27,7 @@ import (
 	"github.com/go-rod/rod/lib/input"
 	"github.com/go-rod/rod/lib/proto"
 
-	"webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
 // DefaultPageMaxBytes caps how much of any page fetch extraction is returned

@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"webmcp/pkg/browsers"
-	"webmcp/pkg/mcp/models"
+	"github.com/dakolli/webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/mcp/models"
 )
 
 // ownerPattern is the accepted shape of a caller-supplied owner label.

@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
 // stubbedManager implements the manager seam with an in-memory, unlaunched

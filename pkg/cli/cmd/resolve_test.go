@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"webmcp/pkg/browsers"
-	"webmcp/pkg/cli/ipc"
+	"github.com/dakolli/webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/cli/ipc"
 )
 
 // TestSelectBrowserEntry pins the daemon-side selector: the pinned id picks its

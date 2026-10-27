@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
 // envelopeProbe is the subset of the result envelope these tests assert on.

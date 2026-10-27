@@ -1,4 +1,4 @@
-module webmcp
+module github.com/dakolli/webmcp
 
 go 1.26.4
 

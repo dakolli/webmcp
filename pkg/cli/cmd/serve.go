@@ -14,10 +14,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"webmcp/pkg/browsers"
-	"webmcp/pkg/cli/ipc"
-	"webmcp/pkg/config"
-	mcpServer "webmcp/pkg/mcp/server"
+	"github.com/dakolli/webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/cli/ipc"
+	"github.com/dakolli/webmcp/pkg/config"
+	mcpServer "github.com/dakolli/webmcp/pkg/mcp/server"
 )
 
 // serveRunOptions carries the construction-time options of one serve loop run,

@@ -11,7 +11,7 @@ import (
 
 	"github.com/go-rod/rod"
 
-	"webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
 func TestOkResultEmbedsJSONPayload(t *testing.T) {

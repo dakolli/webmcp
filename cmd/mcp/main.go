@@ -13,9 +13,9 @@ import (
 	"syscall"
 	"time"
 
-	"webmcp/pkg/browsers"
-	"webmcp/pkg/config"
-	"webmcp/pkg/mcp/server"
+	"github.com/dakolli/webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/config"
+	"github.com/dakolli/webmcp/pkg/mcp/server"
 )
 
 func main() {

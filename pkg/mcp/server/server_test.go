@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"webmcp/pkg/browsers"
-	"webmcp/pkg/mcp/models"
-	"webmcp/pkg/mcp/tools"
+	"github.com/dakolli/webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/mcp/models"
+	"github.com/dakolli/webmcp/pkg/mcp/tools"
 )
 
 func TestProcessRequestInitialize(t *testing.T) {

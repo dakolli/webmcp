@@ -15,9 +15,9 @@ builds:
       - amd64
       - arm64
     ldflags:
-      - -X webmcp/pkg/version.Version={{ .Version }}
-      - -X webmcp/pkg/version.Commit={{ .Commit }}
-      - -X webmcp/pkg/version.Date={{ .Date }}
+      - -X github.com/dakolli/webmcp/pkg/version.Version={{ .Version }}
+      - -X github.com/dakolli/webmcp/pkg/version.Commit={{ .Commit }}
+      - -X github.com/dakolli/webmcp/pkg/version.Date={{ .Date }}
 
 archives:
   - id: browser

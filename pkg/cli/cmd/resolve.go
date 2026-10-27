@@ -14,9 +14,9 @@ import (
 	"strconv"
 	"strings"
 
-	"webmcp/pkg/browsers"
-	"webmcp/pkg/cli/ipc"
-	"webmcp/pkg/cli/pageops"
+	"github.com/dakolli/webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/cli/ipc"
+	"github.com/dakolli/webmcp/pkg/cli/pageops"
 )
 
 // whatVocab is the fetch-aspect vocabulary shared by `page fetch` parsing and

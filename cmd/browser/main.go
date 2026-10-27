@@ -37,11 +37,11 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"webmcp/pkg/browsers"
-	"webmcp/pkg/cli/cmd"
-	"webmcp/pkg/config"
-	"webmcp/pkg/store"
-	"webmcp/pkg/version"
+	"github.com/dakolli/webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/cli/cmd"
+	"github.com/dakolli/webmcp/pkg/config"
+	"github.com/dakolli/webmcp/pkg/store"
+	"github.com/dakolli/webmcp/pkg/version"
 )
 
 func main() {

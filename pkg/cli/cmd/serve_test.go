@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	mcpServer "webmcp/pkg/mcp/server"
+	mcpServer "github.com/dakolli/webmcp/pkg/mcp/server"
 )
 
 // TestServeLoggerWritesToServeLog pins the production wiring: the serve loop's

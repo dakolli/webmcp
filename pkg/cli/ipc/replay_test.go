@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
 // TestPageActReplayVocabulary pins replay as a first-class page.act action on

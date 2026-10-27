@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
 func TestActValidateRequiredArgs(t *testing.T) {

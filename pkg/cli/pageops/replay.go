@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
 // ReplayRequest is one captured network entry to resend with optional

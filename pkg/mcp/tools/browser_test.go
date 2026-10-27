@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
 func TestBrowserCreateResultCarriesLifecycleFields(t *testing.T) {

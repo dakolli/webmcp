@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"webmcp/pkg/store"
+	"github.com/dakolli/webmcp/pkg/store"
 )
 
 // useTempAuthDB points the snapshot helpers at a throwaway state database for

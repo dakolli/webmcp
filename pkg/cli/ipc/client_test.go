@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
 // TestClientPingRoundTrip drives the full client/server stack: Dial + Ping

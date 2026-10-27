@@ -10,7 +10,7 @@ import (
 
 	"github.com/go-rod/rod"
 
-	"webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
 // Error types carried in resultEnvelope.Error.Type. They are the agent's

@@ -14,9 +14,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"webmcp/pkg/browsers"
-	"webmcp/pkg/cli/pageops"
-	"webmcp/pkg/mcp/models"
+	"github.com/dakolli/webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/cli/pageops"
+	"github.com/dakolli/webmcp/pkg/mcp/models"
 )
 
 const (

@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"webmcp/pkg/config"
+	"github.com/dakolli/webmcp/pkg/config"
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"

@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	"webmcp/pkg/cli/ipc"
+	"github.com/dakolli/webmcp/pkg/cli/ipc"
 )
 
 // servePollInterval is how often the spawner re-probes ping while waiting for

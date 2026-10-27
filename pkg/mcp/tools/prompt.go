@@ -1,7 +1,7 @@
 package tools
 
 import (
-	"webmcp/pkg/mcp/models"
+	"github.com/dakolli/webmcp/pkg/mcp/models"
 )
 
 // Prompt represents an MCP prompt template implementation.

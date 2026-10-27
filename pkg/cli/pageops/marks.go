@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
 // PageMarks captures the set-of-marks overlay — numbered boxes over the live

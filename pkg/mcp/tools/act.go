@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"webmcp/pkg/browsers"
-	"webmcp/pkg/cli/pageops"
-	"webmcp/pkg/mcp/models"
+	"github.com/dakolli/webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/cli/pageops"
+	"github.com/dakolli/webmcp/pkg/mcp/models"
 )
 
 // defaultActTimeout bounds every page_act helper so a missing element (sleeper

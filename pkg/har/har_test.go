@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
 // TestEncodeEntryShape pins the HAR 1.2 keys on one entry and the redaction

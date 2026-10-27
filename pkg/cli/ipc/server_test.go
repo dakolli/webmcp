@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
 // TestServerPingRoundTrip pins the exact ping wire shape: a request id 1 ping

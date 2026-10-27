@@ -8,7 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"webmcp/pkg/skill"
+	"github.com/dakolli/webmcp/pkg/skill"
 )
 
 // NewSkillCmd constructs the "skill" command: it installs the embedded web-mcp

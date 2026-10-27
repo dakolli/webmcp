@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"webmcp/pkg/browsers"
-	"webmcp/pkg/har"
+	"github.com/dakolli/webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/har"
 )
 
 // fakeHARPage records the body reads PageHAR performs, so the test proves both

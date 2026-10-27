@@ -7,7 +7,7 @@ import (
 
 	"github.com/go-rod/rod/lib/proto"
 
-	"webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
 // cspBypassIDs pins the probe order and count so the report stays deterministic.

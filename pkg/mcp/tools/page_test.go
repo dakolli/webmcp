@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"webmcp/pkg/mcp/models"
+	"github.com/dakolli/webmcp/pkg/mcp/models"
 )
 
 // testCarrier is the image carrier decoded by the tests.

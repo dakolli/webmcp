@@ -12,7 +12,7 @@ import (
 	"sort"
 	"strings"
 
-	"webmcp"
+	"github.com/dakolli/webmcp"
 )
 
 const (

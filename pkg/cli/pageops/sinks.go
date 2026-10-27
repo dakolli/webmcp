@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
 // sinksInstalled is the JSON result of arming the tracer: installed is always

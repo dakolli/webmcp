@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
 // PageWebsocket returns the newest buffered WebSocket frames, capped at

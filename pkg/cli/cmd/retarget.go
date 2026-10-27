@@ -10,7 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"webmcp/pkg/cli/ipc"
+	"github.com/dakolli/webmcp/pkg/cli/ipc"
 )
 
 // serveHint is printed to stderr (never stdout — stdout must stay byte-identical

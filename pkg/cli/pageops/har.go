@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"webmcp/pkg/browsers"
-	"webmcp/pkg/har"
+	"github.com/dakolli/webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/har"
 )
 
 // harPage is the engine surface the HAR export reads: the observed entries,

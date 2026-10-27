@@ -1,7 +1,7 @@
 // Client-side half of the web-cli IPC transport: a JSON-RPC 2.0 client for the
 // unix socket served by `web-cli serve`. It is a pure wire consumer — it
 // imports only the wire types this package defines (plus stdlib), never rod,
-// never webmcp/pkg/browsers and never webmcp/pkg/mcp (AGENTS.md CLI boundary).
+// never pkg/browsers and never pkg/mcp (AGENTS.md CLI boundary).
 // The web-cli commands use it to forward their work to the long-lived serve
 // process (WEB-29); the Server half lives in server.go.
 package ipc

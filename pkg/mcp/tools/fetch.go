@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"webmcp/pkg/browsers"
-	"webmcp/pkg/cli/pageops"
-	"webmcp/pkg/mcp/models"
+	"github.com/dakolli/webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/cli/pageops"
+	"github.com/dakolli/webmcp/pkg/mcp/models"
 )
 
 // defaultFetchTimeout bounds the whole fetch_page tool call when the caller

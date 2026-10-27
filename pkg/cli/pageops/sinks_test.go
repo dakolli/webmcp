@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
 // TestSinksAspectRegistered pins the registry entry: sinks validates, is

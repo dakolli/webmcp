@@ -20,7 +20,7 @@ import (
 
 	"github.com/go-rod/rod"
 
-	"webmcp/pkg/config"
+	"github.com/dakolli/webmcp/pkg/config"
 )
 
 // BrowserID uniquely identifies a live Browser instance (e.g. "browser-1", "browser-2").

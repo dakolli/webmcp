@@ -5,8 +5,8 @@ import (
 	"strings"
 	"time"
 
-	"webmcp/pkg/browsers"
-	"webmcp/pkg/cli/pageops"
+	"github.com/dakolli/webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/cli/pageops"
 )
 
 // fullPageScreenshotTimeout bounds a full_page screenshot capture. A full-page

@@ -15,7 +15,7 @@ import (
 
 	"github.com/go-rod/rod"
 
-	"webmcp/pkg/config"
+	"github.com/dakolli/webmcp/pkg/config"
 )
 
 func TestCloseBrowserUnknownID(t *testing.T) {

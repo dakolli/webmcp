@@ -15,8 +15,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"webmcp/pkg/browsers"
-	"webmcp/pkg/cli/ipc"
+	"github.com/dakolli/webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/cli/ipc"
 )
 
 // singleBrowserID is the id reported for the manager's one Browser, mirroring

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
 // TestPageActRawWireRoundTrip pins that the raw intent survives the JSON-RPC

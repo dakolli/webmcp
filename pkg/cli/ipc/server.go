@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
 // maxMessageBytes caps a single newline-delimited request line at 1 MiB; a

@@ -17,10 +17,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"webmcp/pkg/browsers"
-	"webmcp/pkg/cli/ipc"
-	"webmcp/pkg/cli/pageops"
-	"webmcp/pkg/mcp/tools"
+	"github.com/dakolli/webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/cli/ipc"
+	"github.com/dakolli/webmcp/pkg/cli/pageops"
+	"github.com/dakolli/webmcp/pkg/mcp/tools"
 )
 
 // TestSurfaceVocabularyParity pins that one name addresses the same aspect or

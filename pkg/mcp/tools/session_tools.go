@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"webmcp/pkg/browsers"
-	"webmcp/pkg/mcp/models"
+	"github.com/dakolli/webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/mcp/models"
 )
 
 // SessionClose implements the "session_close" tool: it closes a live browser

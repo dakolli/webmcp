@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"webmcp/pkg/browsers"
-	"webmcp/pkg/cli/pageops"
+	"github.com/dakolli/webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/cli/pageops"
 )
 
 // browserID is the id reported for the serve process's single Browser,

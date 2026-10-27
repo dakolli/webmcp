@@ -12,7 +12,7 @@ import (
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/proto"
 
-	"webmcp/pkg/config"
+	"github.com/dakolli/webmcp/pkg/config"
 )
 
 // parseProxy validates an upstream proxy address and returns the value for

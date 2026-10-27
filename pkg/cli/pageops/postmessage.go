@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
 // postMessageInstalled is the JSON result of arming the recorder: installed is

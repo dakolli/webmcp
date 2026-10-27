@@ -14,8 +14,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"webmcp/pkg/browsers"
-	"webmcp/pkg/cli/ipc"
+	"github.com/dakolli/webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/cli/ipc"
 )
 
 // TestExplicitBrowserID pins WEB-133's flag-explicitness rule: an omitted
