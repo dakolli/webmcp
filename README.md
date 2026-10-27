@@ -12,36 +12,25 @@ console. An agent can build a scraper or an automation for a site without a gues
 
 ## Install
 
+```sh
+# 1. Go 1.26 or later, one line:
+go install github.com/dakolli/webmcp/cmd/browser@latest
+```
+
+```sh
+# 2. No Go toolchain, one line:
+curl -fsSL https://raw.githubusercontent.com/dakolli/webmcp/main/install.sh | sh
+```
+
+```sh
+# 3. From source:
+git clone https://github.com/dakolli/webmcp && cd webmcp && make install
+```
+
+Method 1 installs into `$(go env GOPATH)/bin`; method 2 installs into `~/.local/bin`.
+Add that directory to `PATH` if it is not there already.
 The first run downloads Chromium (~100 MB) unless Brave, Chrome or Chromium is already on `PATH`.
 The probe order is `brave-browser`, `brave`, `google-chrome`, `chrome`, `chromium`.
-
-### From a release binary
-
-Linux amd64 is shown; use the `darwin` or `arm64` artifact that matches your machine.
-
-```sh
-VERSION=v0.1.0
-gh release download "$VERSION" --repo dakolli/webmcp \
-  --pattern 'browser_*_linux_amd64.tar.gz' --pattern checksums.txt
-sha256sum -c --ignore-missing checksums.txt
-tar -xzf browser_*_linux_amd64.tar.gz
-install -m 0755 browser ~/.local/bin/browser   # any directory on PATH
-browser --version
-```
-
-### From source
-
-Go 1.26 or later is necessary.
-
-```sh
-git clone https://github.com/dakolli/webmcp.git
-cd webmcp
-go build ./cmd/browser        # ./browser in the current directory
-make install                  # shortcut: installs to GOPATH/bin and stops a running daemon
-```
-
-The module path is `webmcp`, not a hosting path, so `go install example.com/...` cannot work from
-outside a clone.
 
 ## Releasing
 
@@ -52,7 +41,6 @@ make notes          # group commits since the last tag into .release/notes.md (a
 make changelog      # insert a dated section into CHANGELOG.md (newest first)
 make bump PART=minor    # create the annotated tag locally and print the push line
 git push origin v0.1.0  # the GitHub Action builds and uploads the archives
-gh release edit v0.1.0 --notes-file .release/notes.md --draft=false
 ```
 
 `make release-dry` is optional. It builds the six archives into `dist/` on your machine when you
@@ -62,8 +50,8 @@ want a local check. The release itself builds on GitHub, so you do not need to r
 dated section for the next version directly under the title, grouped by commit prefix, and replaces
 an existing section for the same version instead of duplicating it.
 
-A tag push runs the release workflow, which opens a **draft** GitHub release for a human to review
-and publish.
+A tag push runs the release workflow. It publishes the release with the six archives and
+`checksums.txt` automatically. Edit the release text on the GitHub website when you want custom notes.
 
 ## Add the agent skill
 

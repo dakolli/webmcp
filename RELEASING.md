@@ -1,145 +1,126 @@
-# Releasing web-mcp
+# Releasing
 
-This is the operating manual for cutting a `browser` release. Read it top to bottom once; after
-that the release loop is six commands.
+Everything runs on GitHub. You need `git` and `make`. You do not need the GitHub CLI, a token,
+or GoReleaser on your machine.
 
-**The local machinery never pushes and never publishes.** `make bump` creates a tag locally and
-prints the push command. `make release` builds a **draft** GitHub release and never runs `git push`.
-Publishing is a human clicking **Publish** on the draft.
+## One-time setup
 
----
+Do this once in the repository:
 
-## 1. One-time setup
+1. Open **Settings → Actions → General**.
+2. Find **Workflow permissions**.
+3. Select **Read and write permissions**.
+4. Click **Save**.
 
-```sh
-gh auth login                 # GitHub CLI: pick HTTPS or SSH, follow the browser prompt
-gh auth status                # confirm the active account and token scopes
-git remote -v                 # confirm origin points at the repository you expect
-```
+The release job creates the GitHub release. It cannot do that with a read-only token.
 
-Install the release tools. `make tools` prints these lines and installs nothing:
+## The loop
 
-```sh
-go install github.com/goreleaser/goreleaser/v2@v2.17.0
-cargo install git-cliff --locked      # optional; git-cliff is Rust, there is no go install
-```
-
-GoReleaser is pinned to `v2.17.0` because `v2.18.0` and later need Go 1.27, while this module builds
-with Go 1.26.
-
-`make notes` and `make changelog` use plain `git log`, so git-cliff is not required for a release.
-Install it only if you want its richer changelog rendering.
-
-GoReleaser authenticates to GitHub with `GH_TOKEN` (or `GITHUB_TOKEN`). `gh auth` keeps a token but
-does not export it, so bridge the two once per shell:
+### 1. Collect the commits
 
 ```sh
-export GH_TOKEN="$(gh auth token)"
+make notes
 ```
 
-`make release-dry` uploads nothing, but the changelog uses the GitHub API
-(`changelog.use: github`), so it still reads the token. CI supplies `secrets.GITHUB_TOKEN` itself.
+Writes `.release/notes.md` with every commit since the last tag, grouped by type. With no tag it
+covers the whole history.
 
----
+### 2. Turn it into prose
 
-## 2. The release loop
+Open `.release/notes.md`. Paste it into your LLM with this prompt:
 
-1. **Work lands.** Merge the changes you want in this release onto the default branch.
-2. **Generate notes and the changelog.** `make notes` writes `.release/notes.md` (grouped commits
-   since the last tag, with empty `## Summary` and `## Highlights` sections). With no tag yet it
-   covers the whole history and prints `no previous tag: this covers the whole history`.
-   `make changelog` writes a dated section into `CHANGELOG.md` at the repo root, newest first,
-   grouped by commit prefix; an existing section for the same version is replaced.
-3. **Ask an LLM for prose.** Open `.release/notes.md`, paste it into your model with the prompt in
-   section 3, then save the model's answer over the `## Summary` and `## Highlights` sections.
-   Leave the grouped commit list intact.
-4. **Optional: local build check.** The release builds on GitHub, so skip this unless you want to
-   see the archives first. `make release-dry` runs `goreleaser release --snapshot --clean` and
-   writes six archives plus `checksums.txt` into `dist/` on your machine. `dist/` is gitignored and
-   takes about 30 MB. Delete it when you are done.
-5. **Optional: inspect those archives.** Run one binary: `./dist/browser_<version>_linux_amd64/browser --version`.
-6. **Tag.** `make bump PART=minor` (or `PART=patch` / `PART=major`) creates the annotated tag
-   locally and prints the push command. It refuses a dirty tree and an existing tag.
-7. **Push the tag.** `git push origin <tag>` — the only command here that writes to the remote, and
-   you run it yourself.
-8. **CI runs.** The `release` workflow runs `verify` (`gofmt -l`, `go vet ./...`, `go test ./...`),
-   then GoReleaser, which uploads the artifacts to a **draft** release.
-9. **Review and publish.** Open the draft release on GitHub, paste the notes from
-   `.release/notes.md` into the description, confirm the artifacts, then click **Publish**.
+> Rewrite these grouped commits as release notes for web-mcp vX.Y.Z. Two sections: Highlights
+> (3-5 bullets, user-facing, no file paths) and Changes (keep the groups). Plain English.
 
-You can also run `make release VERSION=<tag>` after the tag exists. It refuses a dirty tree, a
-missing tag and a missing `.release/notes.md`, builds a draft release, and never pushes or publishes.
+Save the answer over `.release/notes.md`.
 
----
+### 3. Update the changelog
 
-## 3. LLM prompt template for release notes
-
-Paste this with the contents of `.release/notes.md`:
-
-```text
-You are writing release notes for web-mcp, a Go browser engine with an MCP server and a `browser`
-CLI. Below are the commits grouped since the last release.
-
-Rewrite them into:
-1. A "## Summary" of 2-3 sentences for a developer who has not followed the project.
-2. A "## Highlights" list of at most 5 user-visible changes, each one line, strongest first.
-3. Keep the grouped commit list unchanged underneath.
-
-Rules: no marketing adjectives, no invented features, no claims that are not in the commits. Name
-the affected surface (CLI, MCP tool, engine) when it matters. Skip internal chores unless they
-change behaviour.
-
-Commit list:
-<PASTE .release/notes.md HERE>
+```sh
+make changelog VERSION=0.1.0
 ```
 
----
+Inserts a `## 0.1.0 - YYYY-MM-DD` section into `CHANGELOG.md` at the top. A section for the same
+version is replaced, never duplicated.
 
-## 4. What each artifact is
+Commit it, because the tag must include the changelog:
 
-For every `linux`/`darwin`/`windows` × `amd64`/`arm64` pair:
+```sh
+git add CHANGELOG.md && git commit -m "docs: changelog for 0.1.0" && git push
+```
 
-| Artifact | Contents |
+### 4. Tag
+
+```sh
+make bump PART=minor
+```
+
+`patch`, `minor` or `major`. Creates the annotated tag locally and prints the push line. It refuses
+a dirty tree and an existing tag. The tag is `v0.1.0` when the latest tag is `v0.0.0` and you ask
+for `minor`.
+
+### 5. Push the tag
+
+```sh
+git push origin v0.1.0
+```
+
+This is the only step that starts the release. The workflow runs `verify` (gofmt, vet, test), then
+GoReleaser builds and publishes.
+
+### 6. Watch it
+
+Open **Actions → release** on GitHub. Two jobs, about two minutes.
+
+Green means the release exists. **Releases** now lists `v0.1.0` with these files:
+
+| File | What it is |
 | :--- | :--- |
-| `browser_<version>_<os>_<arch>.tar.gz` | the `browser` binary plus `README.md` and `LICENSE` (unix) |
-| `browser_<version>_windows_<arch>.zip` | the same, zipped for Windows |
+| `browser_<version>_linux_amd64.tar.gz` | Linux x86-64 |
+| `browser_<version>_linux_arm64.tar.gz` | Linux ARM64 |
+| `browser_<version>_darwin_amd64.tar.gz` | macOS Intel |
+| `browser_<version>_darwin_arm64.tar.gz` | macOS Apple silicon |
+| `browser_<version>_windows_amd64.zip` | Windows x86-64 |
+| `browser_<version>_windows_arm64.zip` | Windows ARM64 |
 | `checksums.txt` | SHA-256 for every archive |
 
-Only `cmd/browser` is released. `cmd/mcp` is a thin legacy MCP-only binary superseded by
-`browser serve mcp`; it keeps compiling but is not a release artifact, so users have one binary to
-install and one code path to trust.
+### 7. Edit the release text
 
-`browser --version` prints the injected build identity:
+Open the release on the website. Click **Edit**. Paste the notes into the description. Click
+**Update release**.
 
-```text
-0.1.0 (abc1234, 2026-10-27T00:00:00Z)
+## How users install
+
+Go toolchain:
+
+```sh
+go install github.com/dakolli/webmcp/cmd/browser@latest
 ```
 
-The shape is `<version> (<short commit>, <RFC3339 build time>)`. GoReleaser's `.Version` strips the
-leading `v`, so a `v0.1.0` tag prints `0.1.0`. A plain `go build` prints
-`dev (none, unknown)`.
+No toolchain:
 
----
+```sh
+curl -fsSL https://raw.githubusercontent.com/dakolli/webmcp/main/install.sh | sh
+```
 
-## 5. Failure modes and fixes
+`install.sh` detects OS and arch, downloads the matching archive, checks it against
+`checksums.txt`, and installs to `~/.local/bin` or `$BIN_DIR`.
 
-| Symptom | Cause | Fix |
+## Failure modes
+
+Open the failed run on the website and read the first red line.
+
+| Message | Cause | Fix |
 | :--- | :--- | :--- |
-| `bump: dirty working tree` or `release: dirty working tree` | uncommitted changes | commit or `git stash`, then rerun |
-| `bump: tag vX.Y.Z already exists` | the next version is already tagged | delete the wrong local tag or bump a different part |
-| `release: tag vX.Y.Z does not exist` | `VERSION` was mistyped or the tag was never created | `make bump PART=…` first |
-| `release-dry: goreleaser not found` | tool not installed | `go install github.com/goreleaser/goreleaser/v2@v2.17.0` then ensure `$(go env GOPATH)/bin` is on `PATH` |
-| `gh: not logged in` / `gh auth status` fails | no GitHub credential | `gh auth login`, then `export GH_TOKEN="$(gh auth token)"` |
-| `notes` prints `no previous tag: this covers the whole history` | this is the first release | expected; the notes cover every commit |
-| `goreleaser check` warns about `snapshot.name_template` | newer GoReleaser renamed it to `snapshot.version_template` | harmless for now; rename when moving past v2.17.x |
+| `Resource not accessible by integration` | Read-only workflow token | The one-time setting above |
+| `git is in a dirty state` | A build step changed a tracked file | Never add a hook that writes files |
+| `gofmt needed on: …` | Unformatted Go file | `gofmt -w` the file, commit, re-tag |
+| `tag already exists` | You tagged twice | `git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`, then bump again |
+| `no releases` after a green run | The release is hidden as a draft | `.goreleaser.yaml` must say `draft: false` |
 
----
+## Boundaries
 
-## 6. Boundaries
-
-- `make notes`, `make changelog`, `make release-dry`, `make bump` and `make release` never run
-  `git push`, never publish a release and never create a GitHub release that is visible to users.
-- Only the human-run `git push origin <tag>` starts CI, and CI only creates a **draft**.
-- `.release/` is gitignored: `make notes` keeps release notes local until you paste them into the
-  GitHub release description. `CHANGELOG.md` is a tracked file at the repo root and is meant to be
-  committed with each release.
+- `make notes` and `make changelog` write local files only. They touch no remote.
+- `make release-dry` builds archives into `dist/` locally. It is optional. `dist/` is gitignored.
+- `make bump` writes a local tag. It pushes nothing.
+- `git push` is yours to run.
