@@ -148,6 +148,10 @@ func PageSecurity(ctx context.Context, p *browsers.Page) (string, error) {
 	cookies, cookiesOmitted := pageCookieChecks(pc, probe.URL, probe.Cookies)
 
 	checks := securityHeaderChecks(probe, headers, found, cut)
+	checks = append(checks, securityCSPBypassChecks(
+		securityPolicy(probe, headers),
+		headerValue(headers, "content-security-policy-report-only"),
+	)...)
 	checks = append(checks, cookies...)
 	checks = append(checks, securityMixedContentCheck(probe, entries))
 	checks = append(checks, securityContentChecks(probe)...)
@@ -366,6 +370,457 @@ func securityHeaderChecks(
 		checks = append(checks, check)
 	}
 	return checks
+}
+
+// securityPolicy returns the enforced policy text, preferring the response
+// header over a meta-delivered policy.
+func securityPolicy(probe securityProbe, headers map[string]string) string {
+	if csp := headerValue(headers, "content-security-policy"); csp != "" {
+		return csp
+	}
+	return strings.TrimSpace(probe.MetaCSP)
+}
+
+// cspBypassHost is a script-src host that cannot be trusted as a script source
+// because it serves attacker-controlled code through JSONP or user hosting.
+type cspBypassHost struct {
+	// suffix is the registrable domain, matched together with its subdomains.
+	suffix string
+	// reason explains the known bypass pattern for the domain.
+	reason string
+}
+
+// cspBypassHosts is the closed set of hosts the bypass probe flags. Every entry
+// serves arbitrary script to anyone, so trusting it in script-src is close to
+// trusting '*'.
+var cspBypassHosts = []cspBypassHost{
+	{"google.com", "Google JSONP endpoints and the /url open redirect"},
+	{"googleapis.com", "Google-hosted JSONP endpoints"},
+	{"cloudflare.com", "cdnjs serves arbitrary third-party scripts"},
+	{"jsdelivr.net", "serves arbitrary npm and GitHub content"},
+	{"unpkg.com", "serves arbitrary npm content"},
+	{"github.io", "user-controlled GitHub Pages"},
+	{"herokuapp.com", "user-controlled apps"},
+	{"firebaseapp.com", "user-controlled hosting"},
+	{"netlify.app", "user-controlled sites"},
+	{"vercel.app", "user-controlled sites"},
+	{"s3.amazonaws.com", "user-controlled buckets"},
+	{"cloudfront.net", "user-controlled distributions"},
+	{"azureedge.net", "user-controlled CDN endpoints"},
+	{"azurewebsites.net", "user-controlled apps"},
+	{"appspot.com", "user-controlled apps"},
+}
+
+// cspDirective is one parsed CSP directive: its lowercased name, the original
+// trimmed text used as evidence and the lowercased source tokens.
+type cspDirective struct {
+	name   string
+	text   string
+	values []string
+}
+
+// cspPolicy is a parsed Content-Security-Policy, preserving the first
+// occurrence of each directive as browsers ignore later duplicates.
+type cspPolicy struct {
+	raw        string
+	directives []cspDirective
+}
+
+// parseCSP parses a policy string into ordered directives.
+func parseCSP(raw string) cspPolicy {
+	p := cspPolicy{raw: strings.TrimSpace(raw)}
+	seen := make(map[string]bool)
+	for _, part := range strings.Split(raw, ";") {
+		fields := strings.Fields(part)
+		if len(fields) == 0 {
+			continue
+		}
+		name := strings.ToLower(fields[0])
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		values := make([]string, 0, len(fields)-1)
+		for _, field := range fields[1:] {
+			values = append(values, strings.ToLower(field))
+		}
+		p.directives = append(p.directives, cspDirective{
+			name:   name,
+			text:   strings.TrimSpace(part),
+			values: values,
+		})
+	}
+	return p
+}
+
+// directive returns the named directive.
+func (p cspPolicy) directive(name string) (cspDirective, bool) {
+	for _, d := range p.directives {
+		if d.name == name {
+			return d, true
+		}
+	}
+	return cspDirective{}, false
+}
+
+// effective returns the named directive, falling back to default-src when the
+// named directive is absent.
+func (p cspPolicy) effective(name string) (cspDirective, bool) {
+	if d, ok := p.directive(name); ok {
+		return d, true
+	}
+	return p.directive("default-src")
+}
+
+// hasSource reports whether a source list contains the exact token.
+func hasSource(values []string, token string) bool {
+	for _, v := range values {
+		if v == token {
+			return true
+		}
+	}
+	return false
+}
+
+// hasNonceOrHash reports whether a script source list carries a nonce or hash,
+// which makes CSP3 ignore a co-listed 'unsafe-inline'.
+func hasNonceOrHash(values []string) bool {
+	for _, v := range values {
+		token := strings.Trim(v, "'")
+		if strings.HasPrefix(token, "nonce-") || strings.HasPrefix(token, "sha256-") ||
+			strings.HasPrefix(token, "sha384-") || strings.HasPrefix(token, "sha512-") {
+			return true
+		}
+	}
+	return false
+}
+
+// cspSourceHost extracts the host from one CSP source token, returning an empty
+// string for keywords, nonces, hashes, schemes and unparseable tokens.
+func cspSourceHost(token string) string {
+	if token == "" || strings.HasPrefix(token, "'") || strings.HasSuffix(token, ":") {
+		return ""
+	}
+	host := token
+	if _, rest, ok := strings.Cut(host, "://"); ok {
+		host = rest
+	}
+	if i := strings.IndexAny(host, "/?#"); i >= 0 {
+		host = host[:i]
+	}
+	host = strings.TrimPrefix(host, "*.")
+	if host == "" || strings.Contains(host, "*") {
+		return ""
+	}
+	if h, _, ok := strings.Cut(host, ":"); ok {
+		host = h
+	}
+	return strings.ToLower(host)
+}
+
+// cspBypassHostFor matches a host against the known bypass set, including its
+// subdomains, and returns the reason for the match.
+func cspBypassHostFor(host string) (string, bool) {
+	for _, b := range cspBypassHosts {
+		if host == b.suffix || strings.HasSuffix(host, "."+b.suffix) {
+			return b.reason, true
+		}
+	}
+	return "", false
+}
+
+// cspNoPolicyDetail explains an info probe when the page declares no policy.
+const cspNoPolicyDetail = "no Content-Security-Policy is set, so there is no policy to bypass"
+
+// securityCSPBypassChecks statically probes the enforced policy for constructs
+// that let an attacker defeat it. It never injects, executes or loads anything:
+// every result is derived from the policy text alone, and evidence quotes a
+// fragment of the real header or meta tag.
+func securityCSPBypassChecks(policy, reportOnly string) []securityCheck {
+	p := parseCSP(policy)
+	return []securityCheck{
+		cspUnsafeInlineCheck(p),
+		cspUnsafeEvalCheck(p),
+		cspScriptWildcardCheck(p),
+		cspObjectSrcCheck(p),
+		cspBaseURICheck(p),
+		cspFrameAncestorsCheck(p),
+		cspReportOnlyCheck(reportOnly),
+		cspTrustedHostCheck(p),
+	}
+}
+
+// cspUnsafeInlineCheck reports whether the effective script directive lets an
+// injected inline <script> run.
+func cspUnsafeInlineCheck(p cspPolicy) securityCheck {
+	const id = "csp_bypass_unsafe_inline"
+	if p.raw == "" {
+		return securityCheck{ID: id, Status: "info", Detail: cspNoPolicyDetail}
+	}
+	d, ok := p.effective("script-src")
+	if !ok {
+		return securityCheck{
+			ID:     id,
+			Status: "info",
+			Detail: "the policy has no script-src or default-src directive, so inline scripts are unrestricted",
+		}
+	}
+	if !hasSource(d.values, "'unsafe-inline'") {
+		return securityCheck{
+			ID:       id,
+			Status:   "ok",
+			Evidence: d.text,
+			Detail:   "the effective script directive does not allow 'unsafe-inline'",
+		}
+	}
+	if hasNonceOrHash(d.values) {
+		return securityCheck{
+			ID:       id,
+			Status:   "ok",
+			Evidence: d.text,
+			Detail:   "'unsafe-inline' is present but a nonce or hash makes CSP3 ignore it for script elements",
+		}
+	}
+	return securityCheck{
+		ID:       id,
+		Status:   "fail",
+		Evidence: d.text,
+		Detail:   "'unsafe-inline' lets any injected inline <script> execute; replace it with a nonce or hash",
+	}
+}
+
+// cspUnsafeEvalCheck reports whether the effective script directive allows eval
+// and Function-string execution.
+func cspUnsafeEvalCheck(p cspPolicy) securityCheck {
+	const id = "csp_bypass_unsafe_eval"
+	if p.raw == "" {
+		return securityCheck{ID: id, Status: "info", Detail: cspNoPolicyDetail}
+	}
+	d, ok := p.effective("script-src")
+	if !ok {
+		return securityCheck{
+			ID:     id,
+			Status: "info",
+			Detail: "the policy has no script-src or default-src directive, so eval is unrestricted",
+		}
+	}
+	if !hasSource(d.values, "'unsafe-eval'") {
+		return securityCheck{
+			ID:       id,
+			Status:   "ok",
+			Evidence: d.text,
+			Detail:   "the effective script directive does not allow 'unsafe-eval'",
+		}
+	}
+	return securityCheck{
+		ID:       id,
+		Status:   "fail",
+		Evidence: d.text,
+		Detail:   "'unsafe-eval' lets eval() and new Function() run injected strings; remove it and refactor eval-style code",
+	}
+}
+
+// cspScriptWildcardCheck reports wildcard, scheme and subdomain-wildcard script
+// sources, which let an attacker choose the script.
+func cspScriptWildcardCheck(p cspPolicy) securityCheck {
+	const id = "csp_bypass_script_wildcard"
+	if p.raw == "" {
+		return securityCheck{ID: id, Status: "info", Detail: cspNoPolicyDetail}
+	}
+	d, ok := p.effective("script-src")
+	if !ok {
+		return securityCheck{
+			ID:     id,
+			Status: "info",
+			Detail: "the policy has no script-src or default-src directive, so any script host is allowed",
+		}
+	}
+	var broad, scoped []string
+	for _, v := range d.values {
+		switch v {
+		case "*", "http:", "https:", "data:", "blob:", "filesystem:":
+			broad = append(broad, v)
+		default:
+			if strings.HasPrefix(v, "*.") {
+				scoped = append(scoped, v)
+			}
+		}
+	}
+	if len(broad) > 0 {
+		return securityCheck{
+			ID:       id,
+			Status:   "fail",
+			Evidence: d.text,
+			Detail: "script-src accepts any script from " + strings.Join(broad, ", ") +
+				"; a wildcard or scheme source lets an attacker load arbitrary script — list exact hosts or use a nonce",
+		}
+	}
+	if len(scoped) > 0 {
+		return securityCheck{
+			ID:       id,
+			Status:   "warn",
+			Evidence: d.text,
+			Detail: "script-src trusts every subdomain of " + strings.Join(scoped, ", ") +
+				"; one compromised subdomain serves arbitrary script — list the exact host",
+		}
+	}
+	return securityCheck{
+		ID:       id,
+		Status:   "ok",
+		Evidence: d.text,
+		Detail:   "script-src uses no wildcard or scheme source",
+	}
+}
+
+// cspObjectSrcCheck reports a policy with no object-src and no default-src
+// fallback, leaving plugin content unrestricted.
+func cspObjectSrcCheck(p cspPolicy) securityCheck {
+	const id = "csp_bypass_object_src"
+	if p.raw == "" {
+		return securityCheck{ID: id, Status: "info", Detail: cspNoPolicyDetail}
+	}
+	if d, ok := p.effective("object-src"); ok {
+		return securityCheck{
+			ID:       id,
+			Status:   "ok",
+			Evidence: d.text,
+			Detail:   "object-src is set directly or through default-src",
+		}
+	}
+	return securityCheck{
+		ID:     id,
+		Status: "warn",
+		Detail: "no object-src directive and no default-src fallback — plugin and <object> content is unrestricted; set object-src 'none'",
+	}
+}
+
+// cspBaseURICheck reports a policy with no base-uri directive, which lets an
+// injected <base> tag redirect relative URLs.
+func cspBaseURICheck(p cspPolicy) securityCheck {
+	const id = "csp_bypass_base_uri"
+	if p.raw == "" {
+		return securityCheck{ID: id, Status: "info", Detail: cspNoPolicyDetail}
+	}
+	if d, ok := p.directive("base-uri"); ok {
+		return securityCheck{
+			ID:       id,
+			Status:   "ok",
+			Evidence: d.text,
+			Detail:   "base-uri is set",
+		}
+	}
+	return securityCheck{
+		ID:     id,
+		Status: "warn",
+		Detail: "no base-uri directive — an injected <base> tag can redirect relative script and form URLs; set base-uri 'self' or 'none'",
+	}
+}
+
+// cspFrameAncestorsCheck reports a frame-ancestors directive that accepts any
+// origin, which permits clickjacking.
+func cspFrameAncestorsCheck(p cspPolicy) securityCheck {
+	const id = "csp_bypass_frame_ancestors"
+	if p.raw == "" {
+		return securityCheck{ID: id, Status: "info", Detail: cspNoPolicyDetail}
+	}
+	d, ok := p.directive("frame-ancestors")
+	if !ok {
+		return securityCheck{
+			ID:     id,
+			Status: "info",
+			Detail: "no frame-ancestors directive; framing is unrestricted and X-Frame-Options is the only remaining control",
+		}
+	}
+	for _, v := range d.values {
+		switch v {
+		case "*", "http:", "https:":
+			return securityCheck{
+				ID:       id,
+				Status:   "warn",
+				Evidence: d.text,
+				Detail: "frame-ancestors accepts " + v +
+					", so any origin can frame the page for clickjacking; list the exact parent origins or use 'none'",
+			}
+		}
+	}
+	return securityCheck{
+		ID:       id,
+		Status:   "ok",
+		Evidence: d.text,
+		Detail:   "frame-ancestors limits which origins may frame the page",
+	}
+}
+
+// cspReportOnlyCheck flags a report-only policy: it reports violations but
+// blocks nothing, so an otherwise strict policy is not enforced.
+func cspReportOnlyCheck(reportOnly string) securityCheck {
+	const id = "csp_bypass_report_only"
+	raw := strings.TrimSpace(reportOnly)
+	if raw == "" {
+		return securityCheck{ID: id, Status: "info", Detail: "no Content-Security-Policy-Report-Only header"}
+	}
+	p := parseCSP(raw)
+	evidence := ""
+	if d, ok := p.directive("script-src"); ok {
+		evidence = d.text
+	} else if len(p.directives) > 0 {
+		evidence = p.directives[0].text
+	}
+	detail := "the policy is delivered as Content-Security-Policy-Report-Only, so violations are reported and nothing is blocked"
+	if d, ok := p.effective("script-src"); ok && !hasSource(d.values, "'unsafe-inline'") {
+		detail += "; this policy would otherwise block inline scripts — send it as Content-Security-Policy once the reports are clean"
+	}
+	return securityCheck{ID: id, Status: "info", Evidence: evidence, Detail: detail}
+}
+
+// cspTrustedHostCheck reports script-src hosts known to serve arbitrary script
+// through JSONP or user-controlled hosting.
+func cspTrustedHostCheck(p cspPolicy) securityCheck {
+	const id = "csp_bypass_trusted_host"
+	if p.raw == "" {
+		return securityCheck{ID: id, Status: "info", Detail: cspNoPolicyDetail}
+	}
+	d, ok := p.effective("script-src")
+	if !ok {
+		return securityCheck{
+			ID:     id,
+			Status: "info",
+			Detail: "the policy has no script-src or default-src directive, so every host is trusted",
+		}
+	}
+	var hits, reasons []string
+	seenHost := make(map[string]bool)
+	seenReason := make(map[string]bool)
+	for _, v := range d.values {
+		host := cspSourceHost(v)
+		if host == "" {
+			continue
+		}
+		reason, matched := cspBypassHostFor(host)
+		if !matched {
+			continue
+		}
+		if !seenHost[v] {
+			seenHost[v] = true
+			hits = append(hits, v)
+		}
+		if !seenReason[reason] {
+			seenReason[reason] = true
+			reasons = append(reasons, reason)
+		}
+	}
+	check := securityFinding(
+		id,
+		"no script-src host matches a known JSONP or open-redirect bypass host",
+		"%d script-src host(s) serve arbitrary script through JSONP or user-controlled hosting; remove them or pin the policy with a nonce or hash",
+		hits,
+	)
+	if check.Status == "warn" {
+		check.Detail += " (" + strings.Join(reasons, "; ") + ")"
+	} else {
+		check.Evidence = d.text
+	}
+	return check
 }
 
 // securityHSTSCheck audits Strict-Transport-Security, treating any non-https
