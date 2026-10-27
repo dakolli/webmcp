@@ -10,9 +10,10 @@ import (
 
 // interceptState is the JSON shape of intercept_add and intercept_list.
 type interceptState struct {
-	Rules  []browsers.InterceptRule `json:"rules"`
-	Count  int                      `json:"count"`
-	Active bool                     `json:"active"`
+	Rules     []browsers.InterceptRule `json:"rules"`
+	Count     int                      `json:"count"`
+	Remaining int                      `json:"remaining"`
+	Active    bool                     `json:"active"`
 }
 
 // interceptClearResult is the JSON shape of intercept_clear.
@@ -22,8 +23,9 @@ type interceptClearResult struct {
 }
 
 // PageInterceptAdd adds page-scoped request rules, arming the in-flight
-// interceptor on first use. Rules are bounded, per session, and disappear when
-// the page closes; listing and clearing are the only reads.
+// interceptor on first use. Rules are bounded per page, and disappear when the
+// page closes; listing and clearing are the only reads. The result reports the
+// page's rules and its remaining rule budget.
 func PageInterceptAdd(
 	ctx context.Context,
 	p *browsers.Page,
@@ -31,30 +33,32 @@ func PageInterceptAdd(
 ) (string, error) {
 	ctx, cancel := interceptContext(ctx)
 	defer cancel()
-	current, err := p.InterceptAdd(ctx, rules)
+	snapshot, err := p.InterceptAdd(ctx, rules)
 	if err != nil {
 		return "", fmt.Errorf("intercept add: %w", err)
 	}
 	return marshalIntercept(interceptState{
-		Rules:  current,
-		Count:  len(current),
-		Active: true,
+		Rules:     snapshot.Rules,
+		Count:     len(snapshot.Rules),
+		Remaining: snapshot.Remaining,
+		Active:    true,
 	})
 }
 
 // PageInterceptList returns the page's rules with sensitive header values
-// redacted, plus whether interception is armed.
+// redacted, the remaining rule budget, and whether interception is armed.
 func PageInterceptList(_ context.Context, p *browsers.Page) (string, error) {
-	rules, active := p.InterceptList()
+	snapshot, active := p.InterceptList()
 	return marshalIntercept(interceptState{
-		Rules:  rules,
-		Count:  len(rules),
-		Active: active,
+		Rules:     snapshot.Rules,
+		Count:     len(snapshot.Rules),
+		Remaining: snapshot.Remaining,
+		Active:    active,
 	})
 }
 
-// PageInterceptClear removes every rule, continues any paused request and
-// disables interception.
+// PageInterceptClear removes every rule, continues any paused request, disables
+// interception and restores the page cache.
 func PageInterceptClear(ctx context.Context, p *browsers.Page) (string, error) {
 	ctx, cancel := interceptContext(ctx)
 	defer cancel()

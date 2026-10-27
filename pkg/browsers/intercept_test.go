@@ -1,7 +1,11 @@
 package browsers
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/go-rod/rod/lib/proto"
@@ -74,6 +78,20 @@ func TestCompileInterceptRule(t *testing.T) {
 		}
 	})
 
+	t.Run("rewrite method is uppercased", func(t *testing.T) {
+		c, err := compileInterceptRule(InterceptRule{
+			ID:            "r1",
+			Action:        "rewrite",
+			RewriteMethod: " post ",
+		})
+		if err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+		if c.rule.RewriteMethod != "POST" {
+			t.Fatalf("rewrite method: got %q, want POST", c.rule.RewriteMethod)
+		}
+	})
+
 	cases := []struct {
 		name string
 		rule InterceptRule
@@ -83,6 +101,8 @@ func TestCompileInterceptRule(t *testing.T) {
 		{"status out of range", InterceptRule{ID: "r1", Action: "fulfill", Status: 99}},
 		{"negative delay", InterceptRule{ID: "r1", Action: "allow", DelayMS: -1}},
 		{"empty header name", InterceptRule{ID: "r1", Action: "rewrite", Headers: map[string]string{" ": "x"}}},
+		{"rewrite method without rewrite", InterceptRule{ID: "r1", Action: "block", RewriteMethod: "POST"}},
+		{"rewrite method with whitespace", InterceptRule{ID: "r1", Action: "rewrite", RewriteMethod: "PO ST"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -346,5 +366,202 @@ func TestObserverRecordsScopeBlock(t *testing.T) {
 	}
 	if got := entries[0].Intercepted; got != InterceptScope {
 		t.Fatalf("intercepted = %q, want %q", got, InterceptScope)
+	}
+}
+
+func TestInterceptRuleCap(t *testing.T) {
+	it := &interceptor{}
+	batch := make([]InterceptRule, interceptRuleCap)
+	for i := range batch {
+		batch[i] = InterceptRule{ID: fmt.Sprintf("r%d", i+1), Action: InterceptBlock}
+	}
+	compiled, err := compileInterceptBatch(batch)
+	if err != nil {
+		t.Fatalf("compile batch: %v", err)
+	}
+
+	first, err := it.upsert(compiled[:interceptRuleCap-1])
+	if err != nil {
+		t.Fatalf("first upsert: %v", err)
+	}
+	if len(first.Rules) != interceptRuleCap-1 || first.Remaining != 1 {
+		t.Fatalf("first snapshot: rules=%d remaining=%d", len(first.Rules), first.Remaining)
+	}
+
+	second, err := it.upsert(compiled[interceptRuleCap-1:])
+	if err != nil {
+		t.Fatalf("second upsert: %v", err)
+	}
+	if len(second.Rules) != interceptRuleCap || second.Remaining != 0 {
+		t.Fatalf("second snapshot: rules=%d remaining=%d", len(second.Rules), second.Remaining)
+	}
+
+	extra, err := compileInterceptBatch([]InterceptRule{{ID: "extra", Action: InterceptAllow}})
+	if err != nil {
+		t.Fatalf("compile extra: %v", err)
+	}
+	_, err = it.upsert(extra)
+	var limit *InterceptRuleLimitError
+	if !errors.As(err, &limit) {
+		t.Fatalf("over-cap error: got %v, want InterceptRuleLimitError", err)
+	}
+	if limit.Held != interceptRuleCap || limit.Added != 1 || limit.Cap != interceptRuleCap {
+		t.Fatalf("limit detail: %+v", limit)
+	}
+
+	replace, err := compileInterceptBatch([]InterceptRule{{ID: "r1", Action: InterceptAllow}})
+	if err != nil {
+		t.Fatalf("compile replace: %v", err)
+	}
+	if _, err := it.upsert(replace); err != nil {
+		t.Fatalf("replacing an id at the cap must be allowed: %v", err)
+	}
+}
+
+// recordingCDP captures the commands the interceptor sends so cache-flag state
+// transitions can be asserted without a live browser.
+type recordingCDP struct {
+	mu   sync.Mutex
+	sent []cdpCommand
+}
+
+func (r *recordingCDP) Send(_ context.Context, msg cdpCommand) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sent = append(r.sent, msg)
+	return nil
+}
+
+func (r *recordingCDP) cacheFlags() []bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []bool
+	for _, msg := range r.sent {
+		if m, ok := msg.(proto.NetworkSetCacheDisabled); ok {
+			out = append(out, m.CacheDisabled)
+		}
+	}
+	return out
+}
+
+func TestInterceptorCacheFlag(t *testing.T) {
+	fake := &recordingCDP{}
+	it := newInterceptor(nil, nil, nil)
+	it.cdp = fake
+	ctx := context.Background()
+
+	if err := it.disableCache(ctx); err != nil {
+		t.Fatalf("disable cache: %v", err)
+	}
+	if err := it.disableCache(ctx); err != nil {
+		t.Fatalf("disable cache twice: %v", err)
+	}
+	if got := fake.cacheFlags(); len(got) != 1 || !got[0] {
+		t.Fatalf("flags after arming: got %v, want [true]", got)
+	}
+
+	it.restoreCache(ctx)
+	if got := fake.cacheFlags(); len(got) != 2 || got[0] != true || got[1] != false {
+		t.Fatalf("flags after restore: got %v, want [true false]", got)
+	}
+
+	it.restoreCache(ctx)
+	if got := fake.cacheFlags(); len(got) != 2 {
+		t.Fatalf("restore must be idempotent, got %v", got)
+	}
+}
+
+func TestInterceptorCacheArmsWithRules(t *testing.T) {
+	fake := &recordingCDP{}
+	it := newInterceptor(nil, nil, nil)
+	it.cdp = fake
+	compiled, err := compileInterceptBatch([]InterceptRule{{ID: "r1", Action: InterceptBlock}})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	if _, err := it.addRules(context.Background(), compiled); err != nil {
+		t.Fatalf("add rules: %v", err)
+	}
+	if got := fake.cacheFlags(); len(got) != 1 || !got[0] {
+		t.Fatalf("flags with rules active: got %v, want [true]", got)
+	}
+
+	it.stop(context.Background())
+	if got := fake.cacheFlags(); len(got) != 2 || got[0] != true || got[1] != false {
+		t.Fatalf("flags after clearing: got %v, want [true false]", got)
+	}
+}
+
+func TestInterceptorStopRestoresCache(t *testing.T) {
+	fake := &recordingCDP{}
+	it := newInterceptor(nil, nil, nil)
+	it.cdp = fake
+	ctx := context.Background()
+
+	if err := it.disableCache(ctx); err != nil {
+		t.Fatalf("disable cache: %v", err)
+	}
+	it.stop(ctx)
+	if got := fake.cacheFlags(); len(got) != 2 || got[0] != true || got[1] != false {
+		t.Fatalf("flags after stop: got %v, want [true false]", got)
+	}
+
+	if err := it.disableCache(ctx); err != nil {
+		t.Fatalf("disable cache after stop: %v", err)
+	}
+	if got := fake.cacheFlags(); len(got) != 2 {
+		t.Fatalf("a stopped interceptor must not re-arm the cache, got %v", got)
+	}
+}
+
+func TestRecordSentRequest(t *testing.T) {
+	page := &Page{observer: newPageObserver()}
+	id := proto.NetworkRequestID("req-rewrite")
+	page.observer.recordRequest(&proto.NetworkRequestWillBeSent{
+		RequestID: id,
+		Request: &proto.NetworkRequest{
+			Method:  "GET",
+			URL:     "https://example.com/api/orders",
+			Headers: proto.NetworkHeaders{"X-Test": gson.New("old")},
+		},
+	})
+
+	paused := &proto.FetchRequestPaused{
+		NetworkID: id,
+		Request: &proto.NetworkRequest{
+			Method:  "GET",
+			URL:     "https://example.com/api/orders",
+			Headers: proto.NetworkHeaders{"X-Test": gson.New("old")},
+		},
+	}
+	rule := InterceptRule{
+		ID:            "rw",
+		Action:        InterceptRewrite,
+		RewriteMethod: "POST",
+		Headers: map[string]string{
+			"X-WM-Rewrite":  "hello",
+			"Authorization": "Bearer secret",
+		},
+	}
+	page.observer.recordIntercept(paused, rule)
+	page.observer.recordSentRequest(paused, rule)
+
+	entries, _ := page.NetworkEntries()
+	if len(entries) != 1 {
+		t.Fatalf("entries: got %d, want 1", len(entries))
+	}
+	got := entries[0]
+	if got.Method != "POST" {
+		t.Fatalf("method: got %q, want POST", got.Method)
+	}
+	if got.ReqHeaders["X-WM-Rewrite"] != "hello" {
+		t.Fatalf("rewritten header missing from the ring: %v", got.ReqHeaders)
+	}
+	if got.ReqHeaders["X-Test"] != "old" {
+		t.Fatalf("original header dropped: %v", got.ReqHeaders)
+	}
+	if got.ReqHeaders["Authorization"] != redactedValue {
+		t.Fatalf("sensitive rewrite header leaked: %q", got.ReqHeaders["Authorization"])
 	}
 }

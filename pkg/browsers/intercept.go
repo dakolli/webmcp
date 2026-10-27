@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/proto"
+	"github.com/ysmood/gson"
 )
 
 const (
@@ -43,10 +44,10 @@ const (
 // InterceptRule is one page-scoped in-flight request rule. URLPattern is a
 // wildcard glob matched against the full request URL ("*" matches anything),
 // Method optionally narrows the match, and Action is InterceptBlock,
-// InterceptAllow, InterceptRewrite or InterceptFulfill. Rewrite applies Headers
-// and a non-empty Body to the outgoing request; fulfill answers with Status
-// (default 200), Headers and Body instead of hitting the network. DelayMS is
-// clamped to interceptDelayCap.
+// InterceptAllow, InterceptRewrite or InterceptFulfill. Rewrite applies Headers,
+// a non-empty Body and RewriteMethod to the outgoing request; fulfill answers
+// with Status (default 200), Headers and Body instead of hitting the network.
+// DelayMS is clamped to interceptDelayCap.
 type InterceptRule struct {
 	// ID names the rule and its network-ring hits; generated when empty.
 	ID string `json:"id"`
@@ -58,6 +59,8 @@ type InterceptRule struct {
 	Action string `json:"action"`
 	// Headers overrides request headers for rewrite and response headers for fulfill.
 	Headers map[string]string `json:"headers,omitempty"`
+	// RewriteMethod overrides the outgoing method for rewrite; empty keeps it.
+	RewriteMethod string `json:"rewrite_method,omitempty"`
 	// Status is the synthetic response status used by fulfill.
 	Status int `json:"status,omitempty"`
 	// Body overrides the request payload for rewrite and is the response payload for fulfill.
@@ -66,15 +69,59 @@ type InterceptRule struct {
 	DelayMS int `json:"delay_ms,omitempty"`
 }
 
+// InterceptSnapshot is a page's rule set with its remaining rule budget.
+type InterceptSnapshot struct {
+	// Rules holds the page's rules with sensitive values redacted.
+	Rules []InterceptRule
+	// Remaining is how many more rules the page can hold.
+	Remaining int
+}
+
+// InterceptRuleLimitError reports that a batch would exceed a page's rule
+// budget. A page holds its rules across calls, so the cap is page-wide.
+type InterceptRuleLimitError struct {
+	// Held is the number of rules the page already holds.
+	Held int
+	// Added is the number of new rules the batch would add.
+	Added int
+	// Cap is the page-wide rule budget.
+	Cap int
+}
+
+// Error renders the refusal with the cap and the recovery.
+func (e *InterceptRuleLimitError) Error() string {
+	return fmt.Sprintf(
+		"intercept: page already holds %d rules; adding %d more exceeds the %d-rule limit (clear rules first)",
+		e.Held,
+		e.Added,
+		e.Cap,
+	)
+}
+
 // compiledIntercept is one validated rule with its pattern compiled.
 type compiledIntercept struct {
 	rule    InterceptRule
 	pattern *regexp.Regexp
 }
 
-// fetchRequest is one CDP Fetch reply that can be sent to the page's client.
-type fetchRequest interface {
+// cdpCommand is one CDP command the interceptor can send.
+type cdpCommand interface {
 	Call(proto.Client) error
+}
+
+// cdpSender sends one CDP command for the interceptor's page within ctx.
+type cdpSender interface {
+	Send(ctx context.Context, msg cdpCommand) error
+}
+
+// rodSender sends CDP commands to a live rod page.
+type rodSender struct {
+	page *rod.Page
+}
+
+// Send runs one command on the sender's page under ctx.
+func (s rodSender) Send(ctx context.Context, msg cdpCommand) error {
+	return msg.Call(s.page.Context(ctx))
 }
 
 // interceptor is a page's live CDP Fetch hook. It owns its own mutex and never
@@ -93,6 +140,11 @@ type interceptor struct {
 	done    chan struct{}
 	cancel  context.CancelFunc
 	stopDo  sync.Once
+	cdp     cdpSender
+	cacheMu sync.Mutex
+	// cacheDisabled reports whether this interceptor turned the page cache off
+	// and therefore owes a restore.
+	cacheDisabled bool
 }
 
 // newInterceptor returns an unarmed interceptor for page, enforcing browser's
@@ -105,6 +157,7 @@ func newInterceptor(page *rod.Page, obs *pageObserver, browser *Browser) *interc
 		browser: browser,
 		sem:     make(chan struct{}, interceptConcurrency),
 		done:    make(chan struct{}),
+		cdp:     rodSender{page: page},
 	}
 }
 
@@ -113,6 +166,7 @@ func newInterceptor(page *rod.Page, obs *pageObserver, browser *Browser) *interc
 func (i *interceptor) start(ctx context.Context) error {
 	capture, cancel := i.page.WithCancel()
 	i.page = capture
+	i.cdp = rodSender{page: capture}
 	i.cancel = cancel
 	stop := capture.EachEvent(func(e *proto.FetchRequestPaused) { i.dispatch(e) })
 	go stop()
@@ -170,11 +224,11 @@ func (i *interceptor) forget(id proto.FetchRequestID) {
 	i.mu.Unlock()
 }
 
-// call runs one Fetch reply under a bounded context.
-func (i *interceptor) call(msg fetchRequest) error {
+// call runs one CDP command under the interceptor's resolve timeout.
+func (i *interceptor) call(msg cdpCommand) error {
 	ctx, cancel := context.WithTimeout(context.Background(), interceptResolveTimeout)
 	defer cancel()
-	return msg.Call(i.page.Context(ctx))
+	return i.cdp.Send(ctx, msg)
 }
 
 // resolveSafely keeps a handler panic from escaping the event loop: a panic
@@ -219,6 +273,9 @@ func (i *interceptor) resolve(e *proto.FetchRequestPaused) {
 	}
 	if i.obs != nil {
 		i.obs.recordIntercept(e, rule)
+		if rule.Action == InterceptRewrite {
+			i.obs.recordSentRequest(e, rule)
+		}
 	}
 }
 
@@ -255,6 +312,7 @@ func (i *interceptor) apply(e *proto.FetchRequestPaused, rule InterceptRule) err
 	case InterceptRewrite:
 		return i.call(proto.FetchContinueRequest{
 			RequestID: e.RequestID,
+			Method:    rule.RewriteMethod,
 			Headers:   mergeInterceptHeaders(e.Request.Headers, rule.Headers),
 			PostData:  interceptPostData(rule.Body),
 		})
@@ -287,8 +345,8 @@ func (i *interceptor) match(method, rawURL string) (InterceptRule, bool) {
 }
 
 // upsert adds or replaces rules by id and returns the page's full rule list with
-// sensitive header values redacted.
-func (i *interceptor) upsert(rules []compiledIntercept) ([]InterceptRule, error) {
+// its remaining budget and sensitive header values redacted.
+func (i *interceptor) upsert(rules []compiledIntercept) (InterceptSnapshot, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	index := make(map[string]int, len(i.rules))
@@ -302,12 +360,11 @@ func (i *interceptor) upsert(rules []compiledIntercept) ([]InterceptRule, error)
 		}
 	}
 	if len(i.rules)+added > interceptRuleCap {
-		return nil, fmt.Errorf(
-			"intercept: page already holds %d rules; adding %d more exceeds the %d-rule limit (clear rules first)",
-			len(i.rules),
-			added,
-			interceptRuleCap,
-		)
+		return InterceptSnapshot{}, &InterceptRuleLimitError{
+			Held:  len(i.rules),
+			Added: added,
+			Cap:   interceptRuleCap,
+		}
 	}
 	for _, r := range rules {
 		if idx, ok := index[r.rule.ID]; ok {
@@ -316,7 +373,23 @@ func (i *interceptor) upsert(rules []compiledIntercept) ([]InterceptRule, error)
 		}
 		i.rules = append(i.rules, r)
 	}
-	return i.listLocked(), nil
+	return InterceptSnapshot{
+		Rules:     i.listLocked(),
+		Remaining: interceptRuleCap - len(i.rules),
+	}, nil
+}
+
+// addRules stores a validated batch and turns the page cache off so the new
+// rules see cached subresources. It returns the page's snapshot.
+func (i *interceptor) addRules(ctx context.Context, rules []compiledIntercept) (InterceptSnapshot, error) {
+	snapshot, err := i.upsert(rules)
+	if err != nil {
+		return InterceptSnapshot{}, err
+	}
+	if err := i.disableCache(ctx); err != nil {
+		return InterceptSnapshot{}, err
+	}
+	return snapshot, nil
 }
 
 // list returns a copy of the page's rules with sensitive header values redacted.
@@ -368,8 +441,9 @@ func (i *interceptor) disarm() {
 	})
 }
 
-// stop disarms, continues every request still paused, disables the Fetch domain
-// and drops the rules. It is idempotent and safe while requests are resolving.
+// stop disarms, continues every request still paused, disables the Fetch domain,
+// restores the page cache and drops the rules. It is idempotent and safe while
+// requests are resolving.
 func (i *interceptor) stop(ctx context.Context) {
 	i.disarm()
 	i.mu.Lock()
@@ -379,20 +453,50 @@ func (i *interceptor) stop(ctx context.Context) {
 
 	callCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), interceptStopTimeout)
 	defer cancel()
-	client := i.page.Context(callCtx)
 	for _, id := range ids {
-		_ = proto.FetchContinueRequest{RequestID: id}.Call(client)
+		_ = i.cdp.Send(callCtx, proto.FetchContinueRequest{RequestID: id})
 	}
-	_ = proto.FetchDisable{}.Call(client)
+	_ = i.cdp.Send(callCtx, proto.FetchDisable{})
+	i.restoreCache(callCtx)
+}
+
+// disableCache turns the page cache off so a cached subresource still reaches
+// the Fetch hook. A second call is a no-op, and a stopped interceptor never
+// arms the flag because its stop path has already restored it.
+func (i *interceptor) disableCache(ctx context.Context) error {
+	i.cacheMu.Lock()
+	defer i.cacheMu.Unlock()
+	if i.cacheDisabled || i.isStopped() {
+		return nil
+	}
+	if err := i.cdp.Send(ctx, proto.NetworkSetCacheDisabled{CacheDisabled: true}); err != nil {
+		return fmt.Errorf("intercept: disable page cache: %w", err)
+	}
+	i.cacheDisabled = true
+	return nil
+}
+
+// restoreCache re-enables the page cache when this interceptor disabled it. A
+// page with no armed cache flag makes no CDP call.
+func (i *interceptor) restoreCache(ctx context.Context) {
+	i.cacheMu.Lock()
+	defer i.cacheMu.Unlock()
+	if !i.cacheDisabled {
+		return
+	}
+	i.cacheDisabled = false
+	_ = i.cdp.Send(ctx, proto.NetworkSetCacheDisabled{CacheDisabled: false})
 }
 
 // InterceptAdd validates and adds or replaces rules on the page, arming the
 // interception hook on first use. Rules are per page, bounded to
-// interceptRuleCap, and disappear when the page closes. The returned list is the
-// page's full rule set with sensitive header values redacted.
-func (p *Page) InterceptAdd(ctx context.Context, rules []InterceptRule) ([]InterceptRule, error) {
+// interceptRuleCap across calls, and disappear when the page closes. While any
+// rule is armed the page cache is off, so a cached subresource still matches.
+// The returned snapshot is the page's full rule set with sensitive header values
+// redacted, plus the remaining rule budget.
+func (p *Page) InterceptAdd(ctx context.Context, rules []InterceptRule) (InterceptSnapshot, error) {
 	if len(rules) == 0 {
-		return nil, fmt.Errorf("intercept: no rules supplied (pass at least one rule)")
+		return InterceptSnapshot{}, fmt.Errorf("intercept: no rules supplied (pass at least one rule)")
 	}
 	p.interceptMu.Lock()
 	used := make(map[string]bool)
@@ -406,25 +510,25 @@ func (p *Page) InterceptAdd(ctx context.Context, rules []InterceptRule) ([]Inter
 	normalized, next, err := assignInterceptIDs(rules, used, next)
 	if err != nil {
 		p.interceptMu.Unlock()
-		return nil, err
+		return InterceptSnapshot{}, err
 	}
 	compiled, err := compileInterceptBatch(normalized)
 	p.interceptMu.Unlock()
 	if err != nil {
-		return nil, err
+		return InterceptSnapshot{}, err
 	}
 
 	it, err := p.interceptor(ctx)
 	if err != nil {
-		return nil, err
+		return InterceptSnapshot{}, err
 	}
 	p.interceptMu.Lock()
 	defer p.interceptMu.Unlock()
 	if it.isStopped() {
-		return nil, fmt.Errorf("intercept: page interception was disarmed while adding rules — retry")
+		return InterceptSnapshot{}, fmt.Errorf("intercept: page interception was disarmed while adding rules — retry")
 	}
 	it.nextID = max(it.nextID, next-1)
-	return it.upsert(compiled)
+	return it.addRules(ctx, compiled)
 }
 
 // interceptor returns the page's armed interceptor, arming a fresh one when the
@@ -460,16 +564,20 @@ func (p *Page) interceptor(ctx context.Context) (*interceptor, error) {
 	return fresh, nil
 }
 
-// InterceptList returns the page's rules with sensitive header values redacted
-// and whether interception is currently armed.
-func (p *Page) InterceptList() ([]InterceptRule, bool) {
+// InterceptList returns the page's rules with sensitive header values redacted,
+// the remaining rule budget, and whether interception is currently armed.
+func (p *Page) InterceptList() (InterceptSnapshot, bool) {
 	p.interceptMu.Lock()
 	it := p.intercept
 	p.interceptMu.Unlock()
 	if it == nil || it.isStopped() {
-		return []InterceptRule{}, false
+		return InterceptSnapshot{Rules: []InterceptRule{}, Remaining: interceptRuleCap}, false
 	}
-	return it.list(), true
+	rules := it.list()
+	return InterceptSnapshot{
+		Rules:     rules,
+		Remaining: interceptRuleCap - len(rules),
+	}, true
 }
 
 // InterceptClear removes every rule, continues any paused request and disables
@@ -585,6 +693,23 @@ func compileInterceptRule(r InterceptRule) (compiledIntercept, error) {
 			r.ID,
 			r.Action,
 		)
+	}
+	r.RewriteMethod = strings.ToUpper(strings.TrimSpace(r.RewriteMethod))
+	if r.RewriteMethod != "" {
+		if r.Action != InterceptRewrite {
+			return compiledIntercept{}, fmt.Errorf(
+				"intercept: rule %q sets rewrite_method but action is %q (rewrite_method needs action=rewrite)",
+				r.ID,
+				r.Action,
+			)
+		}
+		if strings.ContainsAny(r.RewriteMethod, " \t\r\n") {
+			return compiledIntercept{}, fmt.Errorf(
+				"intercept: rule %q has rewrite_method %q (must be one HTTP method token)",
+				r.ID,
+				r.RewriteMethod,
+			)
+		}
 	}
 	if r.Action == InterceptFulfill && r.Status == 0 {
 		r.Status = 200
@@ -715,8 +840,46 @@ func mergeInterceptHeaders(
 	return out
 }
 
-// fulfillHeaders renders the synthetic response headers, adding a text/html
-// content type when a body is present and the rule supplied none.
+// sentNetworkHeaders renders the headers actually sent after a rewrite as the
+// capture type, so the network ring can store and redact them. It returns nil
+// when the rule overrides no headers.
+func sentNetworkHeaders(request *proto.NetworkRequest, rule InterceptRule) proto.NetworkHeaders {
+	entries := mergeInterceptHeaders(request.Headers, rule.Headers)
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make(proto.NetworkHeaders, len(entries))
+	for _, header := range entries {
+		out[header.Name] = gson.New(header.Value)
+	}
+	return out
+}
+
+// recordSentRequest rewrites the network ring entry with the method and headers
+// a rewrite rule actually sent, so the ring is the truth. It writes nothing when
+// the request has no ring entry yet.
+func (o *pageObserver) recordSentRequest(e *proto.FetchRequestPaused, rule InterceptRule) {
+	if e.Request == nil || e.NetworkID == "" {
+		return
+	}
+	headers, cut := redactHeaders(sentNetworkHeaders(e.Request, rule), o.secrets)
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	idx := o.indexOfRequest(e.NetworkID)
+	if idx < 0 {
+		return
+	}
+	entry := &o.net.items[idx]
+	if rule.RewriteMethod != "" {
+		entry.Method = rule.RewriteMethod
+	}
+	if headers != nil {
+		entry.ReqHeaders = headers
+		entry.ReqHeadersTruncated = cut
+	}
+}
+
+// fulfillHeaders renders the synthetic response headers, adding a text/html// content type when a body is present and the rule supplied none.
 func fulfillHeaders(override map[string]string, hasBody bool) []*proto.FetchHeaderEntry {
 	headers := make(map[string]*proto.FetchHeaderEntry, len(override)+1)
 	for name, value := range override {

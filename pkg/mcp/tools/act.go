@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -37,6 +38,18 @@ var actActionNames = []string{
 // actActionList renders actActionNames for an error message.
 func actActionList() string {
 	return strings.Join(actActionNames, ", ")
+}
+
+// failWithHint builds a failure envelope whose remediation is more specific than
+// the generic classifier hint, which cannot infer a per-page budget.
+func failWithHint(err error, errType, hint string) (string, error) {
+	return marshalEnvelope(resultEnvelope{
+		Error: &envelopeError{
+			Type:    errType,
+			Message: err.Error(),
+			Hint:    hint,
+		},
+	})
 }
 
 // Act implements the "page_act" tool: it interacts with a LIVE page that was
@@ -101,13 +114,17 @@ func (t *Act) Description() string {
 		"before the call is returned immediately, each popup is reported once, and timeout_ms " +
 		"bounds the wait. Use the returned session_id with page_fetch/page_act), " +
 		"intercept_add (arm a page-scoped in-flight request interceptor; rules is an array of " +
-		"{id, url_pattern, method, action, headers, status, body, delay_ms} where action is " +
-		"block, allow, rewrite or fulfill, url_pattern is a wildcard glob like *api*, and a " +
-		"miss continues immediately; interception is opt-in, changes page behaviour and " +
-		"disables caching, so clear it when done; max 50 rules per page), " +
-		"intercept_list (returns the page's rules with sensitive header values redacted), or " +
-		"intercept_clear (remove every rule, continue any paused request and disable " +
-		"interception; rules never outlive the page). " +
+		"{id, url_pattern, method, action, headers, rewrite_method, status, body, delay_ms} where " +
+		"action is block, allow, rewrite or fulfill, url_pattern is a wildcard glob like *api*, and " +
+		"a miss continues immediately; rewrite continues the request with headers, a non-empty body " +
+		"and rewrite_method, and the network ring records the method and headers as sent; interception " +
+		"is opt-in, changes page behaviour and disables the page HTTP cache while any rule is armed, so " +
+		"cached subresources still match; the page holds at most 50 rules across calls, so the cap is " +
+		"page-wide rather than per call; the result reports rules and the remaining budget), " +
+		"intercept_list (returns the page's rules with sensitive header values redacted, plus the " +
+		"remaining rule budget), or " +
+		"intercept_clear (remove every rule, continue any paused request, disable interception and " +
+		"restore the page cache; rules never outlive the page). " +
 		"auth_save (capture the live page's cookies for site, plus local storage, session " +
 		"storage and IndexedDB database/store names, and persist them under name; needs " +
 		"session_id, site and name; returns counts only — no cookie or storage value is ever " +
@@ -154,7 +171,7 @@ func (t *Act) InputSchema() models.InputSchema {
 			"action": map[string]any{
 				"type":        "string",
 				"enum":        append([]string(nil), actActionNames...),
-				"description": "The interaction to perform: click (selector), input (set field text; the result reports the target and rune length, never the value, plus value_redacted=true for a password or hidden field), type (keystrokes, same result rule as input), press_key (key/combo e.g. Enter, Escape, Control+A), click_at/hover_at ({x, y} coordinates), drag_and_drop (from {x,y}/selector to {target_x,target_y}/target_selector), upload_file (set file input paths), eval (run JS), navigate (URL), back/forward/reload, hover (selector), scroll (x/y), select (option value), wait (readiness mode), set_viewport (W x H), emulate (device preset), clear_logs (empty the network, console and websocket buffers; no parameters; returns {\"network\":N,\"console\":M,\"websocket\":K} cleared counts), sinks_install (arm the source-to-sink tracer; no parameters; returns {\"installed\":true}; capture is opt-in, changes page behavior, survives client-side route changes and full navigations while its per-document ring resets on a full navigation; read it with page_fetch what=sinks, which is read-only and never arms capture), sinks_clear (empty the tracer ring; no parameters; returns {\"cleared\":N}), replay (resend one captured network entry; needs target, optionally method, headers, value and max_bytes; returns {status,headers,body,bytes,truncated,body_redactions,ms,request,chain} with sensitive headers and text-body secrets redacted and truncated/chain always present), inject_canary (inject a canary into query/hash/postmessage/name — default all four, narrow with targets — and return {canary, injected:[{target, where}], hits:[{sink, context, selector, value, stack}], installed}; requires sinks_install first; query reloads, hash does not; capped at 20 frames), postmessage_install (arm the postMessage recorder: one capture-phase listener per window and iframe without wrapping addEventListener, so page listeners keep their identity; no parameters; returns {\"installed\":true}; read it with page_fetch what=postmessage), postmessage_clear (empty every recorder ring; no parameters; returns {\"cleared\":N}), post_message (deliver value to window.top/self/parent when target_selector is \"top\", \"self\", \"parent\" or omitted, or to the contentWindow of the <iframe>/<frame> matched by any other target_selector; a selector that is not a frame errors instead of falling back to top; origin is the target origin, default \"*\"; arms the recorder first and returns {origin,target}), wait_open (block until this page opens a popup or new tab — target=\"_blank\" or window.open — and return {session_id,url,opener}; timeout_ms bounds the wait; a popup opened before the call is returned immediately), intercept_add (arm a page-scoped in-flight request interceptor with rules=[{id,url_pattern,method,action,headers,status,body,delay_ms}]; action is block|allow|rewrite|fulfill, url_pattern is a wildcard glob (default *), a miss continues immediately, at most 50 rules per page; opt-in, changes page behaviour and disables caching; returns {rules,count,active}), intercept_list (return the page's rules with sensitive header values redacted; returns {rules,count,active}), intercept_clear (remove every rule, continue any paused request and disable interception; returns {rules_removed,active:false}). Rules are per session and never outlive the page. Logs are cumulative from page creation — filter client-side or clear_logs right before the step under observation.",
+				"description": "The interaction to perform: click (selector), input (set field text; the result reports the target and rune length, never the value, plus value_redacted=true for a password or hidden field), type (keystrokes, same result rule as input), press_key (key/combo e.g. Enter, Escape, Control+A), click_at/hover_at ({x, y} coordinates), drag_and_drop (from {x,y}/selector to {target_x,target_y}/target_selector), upload_file (set file input paths), eval (run JS), navigate (URL), back/forward/reload, hover (selector), scroll (x/y), select (option value), wait (readiness mode), set_viewport (W x H), emulate (device preset), clear_logs (empty the network, console and websocket buffers; no parameters; returns {\"network\":N,\"console\":M,\"websocket\":K} cleared counts), sinks_install (arm the source-to-sink tracer; no parameters; returns {\"installed\":true}; capture is opt-in, changes page behavior, survives client-side route changes and full navigations while its per-document ring resets on a full navigation; read it with page_fetch what=sinks, which is read-only and never arms capture), sinks_clear (empty the tracer ring; no parameters; returns {\"cleared\":N}), replay (resend one captured network entry; needs target, optionally method, headers, value and max_bytes; returns {status,headers,body,bytes,truncated,body_redactions,ms,request,chain} with sensitive headers and text-body secrets redacted and truncated/chain always present), inject_canary (inject a canary into query/hash/postmessage/name — default all four, narrow with targets — and return {canary, injected:[{target, where}], hits:[{sink, context, selector, value, stack}], installed}; requires sinks_install first; query reloads, hash does not; capped at 20 frames), postmessage_install (arm the postMessage recorder: one capture-phase listener per window and iframe without wrapping addEventListener, so page listeners keep their identity; no parameters; returns {\"installed\":true}; read it with page_fetch what=postmessage), postmessage_clear (empty every recorder ring; no parameters; returns {\"cleared\":N}), post_message (deliver value to window.top/self/parent when target_selector is \"top\", \"self\", \"parent\" or omitted, or to the contentWindow of the <iframe>/<frame> matched by any other target_selector; a selector that is not a frame errors instead of falling back to top; origin is the target origin, default \"*\"; arms the recorder first and returns {origin,target}), wait_open (block until this page opens a popup or new tab — target=\"_blank\" or window.open — and return {session_id,url,opener}; timeout_ms bounds the wait; a popup opened before the call is returned immediately), intercept_add (arm a page-scoped in-flight request interceptor with rules=[{id,url_pattern,method,action,headers,rewrite_method,status,body,delay_ms}]; action is block|allow|rewrite|fulfill, url_pattern is a wildcard glob (default *), rewrite continues with headers/body/rewrite_method, a miss continues immediately, and the page holds at most 50 rules across calls (page-wide, not per call); opt-in, changes page behaviour and disables the page HTTP cache while armed so cached subresources still match; returns {rules,count,remaining,active}), intercept_list (return the page's rules with sensitive header values redacted and the remaining rule budget; returns {rules,count,remaining,active}), intercept_clear (remove every rule, continue any paused request, disable interception and restore the cache; returns {rules_removed,active:false}). Rules are per session and never outlive the page. Logs are cumulative from page creation — filter client-side or clear_logs right before the step under observation.",
 			},
 			"selector": map[string]any{
 				"type":        "string",
@@ -286,14 +303,17 @@ func (t *Act) InputSchema() models.InputSchema {
 					"the stored one. Without it the restore is refused and both agents are named.",
 			},
 			"rules": map[string]any{
-				"type":     "array",
-				"maxItems": 50,
-				"description": "Rules for intercept_add. Each rule matches requests in order; the first match wins " +
-					"and a request that matches none continues immediately. A matching block fails the request " +
-					"(the page sees a network error), allow passes it through, rewrite continues it with the " +
-					"listed headers and non-empty body, and fulfill answers it with status (default 200), " +
-					"headers and body without any network fetch. Interception is opt-in, changes page " +
-					"behaviour and disables caching; rules are per session and disappear when the page closes.",
+				"type": "array",
+				"description": "Rules for intercept_add. Each rule matches requests in order; the first match " +
+					"wins and a request that matches none continues immediately. A matching block fails the " +
+					"request (the page sees a network error), allow passes it through, rewrite continues it with " +
+					"the listed headers, non-empty body and rewrite_method, and fulfill answers it with status " +
+					"(default 200), headers and body without any network fetch. The page holds at most 50 rules " +
+					"across calls: the cap is page-wide, not per call, and both intercept_add and intercept_list " +
+					"report the remaining budget. Interception is opt-in, changes page behaviour and disables " +
+					"the page HTTP cache while any rule is armed (restored by intercept_clear and by page " +
+					"close), so a cached subresource still matches. The network ring records the headers and " +
+					"method actually sent by a rewrite. Rules are per session and disappear when the page closes.",
 				"items": map[string]any{
 					"type":     "object",
 					"required": []string{"action"},
@@ -309,17 +329,21 @@ func (t *Act) InputSchema() models.InputSchema {
 						},
 						"method": map[string]any{
 							"type":        "string",
-							"description": "Optional HTTP method filter (e.g. POST); empty matches every method.",
+							"description": "Optional HTTP method filter (e.g. POST); empty matches every method. This filters the incoming request and does not change it; use rewrite_method to send a different method.",
 						},
 						"action": map[string]any{
 							"type":        "string",
 							"enum":        []string{"block", "allow", "rewrite", "fulfill"},
-							"description": "block fails the request, allow passes it through, rewrite continues it with headers/body, fulfill answers it synthetically.",
+							"description": "block fails the request, allow passes it through, rewrite continues it with headers/body/rewrite_method, fulfill answers it synthetically.",
 						},
 						"headers": map[string]any{
 							"type":                 "object",
 							"additionalProperties": map[string]any{"type": "string"},
 							"description":          "Request header overrides for rewrite, or response headers for fulfill (max 32).",
+						},
+						"rewrite_method": map[string]any{
+							"type":        "string",
+							"description": "rewrite only: send the request with this HTTP method (e.g. POST) instead of the original; empty keeps the original. Refused with any other action.",
 						},
 						"status": map[string]any{
 							"type":        "integer",
@@ -579,6 +603,17 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 		}
 	case "intercept_add":
 		out, err = pageops.PageInterceptAdd(ctx, p, a.Rules)
+		var limit *browsers.InterceptRuleLimitError
+		if errors.As(err, &limit) {
+			return failWithHint(
+				fmt.Errorf("page_act: %w", err),
+				errInvalidArgs,
+				fmt.Sprintf(
+					"the page holds the %d-rule cap — reuse an id to replace a rule, or call intercept_clear first",
+					limit.Cap,
+				),
+			)
+		}
 	case "intercept_list":
 		out, err = pageops.PageInterceptList(ctx, p)
 	case "intercept_clear":
