@@ -147,7 +147,8 @@ func (t *Act) Description() string {
 		"session_id, so a stale id is harmless), or " +
 		"poc_bundle (package one finding as a self-contained evidence directory; pass value=<finding title>, " +
 		"paths=[<absolute output directory>] and optionally target=<seq or URL substring> to select the captured " +
-		"request, otherwise the main document request is used. It writes meta.json, request.http, response.http, " +
+		"request, otherwise the main document request is used. request.http and response.http come from the " +
+		"network ring, so a prior clear_logs omits both files with reason no network entry. It writes meta.json, request.http, response.http, " +
 		"screenshot.png, dom.html, storage.json and README.md, plus sinks.json only when the tracer was installed, " +
 		"returns {directory,files:[{name,bytes}],omitted:[{name,reason}]} where reason is one of not installed, " +
 		"no body, no network entry, cap reached or secrets hidden; it refuses a relative path or a non-empty " +
