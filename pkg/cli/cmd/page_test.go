@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"testing"
 	"time"
@@ -43,10 +44,14 @@ func TestSurfaceVocabularyParity(t *testing.T) {
 		}
 	})
 
-	// replay is the one page_act action whose CLI/IPC surface is still landing
-	// in WEB-112's follow-up: it may be absent from both surfaces, but never
-	// from only one.
-	pending := map[string]bool{"replay": true}
+	// intercept_* are landing with WEB-194's observer work: until that ticket
+	// wires the CLI and IPC surfaces they may be absent from both, but never
+	// from only one. replay (WEB-112) is fully wired and is not exempt.
+	pending := map[string]bool{
+		"intercept_add":   true,
+		"intercept_list":  true,
+		"intercept_clear": true,
+	}
 	ipcActions := ipc.PageActActions()
 	t.Run("actions", func(t *testing.T) {
 		for _, action := range mcpActions {
@@ -89,6 +94,110 @@ func schemaEnum(t *testing.T, props map[string]any, field string) []string {
 		t.Fatalf("schema property %q has no []string enum", field)
 	}
 	return enum
+}
+
+// TestParseActArgsReplay pins the replay argument mapping: a positional target
+// (the README form) and the --target/--method/--header/--max-bytes/--value
+// overrides, with positionals winning over their flag fallbacks.
+func TestParseActArgsReplay(t *testing.T) {
+	tests := []struct {
+		name  string
+		args  []string
+		flags actArgFlags
+		want  actArgs
+	}{
+		{
+			name: "action-first positional target",
+			args: []string{"replay", "/api/user"},
+			want: actArgs{action: "replay", target: "/api/user"},
+		},
+		{
+			name: "id plus positional target",
+			args: []string{"12", "replay", "/api/user"},
+			want: actArgs{id: "12", action: "replay", target: "/api/user"},
+		},
+		{
+			name:  "flag-only overrides",
+			flags: actArgFlags{id: "page-1", action: "replay", target: "/api/user", method: "PUT", headers: []string{"X-Env=staging"}, value: `{"id":2}`, valueSet: true, maxBytes: 4096},
+			want:  actArgs{id: "page-1", action: "replay", target: "/api/user", method: "PUT", headers: []string{"X-Env=staging"}, value: `{"id":2}`, valueSet: true, maxBytes: 4096},
+		},
+		{
+			name:  "positional target wins over the flag",
+			args:  []string{"replay", "/api/user"},
+			flags: actArgFlags{target: "/other", method: "PATCH"},
+			want:  actArgs{action: "replay", target: "/api/user", method: "PATCH"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseActArgs(tt.args, tt.flags)
+			if err != nil {
+				t.Fatalf("parseActArgs(%v, %+v) error = %v, want nil", tt.args, tt.flags, err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("parseActArgs(%v, %+v) = %+v, want %+v", tt.args, tt.flags, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestPageActReplayFlags pins the CLI surface the README advertises: replay
+// overrides ride dedicated flags, and --max-bytes defaults to the engine cap.
+func TestPageActReplayFlags(t *testing.T) {
+	cmd := newPageActCmd(nil)
+	for _, name := range []string{"target", "method", "header", "max-bytes"} {
+		if cmd.Flags().Lookup(name) == nil {
+			t.Errorf("page act is missing --%s for replay", name)
+		}
+	}
+	if flag := cmd.Flags().Lookup("max-bytes"); flag != nil && flag.DefValue != "0" {
+		t.Errorf("--max-bytes default = %q, want 0 (engine 256 KB ceiling)", flag.DefValue)
+	}
+}
+
+// TestPageActViaIPCForwardsReplay pins the daemon path: every replay override
+// reaches the wire intact, including value_set for an explicitly empty body.
+func TestPageActViaIPCForwardsReplay(t *testing.T) {
+	path, captured := startCapturingActServer(t)
+	cl, err := ipc.Dial(path)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+
+	err = pageActViaIPC(context.Background(), cl, &ipc.PageActParams{
+		SessionID: "page-1",
+		Action:    "replay",
+		Target:    "/api/user",
+		Method:    "PUT",
+		Headers:   map[string]string{"X-Env": "staging"},
+		Value:     `{"id":2}`,
+		ValueSet:  true,
+		MaxBytes:  4096,
+	})
+	if err != nil {
+		t.Fatalf("pageActViaIPC: %v", err)
+	}
+
+	select {
+	case params := <-captured:
+		if params.Action != "replay" || params.SessionID != "page-1" {
+			t.Errorf("wire params = %+v, want session_id page-1 action replay", params)
+		}
+		if params.Target != "/api/user" || params.Method != "PUT" {
+			t.Errorf("wire target/method = %q/%q, want /api/user/PUT", params.Target, params.Method)
+		}
+		if params.Headers["X-Env"] != "staging" {
+			t.Errorf("wire headers = %v, want X-Env=staging", params.Headers)
+		}
+		if params.Value != `{"id":2}` || !params.ValueSet {
+			t.Errorf("wire value/value_set = %q/%v, want the edited body marked set", params.Value, params.ValueSet)
+		}
+		if params.MaxBytes != 4096 {
+			t.Errorf("wire max_bytes = %d, want 4096", params.MaxBytes)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the fake server saw no page.act request")
+	}
 }
 
 // TestPageListRowReportsOpener pins the listing format: a top-level page keeps
@@ -215,6 +324,50 @@ func startCapturingServer(t *testing.T) (string, <-chan ipc.PageFetchParams) {
 					return
 				}
 				var params ipc.PageFetchParams
+				if err := json.Unmarshal(req.Params, &params); err != nil {
+					return
+				}
+				select {
+				case captured <- params:
+				default:
+				}
+				_, _ = c.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"data":"ok"}}` + "\n"))
+			}(conn)
+		}
+	}()
+	return path, captured
+}
+
+// startCapturingActServer listens on a temp unix socket and reports the
+// page.act params of the first real request, skipping the Dial probe.
+func startCapturingActServer(t *testing.T) (string, <-chan ipc.PageActParams) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "cli.sock")
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen %s: %v", path, err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+
+	captured := make(chan ipc.PageActParams, 1)
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+				line, err := bufio.NewReader(c).ReadBytes('\n')
+				if err != nil {
+					return
+				}
+				var req ipc.Request
+				if err := json.Unmarshal(line, &req); err != nil {
+					return
+				}
+				var params ipc.PageActParams
 				if err := json.Unmarshal(req.Params, &params); err != nil {
 					return
 				}

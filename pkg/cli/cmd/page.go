@@ -63,7 +63,7 @@ resolve only against that browser and an unknown id fails with the live ids.
 Subcommands:
   list   List the browser's open pages (id, url)
   fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, console, body, article, tables, forms, marks, security, storage, sinks, postmessage, har); a URL opens a new page first
-  act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, inject_canary, wait_open)
+  act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, inject_canary, wait_open)
   close  Close an open page
 
 Run a subcommand with --help for its flags and examples.`,
@@ -390,8 +390,9 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 // newPageActCmd builds `page act`: it performs an action on a live page —
 // click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file,
 // hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport,
-// emulate, clear_logs, sinks_install, sinks_clear, inject_canary, postmessage_install,
-// postmessage_clear, post_message and wait_open (mirroring the MCP page_act surface).
+// emulate, clear_logs, sinks_install, sinks_clear, replay, inject_canary,
+// postmessage_install, postmessage_clear, post_message and wait_open (mirroring
+// the MCP page_act surface).
 func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 	var (
 		id             string
@@ -415,6 +416,10 @@ func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 		timeoutMS      int
 		width, height  int
 		device         string
+		target         string
+		method         string
+		headers        []string
+		maxBytes       int64
 	)
 	cmd := &cobra.Command{
 		Use:   "act [id] [action] [payload...]",
@@ -422,8 +427,8 @@ func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 		Long: `Performs an action on a live page (click, input, type, press_key, click_at,
 hover_at, drag_and_drop, upload_file, hover, scroll, select, eval, navigate, back,
 forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install,
-sinks_clear, inject_canary, postmessage_install, postmessage_clear, post_message,
-wait_open) and prints the confirmation. The page id
+sinks_clear, replay, inject_canary, postmessage_install, postmessage_clear,
+post_message, wait_open) and prints the confirmation. The page id
 is optional when only one page is open; 'last' means the most recently opened page;
 a bare number resolves to page-N.
 Positional payloads fill each action's fields — flags remain as fallbacks.
@@ -457,6 +462,7 @@ redirect it is rejected as stale, so re-fetch before acting.
   clear_logs   (none)
   sinks_install (none)
   sinks_clear  (none)
+  replay       [target]   (target via --target; overrides via --method, --header, --value, --max-bytes)
   inject_canary [canary]  (optional custom value; targets via --targets)
   postmessage_install (none)
   postmessage_clear   (none)
@@ -488,13 +494,23 @@ complete JSON object or array is delivered as that structure; anything else is
 delivered as a string. wait_open blocks until this page opens a popup (a
 target="_blank" link or window.open) and prints {session_id,url,opener};
 --timeout-ms bounds the wait, and a popup opened before the call returns at
-once.`,
+once. replay resends one captured network entry through a Go HTTP client,
+outside the browser: it bypasses CORS and carries the page's cookies for the
+target host without writing any back. --target takes the entry's seq number or
+a unique substring of its request URL (read the ring with
+'page fetch <id> network'); --method, --header NAME=VALUE and --value override
+the captured method, headers and body, and an omitted --value keeps the captured
+body. The result is the same compact JSON the MCP page_act replay action returns
+({status, headers, body|base64, bytes, truncated, body_redactions, ms, request,
+chain}) with sensitive headers redacted and the body capped at 256 KB.`,
 		Example: `  web-cli page act click "#submit"                          # click on the single open page
   web-cli page act 12 input "#search" "pizza"               # type into a search box
   web-cli page act 12 press_key "Enter"                     # press Enter key
   web-cli page act 12 click_at 100 200                     # click at x=100 y=200
   web-cli page act 12 navigate https://news.ycombinator.com # go somewhere
   web-cli page act last eval '() => document.title'         # run JS on the latest page
+  web-cli page act last replay /api/user --method PUT --value '{"id":2}'  # replay with an edited body
+  web-cli page act last replay --target /api/user --header X-Env=staging  # header override, same target
   web-cli page act last clear_logs  # reset all three buffers, print {network,console,websocket} counts
   web-cli page act last sinks_install  # arm the source-to-sink tracer
   web-cli page act last sinks_clear    # empty the tracer ring, print {cleared}
@@ -513,6 +529,8 @@ once.`,
 				button: button, clickCount: clickCount, targetSelector: targetSelector, origin: origin,
 				paths: paths, targets: targets, waitMode: waitMode, device: device, x: x, y: y,
 				targetX: targetX, targetY: targetY, width: width, height: height,
+				target: target, method: method, headers: headers, maxBytes: maxBytes,
+				valueSet: cmd.Flags().Changed("value"),
 			})
 			if err != nil {
 				return err
@@ -523,6 +541,8 @@ once.`,
 			targets = parsed.targets
 			x, y, targetX, targetY = parsed.x, parsed.y, parsed.targetX, parsed.targetY
 			width, height = parsed.width, parsed.height
+			target, method, headers, maxBytes = parsed.target, parsed.method, parsed.headers, parsed.maxBytes
+			valueSet := parsed.valueSet
 
 			// Enforce an explicit per-call timeout so a wedged page (or a
 			// stuck wait) cannot block the CLI: default 30s, honoring
@@ -561,6 +581,18 @@ once.`,
 					return fmt.Errorf("page act: %w", err)
 				}
 			}
+			if action == "replay" {
+				if target == "" {
+					return fmt.Errorf("page act: replay requires target=<seq> or target=<url substring> from page_fetch what=network")
+				}
+				if maxBytes < 0 {
+					return fmt.Errorf("page act: replay max_bytes must be >= 0")
+				}
+			}
+			headerMap, err := parseHeaderFlags(headers)
+			if err != nil {
+				return fmt.Errorf("page act: %w", err)
+			}
 
 			var vp *browsers.Viewport
 			if action == "set_viewport" {
@@ -584,7 +616,35 @@ once.`,
 					return err
 				}
 				reportBrowserTarget(cmd, browserID)
-				return pageActViaIPC(cmd, ctx, cl, rid, browserID, owner, action, handle, selector, value, key, button, clickCount, x, y, targetX, targetY, targetSelector, origin, paths, targets, waitMode, timeoutMS, vp, device)
+				return pageActViaIPC(ctx, cl, &ipc.PageActParams{
+					SessionID:      rid,
+					BrowserID:      browserID,
+					Owner:          owner,
+					Action:         action,
+					Selector:       selector,
+					Handle:         handle,
+					Value:          value,
+					ValueSet:       valueSet,
+					Key:            key,
+					Button:         button,
+					ClickCount:     clickCount,
+					X:              x,
+					Y:              y,
+					TargetX:        targetX,
+					TargetY:        targetY,
+					TargetSelector: targetSelector,
+					Origin:         origin,
+					Target:         target,
+					Method:         method,
+					Headers:        headerMap,
+					MaxBytes:       maxBytes,
+					Paths:          paths,
+					Targets:        targets,
+					TimeoutMS:      timeoutMS,
+					WaitMode:       waitMode,
+					Viewport:       vp,
+					Device:         device,
+				})
 			}
 			printServeHint(cmd)
 
@@ -659,6 +719,18 @@ once.`,
 				out, err = pageops.PageSinksInstall(ctx, p)
 			case "sinks_clear":
 				out, err = pageops.PageSinksClear(ctx, p)
+			case "replay":
+				out, err = pageops.PageReplay(ctx, p, pageops.ReplayRequest{
+					Target:   target,
+					Method:   method,
+					Headers:  headerMap,
+					Body:     value,
+					BodySet:  valueSet,
+					MaxBytes: maxBytes,
+					CheckScope: func(rawURL string) error {
+						return mgr.CheckPageScope(browsers.PageID(rid), rawURL)
+					},
+				})
 			case "inject_canary":
 				out, err = pageops.PageCanaryInject(ctx, p, targets, value)
 			case "postmessage_install":
@@ -688,7 +760,7 @@ once.`,
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to act on (optional with one page open; 'last'; or a bare number)")
-	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, inject_canary, postmessage_install, postmessage_clear, post_message, wait_open")
+	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, inject_canary, postmessage_install, postmessage_clear, post_message, wait_open")
 	cmd.Flags().StringVar(&selector, "selector", "", "CSS selector targeting the element (element actions)")
 	cmd.Flags().StringVar(&handle, "handle", "", "element handle from page fetch (g<document>-b<backendNodeId>, scoped to its document); wins over --selector (element actions)")
 	cmd.Flags().StringVar(&value, "value", "", "value for eval (JS function), input (text), type (text), navigate (URL), select (option value), or inject_canary (custom canary)")
@@ -702,7 +774,11 @@ once.`,
 	cmd.Flags().StringVar(&targetSelector, "target-selector", "", "target element selector (drag_and_drop), or destination frame for post_message: \"top\" (default) or a CSS selector naming an iframe")
 	cmd.Flags().StringVar(&origin, "origin", "*", "target origin for post_message (default \"*\"); pass the receiver's origin to restrict delivery")
 	cmd.Flags().StringArrayVar(&paths, "path", nil, "file paths for upload_file action")
-	cmd.Flags().StringSliceVar(&targets, "targets", nil, "canary injection points for inject_canary: query, hash, postmessage, name (repeatable or comma-separated; default all four)")
+	cmd.Flags().StringArrayVar(&targets, "targets", nil, "canary injection points for inject_canary: query, hash, postmessage, name (repeatable or comma-separated; default all four)")
+	cmd.Flags().StringVar(&target, "target", "", "replay target: a seq number or a substring of the captured request URL (read the ring with 'page fetch <id> network')")
+	cmd.Flags().StringVar(&method, "method", "", "HTTP method override for replay (e.g. PUT, PATCH); omit to keep the captured method")
+	cmd.Flags().StringArrayVar(&headers, "header", nil, "replay header override NAME=VALUE (repeatable); omitted headers keep their captured values")
+	cmd.Flags().Int64Var(&maxBytes, "max-bytes", 0, "cap the replay response body in bytes (0 = the engine's 256 KB ceiling)")
 	cmd.Flags().StringVar(&waitMode, "wait", "ms", "wait mode (wait action): load, idle, stable, interactable (needs --selector or --handle), ms (sleep --timeout-ms; default ms)")
 	cmd.Flags().IntVar(&timeoutMS, "timeout-ms", 30000, "per-action timeout in milliseconds (default 30000)")
 	cmd.Flags().StringVar(&browserID, "browser", "", "browser_id to resolve the page inside that browser only (use when more than one browser is live)")
@@ -866,51 +942,16 @@ func pageFetchViaIPC(
 	return nil
 }
 
-// pageActViaIPC implements `page act` against a live serve process: it
-// forwards the action (with its handle/selector/value/key/button/click_count/
-// x/y/target_x/target_y/target_selector/origin/paths/timeout/wait/viewport/device
-// params) to page.act and prints the confirmation byte-identically to the
-// in-process path.
+// pageActViaIPC implements `page act` against a live serve process: it forwards
+// the fully mapped action parameters to page.act and prints the confirmation
+// byte-identically to the in-process path.
 func pageActViaIPC(
-	cmd *cobra.Command,
 	ctx context.Context,
 	cl *ipc.Client,
-	id, browserID, owner, action, handle, selector, value, key, button string,
-	clickCount int,
-	x, y, targetX, targetY float64,
-	targetSelector, origin string,
-	paths []string,
-	targets []string,
-	waitMode string,
-	timeoutMS int,
-	vp *browsers.Viewport,
-	device string,
+	params *ipc.PageActParams,
 ) error {
 	var res ipc.PageActResult
-	if err := cl.Call(ctx, ipc.MethodPageAct, &ipc.PageActParams{
-		SessionID:      id,
-		BrowserID:      browserID,
-		Owner:          owner,
-		Action:         action,
-		Selector:       selector,
-		Handle:         handle,
-		Value:          value,
-		Key:            key,
-		Button:         button,
-		ClickCount:     clickCount,
-		X:              x,
-		Y:              y,
-		TargetX:        targetX,
-		TargetY:        targetY,
-		TargetSelector: targetSelector,
-		Origin:         origin,
-		Paths:          paths,
-		Targets:        targets,
-		TimeoutMS:      timeoutMS,
-		WaitMode:       waitMode,
-		Viewport:       vp,
-		Device:         device,
-	}, &res); err != nil {
+	if err := cl.Call(ctx, ipc.MethodPageAct, params, &res); err != nil {
 		return fmt.Errorf("page act: %w", err)
 	}
 	fmt.Println(res.Data)

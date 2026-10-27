@@ -39,7 +39,7 @@ var actionVocab = map[string]bool{
 	"forward": true, "reload": true, "hover": true, "scroll": true,
 	"select": true, "wait": true, "set_viewport": true, "emulate": true,
 	"clear_logs": true, "sinks_install": true, "sinks_clear": true,
-	"inject_canary": true, "postmessage_install": true,
+	"replay": true, "inject_canary": true, "postmessage_install": true,
 	"postmessage_clear": true, "post_message": true, "wait_open": true,
 }
 
@@ -73,6 +73,7 @@ var actPayloadSpecs = map[string][]string{
 	"clear_logs":          {},
 	"sinks_install":       {},
 	"sinks_clear":         {},
+	"replay":              {"target"},
 	"inject_canary":       {"value"},
 	"postmessage_install": {},
 	"postmessage_clear":   {},
@@ -474,22 +475,62 @@ func parseFetchArgs(args []string, idFlag, whatFlag string) (id, what, url strin
 // override: a positional always wins over its flag counterpart, and the flag
 // is the fallback when the positional grammar leaves the field unfilled.
 type actArgFlags struct {
-	id, action, selector, handle, value, key, button, targetSelector, origin, waitMode, device string
-	x, y, targetX, targetY                                                                     float64
-	clickCount, width, height                                                                  int
-	paths                                                                                      []string
-	targets                                                                                    []string
+	id             string
+	action         string
+	selector       string
+	handle         string
+	value          string
+	key            string
+	button         string
+	targetSelector string
+	origin         string
+	waitMode       string
+	device         string
+	target         string
+	method         string
+	headers        []string
+	x              float64
+	y              float64
+	targetX        float64
+	targetY        float64
+	clickCount     int
+	width          int
+	height         int
+	paths          []string
+	targets        []string
+	maxBytes       int64
+	valueSet       bool
 }
 
 // actArgs is the merged result of `page act` parsing: the effective
 // id/action/payload fields after the positionals (which win) are merged over
 // the flag values.
 type actArgs struct {
-	id, action, selector, handle, value, key, button, targetSelector, origin, waitMode, device string
-	x, y, targetX, targetY                                                                     float64
-	clickCount, width, height                                                                  int
-	paths                                                                                      []string
-	targets                                                                                    []string
+	id             string
+	action         string
+	selector       string
+	handle         string
+	value          string
+	key            string
+	button         string
+	targetSelector string
+	origin         string
+	waitMode       string
+	device         string
+	target         string
+	method         string
+	headers        []string
+	x              float64
+	y              float64
+	targetX        float64
+	targetY        float64
+	clickCount     int
+	width          int
+	height         int
+	paths          []string
+	targets        []string
+	maxBytes       int64
+	valueSet       bool
 }
 
 // parseActArgs parses `page act` positional args against the flag values and
@@ -637,6 +678,10 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 		if len(payload) >= 1 {
 			a.value = payload[0]
 		}
+	case "replay":
+		if len(payload) >= 1 {
+			a.target = payload[0]
+		}
 	case "post_message":
 		if len(payload) >= 1 {
 			a.value = payload[0]
@@ -658,6 +703,21 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 	}
 	if a.value == "" {
 		a.value = f.value
+	}
+	if !a.valueSet {
+		a.valueSet = f.valueSet
+	}
+	if a.target == "" {
+		a.target = f.target
+	}
+	if a.method == "" {
+		a.method = f.method
+	}
+	if len(a.headers) == 0 {
+		a.headers = f.headers
+	}
+	if a.maxBytes == 0 {
+		a.maxBytes = f.maxBytes
 	}
 	if a.key == "" {
 		a.key = f.key

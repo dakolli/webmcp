@@ -490,7 +490,7 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 // handlePageAct implements page.act: it performs the requested action on a
 // live page — click, input, type, press_key, click_at, hover_at, drag_and_drop,
 // upload_file, hover, scroll, select, eval, navigate, back, forward, reload,
-// wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear,
+// wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay,
 // inject_canary, postmessage_install, postmessage_clear, post_message or
 // wait_open — mirroring the CLI page act command. An unknown action is a
 // -32602 invalid-params error.
@@ -521,6 +521,20 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		return nil, &Error{
 			Code:    CodeInvalidParams,
 			Message: "page.act: post_message requires a payload (e.g. 'page act last post_message '{\"t\":\"wm\"}''",
+		}
+	}
+	if p.Action == "replay" {
+		if p.Target == "" {
+			return nil, &Error{
+				Code:    CodeInvalidParams,
+				Message: "page.act: replay requires target=<seq> or target=<url substring> from page_fetch what=network",
+			}
+		}
+		if p.MaxBytes < 0 {
+			return nil, &Error{
+				Code:    CodeInvalidParams,
+				Message: "page.act: replay max_bytes must be >= 0",
+			}
 		}
 	}
 	if p.Action == "wait" {
@@ -622,6 +636,18 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		out, err = pageops.PageSinksInstall(ctx, page)
 	case "sinks_clear":
 		out, err = pageops.PageSinksClear(ctx, page)
+	case "replay":
+		out, err = pageops.PageReplay(ctx, page, pageops.ReplayRequest{
+			Target:   p.Target,
+			Method:   p.Method,
+			Headers:  p.Headers,
+			Body:     p.Value,
+			BodySet:  p.ValueSet || p.Value != "",
+			MaxBytes: p.MaxBytes,
+			CheckScope: func(rawURL string) error {
+				return s.mgr.CheckPageScope(browsers.PageID(p.SessionID), rawURL)
+			},
+		})
 	case "inject_canary":
 		out, err = pageops.PageCanaryInject(ctx, page, p.Targets, p.Value)
 	case "postmessage_install":

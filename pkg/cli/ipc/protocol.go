@@ -40,7 +40,7 @@ const (
 	MethodPageList = "page.list"
 	// MethodPageFetch extracts any aspect in the shared pageops registry from a live page.
 	MethodPageFetch = "page.fetch"
-	// MethodPageAct performs an action on a live page (click/input/hover/scroll/select/eval/navigate/back/forward/reload/wait/set_viewport/emulate/clear_logs/sinks_install/sinks_clear/inject_canary/postmessage_install/postmessage_clear/post_message/wait_open).
+	// MethodPageAct performs an action on a live page (click/input/hover/scroll/select/eval/navigate/back/forward/reload/wait/set_viewport/emulate/clear_logs/sinks_install/sinks_clear/replay/inject_canary/postmessage_install/postmessage_clear/post_message/wait_open).
 	MethodPageAct = "page.act"
 	// MethodPageClose closes an open page.
 	MethodPageClose = "page.close"
@@ -73,7 +73,7 @@ var pageActActions = []string{
 	"drag_and_drop", "upload_file", "eval", "navigate",
 	"back", "forward", "reload", "hover", "scroll", "select",
 	"wait", "set_viewport", "emulate", "clear_logs",
-	"sinks_install", "sinks_clear", "inject_canary",
+	"sinks_install", "sinks_clear", "replay", "inject_canary",
 	"postmessage_install", "postmessage_clear", "post_message",
 	"wait_open",
 }
@@ -357,14 +357,17 @@ type PageFetchResult struct {
 // PageActParams carries the page.act parameters. action ∈ click|input|type|
 // press_key|click_at|hover_at|drag_and_drop|upload_file|eval|navigate|back|
 // forward|reload|hover|scroll|select|wait|set_viewport|emulate|clear_logs|
-// sinks_install|sinks_clear|inject_canary|postmessage_install|postmessage_clear|
+// sinks_install|sinks_clear|replay|inject_canary|postmessage_install|postmessage_clear|
 // post_message; selector/handle/value/key/button/click_count/x/y/
 // target_x/target_y/target_selector/origin/paths/targets are the per-action
 // payloads (handle wins over selector for element actions); viewport carries the
 // target size for set_viewport and device the preset for emulate; timeout_ms
 // bounds the action (default 30000) and sizes the wait action's "ms" sleep;
 // wait_mode selects what the wait action waits for: load|idle|stable|interactable|ms
-// (default ms). clear_logs, sinks_install, sinks_clear, postmessage_install and
+// (default ms). replay resends one captured network entry: target selects it by
+// seq or URL substring, method/headers override the captured request, value
+// replaces the captured body when value_set is true (or value is non-empty), and
+// max_bytes caps the returned body. clear_logs, sinks_install, sinks_clear, postmessage_install and
 // postmessage_clear take no required payload: clear_logs empties both log
 // buffers and returns the cleared counts; sinks_install arms the source-to-sink
 // tracer and returns {"installed":true}; sinks_clear empties its ring and
@@ -387,8 +390,24 @@ type PageActParams struct {
 	// {"cleared":N} and wait_open {session_id,url,opener}).
 	Action string `json:"action"`
 	// Value is the payload: a JS function for eval, text for input/type, URL for
-	// navigate, an option value for select, fallback key for press_key, or single path for upload_file.
+	// navigate, an option value for select, fallback key for press_key, single
+	// path for upload_file, or the replacement request body for replay.
 	Value string `json:"value,omitempty"`
+	// ValueSet marks Value as explicitly supplied, so replay distincts an
+	// absent body from an intentionally empty one. Empty Value with ValueSet
+	// false keeps the captured replay body.
+	ValueSet bool `json:"value_set,omitempty"`
+	// Target selects the captured network entry a replay resends: a seq number
+	// or a substring of its request URL.
+	Target string `json:"target,omitempty"`
+	// Method overrides the captured request method for replay.
+	Method string `json:"method,omitempty"`
+	// Headers overrides captured request headers for replay; each named header
+	// replaces its captured value.
+	Headers map[string]string `json:"headers,omitempty"`
+	// MaxBytes caps the replay response body in bytes; 0 uses the engine's
+	// 256 KB ceiling and larger values are clamped to it.
+	MaxBytes int64 `json:"max_bytes,omitempty"`
 	// Selector targets an element for element actions.
 	Selector string `json:"selector,omitempty"`
 	// Handle is an element handle from a previous page.fetch
