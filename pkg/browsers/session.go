@@ -71,6 +71,14 @@ type Page struct {
 	// pre-registration window and cleared by stopObservation. Guarded by the
 	// operation lock.
 	obsCancel context.CancelFunc
+	// intercept holds the page's request interception state, nil until the first
+	// rule is added and after it is cleared. It is guarded by interceptMu, never
+	// by the operation lock, because its handlers make CDP calls from their own
+	// goroutines.
+	intercept *interceptor
+	// interceptMu guards intercept and serializes interception arm/disarm. Lock
+	// order is Page.mu -> interceptMu; no path takes them the other way.
+	interceptMu sync.Mutex
 
 	// opMu is the operation lock: a one-slot channel semaphore, lazily
 	// initialized so a zero-value Page stays usable. A channel (rather than
@@ -152,6 +160,7 @@ func (p *Page) LockContext(ctx context.Context, op string) error {
 // surfaces a ctx-bound error (e.g. context.DeadlineExceeded) instead of
 // blocking the caller past its deadline.
 func (p *Page) Close(ctx context.Context) error {
+	p.stopInterception(ctx)
 	if err := p.LockContext(ctx, "close page"); err != nil {
 		return err
 	}

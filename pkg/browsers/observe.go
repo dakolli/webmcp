@@ -52,6 +52,11 @@ type NetworkEntry struct {
 	ReqHeadersTruncated bool `json:"req_headers_truncated,omitempty"`
 	// RespHeadersTruncated reports a response header set cut by the entry bound.
 	RespHeadersTruncated bool `json:"resp_headers_truncated,omitempty"`
+	// Intercepted names the rule action that resolved this request in flight:
+	// block, rewrite or fulfill. Empty means the request was not intercepted.
+	Intercepted string `json:"intercepted,omitempty"`
+	// InterceptRuleID names the rule that resolved the request in flight.
+	InterceptRuleID string `json:"intercept_rule_id,omitempty"`
 
 	requestID   proto.NetworkRequestID
 	requestedAt proto.MonotonicTime
@@ -267,6 +272,56 @@ func (o *pageObserver) recordFailed(e *proto.NetworkLoadingFailed) {
 	entry.Error = cutString(msg, networkErrorLimit)
 	if entry.Type == "" {
 		entry.Type = string(e.Type)
+	}
+}
+
+// recordIntercept tags the network entry for a paused request with the rule
+// action that resolved it, appending an entry when the request was captured
+// before the Network event arrived.
+func (o *pageObserver) recordIntercept(e *proto.FetchRequestPaused, rule InterceptRule) {
+	if e.Request == nil {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	id := e.NetworkID
+	idx := -1
+	if id != "" {
+		idx = o.indexOfRequest(id)
+	}
+	if idx < 0 {
+		o.netSeq++
+		entry := NetworkEntry{
+			Method:          e.Request.Method,
+			URL:             cutString(e.Request.URL, networkURLLimit),
+			Type:            string(e.ResourceType),
+			Seq:             o.netSeq,
+			Intercepted:     rule.Action,
+			InterceptRuleID: rule.ID,
+			requestID:       id,
+		}
+		markIntercepted(&entry, rule)
+		o.net.push(entry)
+		return
+	}
+	entry := &o.net.items[idx]
+	entry.Intercepted = rule.Action
+	entry.InterceptRuleID = rule.ID
+	markIntercepted(entry, rule)
+}
+
+// markIntercepted records the visible outcome of an intercepted action on an
+// entry: a block is a failure, and a fulfill reports its synthetic status.
+func markIntercepted(entry *NetworkEntry, rule InterceptRule) {
+	switch rule.Action {
+	case InterceptBlock:
+		entry.Failed = true
+		entry.Error = cutString("blocked by client (intercept rule "+rule.ID+")", networkErrorLimit)
+	case InterceptFulfill:
+		entry.Status = rule.Status
+		if mime := capturedHeader(rule.Headers, "Content-Type"); mime != "" {
+			entry.MIME = mime
+		}
 	}
 }
 
@@ -619,8 +674,12 @@ func (p *Page) startObservation() {
 }
 
 // stopObservation disarms capture idempotently by cancelling the capture context
-// and clearing the stored cancel. It does not wait for the drain goroutine.
+// and clearing the stored cancel. It also disarms request interception, the
+// other page-scoped CDP subscription, so every teardown path (including the one
+// that closes the tab directly) leaves no live Fetch hook. It does not wait for
+// the drain goroutine.
 func (p *Page) stopObservation() {
+	p.disarmInterception()
 	if p.obsCancel == nil {
 		return
 	}

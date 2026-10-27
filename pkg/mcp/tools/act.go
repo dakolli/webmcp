@@ -30,7 +30,7 @@ var actActionNames = []string{
 	"wait", "set_viewport", "emulate", "clear_logs",
 	"sinks_install", "sinks_clear", "replay", "inject_canary",
 	"postmessage_install", "postmessage_clear", "post_message",
-	"wait_open",
+	"wait_open", "intercept_add", "intercept_list", "intercept_clear",
 }
 
 // actActionList renders actActionNames for an error message.
@@ -98,7 +98,15 @@ func (t *Act) Description() string {
 		"wait_open (block until this page opens a popup or new tab — a target=\"_blank\" link " +
 		"or window.open — and return {session_id,url,opener} for the new page; a popup opened " +
 		"before the call is returned immediately, each popup is reported once, and timeout_ms " +
-		"bounds the wait. Use the returned session_id with page_fetch/page_act). " +
+		"bounds the wait. Use the returned session_id with page_fetch/page_act), " +
+		"intercept_add (arm a page-scoped in-flight request interceptor; rules is an array of " +
+		"{id, url_pattern, method, action, headers, status, body, delay_ms} where action is " +
+		"block, allow, rewrite or fulfill, url_pattern is a wildcard glob like *api*, and a " +
+		"miss continues immediately; interception is opt-in, changes page behaviour and " +
+		"disables caching, so clear it when done; max 50 rules per page), " +
+		"intercept_list (returns the page's rules with sensitive header values redacted), or " +
+		"intercept_clear (remove every rule, continue any paused request and disable " +
+		"interception; rules never outlive the page). " +
 		"Pass session_id plus action=... and any required parameters. When more than " +
 		"one browser is live, pass browser_id or owner to declare which browser holds " +
 		"the session; with one live browser both may be omitted, and a session held " +
@@ -133,7 +141,7 @@ func (t *Act) InputSchema() models.InputSchema {
 			"action": map[string]any{
 				"type":        "string",
 				"enum":        append([]string(nil), actActionNames...),
-				"description": "The interaction to perform: click (selector), input (set field text; the result reports the target and rune length, never the value, plus value_redacted=true for a password or hidden field), type (keystrokes, same result rule as input), press_key (key/combo e.g. Enter, Escape, Control+A), click_at/hover_at ({x, y} coordinates), drag_and_drop (from {x,y}/selector to {target_x,target_y}/target_selector), upload_file (set file input paths), eval (run JS), navigate (URL), back/forward/reload, hover (selector), scroll (x/y), select (option value), wait (readiness mode), set_viewport (W x H), emulate (device preset), clear_logs (empty the network, console and websocket buffers; no parameters; returns {\"network\":N,\"console\":M,\"websocket\":K} cleared counts), sinks_install (arm the source-to-sink tracer; no parameters; returns {\"installed\":true}; capture is opt-in, changes page behavior, survives client-side route changes and full navigations while its per-document ring resets on a full navigation; read it with page_fetch what=sinks, which is read-only and never arms capture), sinks_clear (empty the tracer ring; no parameters; returns {\"cleared\":N}), replay (resend one captured network entry; needs target, optionally method, headers, value and max_bytes; returns {status,headers,body,bytes,truncated,body_redactions,ms,request,chain} with sensitive headers and text-body secrets redacted and truncated/chain always present), inject_canary (inject a canary into query/hash/postmessage/name — default all four, narrow with targets — and return {canary, injected:[{target, where}], hits:[{sink, context, selector, value, stack}], installed}; requires sinks_install first; query reloads, hash does not; capped at 20 frames), postmessage_install (arm the postMessage recorder: one capture-phase listener per window and iframe without wrapping addEventListener, so page listeners keep their identity; no parameters; returns {\"installed\":true}; read it with page_fetch what=postmessage), postmessage_clear (empty every recorder ring; no parameters; returns {\"cleared\":N}), post_message (deliver value to window.top/self/parent when target_selector is \"top\", \"self\", \"parent\" or omitted, or to the contentWindow of the <iframe>/<frame> matched by any other target_selector; a selector that is not a frame errors instead of falling back to top; origin is the target origin, default \"*\"; arms the recorder first and returns {origin,target}), wait_open (block until this page opens a popup or new tab — target=\"_blank\" or window.open — and return {session_id,url,opener}; timeout_ms bounds the wait; a popup opened before the call is returned immediately). Logs are cumulative from page creation — filter client-side or clear_logs right before the step under observation.",
+				"description": "The interaction to perform: click (selector), input (set field text; the result reports the target and rune length, never the value, plus value_redacted=true for a password or hidden field), type (keystrokes, same result rule as input), press_key (key/combo e.g. Enter, Escape, Control+A), click_at/hover_at ({x, y} coordinates), drag_and_drop (from {x,y}/selector to {target_x,target_y}/target_selector), upload_file (set file input paths), eval (run JS), navigate (URL), back/forward/reload, hover (selector), scroll (x/y), select (option value), wait (readiness mode), set_viewport (W x H), emulate (device preset), clear_logs (empty the network, console and websocket buffers; no parameters; returns {\"network\":N,\"console\":M,\"websocket\":K} cleared counts), sinks_install (arm the source-to-sink tracer; no parameters; returns {\"installed\":true}; capture is opt-in, changes page behavior, survives client-side route changes and full navigations while its per-document ring resets on a full navigation; read it with page_fetch what=sinks, which is read-only and never arms capture), sinks_clear (empty the tracer ring; no parameters; returns {\"cleared\":N}), replay (resend one captured network entry; needs target, optionally method, headers, value and max_bytes; returns {status,headers,body,bytes,truncated,body_redactions,ms,request,chain} with sensitive headers and text-body secrets redacted and truncated/chain always present), inject_canary (inject a canary into query/hash/postmessage/name — default all four, narrow with targets — and return {canary, injected:[{target, where}], hits:[{sink, context, selector, value, stack}], installed}; requires sinks_install first; query reloads, hash does not; capped at 20 frames), postmessage_install (arm the postMessage recorder: one capture-phase listener per window and iframe without wrapping addEventListener, so page listeners keep their identity; no parameters; returns {\"installed\":true}; read it with page_fetch what=postmessage), postmessage_clear (empty every recorder ring; no parameters; returns {\"cleared\":N}), post_message (deliver value to window.top/self/parent when target_selector is \"top\", \"self\", \"parent\" or omitted, or to the contentWindow of the <iframe>/<frame> matched by any other target_selector; a selector that is not a frame errors instead of falling back to top; origin is the target origin, default \"*\"; arms the recorder first and returns {origin,target}), wait_open (block until this page opens a popup or new tab — target=\"_blank\" or window.open — and return {session_id,url,opener}; timeout_ms bounds the wait; a popup opened before the call is returned immediately), intercept_add (arm a page-scoped in-flight request interceptor with rules=[{id,url_pattern,method,action,headers,status,body,delay_ms}]; action is block|allow|rewrite|fulfill, url_pattern is a wildcard glob (default *), a miss continues immediately, at most 50 rules per page; opt-in, changes page behaviour and disables caching; returns {rules,count,active}), intercept_list (return the page's rules with sensitive header values redacted; returns {rules,count,active}), intercept_clear (remove every rule, continue any paused request and disable interception; returns {rules_removed,active:false}). Rules are per session and never outlive the page. Logs are cumulative from page creation — filter client-side or clear_logs right before the step under observation.",
 			},
 			"selector": map[string]any{
 				"type":        "string",
@@ -247,6 +255,57 @@ func (t *Act) InputSchema() models.InputSchema {
 				"type":        "string",
 				"description": "Go-rod device preset name for emulate action (e.g. IPhoneX, IPadPro, LaptopWithHiDPIScreen; 'clear' resets).",
 			},
+			"rules": map[string]any{
+				"type":     "array",
+				"maxItems": 50,
+				"description": "Rules for intercept_add. Each rule matches requests in order; the first match wins " +
+					"and a request that matches none continues immediately. A matching block fails the request " +
+					"(the page sees a network error), allow passes it through, rewrite continues it with the " +
+					"listed headers and non-empty body, and fulfill answers it with status (default 200), " +
+					"headers and body without any network fetch. Interception is opt-in, changes page " +
+					"behaviour and disables caching; rules are per session and disappear when the page closes.",
+				"items": map[string]any{
+					"type":     "object",
+					"required": []string{"action"},
+					"properties": map[string]any{
+						"id": map[string]any{
+							"type":        "string",
+							"description": "Rule id reported with every network hit; reusing an id replaces that rule; generated when omitted.",
+						},
+						"url_pattern": map[string]any{
+							"type":        "string",
+							"default":     "*",
+							"description": "Wildcard glob matched against the full request URL: * matches any run, ? matches one character, everything else is literal (dots included). Default * matches every request.",
+						},
+						"method": map[string]any{
+							"type":        "string",
+							"description": "Optional HTTP method filter (e.g. POST); empty matches every method.",
+						},
+						"action": map[string]any{
+							"type":        "string",
+							"enum":        []string{"block", "allow", "rewrite", "fulfill"},
+							"description": "block fails the request, allow passes it through, rewrite continues it with headers/body, fulfill answers it synthetically.",
+						},
+						"headers": map[string]any{
+							"type":                 "object",
+							"additionalProperties": map[string]any{"type": "string"},
+							"description":          "Request header overrides for rewrite, or response headers for fulfill (max 32).",
+						},
+						"status": map[string]any{
+							"type":        "integer",
+							"description": "Synthetic response status for fulfill (default 200, range 100-599).",
+						},
+						"body": map[string]any{
+							"type":        "string",
+							"description": "Request payload for rewrite (non-empty replaces the sent body), or the response payload for fulfill.",
+						},
+						"delay_ms": map[string]any{
+							"type":        "integer",
+							"description": "Delay before resolving the request, clamped to 10000 ms.",
+						},
+					},
+				},
+			},
 		},
 		Required: []string{"session_id", "action"},
 	}
@@ -254,32 +313,33 @@ func (t *Act) InputSchema() models.InputSchema {
 
 // actArgs is the strict decoding target for page_act arguments.
 type actArgs struct {
-	SessionID      browsers.PageID    `json:"session_id"`
-	BrowserID      string             `json:"browser_id"`
-	Owner          string             `json:"owner"`
-	Action         string             `json:"action"`
-	Selector       string             `json:"selector"`
-	Handle         string             `json:"handle"`
-	Value          string             `json:"value"`
-	Key            string             `json:"key"`
-	Button         string             `json:"button"`
-	ClickCount     int                `json:"click_count"`
-	X              float64            `json:"x"`
-	Y              float64            `json:"y"`
-	TargetX        float64            `json:"target_x"`
-	TargetY        float64            `json:"target_y"`
-	TargetSelector string             `json:"target_selector"`
-	Origin         string             `json:"origin"`
-	Target         string             `json:"target"`
-	Targets        []string           `json:"targets"`
-	Method         string             `json:"method"`
-	Headers        map[string]string  `json:"headers"`
-	MaxBytes       int64              `json:"max_bytes"`
-	Paths          []string           `json:"paths"`
-	TimeoutMS      int                `json:"timeout_ms"`
-	WaitMode       string             `json:"wait_mode"`
-	Viewport       *browsers.Viewport `json:"viewport"`
-	Device         string             `json:"device"`
+	SessionID      browsers.PageID          `json:"session_id"`
+	BrowserID      string                   `json:"browser_id"`
+	Owner          string                   `json:"owner"`
+	Action         string                   `json:"action"`
+	Selector       string                   `json:"selector"`
+	Handle         string                   `json:"handle"`
+	Value          string                   `json:"value"`
+	Key            string                   `json:"key"`
+	Button         string                   `json:"button"`
+	ClickCount     int                      `json:"click_count"`
+	X              float64                  `json:"x"`
+	Y              float64                  `json:"y"`
+	TargetX        float64                  `json:"target_x"`
+	TargetY        float64                  `json:"target_y"`
+	TargetSelector string                   `json:"target_selector"`
+	Origin         string                   `json:"origin"`
+	Target         string                   `json:"target"`
+	Targets        []string                 `json:"targets"`
+	Method         string                   `json:"method"`
+	Headers        map[string]string        `json:"headers"`
+	MaxBytes       int64                    `json:"max_bytes"`
+	Paths          []string                 `json:"paths"`
+	TimeoutMS      int                      `json:"timeout_ms"`
+	WaitMode       string                   `json:"wait_mode"`
+	Viewport       *browsers.Viewport       `json:"viewport"`
+	Device         string                   `json:"device"`
+	Rules          []browsers.InterceptRule `json:"rules"`
 }
 
 // validate checks the arguments an action requires and returns a one-line
@@ -316,6 +376,10 @@ func (a *actArgs) validate(provided map[string]json.RawMessage) error {
 		}
 		if a.MaxBytes < 0 {
 			return fmt.Errorf("replay max_bytes must be >= 0")
+		}
+	case "intercept_add":
+		if len(a.Rules) == 0 {
+			return fmt.Errorf("intercept_add requires rules (e.g. [{\"url_pattern\":\"*api*\",\"action\":\"block\"}])")
 		}
 	}
 	return nil
@@ -466,6 +530,12 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 			data, err = json.Marshal(popup)
 			out = string(data)
 		}
+	case "intercept_add":
+		out, err = pageops.PageInterceptAdd(ctx, p, a.Rules)
+	case "intercept_list":
+		out, err = pageops.PageInterceptList(ctx, p)
+	case "intercept_clear":
+		out, err = pageops.PageInterceptClear(ctx, p)
 	default:
 		return failResult(fmt.Errorf("page_act: unknown action=%q (must be one of %s)", a.Action, actActionList()))
 	}
