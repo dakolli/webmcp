@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -303,5 +304,187 @@ func TestPageInfoPayloadShape(t *testing.T) {
 		if _, ok := got[key]; !ok {
 			t.Errorf("PageInfo payload missing key %q: %s", key, data)
 		}
+	}
+}
+
+// healthyInfo is a page metadata seam that always answers, so a watchdog
+// recovery probe passes without a live browser.
+func healthyInfo(context.Context) (string, string, error) {
+	return "https://app.test/", "App", nil
+}
+
+// settle polls cond for up to three seconds.
+func settle(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// TestGuardPageShortDeadlineCallsLeaveNoLock pins WEB-220: fifty operations
+// that spend their whole budget each return, leave the operation lock free,
+// and leave no goroutine behind.
+func TestGuardPageShortDeadlineCallsLeaveNoLock(t *testing.T) {
+	p := &Page{ID: "page-1", info: healthyInfo}
+	baseline := runtime.NumGoroutine()
+
+	for i := range 50 {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		value, err := GuardPage(ctx, p, "click", func(ctx context.Context) (string, error) {
+			<-ctx.Done()
+			return "", ctx.Err()
+		})
+		cancel()
+		if value != "" {
+			t.Fatalf("call %d: value = %q, want empty", i, value)
+		}
+		if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+			t.Fatalf("call %d: error = %v, want the operation budget error", i, err)
+		}
+	}
+
+	unlock, ok := p.TryLock()
+	if !ok {
+		t.Fatal("page lock still held after 50 short-deadline calls")
+	}
+	unlock()
+
+	settle(t, "guard goroutines to exit", func() bool {
+		return runtime.NumGoroutine() <= baseline+2
+	})
+}
+
+// TestGuardPageWatchdogTripsThenRecovers pins WEB-220: an operation that
+// ignores its cancelled context trips the watchdog, the call returns the typed
+// watchdog error, the page refuses new work while wedged, and once the stuck
+// operation returns the page is probed and usable again.
+func TestGuardPageWatchdogTripsThenRecovers(t *testing.T) {
+	p := &Page{ID: "page-1", info: healthyInfo}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	release := make(chan struct{})
+	started := time.Now()
+	value, err := GuardPage(ctx, p, "click", func(context.Context) (string, error) {
+		<-release
+		return "ok", nil
+	})
+	if value != "" {
+		t.Fatalf("value = %q, want empty on a watchdog trip", value)
+	}
+	var trip *PageWatchdogError
+	if !errors.As(err, &trip) {
+		t.Fatalf("error = %v, want *PageWatchdogError", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want it to unwrap context.DeadlineExceeded", err)
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "watchdog") {
+		t.Fatalf("error = %q, want it to name the watchdog", err)
+	}
+	if elapsed := time.Since(started); elapsed < watchdogGrace {
+		t.Fatalf("watchdog tripped after %s, want at least the grace %s", elapsed, watchdogGrace)
+	}
+
+	if lockErr := p.LockContext(context.Background(), "probe"); !errors.As(lockErr, &trip) {
+		t.Fatalf("LockContext while wedged = %v, want *PageWatchdogError", lockErr)
+	}
+
+	close(release)
+	settle(t, "the page to recover", func() bool {
+		return p.wedgeErr.Load() == nil && p.closedErr.Load() == nil
+	})
+
+	after := context.Background()
+	next, err := GuardPage(after, p, "click", func(context.Context) (string, error) {
+		return "ok", nil
+	})
+	if err != nil || next != "ok" {
+		t.Fatalf("next GuardPage = (%q, %v), want (\"ok\", nil)", next, err)
+	}
+}
+
+// TestGuardPageReleasesLockOnEveryReturnPath pins that a value return, an
+// error return, a panic and a budget cancellation each release the operation
+// lock.
+func TestGuardPageReleasesLockOnEveryReturnPath(t *testing.T) {
+	tests := []struct {
+		name    string
+		fn      func(context.Context) (string, error)
+		wantErr string
+	}{
+		{
+			name: "value",
+			fn:   func(context.Context) (string, error) { return "ok", nil },
+		},
+		{
+			name:    "error",
+			fn:      func(context.Context) (string, error) { return "", errors.New("boom") },
+			wantErr: "boom",
+		},
+		{
+			name:    "panic",
+			fn:      func(context.Context) (string, error) { panic("kaboom") },
+			wantErr: "panicked",
+		},
+		{
+			name: "budget cancellation",
+			fn: func(ctx context.Context) (string, error) {
+				<-ctx.Done()
+				return "", ctx.Err()
+			},
+			wantErr: "deadline exceeded",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &Page{ID: "page-1", info: healthyInfo}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+			defer cancel()
+			_, err := GuardPage(ctx, p, "click", tt.fn)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("GuardPage() error = %v, want nil", err)
+				}
+			} else if err == nil || !strings.Contains(strings.ToLower(err.Error()), tt.wantErr) {
+				t.Fatalf("GuardPage() error = %v, want it to contain %q", err, tt.wantErr)
+			}
+			settle(t, "the operation lock to be free", func() bool {
+				unlock, ok := p.TryLock()
+				if ok {
+					unlock()
+				}
+				return ok
+			})
+		})
+	}
+}
+
+// TestPageBrokenErrorClosesTheSession pins the typed closure path: a page the
+// watchdog could not recover fails every new operation with a page_closed
+// error that says the session is closed.
+func TestPageBrokenErrorClosesTheSession(t *testing.T) {
+	p := &Page{ID: "page-1", info: healthyInfo}
+	p.closedErr.Store(&PageBrokenError{
+		Op:   "click",
+		Page: p.ID,
+		Err:  errors.New("no answer"),
+	})
+
+	err := p.LockContext(context.Background(), "click")
+	var broken *PageBrokenError
+	if !errors.As(err, &broken) {
+		t.Fatalf("LockContext() = %v, want *PageBrokenError", err)
+	}
+	if !strings.Contains(err.Error(), "page session is closed") {
+		t.Fatalf("error = %q, want it to say the session is closed", err)
+	}
+	if _, ok := p.TryLock(); ok {
+		t.Fatal("TryLock acquired a session marked closed")
 	}
 }

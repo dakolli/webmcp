@@ -2,6 +2,7 @@ package browsers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -53,6 +54,19 @@ type Page struct {
 	// Browser.Page lookup. Atomic so listings and the sweeper never take the
 	// operation lock (a stuck page must not block them).
 	lastAccessNano atomic.Int64
+	// wedgeErr holds the error of an operation whose watchdog forced the
+	// operation lock open. While set, every new operation fails fast with it
+	// instead of touching a page the stuck operation may still be using.
+	// Atomic so a waiting caller can refuse without the operation lock.
+	wedgeErr atomic.Pointer[PageWatchdogError]
+	// closedErr marks a page the watchdog could not confirm usable after a
+	// forced release. It fail-fasts every new operation with a page_closed
+	// error; the page stays listed so the operator can close it.
+	closedErr atomic.Pointer[PageBrokenError]
+	// pointerX and pointerY are the last humanized pointer position in CSS
+	// pixels, so the next move is stepped from where the cursor already is.
+	// Guarded by the operation lock.
+	pointerX, pointerY float64
 	// docMarkerInstalled reports whether the handle-scope marker script has
 	// been installed on this page (see CaptureSnapshot). Guarded by the
 	// operation lock.
@@ -93,6 +107,182 @@ type Page struct {
 	opOnce sync.Once
 }
 
+// Operation-watchdog budgets. An operation gets watchdogGrace past its call
+// budget to unwind on cancellation before the watchdog stops trusting it, and
+// watchdogRecover to return at all before the page is marked closed.
+const (
+	defaultOpBudget = 30 * time.Second
+	watchdogGrace   = time.Second
+	watchdogRecover = 5 * time.Second
+	watchdogProbe   = 2 * time.Second
+)
+
+// PageWatchdogError reports that an operation outlived its call budget and the
+// page watchdog force-released the operation lock. It unwraps to
+// context.DeadlineExceeded so every surface classifies it as a timeout, and its
+// message names the watchdog so an operator can tell it from an ordinary slow
+// call.
+type PageWatchdogError struct {
+	// Op is the operation the watchdog stopped waiting for, e.g. "click".
+	Op string
+	// Page is the page that operation targeted.
+	Page PageID
+	// Waited is how long the operation ran before the watchdog tripped.
+	Waited time.Duration
+}
+
+// Error names the operation, the page and the watchdog.
+func (e *PageWatchdogError) Error() string {
+	return fmt.Sprintf(
+		"%s: page %s did not return within %s — the page watchdog force-released its lock; retry once the page recovers, or raise timeout_ms",
+		e.Op,
+		e.Page,
+		e.Waited.Round(time.Millisecond),
+	)
+}
+
+// Unwrap exposes context.DeadlineExceeded so surfaces classify the trip as a
+// timeout.
+func (e *PageWatchdogError) Unwrap() error { return context.DeadlineExceeded }
+
+// PageBrokenError reports that the watchdog forced a wedged page open and the
+// page did not answer the recovery probe, so the session was marked closed. It
+// is the typed page_closed error for a page that can no longer answer.
+type PageBrokenError struct {
+	// Op is the operation the watchdog was recovering from.
+	Op string
+	// Page is the page that was marked closed.
+	Page PageID
+	// Err is why the page could not be confirmed usable.
+	Err error
+}
+
+// Error states that the session is closed and names the cause.
+func (e *PageBrokenError) Error() string {
+	return fmt.Sprintf(
+		"%s: page %s did not answer the recovery probe after the page watchdog forced its lock open — page session is closed: %v",
+		e.Op,
+		e.Page,
+		e.Err,
+	)
+}
+
+// Unwrap exposes the probe failure.
+func (e *PageBrokenError) Unwrap() error { return e.Err }
+
+// GuardPage runs fn under the page operation lock while a watchdog watches the
+// call budget. The caller returns as soon as fn finishes; if fn outlives the
+// budget by watchdogGrace, the watchdog cancels fn, force-releases the lock and
+// returns a *PageWatchdogError. A recovery goroutine then waits for fn to
+// return, probes the page and either clears the wedge (the page is usable) or
+// marks the session closed with *PageBrokenError. The caller must not hold the
+// lock; fn must not lock either — the lock stays held for its whole run.
+func GuardPage[T any](
+	ctx context.Context,
+	p *Page,
+	op string,
+	fn func(context.Context) (T, error),
+) (T, error) {
+	var zero T
+	started := time.Now()
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultOpBudget)
+		defer cancel()
+	}
+	if err := p.LockContext(ctx, op); err != nil {
+		return zero, err
+	}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(p.Unlock) }
+
+	opCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type result struct {
+		value T
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- result{err: fmt.Errorf("%s: page %s panicked: %v", op, p.ID, r)}
+			}
+		}()
+		v, err := fn(opCtx)
+		done <- result{value: v, err: err}
+	}()
+
+	select {
+	case r := <-done:
+		release()
+		return r.value, r.err
+	case <-ctx.Done():
+	}
+
+	cancel()
+	select {
+	case r := <-done:
+		release()
+		return r.value, r.err
+	case <-time.After(watchdogGrace):
+	}
+
+	trip := &PageWatchdogError{Op: op, Page: p.ID, Waited: time.Since(started)}
+	p.wedgeErr.Store(trip)
+	release()
+	go func() {
+		select {
+		case <-done:
+		case <-time.After(watchdogRecover):
+			p.closedErr.Store(&PageBrokenError{
+				Op:   op,
+				Page: p.ID,
+				Err:  errors.New("the stuck operation never returned"),
+			})
+			return
+		}
+		probeCtx, cancel := context.WithTimeout(context.Background(), watchdogProbe)
+		defer cancel()
+		if err := p.probe(probeCtx); err != nil {
+			p.closedErr.Store(&PageBrokenError{Op: op, Page: p.ID, Err: err})
+			return
+		}
+		p.wedgeErr.CompareAndSwap(trip, nil)
+	}()
+	return zero, trip
+}
+
+// probe confirms the page still answers one minimal read. It takes the
+// operation lock itself; the caller must not hold it. A page already in use by
+// a newer operation is alive, so a lock that stays busy only up to ctx is not
+// treated as a failure.
+func (p *Page) probe(ctx context.Context) error {
+	select {
+	case <-p.lockCh():
+	case <-ctx.Done():
+		return nil
+	}
+	defer p.Unlock()
+	if _, _, err := p.readInfo(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+// unusable returns the typed error a page carries while wedged or closed, or
+// nil when the page may be operated. It never waits on the operation lock.
+func (p *Page) unusable() error {
+	if e := p.closedErr.Load(); e != nil {
+		return e
+	}
+	if e := p.wedgeErr.Load(); e != nil {
+		return e
+	}
+	return nil
+}
+
 // touch records that the page was just used, resetting its idle clock so the
 // manager's sweeper does not close it. It is lock-free: listings and the
 // sweeper must never wait on a page operation.
@@ -129,10 +319,18 @@ func (p *Page) Unlock() {
 
 // TryLock acquires the operation lock without waiting, reporting whether it
 // succeeded. A caller that cannot acquire it must treat the page as busy, not
-// dead: an in-flight operation means the tab is alive.
+// dead: an in-flight operation means the tab is alive. A page its watchdog
+// force-released or marked closed reports not-ok without touching the lock.
 func (p *Page) TryLock() (unlock func(), ok bool) {
+	if p.unusable() != nil {
+		return nil, false
+	}
 	select {
 	case <-p.lockCh():
+		if p.unusable() != nil {
+			p.Unlock()
+			return nil, false
+		}
 		return p.Unlock, true
 	default:
 		return nil, false
@@ -141,12 +339,23 @@ func (p *Page) TryLock() (unlock func(), ok bool) {
 
 // LockContext acquires the page operation lock, waiting only until ctx is
 // done. It returns one actionable sentence naming op and the time spent
-// waiting when another operation still holds the page.
+// waiting when another operation still holds the page, and the page's typed
+// watchdog or closed error when the page is no longer usable.
 func (p *Page) LockContext(ctx context.Context, op string) error {
+	return p.lockContext(ctx, op, true)
+}
+
+// lockContext is LockContext with the unusable-page guard switchable, so
+// teardown can still close a page its watchdog marked closed.
+func (p *Page) lockContext(ctx context.Context, op string, guard bool) error {
+	if guard {
+		if err := p.unusable(); err != nil {
+			return err
+		}
+	}
 	start := time.Now()
 	select {
 	case <-p.lockCh():
-		return nil
 	case <-ctx.Done():
 		return fmt.Errorf(
 			"%s: page %s is still busy after %s — a previous operation on this page did not return; retry, or close it with session_close",
@@ -155,6 +364,13 @@ func (p *Page) LockContext(ctx context.Context, op string) error {
 			time.Since(start).Round(time.Millisecond),
 		)
 	}
+	if guard {
+		if err := p.unusable(); err != nil {
+			p.Unlock()
+			return err
+		}
+	}
+	return nil
 }
 
 // Close closes the underlying rod tab, releasing the browser tab. The page
@@ -166,7 +382,7 @@ func (p *Page) LockContext(ctx context.Context, op string) error {
 // blocking the caller past its deadline.
 func (p *Page) Close(ctx context.Context) error {
 	p.stopInterception(ctx)
-	if err := p.LockContext(ctx, "close page"); err != nil {
+	if err := p.lockContext(ctx, "close page", false); err != nil {
 		return err
 	}
 	defer p.Unlock()
@@ -240,6 +456,14 @@ func (p *Page) snapshot(ctx context.Context, identity string) PageInfo {
 	info.URL = url
 	info.Title = title
 	return info
+}
+
+// State reads the tab's live URL and title under ctx. Unlike rod's Page.Info,
+// which routes through the browser's own unbounded context, this read is bound
+// to the caller's deadline, so a wedged target cannot hold the page lock past
+// the call budget. The caller must already hold the operation lock.
+func (p *Page) State(ctx context.Context) (string, string, error) {
+	return p.readInfo(ctx)
 }
 
 // readInfo reads the tab's live URL and title as one atomic pair: a single
@@ -382,7 +606,9 @@ func ValidateDeviceName(name string) error {
 // lock, with the nil-Rod guard; a name that matches no preset returns the
 // exact pinned unknown-device error.
 func (p *Page) Emulate(ctx context.Context, deviceName string) error {
-	p.Lock()
+	if err := p.LockContext(ctx, "emulate"); err != nil {
+		return err
+	}
 	defer p.Unlock()
 	if p.Rod == nil {
 		return fmt.Errorf("page session is closed")
@@ -408,7 +634,9 @@ func (p *Page) Emulate(ctx context.Context, deviceName string) error {
 // guard. vp must be non-nil; the MCP/CLI layers enforce their own pinned
 // "requires a viewport" errors before calling.
 func (p *Page) SetViewport(ctx context.Context, vp *Viewport) error {
-	p.Lock()
+	if err := p.LockContext(ctx, "set viewport"); err != nil {
+		return err
+	}
 	defer p.Unlock()
 	if p.Rod == nil {
 		return fmt.Errorf("page session is closed")
