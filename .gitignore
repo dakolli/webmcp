@@ -18,3 +18,5 @@ smoketest.md
 !.agents/skills/
 .agents/skills/go-rod/
 .opencode/*
+dist/
+.release/

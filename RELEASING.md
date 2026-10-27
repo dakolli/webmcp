@@ -53,10 +53,11 @@ export GH_TOKEN="$(gh auth token)"
 3. **Ask an LLM for prose.** Open `.release/notes.md`, paste it into your model with the prompt in
    section 3, then save the model's answer over the `## Summary` and `## Highlights` sections.
    Leave the grouped commit list intact.
-4. **Dry run.** `make release-dry` runs `goreleaser release --snapshot --clean` and builds every
-   artifact into `dist/` locally. It uploads nothing and needs no tag.
-5. **Inspect the artifacts.** Check the six archives and `checksums.txt`, and run one binary:
-   `./dist/browser_<version>_linux_amd64/browser --version`.
+4. **Optional: local build check.** The release builds on GitHub, so skip this unless you want to
+   see the archives first. `make release-dry` runs `goreleaser release --snapshot --clean` and
+   writes six archives plus `checksums.txt` into `dist/` on your machine. `dist/` is gitignored and
+   takes about 30 MB. Delete it when you are done.
+5. **Optional: inspect those archives.** Run one binary: `./dist/browser_<version>_linux_amd64/browser --version`.
 6. **Tag.** `make bump PART=minor` (or `PART=patch` / `PART=major`) creates the annotated tag
    locally and prints the push command. It refuses a dirty tree and an existing tag.
 7. **Push the tag.** `git push origin <tag>` — the only command here that writes to the remote, and

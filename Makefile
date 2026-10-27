@@ -15,7 +15,7 @@
 # notes       — group the commits since the last tag (or the whole history when
 #               there is none) into .release/notes.md
 # changelog   — write a dated, grouped section into CHANGELOG.md (newest first)
-# release-dry — build every release artifact locally (snapshot, no upload)
+# release-dry — OPTIONAL local build. The release workflow builds the archives on GitHub.
 # bump        — create the next annotated tag locally and print the push command
 # release     — build a DRAFT GitHub release; never pushes, never publishes
 # tools       — print the install commands for goreleaser and git-cliff
@@ -236,7 +236,7 @@ changelog:
 	fi; \
 	printf 'wrote %s\n' CHANGELOG.md
 
-# release-dry — build every artifact locally with goreleaser --snapshot; uploads nothing.
+# release-dry — OPTIONAL local snapshot build into dist/. The GitHub Action is the real builder.
 release-dry:
 	@if ! command -v goreleaser >/dev/null 2>&1; then \
 		echo "release-dry: goreleaser not found — install it with: go install github.com/goreleaser/goreleaser/v2@v2.17.0" >&2; \

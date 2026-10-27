@@ -50,10 +50,13 @@ The full operating manual is [RELEASING.md](RELEASING.md). The short loop:
 ```sh
 make notes          # group commits since the last tag into .release/notes.md (all history on the first release)
 make changelog      # insert a dated section into CHANGELOG.md (newest first)
-make release-dry    # build every artifact locally (snapshot, no upload)
-make bump PART=minor
-make release VERSION=v0.2.0
+make bump PART=minor    # create the annotated tag locally and print the push line
+git push origin v0.1.0  # the GitHub Action builds and uploads the archives
+gh release edit v0.1.0 --notes-file .release/notes.md --draft=false
 ```
+
+`make release-dry` is optional. It builds the six archives into `dist/` on your machine when you
+want a local check. The release itself builds on GitHub, so you do not need to run it.
 
 `make changelog` maintains [`CHANGELOG.md`](CHANGELOG.md) at the repository root: it inserts a
 dated section for the next version directly under the title, grouped by commit prefix, and replaces
