@@ -91,18 +91,21 @@ Connect an MCP client:
 - An idle browser closes after 30 minutes. A dead Chromium relaunches with the same id.
 - `purge` deletes one owned profile. `prune` removes orphan ephemeral profiles.
 - Stealth applies to every page. Device, viewport, window position and user agent are per page.
+- The default User-Agent tracks the launched Chromium major, with matching `Sec-CH-UA` hints and an `en-US` language, and an explicit `user_agent` wins.
 - The page lock is context-bound. A slow action cannot block the daemon.
 
 ### Isolation and control
 
 - Named incognito identities share one Chromium process. Each identity keeps its own cookies and
   storage.
-- A scope allowlist limits navigation. The engine refuses an off-scope host.
+- A scope allowlist bounds navigation, replay, every redirect hop, and intercepted subresources. The engine refuses an off-scope request before it is sent.
+- A per-host rate limit (`rps` 5, `burst` 10 by default) spaces requests. A request that cannot get a token before its deadline fails as `timeout`.
+- Auth snapshots save and restore a login across browsers and identities. Results carry counts only, never a cookie or storage value.
 - Extra headers go on every request of a browser.
 - Proxy support includes credentials, a bypass list, and `ignore_certs`.
 - Replay sends a captured request through Go. It carries the page cookies and follows redirects.
 
-### Reads: `page_fetch` has 21 aspects
+### Reads: `page_fetch` has 23 aspects
 
 - Document: `html`, `text`, `dom`, `links`, `meta`.
 - Sources: `css`, `js`, and `body` for one resource.
@@ -111,13 +114,13 @@ Connect an MCP client:
 - Accessibility: `a11y` reports 400 nodes with role, name, value, state flags, and handles.
 - Runtime: `network` with request and response headers. `console` for logs.
 - Text: `article` returns the readable body as markdown.
-- Security: `security` audits headers, CSP, cookie flags, mixed content, and form targets.
+- Security: `security` audits headers, CSP, cookie flags, mixed content, and form targets, and probes the CSP for eight bypass patterns. It is passive: no injection, execution, or load.
 - State: `storage` reports cookies with flags, local and session storage, IndexedDB and caches. Values
   are redacted by default.
 - Tracer: `sinks` reports source-to-sink hits. It is read-only. Arm it with `page_act sinks_install`.
 - Export: `har` returns HAR 1.2 for the observed network traffic.
 
-### Actions: `page_act` has 23 actions
+### Actions: `page_act` has 34 actions
 
 - Mouse: `click`, `click_at`, `hover`, `hover_at`, `drag_and_drop`.
 - Keyboard: `input`, `type`, `press_key` with combos such as `Control+a`.
@@ -126,7 +129,8 @@ Connect an MCP client:
 - View and time: `scroll`, `wait`, `set_viewport`, `emulate`.
 - Code and logs: `eval`, `clear_logs`.
 - Tracer: `sinks_install`, `sinks_clear`. Both take no payload.
-- Network: `replay`.
+- Network: `replay`, `intercept_add`, `intercept_list`, `intercept_clear`.
+- Auth: `auth_save`, `auth_restore`, `auth_list`. Results carry counts only.
 
 ### Surfaces
 
@@ -174,12 +178,15 @@ The arm survives a full navigation. The hit ring restarts for each document.
 
 ## Scope and headers
 
-- `--scope HOST` confines navigation. A bare host covers its subdomains. A leading `*.` glob and
+- `--scope HOST` confines requests. A bare host covers its subdomains. A leading `*.` glob and
   `host:port` are accepted. `*` allows all.
 - No scope means no limit. `browser_list` reports the live state as `scope` plus `scope_strict`.
-- `--scope-strict` is opt-in. It makes an empty allowlist deny every navigation.
+- `--scope-strict` is opt-in. It makes an empty allowlist deny every request.
 - A refusal names the host, the allowed list, and the fix.
-- The limit applies to navigation only. Subresources and redirects are not gated.
+- The limit covers navigation, replay, every redirect hop, and intercepted subresources. An off-scope
+  request is refused before it is sent, and a refused replay redirect names the hop and the host.
+- `rps` and `burst` are MCP create inputs only: the CLI has no flags for them. The default is 5/s with
+  a burst of 10 per host, and the effective policy appears as `limits` on `browser_list`.
 
 ## Proxy and TLS
 
@@ -211,8 +218,8 @@ asks for it.
 
 | Tool | Purpose |
 | :--- | :--- |
-| `browser_create` | Create or reuse a browser. Inputs: `bin`, `profile`, `persist`, `owner`, `headless`, `stealth`, `position`, `proxy`, `proxy_bypass`, `ignore_certs`, `headers`, `scope`, `scope_strict`. |
-| `browser_list` | List live browsers with `owner`, `persist`, `ephemeral`, `created_at`, `idle_for`, `ttl`, `scope`, `scope_strict`, `profile_dir`, and their pages. |
+| `browser_create` | Create or reuse a browser. Inputs: `bin`, `profile`, `persist`, `owner`, `headless`, `stealth`, `position`, `proxy`, `proxy_bypass`, `ignore_certs`, `headers`, `scope`, `scope_strict`, `rps`, `burst`. |
+| `browser_list` | List live browsers with `owner`, `persist`, `ephemeral`, `created_at`, `idle_for`, `ttl`, `scope`, `scope_strict`, `limits`, `profile_dir`, and their pages. |
 | `browser_close` | Close one browser, or all when `browser_id` is empty. `purge` deletes one profile. `prune` removes orphan ephemeral profiles. |
 | `fetch_page` | Open a URL in a new session. Returns `session_id` and a summary. `wait_for` defaults to `idle`. `identity` selects an incognito context. |
 | `page_list` | List the pages of a browser with the live URL, title, and `context`. |
@@ -227,7 +234,7 @@ template. It names the tools. You still call them.
 
 ## Page aspects
 
-`what` accepts 21 values. `selector` scopes `html` and `text`. `max_bytes` defaults to 50000.
+`what` accepts 23 values. `selector` scopes `html` and `text`. `max_bytes` defaults to 50000.
 `full_page` applies to `screenshot`. `timeout_ms` bounds each call: it defaults to 30000 and is
 clamped to 1..120000. A full-page screenshot keeps a 90s floor unless `timeout_ms` is larger.
 
@@ -287,6 +294,21 @@ then the action, then `page_fetch` with `network` or `console`.
 target host and follows up to 5 redirects. It returns `{status, headers, body, bytes, truncated, ms,
 request, chain}`. Sensitive response headers are redacted.
 
+`page_act` can also intercept requests in flight with `intercept_add`, `intercept_list`, and
+`intercept_clear`. A URL-matched rule blocks, allows, rewrites, or fulfills a request, and every match
+is tagged on the `network` ring. Rules are per page, capped at 50, and must not run beside proxy
+authentication. The CLI and IPC have no `intercept_*` action yet. A response served from the HTTP
+cache bypasses the rules, `rewrite` cannot change the HTTP method, and a rewritten header does not
+appear in the ring's `req_headers`.
+
+`page_act auth_save` captures the live page's cookies for `site` plus local storage, session storage,
+and IndexedDB names. `auth_restore` writes the snapshot into the page's browser context, so a new
+browser and a new `identity` both render the login. `auth_list` needs no live session. Results carry
+counts and a `warning` only; the store is plaintext with mode 0600, so that warning is the only
+confidentiality signal. Host-only cookies stay host-only. The CLI mirrors them as
+`browser page auth save <site> <name>`, `browser page auth restore <site> <name>` (with `--force`),
+and `browser page auth list [site]`.
+
 ---
 
 ## CLI
@@ -311,6 +333,7 @@ browser page close last
 | `browser page list` | `page_list` / `session_list` |
 | `browser page fetch [id\|url] [what]` | `page_fetch` |
 | `browser page act [id] [action] [payload...]` | `page_act` |
+| `browser page auth save\|restore\|list` | `page_act` `auth_*` |
 | `browser page close [id]` | `session_close` |
 | `browser create` / `list` / `close` | `browser_create` / `browser_list` / `browser_close` |
 | `browser skill <harness>` | — (CLI-only: install the agent skill) |

@@ -1,4 +1,4 @@
-> Tool: `page_act` · Server: web-mcp · Surface: MCP · Tested: 2026-10-26
+> Tool: `page_act` · Server: web-mcp · Surface: MCP · Tested: 2026-10-27
 
 # page_act example
 
@@ -33,8 +33,7 @@ Expect `set input selector="input[name=\"custname\"]" length=12`, `set input sel
 
 ## 3. select and upload_file
 
-The httpbin form has no `<select>` and no file input. Open the Selenium web-form page and
-use its `session_id` (`page-2` in this run):
+The httpbin form has no `<select>` and no file input, so open the Selenium web-form page as `page-2`:
 
 ```json
 {"tool":"page_act","arguments":{"session_id":"page-2","action":"select","selector":"select[name=\"my-select\"]","value":"2"}}
@@ -56,9 +55,7 @@ Expect `selected option value="2" in selector="select[name=\"my-select\"]"` and 
 {"tool":"page_act","arguments":{"session_id":"page-3","action":"click","selector":"h1#firstHeading","click_count":2}}
 ```
 
-Expect `clicked handle="gcq7sm3ng-b48"`, `clicked at (34.0, 33.0) button=left count=1`,
-`hovered at (512.0, 33.0)`, `scrolled to [\n  0,\n  400\n]`, `pressed key "Control+A"`,
-and `clicked selector="h1#firstHeading" button=left count=2`.
+Expect `clicked handle="gcq7sm3ng-b48"`, `clicked at (34.0, 33.0) button=left count=1`, `hovered at (512.0, 33.0)`, `scrolled to [\n  0,\n  400\n]`, `pressed key "Control+A"`, and `clicked selector="h1#firstHeading" button=left count=2`.
 
 ## 5. Navigation, eval, logs, viewport, and emulation
 
@@ -74,12 +71,7 @@ and `clicked selector="h1#firstHeading" button=left count=2`.
 {"tool":"page_act","arguments":{"session_id":"page-5","action":"emulate","device":"IPadPro"}}
 ```
 
-Expect `navigated to "https://react.dev/learn/describing-the-ui" (title "Describing the UI – React")`
-(`navigate` never appends a delta), `navigated back to "https://react.dev/learn"`,
-`navigated forward to "https://react.dev/learn/describing-the-ui"`, `reloaded page`,
-`{"ready":"complete","title":"Describing the UI – React"}` (a DOM node returns `{}`),
-`{"network":132,"console":1,"websocket":0}`, `set viewport to 1024x768`, and `emulated device: IPadPro`.
-The page then reports `1024x1366` at DPR 2. `emulate` wins. `{"device":"clear"}` resets both.
+Expect `navigated to "https://react.dev/learn/describing-the-ui" (title "Describing the UI – React")` with no delta, then `navigated back to "https://react.dev/learn"`, `navigated forward to "https://react.dev/learn/describing-the-ui"`, `reloaded page`, `{"ready":"complete","title":"Describing the UI – React"}` (a DOM node returns `{}`), `{"network":132,"console":1,"websocket":0}`, `set viewport to 1024x768`, and `emulated device: IPadPro`. The page then reports `1024x1366` at DPR 2. `emulate` wins, and `{"device":"clear"}` resets both.
 
 ## 6. Drag and drop
 
@@ -106,9 +98,23 @@ The second `target` is the seq of this run's `news.css` request. Success rides `
 {"ok":true,"data":{"status":200,"headers":{"Content-Type":["text/css; charset=utf-8"],"Server":["nginx"],"Vary":["Accept-Encoding"]},"body":"body  { font-family:Verdana, Geneva, sans-serif; … }","bytes":7418,"ms":63,"request":{"method":"GET","url":"https://news.ycombinator.com/news.css?EieZrD3Ae1qf3cIQQaRb","headers":{"Accept-Language":"en","Referer":"https://news.ycombinator.com/","User-Agent":"Mozilla/5.0 …"}}}}
 ```
 
-Replay re-reads the request and carries the page's cookies for the target host, and it never writes to the page. Pass `method` to override the method, `headers` to replace captured headers, or `value` to replace the request body.
+Replay re-reads the request and carries the page's cookies for the target host, and it never writes to the page. Pass `method` to override the method, `headers` to replace captured headers, or `value` to replace the request body. From a shell with the daemon up, the same replay is `browser page act last replay 2`, or `browser page act last replay /news.css --method GET --max-bytes 4000 --value ''`. The first positional is the target, and `--value` (not a positional) carries the replacement body.
 
-## 8. Arm the sink tracer and inject a canary
+## 8. Intercept and rewrite requests
+
+Reuse `page-6` from §7: fulfill its `news.css`, reload, then read the tag and clear:
+
+```json
+{"tool":"page_act","arguments":{"session_id":"page-6","action":"intercept_add","rules":[{"id":"css","url_pattern":"*news.css*","action":"fulfill","status":200,"headers":{"Content-Type":"text/css"},"body":"body{background:#fff}"}]}}
+{"tool":"page_act","arguments":{"session_id":"page-6","action":"reload"}}
+{"tool":"page_fetch","arguments":{"session_id":"page-6","what":"network"}}
+{"tool":"page_act","arguments":{"session_id":"page-6","action":"intercept_list"}}
+{"tool":"page_act","arguments":{"session_id":"page-6","action":"intercept_clear"}}
+```
+
+Expect `{"rules":[{"id":"css","url_pattern":"*news.css*","action":"fulfill","headers":{"Content-Type":"text/css"},"status":200,"body":"body{background:#fff}"}],"count":1,"active":true}`, then `reloaded page`, then a `news.css` entry carrying `"intercepted":"fulfill"`, `"intercept_rule_id":"css"`, `"status":200`, and `"mime":"text/css"`. `intercept_list` repeats the rule, and `intercept_clear` returns `{"rules_removed":1,"active":false}`. `block`, `allow`, and `rewrite` rules work the same way, and every match is tagged on the ring. The three actions are MCP-only. `browser page act … intercept_add` returns `page act: unknown action="intercept_add"`. This block is source-verified: the daemon running on 2026-10-27 predated `intercept_add`. Three limits apply. A response served from cache bypasses the rules, so a rule for a cached CSS file does nothing until you use a fresh context or clear the cache. `rewrite` cannot change the HTTP method, because `method` is a match filter only. A rewritten header does not appear in the network ring's `req_headers`.
+
+## 9. Arm the sink tracer and inject a canary
 
 Open `https://www.sqlite.org/index.html` as `page-7`, install, inject the hash, read the hits, then clear:
 
@@ -123,7 +129,7 @@ Open `https://www.sqlite.org/index.html` as `page-7`, install, inject the hash, 
 
 Expect `{"installed":true}`, then `{"canary":"wm-canary-…","injected":[{"target":"hash","where":"https://www.sqlite.org/index.html"}],"hits":[],"installed":true}`. The static page has no hash sink, so `hits:[]` is a clean result. The control eval makes a real finding: `{"source":"location.hash","sink":"innerHTML","context":"html","selector":"div#probe","value":"#wm-canary-…","stack":[…]}`. `selector` and `stack` are omitted when empty. Without `sinks_install` the call fails with `page_act: inject_canary needs the sink tracer — run action "sinks_install" first`. Then `{"cleared":1}` and a second `sinks_install` is a no-op.
 
-## 9. Failure examples
+## 10. Failure examples
 
 An ambiguous replay URL substring anchors the failure path (tested live on 2026-10-26):
 
@@ -141,14 +147,35 @@ An ambiguous replay URL substring anchors the failure path (tested live on 2026-
 {"tool":"page_act","arguments":{"session_id":"page-2","action":"eval","value":"() => {"}}
 ```
 
-Expect `page_act: click requires selector (or a handle from page_fetch what=interactives)`, `page_act: press_key: unknown key name "Banana"`, and `page_act: evaluate js: eval js error: SyntaxError: Unexpected token ')' <nil>`. Stale handles return the `page_act: handle "…" is stale — …` message, so re-read `interactives`.
+Expect `page_act: click requires selector (or a handle from page_fetch what=interactives)`, `page_act: press_key: unknown key name "Banana"`, and `page_act: evaluate js: eval js error: SyntaxError: Unexpected token ')' <nil>`. Stale handles return the `page_act: handle "…" is stale — …` message, so re-read `interactives`. Do not send an unknown `select` value: a live `"value":"nope"` returned `MCP error -32001: Request timed out` and wedged the whole server.
 
-Do not send an unknown `select` value. A live `"value":"nope"` returned `MCP error -32001: Request timed out` and wedged the whole server.
+## 11. Save and restore a login
 
-## 10. Clean up
+Log in on `www.saucedemo.com`, save the session, close the browser, then restore it into a new browser and a new identity:
 
 ```json
+{"tool":"browser_create","arguments":{"owner":"auth-demo","headless":true,"stealth":true}}
+{"tool":"fetch_page","arguments":{"url":"https://www.saucedemo.com/","browser_id":"browser-11","wait_for":"load"}}
+{"tool":"page_act","arguments":{"browser_id":"browser-11","session_id":"page-1","action":"input","selector":"#user-name","value":"standard_user"}}
+{"tool":"page_act","arguments":{"browser_id":"browser-11","session_id":"page-1","action":"input","selector":"#password","value":"secret_sauce"}}
+{"tool":"page_act","arguments":{"browser_id":"browser-11","session_id":"page-1","action":"click","selector":"#login-button"}}
+{"tool":"page_fetch","arguments":{"browser_id":"browser-11","session_id":"page-1","what":"meta"}}
+{"tool":"page_act","arguments":{"browser_id":"browser-11","session_id":"page-1","action":"auth_save","site":"www.saucedemo.com","name":"main"}}
+{"tool":"browser_close","arguments":{"browser_id":"browser-11"}}
+{"tool":"browser_create","arguments":{"owner":"auth-demo-2","headless":true,"stealth":true}}
+{"tool":"fetch_page","arguments":{"url":"https://www.saucedemo.com/","browser_id":"browser-12","identity":"restored","wait_for":"load"}}
+{"tool":"page_act","arguments":{"browser_id":"browser-12","session_id":"page-1","action":"auth_restore","site":"www.saucedemo.com","name":"main"}}
+{"tool":"page_act","arguments":{"browser_id":"browser-12","session_id":"page-1","action":"navigate","value":"https://www.saucedemo.com/inventory.html"}}
+{"tool":"page_fetch","arguments":{"browser_id":"browser-12","session_id":"page-1","what":"meta"}}
+```
+
+Expect the login click to land on `https://www.saucedemo.com/inventory.html` with title `Swag Labs`. `auth_save` returns `{"site":"www.saucedemo.com","name":"main","cookies":N,"origins":1,"user_agent":"…","updated_at":"…","warning":"auth snapshots are stored unencrypted in the local state database (mode 0600) …"}`. `auth_list` needs no session: it answers with a stale `session_id` and with no live browser, returning `{"snapshots":[{"site":"www.saucedemo.com","name":"main","cookie_count":N,"origin_count":1,"user_agent":"…","updated_at":"…"}],"count":1,"warning":"…"}` and never a value. `auth_restore` returns counts plus `forced:false` and the same `warning`, and the new identity renders the inventory page. The host-only `session-username` cookie stays scoped to `www.saucedemo.com` after restore. The store is plaintext with mode 0600, so the `warning` is the only confidentiality signal. Verified live on 2026-10-27.
+
+## 12. Clean up
+
+```json
+{"tool":"browser_close","arguments":{"browser_id":"browser-12"}}
 {"tool":"browser_close","arguments":{"browser_id":"browser-10"}}
 ```
 
-Expect the browser to disappear from `browser_list`. Close only your own id and never close an empty id.
+Expect each browser to disappear from `browser_list`. Close only your own ids and never close an empty id.

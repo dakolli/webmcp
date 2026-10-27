@@ -1,4 +1,4 @@
-> Tool: `browser_list` · Server: web-mcp · Surface: MCP · Tested: 2026-10-25
+> Tool: `browser_list` · Server: web-mcp · Surface: MCP · Tested: 2026-10-27
 
 # browser_list example
 
@@ -16,11 +16,11 @@ Every result rides the envelope: `{"ok":true,"data":<shown payload>}`. Errors ri
 Expected payloads:
 
 ```json
-{"browser_id":"browser-2","owner":"client-a","persist":false,"ttl":"30m0s","scope":"open","scope_strict":false,"reused":false}
-{"browser_id":"browser-3","owner":"client-b","persist":false,"ttl":"30m0s","scope":"wikipedia.org","scope_strict":false,"reused":false}
+{"browser_id":"browser-2","owner":"client-a","persist":false,"ttl":"30m0s","scope":"open","scope_strict":false,"limits":{"rps":5,"burst":10,"hosts":[]},"reused":false}
+{"browser_id":"browser-3","owner":"client-b","persist":false,"ttl":"30m0s","scope":"wikipedia.org","scope_strict":false,"limits":{"rps":5,"burst":10,"hosts":[]},"reused":false}
 ```
 
-The scoped browser can navigate only to wikipedia.org and its subdomains. A fetch to any other host fails with a refusal that names the allowed hosts.
+The scoped browser can reach only wikipedia.org and its subdomains. A request to any other host is refused before it is sent, with a refusal that names the allowed hosts.
 
 ## 2. Read the live state
 
@@ -31,10 +31,10 @@ The scoped browser can navigate only to wikipedia.org and its subdomains. A fetc
 Expected envelope. `created_at`, `idle_for`, and the ephemeral suffix differ on your host.
 
 ```json
-{"ok":true,"data":[{"browser_id":"browser-2","owner":"client-a","profile_dir":"<profiles-dir>/.ephemeral/browser-2-150041042","persist":false,"ephemeral":true,"created_at":"2026-10-25T12:00:00.123456Z","idle_for":"0s","ttl":"30m0s","scope":"open","scope_strict":false,"pages":[]},{"browser_id":"browser-3","owner":"client-b","profile_dir":"<profiles-dir>/.ephemeral/browser-3-150041091","persist":false,"ephemeral":true,"created_at":"2026-10-25T12:00:05.654321Z","idle_for":"2s","ttl":"30m0s","scope":"wikipedia.org","scope_strict":false,"pages":[]}]}
+{"ok":true,"data":[{"browser_id":"browser-2","owner":"client-a","profile_dir":"<profiles-dir>/.ephemeral/browser-2-150041042","persist":false,"ephemeral":true,"created_at":"2026-10-25T12:00:00.123456Z","idle_for":"0s","ttl":"30m0s","scope":"open","scope_strict":false,"limits":{"rps":5,"burst":10,"hosts":[]},"pages":[]},{"browser_id":"browser-3","owner":"client-b","profile_dir":"<profiles-dir>/.ephemeral/browser-3-150041091","persist":false,"ephemeral":true,"created_at":"2026-10-25T12:00:05.654321Z","idle_for":"2s","ttl":"30m0s","scope":"wikipedia.org","scope_strict":false,"limits":{"rps":5,"burst":10,"hosts":[]},"pages":[]}]}
 ```
 
-`scope` is the navigation allowlist. `open` means no limit. A host list means traffic outside it fails. `strict` in place of `open` means every navigation is refused. Read `scope` before you send traffic to a new host. The array is sorted by `browser_id`.
+`scope` is the request allowlist. `open` means no limit. A host list means a request outside it is refused before it is sent. `strict` in place of `open` means every request is refused. `limits` shows the per-host budget and each host's `throttled` count. Read both before you send traffic to a new host. The array is sorted by `browser_id`.
 
 ## 3. Open a page in the unscoped browser
 
@@ -68,6 +68,7 @@ Expected entry for your browser:
   "ttl": "30m0s",
   "scope": "open",
   "scope_strict": false,
+  "limits": {"rps": 5, "burst": 10, "hosts": []},
   "pages": [{"id": "page-1", "url": "https://example.com"}]
 }
 ```

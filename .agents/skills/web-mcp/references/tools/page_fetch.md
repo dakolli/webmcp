@@ -1,4 +1,4 @@
-> Tool: `page_fetch` · Server: web-mcp · Surface: MCP · Tested: 2026-10-26
+> Tool: `page_fetch` · Server: web-mcp · Surface: MCP · Tested: 2026-10-27
 
 # page_fetch
 
@@ -76,7 +76,7 @@ Image blocks are on by default. A client opts out at `initialize` with `capabili
 - **`meta`** holds `title`, `url`, and a `meta` array with any of `name`, `property`, `http-equiv`, `content`, `charset`. **`css`** and **`js`** list resources, with inline `<style>`/`<script>` blocks appearing as `inline-style[1]`. Both lists end with a hint naming `what=<css|js>&target=<url>`.
 - **`interactives`** holds `handle`, `role`, `text`, `href`, `type`, `x`, `y`, `width`, `height`, `box {x,y,w,h}`, `frame_url`, `visible`. `box` is the layout bounds as top-left plus size, `frame_url` names the same-process child frame that owns a framed entry (absent on the top document), and every x/y/box value is page-absolute CSS px, so `box.x + box.w/2 == x`. `visible: true` means the node has a layout box, not that it is in the viewport. The payload also carries `frames`, one row per child frame and `[]` on a frameless page, and `frames_truncated`, the child-frame remainder, which is `0` on a frameless page. `truncated` is the root remainder only.
 - **`a11y`** holds `handle`, `depth`, `role`, `name`, `value`, `states`, plus `count` and `truncated`. Names and values are clipped at 200 runes. Root frame only.
-- **`network`** entries hold `method`, `url`, `type`, `status`, `mime`, `bytes`, `ms`, `failed`, `error`, `seq`, `req_headers`, `resp_headers`. Each header map keeps at most 32 headers per direction at 512 bytes per value under a 4 KB name+value budget, and a cut set adds `req_headers_truncated` or `resp_headers_truncated`. No bodies. **`console`** entries hold `level`, `text`, `source`, `line`, `seq`.
+- **`network`** entries hold `method`, `url`, `type`, `status`, `mime`, `bytes`, `ms`, `failed`, `error`, `seq`, `req_headers`, `resp_headers`, and, when `page_act` `intercept_*` resolved the request, `intercepted` (`block`, `allow`, `rewrite`, or `fulfill`) plus `intercept_rule_id`. A `block` also sets `failed` and an `error` naming the rule, and a `fulfill` sets the synthetic `status` and `mime`. Each header map keeps at most 32 headers per direction at 512 bytes per value under a 4 KB name+value budget, and a cut set adds `req_headers_truncated` or `resp_headers_truncated`. A header set by a `page_act` `intercept_*` `rewrite` rule is absent from `req_headers`, so the ring is not proof of the header set that was sent. No bodies. **`console`** entries hold `level`, `text`, `source`, `line`, `seq`.
 - **`body`** adds `body` for UTF-8 text or `base64` plus `content_type` for binary, both exclusive, with `bytes` as the pre-cap size and `truncated` on the 256 KB cut. **`marks`** items hold `index`, `role`, `text`, `x`, `y`, `width`, `height` in viewport CSS pixels that can be negative, and the top-left `x`/`y` feed `page_act` `click_at` directly. The `screenshot` field appears only for a text-only client.
 
 ## Behavior and limits
@@ -94,7 +94,7 @@ Capture starts before the first document loads. All three rings are cumulative f
 
 #### Header redaction
 
-`Cookie` and `Set-Cookie` are absent, not redacted, because Chrome omits them from CDP events. `Authorization` and `X-CSRF-Token` values show `<redacted>` by default, and the name match is case-insensitive (`code://pkg/browsers/redact.go#L24`). The engine switch `Page.CaptureSecrets(true)` keeps the values of entries captured after the switch, and entries already captured are not rewritten (`code://pkg/browsers/observe.go#L400`). No surface exposes the switch today.
+`Cookie` and `Set-Cookie` are absent, not redacted, because Chrome omits them from CDP events. `Authorization` and `X-CSRF-Token` values show `<redacted>` by default, and the name match is case-insensitive (`code://pkg/browsers/redact.go#L24`). The engine switch `Page.CaptureSecrets(true)` keeps the values of entries captured after the switch, and entries already captured are not rewritten (`code://pkg/browsers/observe.go#L483`). No surface exposes it today.
 
 #### Response bodies with what=body
 
@@ -102,15 +102,17 @@ Capture starts before the first document loads. All three rings are cumulative f
 
 #### Security audit with what=security
 
-`security` returns one passive audit. It never reloads or probes the site. It reads observed response headers from the network ring, the cookie jar for the current URL, and one DOM evaluation. Source: `code://pkg/cli/pageops/security.go#L124-L167`.
-
-The report holds `url`, `checks`, `count`, and `truncated`. Each check holds `id`, `status` — `ok`, `warn`, `fail`, or `info` — evidence, and detail. Check ids and the status you get when the protection is missing (`code://pkg/cli/pageops/security.go#L223-L601`):
+`security` returns one passive audit. It never reloads, injects, executes, or loads anything. It reads observed response headers from the network ring, the cookie jar for the current URL, and one DOM evaluation. Source: `code://pkg/cli/pageops/security.go#L124-L167`. The report holds `url`, `checks`, `count`, and `truncated`. Each check holds `id`, `status` — `ok`, `warn`, `fail`, or `info` — evidence, and detail. Check ids and the status you get when the protection is missing (`code://pkg/cli/pageops/security.go#L223-L823`):
 
 | `id` | Meaning and status when the protection is missing |
 | :--- | :--- |
-| `headers` | `info` only: the document response left the ring and every header check reads absent, or the captured header set was cut at 32 headers / 4 KB. |
+| `headers` | `info` only: the document response left the ring, or the captured set was cut at 32 headers / 4 KB, so every header check below reads absent. |
 | `csp` | `warn` when no `Content-Security-Policy` header and no `<meta http-equiv>` policy exists. A meta-only policy is a warning too. |
 | `csp_unsafe_inline`, `csp_unsafe_eval` | `warn` when the policy allows the directive. Present only when any policy was found. |
+| `csp_bypass_unsafe_inline`, `csp_bypass_unsafe_eval` | `fail` when the effective `script-src` or its `default-src` fallback allows the token. `unsafe-inline` is `ok` when a nonce or hash neutralizes it. |
+| `csp_bypass_script_wildcard` | `fail` for `*` or a scheme source (`http:`, `https:`, `data:`, `blob:`, `filesystem:`), `warn` for a `*.host` subdomain wildcard. |
+| `csp_bypass_object_src`, `csp_bypass_base_uri`, `csp_bypass_frame_ancestors` | `warn` when `object-src` has no direct or `default-src` value, when `base-uri` is absent, or when `frame-ancestors` accepts `*`, `http:`, or `https:`. An absent `frame-ancestors` is `info`. |
+| `csp_bypass_report_only`, `csp_bypass_trusted_host` | `info` for any `Content-Security-Policy-Report-Only` policy, quoting its first directive. `warn` when a script-src host is a known JSONP or user-host domain. |
 | `hsts` | `fail` with no header or on plain http, `warn` when a value sets `max-age=0`. |
 | `x_frame_options` | `warn` when absent. A CSP `frame-ancestors` directive satisfies it. |
 | `x_content_type_options` | `warn` unless the header is exactly `nosniff`. |
@@ -122,7 +124,9 @@ The report holds `url`, `checks`, `count`, and `truncated`. Each check holds `id
 | `password_autocomplete` | `warn` for password fields lacking `current-password` or `new-password`. |
 | `cors` | `warn` for an observed response pairing `Access-Control-Allow-Origin: *` with credentials, `info` before any response is observed. |
 
-Evidence names at most 10 offending values, then `(+N more)`. The script, form, password, and cookie lists are each cut at 200 entries and every omission is reported in `truncated`. Live run on 2026-10-26 against `https://go.dev/`: `count: 20` (6 cookie checks, 2 `csp_unsafe_*`, 14 header/content/cors checks), `truncated: 0`.
+Evidence names at most 10 offending values, then `(+N more)`. The script, form, password, and cookie lists are each cut at 200 entries and every omission is reported in `truncated`. Live run on 2026-10-26 against `https://go.dev/`: `count: 20` (6 cookie checks, 2 `csp_unsafe_*`, 14 header/content/cors checks), `truncated: 0`, before the eight `csp_bypass_*` checks landed.
+
+The eight `csp_bypass_*` probes (`code://pkg/cli/pageops/security.go#L539`) read the enforced policy text — the response header, or a meta policy when the header is absent — plus the report-only header. They never inject, execute, or load anything, and the evidence quotes the real directive, so they report policy weakness, not proven exploitability. `csp_bypass_trusted_host` uses a closed list: google.com, googleapis.com, cloudflare.com, jsdelivr.net, unpkg.com, github.io, herokuapp.com, firebaseapp.com, netlify.app, vercel.app, s3.amazonaws.com, cloudfront.net, azureedge.net, azurewebsites.net, and appspot.com, subdomains included.
 
 ### WebSocket frames with what=websocket
 
@@ -136,15 +140,13 @@ The payload is `{installed, hits:[{source, sink, context, value, value_cut?, sta
 
 `source` names the tagged read, for example `location.hash`, `message`, `localStorage.getItem`, or `unknown`. `sink` names the instrumented API, for example `innerHTML`, `eval`, `setAttribute:href`, or `location.assign`. `context` is `html`, `attr`, `url`, or `js`. `stack` keeps 5 frames. `selector` is a short CSS path to the node that received the value. `ts` is Unix milliseconds. `value` and each stack or selector string clip at 200 runes, and `value_cut` marks a clipped value. `stack` and `selector` are omitted when empty.
 
-An unarmed page returns `{"installed":false,"hits":[],"dropped":0,"truncated":0}` with no error. A read is not a state change.
-
-The ring is per document. A full navigation starts a fresh ring, because the arm step re-injects the script before the new document's own scripts, so `installed` stays true. The new document's own scripts can write hits at once, so a post-navigation read can be non-empty. A client-side route change keeps the same ring and appends to it. Clear with `page_act action=sinks_clear`, which returns `{"cleared":N}`.
+An unarmed page returns `{"installed":false,"hits":[],"dropped":0,"truncated":0}` with no error. A read is not a state change. The ring is per document. A full navigation starts a fresh ring, because the arm step re-injects the script before the new document's own scripts, so `installed` stays true. The new document's own scripts can write hits at once, so a post-navigation read can be non-empty. A client-side route change keeps the same ring and appends to it. Clear with `page_act action=sinks_clear`, which returns `{"cleared":N}`.
 
 ### postMessage recorder with what=postmessage
 
 `postmessage` reads the `message` event ring. Arm it with `page_act action=postmessage_install`. The payload is `{installed, messages:[{origin, source_kind, data, data_type, ts, stack}], dropped, truncated, frames:[{url, probed}]}`. `messages` is `[]` and never null. `source_kind` is `window`, `frame`, `worker`, or `unknown`. `data_type` is `string`, `json`, `object`, or `other`. `stack` keeps 5 receive-side frames and is omitted when empty.
 
-The ring holds 100 messages per window. One read emits the newest 100 across the root window and every iframe, oldest first. `dropped` counts ring eviction. `truncated` counts buffered messages above the emit cap. `data` clips at 500 runes. `frames` lists each window the read reached, up to 20, and `probed` reports whether the recorder was armed there. There is no per-frame ring and no count per frame: `messages` is one merged list and `frames` lists probed URLs only, so a frame-targeted send cannot be attributed to a specific frame element from the payload alone. An unarmed page returns `{"installed":false,"messages":[],"dropped":0,"truncated":0,"frames":[{"url":"…","probed":false}]}` with no error. `target=clear` empties every ring and returns `{"cleared":N}`. `max_bytes` does not apply.
+The ring holds 100 messages per window. One read emits the newest 100 across the root window and every iframe, oldest first. `dropped` counts ring eviction, and `truncated` counts buffered messages above the emit cap. `data` clips at 500 runes. `frames` lists each window the read reached, up to 20, and `probed` reports whether the recorder was armed there. There is no per-frame ring and no count per frame: `messages` is one merged list and `frames` lists probed URLs only, so a frame-targeted send cannot be attributed to a specific frame element from the payload alone. An unarmed page returns `{"installed":false,"messages":[],"dropped":0,"truncated":0,"frames":[{"url":"…","probed":false}]}` with no error. `target=clear` empties every ring and returns `{"cleared":N}`. `max_bytes` does not apply.
 
 ### Storage snapshot with what=storage
 
@@ -169,7 +171,7 @@ The ring holds 100 messages per window. One read emits the newest 100 across the
 
 The text note is exact: `… (truncated at max_bytes=600 bytes; raise max_bytes — dom/links/meta do not use selector)`. The array envelope is `{"items":[...],"max_bytes":N,"omitted":N,"truncated":true}`.
 
-**`dom` is nearly all-or-nothing.** The envelope cuts whole documents, not nodes. The Wikipedia document exceeded 400000 bytes. At `max_bytes: 50000` the live result was `{"items":[],"max_bytes":50000,"omitted":1,"truncated":true}`. Use `article`, `text`, or `html` with a `selector` for large pages, never a megabyte `max_bytes`.
+**`dom` is nearly all-or-nothing.** The envelope cuts whole documents, not nodes. The Wikipedia document exceeded 400000 bytes, and at `max_bytes: 50000` the live result was `{"items":[],"max_bytes":50000,"omitted":1,"truncated":true}`. Use `article`, `text`, or `html` with a `selector` for large pages, never a megabyte `max_bytes`.
 
 ## Failure modes and recovery
 
@@ -207,13 +209,12 @@ Recovery: re-read `what=network` for the current `seq` values, then read the bod
 - 2026-10-25 — `meta`, `text` with selector, `css` with `target`, `interactives`, `network`, `body`, `network` header redaction, and the unknown-`what` failure. Commit `819ba12`.
 - 2026-10-26 — `security` on `https://go.dev/` returned `count: 20`, `truncated: 0`. Failure envelopes for `unknown what` and a no-match selector were recorded live. The no-match selector returned `element_not_found`.
 - 2026-10-26 — `tables` and `forms` on a live page. `forms` reported `has_value:false`, then `has_value:true` after an input, and never returned the value. `timeout_ms` bounded a slow read and the failure named `what` and the value.
+- 2026-10-27 — source-verified against commit `83a6797` and its tests: the eight `csp_bypass_*` checks, their `fail`/`warn`/`info` statuses, and the trusted-host list. The running daemon predated the commit and returned the 13-check report above, so there is no live call for the new ids yet.
 
 ## When not to use it
 
-Do not use `page_fetch` to open a page. Use `fetch_page`. Do not use it to click, type, scroll, or navigate. Use `page_act`. Do not use `dom` for prose on a large page. Use `article` or `text`. Do not use `interactives` to test whether an element is on screen — use `marks` for viewport boxes. Do not expect `selector` to scope `dom`, `meta`, `links`, `a11y`, `marks`, or `security`. They ignore it. `interactives` is scoped by it. `security` is a passive audit of what the browser already holds, not an exploit scanner.
+Do not use `page_fetch` to open a page, use `fetch_page`. Do not use it to click, type, scroll, or navigate, use `page_act`. Do not use `dom` for prose on a large page, use `article` or `text`. Do not use `interactives` to test whether an element is on screen — use `marks` for viewport boxes. Do not expect `selector` to scope `dom`, `meta`, `links`, `a11y`, `marks`, or `security`. They ignore it, while `interactives` is scoped by it. `security` is a passive audit of what the browser already holds, not an exploit scanner.
 
 ## Related tools
 
-- `fetch_page` opens the session. `page_act` acts on it. `page_list`, `session_list`, `session_close`, and `browser_list` manage pages and browsers.
-
-For copyable calls with expected output, see the example file at `.agents/skills/web-mcp/references/examples/page_fetch_example.md`.
+`fetch_page` opens the session, `page_act` acts on it, and `page_list`, `session_list`, `session_close`, and `browser_list` manage pages and browsers. For copyable calls with expected output, see the example file at `.agents/skills/web-mcp/references/examples/page_fetch_example.md`.

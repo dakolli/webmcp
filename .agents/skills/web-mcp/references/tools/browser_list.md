@@ -1,8 +1,8 @@
-> Tool: `browser_list` · Server: web-mcp · Surface: MCP · Tested: 2026-10-26
+> Tool: `browser_list` · Server: web-mcp · Surface: MCP · Tested: 2026-10-27
 
 # browser_list
 
-List every live browser with its owner, profile, idle state, TTL, scope, and open pages.
+List every live browser with its owner, profile, idle state, TTL, scope, request budget, and open pages.
 
 ## What it does
 
@@ -40,7 +40,8 @@ Fields appear in this order, the order `browserEntry` emits at `code://pkg/mcp/t
 | `idle_for` | string | Time since the browser was last used, rounded to seconds, for example `0s` or `12m4s`. |
 | `ttl` | string | The browser idle TTL as a Go duration, for example `30m0s`. `0s` means browser sweeping is disabled. |
 | `scope` | string | The navigation allowlist state. See the scope table below. |
-| `scope_strict` | boolean | The strict flag as configured. It matters only when the allowlist is empty: then `true` denies every navigation. |
+| `scope_strict` | boolean | The strict flag as configured. It matters only when the allowlist is empty: then `true` denies every request. |
+| `limits` | object | The effective per-host budget `{rps, burst, hosts}`. `rps` is the sustained rate, `burst` the token depth, and `hosts` lists `{host, throttled}` for every host whose bucket has seen traffic, sorted by host. `hosts` is `[]` before any request. |
 | `pages` | array | The open pages of this browser. Always present, possibly `[]`. |
 
 ### Scope values
@@ -50,10 +51,10 @@ Rendered by `scopeState` at `code://pkg/browsers/policy.go#L157-L165`:
 | Value | Meaning |
 | :--- | :--- |
 | `open` | No allowlist exists. Navigation is unrestricted. |
-| `strict` | The allowlist is empty and `scope_strict` is true. Every navigation is refused. |
+| `strict` | The allowlist is empty and `scope_strict` is true. Every request is refused. |
 | joined patterns | The allowlist entries joined with `, `, for example `wikipedia.org, example.org`. A bare host covers its subdomains. `*` allows all. |
 
-Read `scope` before you send traffic to a new host. `scope=open` means no limit. A value that names hosts means navigation outside them fails with a refusal that names the allowed hosts. Scope applies to navigation, not to subresources or redirects. Scope is fixed at creation and joins the reuse key, so a reuse with a different scope gets a separate browser. Creation options live in [browser_create.md](browser_create.md).
+Read `scope` before you send traffic to a new host. `scope=open` means no limit. A value that names hosts means a request outside them is refused before it is sent. Scope covers navigation, replay, every redirect hop, and intercepted subresources. Scope and the `limits` budget are fixed at creation and join the reuse key, so a reuse with a different scope or rate gets a separate browser. Creation options live in [browser_create.md](browser_create.md).
 
 In the examples, `<profiles-dir>` is the absolute ~/.config/browser-mcp/profiles directory.
 
@@ -61,8 +62,8 @@ The `data` payload for an unscoped browser and a browser scoped to one host:
 
 ```json
 [
-  {"browser_id":"browser-2","owner":"client-a","profile_dir":"<profiles-dir>/.ephemeral/browser-2-150041042","persist":false,"ephemeral":true,"created_at":"2026-10-25T12:00:00.123456Z","idle_for":"0s","ttl":"30m0s","scope":"open","scope_strict":false,"pages":[]},
-  {"browser_id":"browser-3","owner":"client-b","profile_dir":"<profiles-dir>/audit","persist":true,"ephemeral":false,"created_at":"2026-10-25T12:00:05.654321Z","idle_for":"3s","ttl":"30m0s","scope":"wikipedia.org","scope_strict":false,"pages":[]}
+  {"browser_id":"browser-2","owner":"client-a","profile_dir":"<profiles-dir>/.ephemeral/browser-2-150041042","persist":false,"ephemeral":true,"created_at":"2026-10-25T12:00:00.123456Z","idle_for":"0s","ttl":"30m0s","scope":"open","scope_strict":false,"limits":{"rps":5,"burst":10,"hosts":[]},"pages":[]},
+  {"browser_id":"browser-3","owner":"client-b","profile_dir":"<profiles-dir>/audit","persist":true,"ephemeral":false,"created_at":"2026-10-25T12:00:05.654321Z","idle_for":"3s","ttl":"30m0s","scope":"wikipedia.org","scope_strict":false,"limits":{"rps":0.5,"burst":1,"hosts":[{"host":"en.wikipedia.org","throttled":2}]},"pages":[]}
 ]
 ```
 
@@ -91,6 +92,7 @@ Each `pages` entry has these fields:
 - `idle_for` resets when a tool uses the browser. A browser idle longer than its `ttl` is closed by the sweeper and disappears from the next listing. An ephemeral profile is deleted on that sweep. A persistent profile is kept.
 - `ttl` is 30 minutes by default. `browser_ttl` in ~/.config/browser-mcp/config.json overrides it. `"0"` disables browser sweeping and reports `0s`.
 - The page idle sweep is separate. It removes pages after 15 minutes without touching the browser.
+- `limits.throttled` counts requests to that host that had to wait for a token. A rising count with a low `rps` explains a slow call better than a page symptom.
 - The tool does not truncate. There is no `max_bytes` argument and no pagination. It returns every browser and every page.
 
 ## Failure modes and recovery
@@ -135,7 +137,7 @@ Do not use it as proof that a browser is yours. Read `owner` but remember that o
 
 ## Related tools
 
-- `browser_create` — creates or reuses a browser and returns its `browser_id`. Its `scope` and `scope_strict` options set the allowlist that this tool reports.
+- `browser_create` — creates or reuses a browser and returns its `browser_id`. Its `scope`, `scope_strict`, `rps`, and `burst` options set the allowlist and the budget that this tool reports.
 - `browser_close` — closes one browser. `purge:true` deletes one profile. `prune:true` closes all and cleans orphan ephemeral directories.
 - `fetch_page` — opens a page in a chosen browser. The page then appears under `pages`. A fetch to a host outside `scope` fails.
 - `page_list` — lists the pages of one browser. Use it when you already know the browser.

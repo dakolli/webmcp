@@ -1,4 +1,4 @@
-> Tool: `browser_create` · Server: web-mcp · Surface: MCP · Tested: 2026-10-25
+> Tool: `browser_create` · Server: web-mcp · Surface: MCP · Tested: 2026-10-27
 
 # browser_create
 
@@ -29,7 +29,9 @@ All inputs are optional. The schema declares no required field. Source: `code://
 | `ignore_certs` | boolean | no | `false` | Accept invalid TLS certificates via `--ignore-certificate-errors`. Independent of `proxy`: set it explicitly. |
 | `headers` | object of name to string | no | empty | Request headers sent with every request of every page in this browser, first navigation and subresources included. Use it for an identity header, for example `{"X-Bug-Bounty":"your-handle"}`. |
 | `scope` | array of strings | no | empty (no limit) | Navigation allowlist. A bare host covers its subdomains. `*.example.com`, `host:port` and `*` are accepted. Omit for no limit. |
-| `scope_strict` | boolean | no | `false` | Opt-in strict mode. When `true` with an empty `scope`, every navigation is refused. |
+| `scope_strict` | boolean | no | `false` | Opt-in strict mode. When `true` with an empty `scope`, every request is refused. |
+| `rps` | number | no | `5` | Per-host sustained request rate in requests per second. Must be finite and greater than 0. Every engine-issued request waits for a token. |
+| `burst` | integer | no | `10` | Per-host token bucket depth: how many requests may leave at once before the `rps` pace applies. Must be at least 1. |
 | `owner` | string | no | session identity, else `unowned` | Owner label of 1 to 64 characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, and `-`. It joins the create key. |
 
 String-encoded arguments are accepted: the registry rewrites `"scope":"[\"wikipedia.org\"]"` into the array and `"true"` into the boolean before the call runs. Source: `code://pkg/mcp/tools/registry.go#L189-L264`.
@@ -38,10 +40,10 @@ String-encoded arguments are accepted: the registry rewrites `"scope":"[\"wikipe
 
 The payload below rides inside the result envelope, so the full reply is `{"ok":true,"data":<payload>}`. See `SKILL.md` for the envelope and for the `{"ok":false,"error":…}` shape.
 
-One line of compact JSON with seven fields. Source: `code://pkg/mcp/tools/browser.go#L238-L261`.
+One line of compact JSON with eight fields. Source: `code://pkg/mcp/tools/browser.go#L238-L261`.
 
 ```json
-{"ok":true,"data":{"browser_id":"browser-4","owner":"unowned","persist":false,"ttl":"30m0s","scope":"open","scope_strict":false,"reused":false}}
+{"ok":true,"data":{"browser_id":"browser-4","owner":"unowned","persist":false,"ttl":"30m0s","scope":"open","scope_strict":false,"limits":{"rps":5,"burst":10,"hosts":[]},"reused":false}}
 ```
 
 | Field | Meaning |
@@ -51,12 +53,13 @@ One line of compact JSON with seven fields. Source: `code://pkg/mcp/tools/browse
 | `persist` | `true` when the profile survives close. |
 | `ttl` | The effective idle TTL as a Go duration, for example `30m0s`. `0s` disables browser sweeping. |
 | `scope` | `open` when unrestricted, `strict` when an empty allowlist denies all, else the patterns joined by `", "`. |
-| `scope_strict` | Whether an empty allowlist denies every navigation. |
+| `scope_strict` | Whether an empty allowlist denies every request. |
+| `limits` | The effective per-host budget: `rps`, `burst`, and `hosts` with one entry per host that has used a bucket, each `{host,throttled}` where `throttled` counts the requests that had to wait. `hosts` is `[]` until traffic starts and sorted by host. |
 | `reused` | `true` when a live browser matched the owner and launch options. |
 
 ## Behavior and limits
 
-**The create key is owner plus every launch option, including headers and scope.** The key holds `owner`, `bin`, `profile`, `persist`, `headless`, `stealth`, `position`, `proxy`, `proxy_bypass`, `ignore_certs`, `headers`, `scope`, and `scope_strict`. A different owner plus a different scope is therefore a different browser. Scope and header identity is canonical: allowlist order, duplicates and blank entries are ignored, and headers compare as sorted `name=value`. Source: `code://pkg/browsers/manager.go#L447-L482`.
+**The create key is owner plus every launch option, including headers and scope.** The key holds `owner`, `bin`, `profile`, `persist`, `headless`, `stealth`, `position`, `proxy`, `proxy_bypass`, `ignore_certs`, `headers`, `scope`, `scope_strict`, `rps`, and `burst`. A different owner plus a different scope is therefore a different browser. Scope and header identity is canonical: allowlist order, duplicates and blank entries are ignored, and headers compare as sorted `name=value`. Source: `code://pkg/browsers/manager.go#L447-L482`.
 
 **Owner joins the key but does not authorize.** `browser_close` works by id and never checks the owner. Source: `code://pkg/browsers/manager.go#L128-L140`.
 
@@ -68,7 +71,9 @@ One line of compact JSON with seven fields. Source: `code://pkg/mcp/tools/browse
 
 **Scope matching.** A bare host also covers its subdomains, so `wikipedia.org` admits `en.wikipedia.org`. `*.example.com` means the same as the bare host. `host:port` pins the port, with the scheme default (`80` for http, `443` for https) applied otherwise. `*` allows all. Entries are lowercased and trimmed. A relative navigation (no host) is always allowed. Source: `code://pkg/browsers/policy.go#L96-L121`.
 
-**Scope enforcement is navigation-only.** `fetch_page` checks before the tab is created, and `page_act navigate` checks before it moves. Subresources and redirects are never checked, so a redirect can still land on an out-of-scope host. Source: `code://pkg/browsers/browser.go#L455-L459`.
+**Scope covers more than navigation.** The engine checks `fetch_page` before the tab is created, `page_act navigate` before it moves, `page_act replay` on the first hop and on every redirect hop, and intercepted subresources. An out-of-scope request is refused before it is sent. A live fetch outside the allowlist failed before the request left, with `host "example.net" is outside the scope allowlist`. A live replay that redirected to `dl.google.com` stopped with `redirect hop 1 …` and named the host. Source: `code://pkg/browsers/browser.go#L455-L459`, `code://pkg/browsers/replay.go#L453-L470`.
+
+**Per-host rate limit.** `rps` defaults to 5 and `burst` to 10, and both join the create key, so a different rate gets a separate browser. Every engine-issued request takes a token for its host. A request whose deadline cannot fit the wait fails as `timeout`: `web-mcp: host "example.org" is rate limited: the next request slot is 6.473s away, beyond this call's deadline — lower rps, raise burst, or retry with a longer timeout`. Live: `rps:0.5, burst:1` spaced three replays about 4 seconds apart, and `rps:0.1` produced the error above. The live budget and the throttled host counters ride `limits` on the create result and on every `browser_list` entry. Source: `code://pkg/browsers/policy.go#L39-L91`.
 
 **Idle TTL is 30 minutes**, overridable by `browser_ttl` in `~/.config/browser-mcp/config.json`. One live browser per profile directory: a second create on the same directory fails before Chromium starts.
 
@@ -108,29 +113,29 @@ profile "…/audit" is already in use by browser-2 (owned by client-a) — close
 
 Recovery: close the holder, or pick a different `profile`.
 
-**Invalid owner.** Source message, not run live.
+**Invalid rate.** Source message, not run live. Validation runs before Chromium starts: `browser_create: invalid arguments: rps must be a finite number greater than 0 (got 0)` and `browser_create: invalid arguments: burst must be at least 1 (got 0)`. Recovery: pass a positive `rps` and a `burst` of at least 1, or omit both for 5 and 10.
 
-```
-browser_create: owner "bad/name" is invalid — use 1 to 64 characters from A-Z, a-z, 0-9, '.', '_' and '-' only
-```
+**Invalid owner.** Source message, not run live: `browser_create: owner "bad/name" is invalid — use 1 to 64 characters from A-Z, a-z, 0-9, '.', '_' and '-' only`.
 
 **Bad argument shape.** The error names the field, the wanted type and the value it received, then shows one corrected call. A client that sends `"true"` as text is corrected automatically. Source: `code://pkg/mcp/tools/registry.go`.
 
 ## Tested calls
 
-Verified 2026-10-25 on the live server. The unscoped call ran over MCP. The scoped, strict and proxy calls ran through the CLI against the same shared manager, so the engine path and every error string above are live.
+Verified 2026-10-25 on the live server, and the `rps`/`burst` and scope paths again on 2026-10-27. The unscoped call ran over MCP. The scoped, strict and proxy calls ran through the CLI against the same shared manager, so the engine path and every error string above are live.
 
 ```json
 {"tool":"browser_create","arguments":{"headless":true,"stealth":true}}
 ```
 
-Payload: `{"browser_id":"browser-4","owner":"unowned","persist":false,"ttl":"30m0s","scope":"open","scope_strict":false,"reused":false}`.
+Payload: `{"browser_id":"browser-4","owner":"unowned","persist":false,"ttl":"30m0s","scope":"open","scope_strict":false,"limits":{"rps":5,"burst":10,"hosts":[]},"reused":false}`.
 
 ```json
 {"tool":"browser_create","arguments":{"owner":"doc-web128","headless":true,"stealth":true,"scope":["wikipedia.org"],"headers":{"X-Doc-Test":"web-128"}}}
 ```
 
-Payload: `scope:"wikipedia.org", scope_strict:false, reused:false`. A fetch to another host failed with the scoped refusal above. A fetch to a page under the allowed domain succeeded, proving the subdomain inherits. `{"owner":"doc-strict","headless":true,"scope_strict":true}` returned `scope:"strict", scope_strict:true` and refused a navigation.
+Payload: `scope:"wikipedia.org", scope_strict:false, limits:{"rps":5,"burst":10,"hosts":[]}, reused:false`. A fetch to another host failed with the scoped refusal above. A fetch to a page under the allowed domain succeeded, proving the subdomain inherits. `{"owner":"doc-strict","headless":true,"scope_strict":true}` returned `scope:"strict", scope_strict:true` and refused a request.
+
+Verified 2026-10-27: `{"owner":"doc-rate","rps":0.5,"burst":1}` returned `limits:{"rps":0.5,"burst":1,"hosts":[]}`. Three replays to one host were spaced about 4 seconds apart. At `rps:0.1` the next request failed with `the next request slot is 6.473s away`. `browser_list` showed the host under `limits.hosts` with its `throttled` count.
 
 ## When not to use it
 
@@ -142,7 +147,7 @@ Do not use `owner` as authentication. It is a label, not a permission check.
 
 Do not pass credentials in `proxy`. They belong in `proxy.json` only.
 
-Do not use `scope` as a security boundary. Redirects and subresources bypass it. It bounds navigation cost, not trust.
+Do not use `scope` as a security boundary. It now refuses replay redirects and intercepted subresources, but it is not authentication, and subresource traffic outside the hook set is not audited. It bounds reach, not trust.
 
 Do not omit `profile` on a second browser that needs the same persistent directory as a live one. The create fails on the profile lock.
 

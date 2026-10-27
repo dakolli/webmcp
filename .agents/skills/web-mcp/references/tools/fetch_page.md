@@ -32,11 +32,9 @@ you want to control the launch options.
 | `timeout_ms` | integer | no | `30000` | Bound for the whole call. `0` means the default. A negative value is rejected. |
 | `viewport` | object | no | none | Manual `{"width":<int>,"height":<int>}` in CSS pixels. Both values must be positive. |
 | `device` | string | no | none | go-rod preset name or Title, case-insensitive. Examples: `IPhoneX`, `iphone x`, `IPadPro`. `clear` resets emulation. |
-| `user_agent` | string | no | browser default | User-Agent override for this page, applied before navigation. |
+| `user_agent` | string | no | coherent default | User-Agent override for this page, applied before navigation. The default tracks the launched Chromium major with matching `Sec-CH-UA` hints and `Accept-Language: en-US,en;q=0.9`, so omit it to keep that identity (see `SKILL.md`). |
 
-**Precedence.** `device` beats `viewport`. Live test: `IPadPro` plus `viewport` `400x400`
-gave a `1024x1366` viewport at DPR 2. A `user_agent` wins over a device preset's UA when
-you pass both. That rule comes from the source and was not run live.
+**Precedence.** `device` beats `viewport`: a live `IPadPro` plus `viewport` `400x400` gave `1024x1366` at DPR 2. A `user_agent` wins over a device preset's UA when you pass both, and a device preset's own UA wins over the coherent default while that preset is applied. The UA precedence comes from the source and was not run live.
 
 ## Returns
 

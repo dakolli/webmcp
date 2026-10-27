@@ -1,4 +1,4 @@
-> Tool: `page_fetch` · Server: web-mcp · Surface: MCP · Tested: 2026-10-26
+> Tool: `page_fetch` · Server: web-mcp · Surface: MCP · Tested: 2026-10-27
 
 # page_fetch example
 
@@ -63,7 +63,7 @@ Expect `{"interactives":[{"handle":"gy1g0vstq-b49","role":"button","text":"Main 
 {"tool":"page_fetch","arguments":{"session_id":"page-1","what":"security"}}
 ```
 
-Expect `data` to hold `{"url":…,"checks":[…],"count":N,"truncated":0}`, each check shaped `{"id":"csp","status":"ok","evidence":"…","detail":"…"}`. On the 2026-10-26 live run against `https://go.dev/` the report returned `count: 20` with check ids `csp`, `csp_unsafe_inline`, `csp_unsafe_eval`, `hsts`, `x_frame_options`, `x_content_type_options`, `referrer_policy`, `permissions_policy`, `coop`, five `cookie:<name>` checks, `mixed_content`, `sri`, `form_target`, `password_autocomplete`, and `cors`. See the reference for the full id table.
+Expect `data` to hold `{"url":…,"checks":[…],"count":N,"truncated":0}`, each check shaped `{"id":"csp","status":"ok","evidence":"…","detail":"…"}`. On the 2026-10-26 live run against `https://go.dev/` the report returned `count: 20` with check ids `csp`, `csp_unsafe_inline`, `csp_unsafe_eval`, `hsts`, `x_frame_options`, `x_content_type_options`, `referrer_policy`, `permissions_policy`, `coop`, five `cookie:<name>` checks, `mixed_content`, `sri`, `form_target`, `password_autocomplete`, and `cors`. The current build adds eight policy probes: `csp_bypass_unsafe_inline`, `csp_bypass_unsafe_eval`, `csp_bypass_script_wildcard`, `csp_bypass_object_src`, `csp_bypass_base_uri`, `csp_bypass_frame_ancestors`, `csp_bypass_report_only`, and `csp_bypass_trusted_host`. They are passive (no injection, execution, or load), evidence quotes the real directive, and they report policy weakness rather than exploitability. See the reference for each status.
 
 ## 7. Attribute traffic to one action
 

@@ -44,6 +44,8 @@ Install or refresh this skill with `browser skill <harness|path|.>`. With no arg
 - A browser idle for 30 minutes closes automatically. Set `browser_ttl` in `~/.config/browser-mcp/config.json` to change it. `browser_list` shows `idle_for` and `ttl`.
 - Idle sessions expire after 15 minutes. A dead Chromium is relaunched under the same `browser_id`.
 - Page ids are unique inside one browser only. Two live browsers can both have `page-1`.
+- Pages get a coherent default identity: the User-Agent's Chrome major matches the launched Chromium, `Accept-Language` is `en-US,en;q=0.9`, and the `Sec-CH-UA` hints agree with both. An explicit `user_agent` wins, and a `device` preset's own UA wins while that preset is applied.
+- With `stealth` on (the default), `navigator.webdriver` is `false` and `window.chrome` exists.
 
 ## Coverage
 
@@ -79,6 +81,10 @@ Install or refresh this skill with `browser skill <harness|path|.>`. With no arg
 16. `page_act` `inject_canary` proves sink reachability. Run `sinks_install` first or it returns the guard error. It injects a `wm-canary-<8 hex>` value into `query`, `hash`, `postmessage`, and `name`, capped at 20 frames, and returns the `hits` whose value contains the canary.
 17. `page_act` `postmessage_install` arms a `message` recorder on every reachable window and returns `{"installed":true}`. Read it with `page_fetch` `what=postmessage`. Send with `post_message`, which takes `value`, `target_selector` (`top` or a CSS frame selector), and `origin` (default `*`). Clear with `postmessage_clear` or `target=clear`. The ring holds 100 messages per window and clips `data` at 500 runes. The read merges every window into one `messages` list, each entry carries `source_kind` (`window`, `frame`, `worker`, or `unknown`) as the only frame hint, and `frames` lists probed URLs only, with no per-frame ring or count, so a frame-targeted send cannot be attributed to a specific frame element from the payload alone.
 18. `page_act` `wait_open` returns the popup as `{session_id,url,opener}`. `page_list` and `session_list` carry `opener` on a popup. Closing the opener closes its popups. A browser holds at most 20 pages, popups included.
+19. `page_act` `intercept_add`, `intercept_list`, and `intercept_clear` are MCP-only. The CLI and IPC action vocabulary omits them, so `browser page act last intercept_add …` fails with `page act: unknown action="intercept_add"` before any daemon call. Use the MCP tool, and read [page_act.md](references/tools/page_act.md#request-interception) before your first rule.
+20. `page_act` `auth_save`, `auth_restore`, and `auth_list` move a login between browsers and identities. Inputs are `site`, `name`, and `force`. Every result carries counts and a `warning` only, never a cookie or storage value. `auth_list` needs no live session, so a stale `session_id` and no running browser are both fine. The store is plaintext with mode 0600, so the warning is the only confidentiality signal. Host-only cookies stay host-only after restore. See [page_act.md](references/tools/page_act.md#auth-snapshots).
+21. `browser_create` rate-limits each host with `rps` (default 5) and `burst` (default 10), and both join the create key. A request that cannot get a token before its deadline fails as `timeout` with `the next request slot is … away`. The effective policy rides `limits:{rps,burst,hosts:[{host,throttled}]}` on every create result and every `browser_list` entry.
+22. Scope is not navigation-only. It gates `fetch_page`, `page_act navigate`, `replay` and every redirect hop, and intercepted subresources. The engine refuses an out-of-scope request before it is sent. Ignore older text that says redirects or subresources are never checked.
 
 ## Incognito identities
 
@@ -129,6 +135,10 @@ Each tool reference states only its own payload and its failure types, and links
 - `fetch_page` `browser_id` is not checked. It can launch a new browser with a literal unknown id.
 - `page_act` `input` on `<input type="time">` can leave the value empty. Use `eval`.
 - `page_act` invalid `select` value can time out the request and wedge the server. Close that browser and retry.
+- `Accept-Language` currently sends `en-US,en;q=0.9;q=0.9`. The contract is `en-US,en;q=0.9`; WEB-209 fixes the duplicate. Do not treat the doubled value as expected.
+- A response served from the HTTP cache bypasses every `intercept_*` rule, so a rule for a cached CSS file has no effect. Use a fresh context or clear the cache before arming rules. WEB-212 may remove this limit.
+- `intercept_*` `rewrite` cannot change the HTTP method. `method` is a match filter only.
+- A header set by `intercept_*` `rewrite` does not appear in the `network` ring `req_headers`. The ring is not proof of what was sent.
 
 ## Isolated test recipe
 
@@ -161,3 +171,6 @@ Keep these shapes in the rotation, with a new host each time:
 - `postmessage` is on the tool surface: `postmessage_install` → `what=postmessage` → `post_message` → `postmessage_clear`.
 - `websocket` is on the tool surface: `what=websocket` reads the frame ring, and `clear_logs` returns its cleared count beside network and console.
 - `tables`, `forms`, popups, `page_fetch` `timeout_ms`, and replay `body_redactions` are on the documented surface.
+- Request interception (`intercept_add`, `intercept_list`, `intercept_clear`), the eight `csp_bypass_*` security probes, replay over CLI and IPC, and the coherent default UA are documented as of 2026-10-27.
+- Auth snapshots (`auth_save`, `auth_restore`, `auth_list`) and the per-host `rps`/`burst` budget with its `limits` report are documented as of 2026-10-27.
+- Scope covers replay, every redirect hop, and intercepted subresources, and the interception limits (cache bypass, method filter, rewritten headers absent from `req_headers`) are documented as of 2026-10-27.

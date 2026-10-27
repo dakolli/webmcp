@@ -12,7 +12,7 @@ primary. Your ids and byte counts can differ.
 ```
 
 ```json
-{"ok":true,"data":{"browser_id":"browser-4","owner":"unowned","persist":false,"ttl":"30m0s","scope":"open","scope_strict":false,"reused":false}}
+{"ok":true,"data":{"browser_id":"browser-4","owner":"unowned","persist":false,"ttl":"30m0s","scope":"open","scope_strict":false,"limits":{"rps":5,"burst":10,"hosts":[]},"reused":false}}
 ```
 
 Record the `browser_id` inside `data`. Use it in every later call. `serve mcp` starts no

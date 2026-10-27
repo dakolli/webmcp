@@ -15,7 +15,7 @@ them, tests two failures, and cleans up. The live test used `browser-4`.
 ```
 
 ```json
-{"ok":true,"data":{"browser_id":"browser-4","owner":"unowned","persist":false,"ttl":"30m0s","scope":"open","scope_strict":false,"reused":false}}
+{"ok":true,"data":{"browser_id":"browser-4","owner":"unowned","persist":false,"ttl":"30m0s","scope":"open","scope_strict":false,"limits":{"rps":5,"burst":10,"hosts":[]},"reused":false}}
 ```
 
 `persist:false` gives an ephemeral profile. The manager deletes it on close. Record the
