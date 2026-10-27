@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"webmcp/pkg/browsers"
 	"webmcp/pkg/cli/ipc"
 	"webmcp/pkg/cli/pageops"
+	"webmcp/pkg/har"
 )
 
 const (
@@ -25,6 +27,9 @@ const (
 	// maxPageTimeoutMS caps page fetch's --timeout-ms so a caller cannot pin a
 	// call open indefinitely.
 	maxPageTimeoutMS = 120_000
+	// harUncapped is the HAR encoder's sentinel for "export every buffered
+	// entry": the document's comment reads "Cap: none" and truncated stays 0.
+	harUncapped = -1
 )
 
 // rawActionsEnabled reports whether WEB_MCP_RAW_ACTIONS is set in this CLI
@@ -86,6 +91,7 @@ Run a subcommand with --help for its flags and examples.`,
   web-cli page fetch https://x.com text   # open + read in one step (no prior fetch)
   web-cli page act click "#search"   # click on the single open page
   web-cli page close                 # close the single open page`,
+		PersistentPreRunE: silenceRuntimeUsage,
 	}
 	cmd.AddCommand(
 		newPageListCmd(mgr),
@@ -104,6 +110,24 @@ func cmdCtx(cmd *cobra.Command) context.Context {
 		return ctx
 	}
 	return context.Background()
+}
+
+// silenceRuntimeUsage stops cobra printing the whole usage block after a page
+// command fails at runtime: usage only helps for a malformed invocation, which
+// cobra rejects before RunE runs.
+func silenceRuntimeUsage(cmd *cobra.Command, _ []string) error {
+	cmd.SilenceUsage = true
+	return nil
+}
+
+// reportFallbackBrowserID writes the resolved browser id to stderr only when it
+// came from the inherited --browser-id flag; an explicit --browser already names
+// the target, so echoing it is noise on a successful run.
+func reportFallbackBrowserID(cmd *cobra.Command, browserID string) {
+	if cmd.Flags().Changed("browser") {
+		return
+	}
+	reportBrowserTarget(cmd, browserID)
 }
 
 // newPageListCmd builds `page list`: it prints one "id\turl" row per open page
@@ -145,7 +169,7 @@ which sessions are still alive before acting on or closing them.`,
 				}
 				pages = entry.Pages
 			}
-			reportBrowserTarget(cmd, browserID)
+			reportFallbackBrowserID(cmd, browserID)
 			if len(pages) == 0 {
 				fmt.Println("no open pages")
 				return nil
@@ -175,6 +199,7 @@ func newPageFetchCmd(mgr *browsers.Manager) *cobra.Command {
 		includeValues bool
 		identity      string
 		timeoutMS     int
+		outPath       string
 	)
 	cmd := &cobra.Command{
 		Use:   "fetch [id|url] [what]",
@@ -210,6 +235,11 @@ dance).
   --max-bytes <n>    cap output size (default 50000; screenshots,
                      interactives, a11y, network, console, body, article, tables,
                      forms, marks, security, sinks and postmessage are never truncated)
+  --out <path>       write the HAR body to this file instead of stdout (har only;
+                     the parent directory must already exist, and the file is
+                     mode 0600). Without --max-bytes, or with --max-bytes 0, the
+                     CLI asks for the uncapped export: the file holds every
+                     observed entry and its comment reads "Cap: none".
   --timeout-ms <n>   per-call timeout in milliseconds (default 30000, clamped
                      to 1..120000); a full-page screenshot keeps a 90s floor
                      unless you ask for more
@@ -264,6 +294,7 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
   web-cli page fetch last storage                       # cookie flags + storage keys, values redacted
   web-cli page fetch last storage --include-values      # real values: exposes live session tokens
   web-cli page fetch last sinks                         # source-to-sink hits after 'page act sinks_install'
+  web-cli page fetch last har --out traffic.har         # write HAR 1.2 to a file (import into Caido/Burp)
   web-cli page fetch https://hackernews.com links       # open + extract in one step`,
 		Args: cobra.MaximumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -291,6 +322,20 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 			}
 			if err := pageops.ValidateAspect(what); err != nil {
 				return fmt.Errorf("page fetch: %w", err)
+			}
+			if what == "har" && maxBytes <= 0 {
+				maxBytes = harUncapped
+			}
+			if outPath != "" {
+				if what != "har" {
+					return fmt.Errorf("--out needs the har aspect (got %q)", what)
+				}
+				if err := validateOutDir(outPath); err != nil {
+					return err
+				}
+				if !cmd.Flags().Changed("max-bytes") {
+					maxBytes = harUncapped
+				}
 			}
 			identity = strings.TrimSpace(identity)
 			if identity != "" {
@@ -322,15 +367,23 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 					}, &summary); err != nil {
 						return fmt.Errorf("page fetch: %w", err)
 					}
-					reportBrowserTarget(cmd, browserID)
-					return pageFetchViaIPC(cmd, ctx, cl, summary.SessionID, browserID, owner, what, selector, target, fullPage, maxBytes, int(timeout/time.Millisecond), includeValues)
+					reportFallbackBrowserID(cmd, browserID)
+					body, err := pageFetchViaIPC(ctx, cl, summary.SessionID, browserID, owner, what, selector, target, fullPage, maxBytes, int(timeout/time.Millisecond), includeValues)
+					if err != nil {
+						return err
+					}
+					return emitFetch(body, outPath)
 				}
 				rid, err := resolvePageID(ctx, mgr, cl, browserID, owner, id, "page fetch")
 				if err != nil {
 					return err
 				}
-				reportBrowserTarget(cmd, browserID)
-				return pageFetchViaIPC(cmd, ctx, cl, rid, browserID, owner, what, selector, target, fullPage, maxBytes, int(timeout/time.Millisecond), includeValues)
+				reportFallbackBrowserID(cmd, browserID)
+				body, err := pageFetchViaIPC(ctx, cl, rid, browserID, owner, what, selector, target, fullPage, maxBytes, int(timeout/time.Millisecond), includeValues)
+				if err != nil {
+					return err
+				}
+				return emitFetch(body, outPath)
 			}
 			printServeHint(cmd)
 
@@ -347,7 +400,7 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 						return fmt.Errorf("page fetch: %w", err)
 					}
 				}
-				reportBrowserTarget(cmd, browserID)
+				reportFallbackBrowserID(cmd, browserID)
 				p, err = b.NewPage(ctx, url, nil, "", "") // new tab; plain launch; stealth applied by default
 				if err != nil {
 					return fmt.Errorf("page fetch: %w", err)
@@ -361,7 +414,7 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 				if err != nil {
 					return err
 				}
-				reportBrowserTarget(cmd, browserID)
+				reportFallbackBrowserID(cmd, browserID)
 				p, err = mgr.Page(
 					ctx,
 					browsers.PageID(rid),
@@ -384,8 +437,7 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 			if err != nil {
 				return fmt.Errorf("page fetch: %w", err)
 			}
-			fmt.Println(out)
-			return nil
+			return emitFetch(out, outPath)
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to fetch (optional with one page open; 'last'; or a bare number)")
@@ -395,6 +447,7 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 	cmd.Flags().BoolVar(&fullPage, "full-page", false, "capture the entire scrollable page instead of the visible viewport (screenshot only)")
 	cmd.Flags().BoolVar(&includeValues, "include-values", false, "with --what storage, print real cookie and localStorage/sessionStorage values instead of <redacted> (exposes live tokens)")
 	cmd.Flags().IntVar(&maxBytes, "max-bytes", pageops.DefaultPageMaxBytes, "maximum output size in bytes (default 50000)")
+	cmd.Flags().StringVar(&outPath, "out", "", "write the HAR body to this file instead of stdout (har aspect only; the parent directory must exist; mode 0600)")
 	cmd.Flags().IntVar(&timeoutMS, "timeout-ms", 30000, "per-call timeout in milliseconds (default 30000, clamped to 1..120000)")
 	cmd.Flags().StringVar(&identity, "identity", "", "incognito identity for a URL open (default \"default\"); a new name is created on first use, cookies/storage stay separate")
 	cmd.Flags().StringVar(&browserID, "browser", "", "browser_id to resolve the page inside that browser only (use when more than one browser is live)")
@@ -727,7 +780,7 @@ needs no page.`,
 				if err != nil {
 					return err
 				}
-				reportBrowserTarget(cmd, browserID)
+				reportFallbackBrowserID(cmd, browserID)
 				return pageActViaIPC(readCtx, cl, &ipc.PageActParams{
 					SessionID:      rid,
 					BrowserID:      browserID,
@@ -772,7 +825,7 @@ needs no page.`,
 			if err != nil {
 				return err
 			}
-			reportBrowserTarget(cmd, browserID)
+			reportFallbackBrowserID(cmd, browserID)
 			p, err := mgr.Page(
 				ctx,
 				browsers.PageID(rid),
@@ -1152,7 +1205,7 @@ The session id becomes invalid afterwards.`,
 				if err != nil {
 					return err
 				}
-				reportBrowserTarget(cmd, browserID)
+				reportFallbackBrowserID(cmd, browserID)
 				return pageCloseViaIPC(cmd, ctx, cl, rid, browserID, owner)
 			}
 			printServeHint(cmd)
@@ -1161,7 +1214,7 @@ The session id becomes invalid afterwards.`,
 			if err != nil {
 				return err
 			}
-			reportBrowserTarget(cmd, browserID)
+			reportFallbackBrowserID(cmd, browserID)
 
 			if _, err := mgr.ClosePage(
 				ctx,
@@ -1201,7 +1254,7 @@ func pageListViaIPC(cmd *cobra.Command, ctx context.Context, cl *ipc.Client, bro
 			return err
 		}
 		pages = entry.Pages
-		reportBrowserTarget(cmd, browserID)
+		reportFallbackBrowserID(cmd, browserID)
 	}
 	if len(pages) == 0 {
 		fmt.Println("no open pages")
@@ -1226,13 +1279,13 @@ func pageListRow(p browsers.PageInfo) string {
 
 // pageFetchViaIPC implements `page fetch` against a live serve process: it
 // forwards the extraction (and the --target/--full-page/--timeout-ms params)
-// to page.fetch (the server truncates to max_bytes itself) and prints the data
+// to page.fetch (the server truncates to max_bytes itself) and returns the data
 // byte-identically to the in-process path. The CLI's --max-bytes 0 means "no
 // truncation" (pageops.PageTruncate returns s unchanged), which the wire
 // contract cannot express (0 → the server default), so it is forwarded as an
-// effectively-unbounded cap.
+// effectively-unbounded cap. har keeps its own negative sentinel instead, so the
+// daemon hands it to the encoder unchanged and the document reports "Cap: none".
 func pageFetchViaIPC(
-	cmd *cobra.Command,
 	ctx context.Context,
 	cl *ipc.Client,
 	id, browserID, owner, what, selector, target string,
@@ -1240,8 +1293,8 @@ func pageFetchViaIPC(
 	maxBytes int,
 	timeoutMS int,
 	includeValues bool,
-) error {
-	if maxBytes <= 0 {
+) (string, error) {
+	if maxBytes <= 0 && what != "har" {
 		maxBytes = int(^uint(0) >> 1) // CLI parity: 0 means "no truncation"
 	}
 	var res ipc.PageFetchResult
@@ -1257,9 +1310,55 @@ func pageFetchViaIPC(
 		TimeoutMS:     timeoutMS,
 		IncludeValues: includeValues,
 	}, &res); err != nil {
-		return fmt.Errorf("page fetch: %w", err)
+		return "", fmt.Errorf("page fetch: %w", err)
 	}
-	fmt.Println(res.Data)
+	return res.Data, nil
+}
+
+// emitFetch prints one fetched aspect body, or writes it to the --out file when
+// that flag is set. The caller validates --out as har-only before any work.
+func emitFetch(body, outPath string) error {
+	if outPath == "" {
+		fmt.Println(body)
+		return nil
+	}
+	line, err := writeHAR(outPath, body)
+	if err != nil {
+		return err
+	}
+	fmt.Println(line)
+	return nil
+}
+
+// writeHAR decodes the received HAR document, writes it to path with mode 0600
+// and returns the "wrote <path> (<n> entries)" line. It never creates the parent
+// directory and never prints the body.
+func writeHAR(path, body string) (string, error) {
+	var archive har.Archive
+	if err := json.Unmarshal([]byte(body), &archive); err != nil {
+		return "", fmt.Errorf("--out: decoding HAR: %w", err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		return "", fmt.Errorf("--out: writing %s: %w", path, err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return "", fmt.Errorf("--out: setting mode on %s: %w", path, err)
+	}
+	line := fmt.Sprintf("wrote %s (%d entries)", path, len(archive.Log.Entries))
+	if archive.Log.Truncated > 0 {
+		line += " (truncated)"
+	}
+	return line, nil
+}
+
+// validateOutDir fails when the --out parent directory does not exist. It never
+// creates one.
+func validateOutDir(path string) error {
+	dir := filepath.Dir(path)
+	st, err := os.Stat(dir)
+	if err != nil || !st.IsDir() {
+		return fmt.Errorf("--out: directory %s does not exist", dir)
+	}
 	return nil
 }
 

@@ -30,7 +30,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"strings"
@@ -69,7 +68,7 @@ func main() {
 	root := cmd.NewRootCmd(mgr)
 	root.AddCommand(newStoreCmd())
 	if err := root.ExecuteContext(ctx); err != nil {
-		log.Fatal(err)
+		os.Exit(1)
 	}
 }
 

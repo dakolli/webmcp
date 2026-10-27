@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -609,8 +611,7 @@ func TestPageFetchViaIPCForwardsTimeout(t *testing.T) {
 		t.Fatalf("Dial: %v", err)
 	}
 
-	err = pageFetchViaIPC(
-		&cobra.Command{},
+	_, err = pageFetchViaIPC(
 		context.Background(),
 		cl,
 		"page-1", "", "", "dom", "", "",
@@ -781,4 +782,345 @@ func startCapturingBrowserOpenServer(t *testing.T) (string, <-chan ipc.BrowserOp
 		}
 	}()
 	return path, captured
+}
+
+// TestPageFetchOutWritesHAR pins the --out file write: the body lands on disk
+// with mode 0600 and the summary names the path, the entry count and, only when
+// entries were dropped, the truncation.
+func TestPageFetchOutWritesHAR(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     string
+		wantWord string
+	}{
+		{
+			name:     "complete export",
+			body:     `{"log":{"version":"1.2","entries":[{"startedDateTime":"a"},{"startedDateTime":"b"}],"truncated":0}}`,
+			wantWord: "",
+		},
+		{
+			name:     "cap applied",
+			body:     `{"log":{"version":"1.2","entries":[{"startedDateTime":"a"}],"truncated":4}}`,
+			wantWord: " (truncated)",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "traffic.har")
+			line, err := writeHAR(path, tt.body)
+			if err != nil {
+				t.Fatalf("writeHAR: %v", err)
+			}
+			var archive struct {
+				Log struct {
+					Entries []json.RawMessage `json:"entries"`
+				} `json:"log"`
+			}
+			if err := json.Unmarshal([]byte(tt.body), &archive); err != nil {
+				t.Fatalf("decoding fixture: %v", err)
+			}
+			want := fmt.Sprintf("wrote %s (%d entries)%s", path, len(archive.Log.Entries), tt.wantWord)
+			if line != want {
+				t.Errorf("writeHAR summary = %q, want %q", line, want)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("reading written HAR: %v", err)
+			}
+			if string(got) != tt.body {
+				t.Errorf("written body = %q, want %q", got, tt.body)
+			}
+			st, err := os.Stat(path)
+			if err != nil {
+				t.Fatalf("stat written HAR: %v", err)
+			}
+			if perm := st.Mode().Perm(); perm != 0o600 {
+				t.Errorf("file mode = %o, want 600", perm)
+			}
+		})
+	}
+}
+
+// TestPageFetchOutNeedsHAR pins the aspect guard: --out with any other aspect
+// fails before any browser work and names the aspect it received.
+func TestPageFetchOutNeedsHAR(t *testing.T) {
+	cmd := newPageFetchCmd(nil)
+	cmd.SetArgs([]string{"dom", "--out", filepath.Join(t.TempDir(), "traffic.har")})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("page fetch accepted --out with the dom aspect")
+	}
+	if want := `--out needs the har aspect (got "dom")`; !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %v, want it to contain %q", err, want)
+	}
+}
+
+// TestPageFetchOutNeedsExistingDir pins that --out never creates a directory: a
+// missing parent fails with the path named.
+func TestPageFetchOutNeedsExistingDir(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing", "traffic.har")
+	cmd := newPageFetchCmd(nil)
+	cmd.SetArgs([]string{"har", "--out", missing})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("page fetch accepted --out with a missing parent directory")
+	}
+	want := "--out: directory " + filepath.Dir(missing) + " does not exist"
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %v, want it to contain %q", err, want)
+	}
+}
+
+// TestPageFetchViaIPCMaxBytesSentinel pins the wire cap per aspect: a non-har
+// zero keeps the historical "no truncation" bound, while har forwards the
+// encoder's own -1 sentinel so the written document reports "Cap: none".
+func TestPageFetchViaIPCMaxBytesSentinel(t *testing.T) {
+	tests := []struct {
+		name     string
+		what     string
+		maxBytes int
+		want     int
+	}{
+		{
+			name:     "dom zero means unbounded",
+			what:     "dom",
+			maxBytes: 0,
+			want:     int(^uint(0) >> 1),
+		},
+		{
+			name:     "har keeps the uncapped sentinel",
+			what:     "har",
+			maxBytes: harUncapped,
+			want:     harUncapped,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path, captured := startCapturingServer(t)
+			cl, err := ipc.Dial(path)
+			if err != nil {
+				t.Fatalf("Dial: %v", err)
+			}
+			t.Cleanup(func() { _ = cl.Close() })
+
+			_, err = pageFetchViaIPC(
+				context.Background(),
+				cl,
+				"page-1",
+				"",
+				"",
+				tt.what,
+				"",
+				"",
+				false,
+				tt.maxBytes,
+				30000,
+				false,
+			)
+			if err != nil {
+				t.Fatalf("pageFetchViaIPC: %v", err)
+			}
+
+			select {
+			case params := <-captured:
+				if params.MaxBytes != tt.want {
+					t.Errorf("wire max_bytes = %d, want %d", params.MaxBytes, tt.want)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("the fake server saw no page.fetch request")
+			}
+		})
+	}
+}
+
+// startHARFetchDaemon answers the calls `page fetch` makes on the daemon path —
+// browser.list for page-id resolution and page.fetch for the body — and reports
+// the page.fetch params it received.
+func startHARFetchDaemon(t *testing.T, body string) (string, <-chan ipc.PageFetchParams) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "cli.sock")
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen %s: %v", path, err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+
+	captured := make(chan ipc.PageFetchParams, 1)
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+				line, err := bufio.NewReader(c).ReadBytes('\n')
+				if err != nil {
+					return // the Dial probe closes without a line
+				}
+				var req ipc.Request
+				if json.Unmarshal(line, &req) != nil {
+					return
+				}
+				var result any
+				switch req.Method {
+				case ipc.MethodBrowserList:
+					result = ipc.BrowserListResult{Browsers: []ipc.BrowserEntry{{
+						BrowserID: "browser-1",
+						Pages:     []browsers.PageInfo{{ID: "page-1", URL: "https://a.test/"}},
+					}}}
+				case ipc.MethodPageFetch:
+					var params ipc.PageFetchParams
+					if json.Unmarshal(req.Params, &params) == nil {
+						select {
+						case captured <- params:
+						default:
+						}
+					}
+					result = ipc.PageFetchResult{Data: body}
+				default:
+					result = ipc.PingResult{OK: true}
+				}
+				resp, err := json.Marshal(ipc.Response{JSONRPC: "2.0", ID: req.ID, Result: result})
+				if err != nil {
+					return
+				}
+				_, _ = c.Write(append(resp, '\n'))
+			}(conn)
+		}
+	}()
+	return path, captured
+}
+
+// TestPageFetchOutWritesUncappedHAR pins the --out path end to end: the CLI asks
+// the daemon for the uncapped export (-1, never MaxInt), writes exactly the body
+// it received, and the file holds every live entry with truncated 0 and the
+// "Cap: none" comment.
+func TestPageFetchOutWritesUncappedHAR(t *testing.T) {
+	body := `{"log":{"version":"1.2","comment":"Cap: none; every buffered entry is exported and truncated is 0. entries: 3","entries":[{"startedDateTime":"a"},{"startedDateTime":"b"},{"startedDateTime":"c"}],"truncated":0}}`
+	path, captured := startHARFetchDaemon(t, body)
+	out := filepath.Join(t.TempDir(), "traffic.har")
+
+	cmd := newPageFetchCmd(nil)
+	cmd.Flags().String("socket", "", "")
+	cmd.SetArgs([]string{"page-1", "har", "--out", out, "--socket", path, "--browser", "browser-1"})
+	var stderr strings.Builder
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(&stderr)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("page fetch: %v", err)
+	}
+
+	select {
+	case params := <-captured:
+		if params.What != "har" {
+			t.Errorf("wire what = %q, want har", params.What)
+		}
+		if params.MaxBytes != harUncapped {
+			t.Errorf("wire max_bytes = %d, want %d (uncapped sentinel)", params.MaxBytes, harUncapped)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the fake daemon saw no page.fetch request")
+	}
+
+	if got := stderr.String(); got != "" {
+		t.Errorf("stderr = %q, want nothing when --browser names the target", got)
+	}
+
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("reading written HAR: %v", err)
+	}
+	if string(got) != body {
+		t.Errorf("written body = %q, want %q", got, body)
+	}
+	var archive struct {
+		Log struct {
+			Comment   string            `json:"comment"`
+			Entries   []json.RawMessage `json:"entries"`
+			Truncated int               `json:"truncated"`
+		} `json:"log"`
+	}
+	if err := json.Unmarshal(got, &archive); err != nil {
+		t.Fatalf("decoding written HAR: %v", err)
+	}
+	if len(archive.Log.Entries) != 3 {
+		t.Errorf("written entries = %d, want the 3 live entries", len(archive.Log.Entries))
+	}
+	if archive.Log.Truncated != 0 {
+		t.Errorf("log.truncated = %d, want 0", archive.Log.Truncated)
+	}
+	if !strings.Contains(archive.Log.Comment, "Cap: none") {
+		t.Errorf("log.comment = %q, want it to name the uncapped export", archive.Log.Comment)
+	}
+}
+
+// TestPageFetchValidationErrorHasNoUsage pins the failure shape: a rejected
+// --out prints its one-line message once, with no usage block for cobra to
+// repeat the whole flag list.
+func TestPageFetchValidationErrorHasNoUsage(t *testing.T) {
+	cmd := NewPageCmd(nil)
+	cmd.SetArgs([]string{"fetch", "dom", "--out", filepath.Join(t.TempDir(), "traffic.har")})
+	var stderr strings.Builder
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(&stderr)
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("page fetch accepted --out with the dom aspect")
+	}
+	if want := `--out needs the har aspect (got "dom")`; !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %v, want it to contain %q", err, want)
+	}
+
+	out := stderr.String()
+	if strings.Contains(out, "Usage:") {
+		t.Errorf("stderr printed a usage block:\n%s", out)
+	}
+	if got := strings.Count(out, "needs the har aspect"); got != 1 {
+		t.Errorf("the message appears %d times on stderr, want 1:\n%s", got, out)
+	}
+}
+
+// TestReportFallbackBrowserID pins the stderr rule: an explicit --browser is
+// silent, while a browser inherited from --browser-id is reported once.
+func TestReportFallbackBrowserID(t *testing.T) {
+	tests := []struct {
+		name     string
+		explicit bool
+		want     string
+	}{
+		{
+			name:     "explicit --browser stays silent",
+			explicit: true,
+			want:     "",
+		},
+		{
+			name: "inherited --browser-id is reported",
+			want: "browser_id: browser-2 (--browser-id)\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := &cobra.Command{}
+			cmd.Flags().String("browser", "", "")
+			if tt.explicit {
+				if err := cmd.Flags().Set("browser", "browser-2"); err != nil {
+					t.Fatalf("set --browser: %v", err)
+				}
+			}
+			var stderr strings.Builder
+			cmd.SetErr(&stderr)
+
+			reportFallbackBrowserID(cmd, "browser-2")
+			if got := stderr.String(); got != tt.want {
+				t.Errorf("stderr = %q, want %q", got, tt.want)
+			}
+		})
+	}
 }
