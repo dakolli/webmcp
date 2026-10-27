@@ -29,6 +29,14 @@ type Page struct {
 	ID PageID
 	// URL is the URL the page was created with (set by NewPage).
 	URL string
+	// Opener is the id of the page that opened this popup (a target="_blank"
+	// link or window.open), empty for a top-level page. Immutable after
+	// registration, so listings read it without the operation lock.
+	Opener PageID
+	// popupClaimed reports that wait_open already returned this popup, so a
+	// second wait blocks for the next one instead of repeating itself. Guarded
+	// by the owning browser's mutex.
+	popupClaimed bool
 	// Rod is the live go-rod page handle for this tab. Only valid while the
 	// page is open. Guarded by the operation lock.
 	Rod *rod.Page
@@ -165,6 +173,9 @@ type PageInfo struct {
 	// URL is the tab's live URL when it could be read, else the URL the page
 	// was created with (see Stale).
 	URL string `json:"url"`
+	// Opener is the id of the page that opened this popup, absent for a
+	// top-level page.
+	Opener PageID `json:"opener,omitempty"`
 	// Context is the incognito identity the page lives in ("default" for the
 	// parent browser); identities share one Chromium process but not cookies.
 	Context string `json:"context"`
@@ -184,11 +195,14 @@ const listingInfoBudget = time.Second
 // snapshot returns this page's listing row tagged with its owning identity. It
 // refreshes URL and title from the live tab, and never waits on the page
 // operation lock: a busy or unreadable page is reported from the stored URL
-// with Stale set. The caller bounds the read with ctx.
+// with Stale set. URL and title come from ONE atomic read, so a row can never
+// pair a new URL with the previous document's title. The caller bounds the read
+// with ctx.
 func (p *Page) snapshot(ctx context.Context, identity string) PageInfo {
 	info := PageInfo{
 		ID:      p.ID,
 		URL:     p.URL,
+		Opener:  p.Opener,
 		Context: identity,
 	}
 	unlock, ok := p.TryLock()
@@ -203,14 +217,22 @@ func (p *Page) snapshot(ctx context.Context, identity string) PageInfo {
 		info.Stale = true
 		return info
 	}
-	if url != "" {
-		info.URL = url
+	if url == "" {
+		// An empty live URL (about:blank) is never paired with a live title:
+		// that would combine the stored URL with another document's title.
+		info.Stale = title != ""
+		return info
 	}
+	info.URL = url
 	info.Title = title
 	return info
 }
 
-// readInfo reads the tab's live URL and title through the stubbable seam.
+// readInfo reads the tab's live URL and title as one atomic pair: a single
+// in-page evaluation reads location.href and document.title from the same
+// document, so a navigation that has committed but not finished cannot pair the
+// new URL with the previous document's title. The stubbable seam returns a pair
+// for tests.
 func (p *Page) readInfo(ctx context.Context) (string, string, error) {
 	if p.info != nil {
 		return p.info(ctx)
@@ -218,11 +240,11 @@ func (p *Page) readInfo(ctx context.Context) (string, string, error) {
 	if p.Rod == nil {
 		return "", "", fmt.Errorf("browsers: page %q has no live tab", p.ID)
 	}
-	live, err := p.Rod.Context(ctx).Info()
+	live, err := p.Rod.Context(ctx).Eval(`() => ({url: location.href, title: document.title})`)
 	if err != nil {
 		return "", "", err
 	}
-	return live.URL, live.Title, nil
+	return live.Value.Get("url").Str(), live.Value.Get("title").Str(), nil
 }
 
 // Viewport is a page viewport size in CSS pixels. It is the engine's MCP-free

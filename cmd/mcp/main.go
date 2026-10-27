@@ -44,6 +44,7 @@ func main() {
 	mgr := browsers.NewManager(
 		browsers.WithPersistentDefault(false),
 		browsers.WithBrowserTTL(browserTTL),
+		browsers.WithLogger(browsers.NewLogger(os.Stderr, nil)),
 	)
 	// Bounded so a hung page cannot block process exit.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

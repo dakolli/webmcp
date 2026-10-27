@@ -3,14 +3,17 @@ package browsers
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/go-rod/rod/lib/proto"
@@ -21,9 +24,16 @@ const (
 	replayTimeout = 30 * time.Second
 	// replayMaxRedirects bounds how many redirect hops a replay follows.
 	replayMaxRedirects = 5
-	// replayBodyCap bounds the returned response body at 256 KB.
+	// replayBodyCap is the ceiling on a returned response body: 256 KB.
 	replayBodyCap = 256 << 10
 )
+
+// ErrReplayTargetAmbiguous reports a target that matched more than one captured
+// entry. The message lists every candidate.
+var ErrReplayTargetAmbiguous = errors.New("replay target is ambiguous")
+
+// ErrReplayTargetNotFound reports a target that matched no captured entry.
+var ErrReplayTargetNotFound = errors.New("replay target was not found")
 
 // replayDroppedHeaders lists, lowercased, the captured request headers that are
 // not copied onto a replay. The cookie jar owns Cookie, the Go transport owns
@@ -62,6 +72,9 @@ type ReplaySpec struct {
 	// CheckScope authorizes a URL before a replay requests it. The surface
 	// wires the manager's scope check here; nil skips the check.
 	CheckScope func(rawURL string) error
+	// MaxBytes caps the returned body. Zero or a value above replayBodyCap uses
+	// the 256 KB ceiling; a larger body reports Truncated.
+	MaxBytes int64
 }
 
 // ReplayHop is one request/response step of a replay redirect chain.
@@ -90,14 +103,16 @@ type ReplayResult struct {
 	Status int `json:"status"`
 	// Headers are the final response headers, redacted per the capture rule.
 	Headers map[string][]string `json:"headers,omitempty"`
-	// Body carries UTF-8 response content.
+	// Body carries UTF-8 response content with secrets redacted.
 	Body string `json:"body,omitempty"`
 	// Base64 carries binary response content, exclusive with Body.
 	Base64 string `json:"base64,omitempty"`
 	// Bytes is the size of the returned payload after the cap.
 	Bytes int64 `json:"bytes"`
-	// Truncated reports a payload cut at the 256 KB cap.
-	Truncated bool `json:"truncated,omitempty"`
+	// Truncated reports a payload cut at the requested cap.
+	Truncated bool `json:"truncated"`
+	// BodyRedactions counts the body values replaced with <redacted>.
+	BodyRedactions int `json:"body_redactions"`
 	// BodyUncaptured reports that the captured entry retained no request body
 	// and the caller supplied none, so the replay sent no payload.
 	BodyUncaptured bool `json:"body_uncaptured,omitempty"`
@@ -105,8 +120,51 @@ type ReplayResult struct {
 	MS int64 `json:"ms"`
 	// Request is the first-hop request.
 	Request ReplaySent `json:"request"`
-	// Chain lists every hop when the replay followed a redirect.
-	Chain []ReplayHop `json:"chain,omitempty"`
+	// Chain lists every hop when the replay followed a redirect; it is [] for a
+	// single-hop replay.
+	Chain []ReplayHop `json:"chain"`
+}
+
+// ReplayTransportError reports a replay request the HTTP client could not
+// complete. Err carries the transport cause so callers can tell a timeout from
+// a failed request.
+type ReplayTransportError struct {
+	// Method is the request method at the failing hop.
+	Method string
+	// URL is the requested URL at the failing hop.
+	URL string
+	// Budget is the whole-replay timeout that applied.
+	Budget time.Duration
+	// Err is the transport cause.
+	Err error
+}
+
+// Error names the method, target and, for a timeout, the ms budget. It never
+// appends a reachability guess: the transport cause already states what failed.
+func (e *ReplayTransportError) Error() string {
+	if e.TimedOut() {
+		return fmt.Sprintf(
+			"replay: %s %s timed out after %d ms: %v",
+			e.Method,
+			e.URL,
+			e.Budget.Milliseconds(),
+			e.Err,
+		)
+	}
+	return fmt.Sprintf("replay: %s %s: %v", e.Method, e.URL, e.Err)
+}
+
+// Unwrap exposes the transport cause.
+func (e *ReplayTransportError) Unwrap() error { return e.Err }
+
+// TimedOut reports whether the transport failure was a deadline or a network
+// timeout.
+func (e *ReplayTransportError) TimedOut() bool {
+	if errors.Is(e.Err, context.DeadlineExceeded) || errors.Is(e.Err, context.Canceled) {
+		return true
+	}
+	var timeout interface{ Timeout() bool }
+	return errors.As(e.Err, &timeout) && timeout.Timeout()
 }
 
 // Replay resends one captured network entry as a real HTTP request through a Go
@@ -118,8 +176,9 @@ type ReplayResult struct {
 // from the browser, and a body it no longer retains is reported in
 // BodyUncaptured rather than sent empty. CheckScope authorizes the target and
 // every redirect before it is requested. Up to five redirects are followed and
-// reported in Chain. The response body is capped at 256 KB and sensitive
-// headers are redacted unless the page enabled secrets capture.
+// reported in Chain. The response body is capped at MaxBytes (256 KB ceiling)
+// and both sensitive headers and text bodies are redacted unless the page
+// enabled secrets capture.
 func (p *Page) Replay(ctx context.Context, spec ReplaySpec) (ReplayResult, error) {
 	entries, _ := p.NetworkEntries()
 	entry, err := matchReplayEntry(entries, spec.Target)
@@ -170,6 +229,7 @@ func (p *Page) Replay(ctx context.Context, spec ReplaySpec) (ReplayResult, error
 		},
 	}
 	keep := p.captureSecrets()
+	limit := replayBodyLimit(spec.MaxBytes)
 	start := time.Now()
 	chain := make([]ReplayHop, 0, replayMaxRedirects+1)
 	curURL, curMethod, curBody, curHasBody := target.String(), method, body, hasBody
@@ -190,12 +250,12 @@ func (p *Page) Replay(ctx context.Context, spec ReplaySpec) (ReplayResult, error
 		req.Header = headers.Clone()
 		resp, err := client.Do(req)
 		if err != nil {
-			return ReplayResult{}, fmt.Errorf(
-				"replay: %s %s: %w (the host is unreachable or rejected the request — verify the URL, DNS and TLS trust)",
-				curMethod,
-				curURL,
-				err,
-			)
+			return ReplayResult{}, &ReplayTransportError{
+				Method: curMethod,
+				URL:    curURL,
+				Budget: replayTimeout,
+				Err:    err,
+			}
 		}
 		chain = append(chain, ReplayHop{Status: resp.StatusCode, URL: curURL})
 
@@ -205,7 +265,7 @@ func (p *Page) Replay(ctx context.Context, spec ReplaySpec) (ReplayResult, error
 				Method:  method,
 				URL:     target.String(),
 				Headers: replayEchoHeaders(headers, keep),
-			}, keep, start)
+			}, keep, start, limit)
 			if err != nil {
 				return ReplayResult{}, err
 			}
@@ -251,7 +311,8 @@ func matchReplayEntry(entries []NetworkEntry, target string) (NetworkEntry, erro
 			}
 		}
 		return NetworkEntry{}, fmt.Errorf(
-			"replay: no network entry with seq %d (read page_fetch what=network for the current seq values)",
+			"%w: no network entry with seq %d (read page_fetch what=network for the current seq values)",
+			ErrReplayTargetNotFound,
 			seq,
 		)
 	}
@@ -265,7 +326,8 @@ func matchReplayEntry(entries []NetworkEntry, target string) (NetworkEntry, erro
 	switch len(matches) {
 	case 0:
 		return NetworkEntry{}, fmt.Errorf(
-			"replay: no network entry matches target %q (target is a seq number or a substring of the request URL; read page_fetch what=network first)",
+			"%w: no network entry matches target %q (target is a seq number or a substring of the request URL; read page_fetch what=network first)",
+			ErrReplayTargetNotFound,
 			target,
 		)
 	case 1:
@@ -276,7 +338,8 @@ func matchReplayEntry(entries []NetworkEntry, target string) (NetworkEntry, erro
 			lines[i] = fmt.Sprintf("seq=%d %s %s", e.Seq, e.Method, e.URL)
 		}
 		return NetworkEntry{}, fmt.Errorf(
-			"replay: target %q matches %d network entries — pass a seq or a longer URL substring: %s",
+			"%w: target %q matches %d network entries — pass a seq or a longer URL substring: %s",
+			ErrReplayTargetAmbiguous,
 			target,
 			len(matches),
 			strings.Join(lines, "; "),
@@ -448,15 +511,17 @@ func replayResponseHeaders(h http.Header, keep bool) map[string][]string {
 }
 
 // replayResult builds the final envelope from the last response. The response
-// body is read and closed here.
+// body is read and closed here, and text bodies are redacted unless the page
+// enabled secrets capture.
 func replayResult(
 	resp *http.Response,
 	chain []ReplayHop,
 	sent ReplaySent,
 	keep bool,
 	start time.Time,
+	limit int64,
 ) (ReplayResult, error) {
-	payload, err := readReplayBody(resp)
+	payload, err := readReplayBody(resp, limit)
 	if err != nil {
 		return ReplayResult{}, fmt.Errorf("replay: read %s %s response: %w", resp.Request.Method, resp.Request.URL, err)
 	}
@@ -469,12 +534,125 @@ func replayResult(
 		Truncated: payload.Truncated,
 		MS:        time.Since(start).Milliseconds(),
 		Request:   sent,
+		Chain:     []ReplayHop{},
 	}
 	if len(chain) > 1 {
 		result.Chain = chain
 	}
+	if result.Body != "" {
+		result.Body, result.BodyRedactions = redactBody(result.Body, keep)
+	}
 	return result, nil
 }
+
+// replayBodyLimit resolves the body cap: zero or anything above the ceiling
+// uses replayBodyCap.
+func replayBodyLimit(requested int64) int64 {
+	if requested <= 0 || requested > replayBodyCap {
+		return replayBodyCap
+	}
+	return requested
+}
+
+// sensitiveBodySegments lists, lowercased, the key segments whose body values
+// are replaced with redactedValue. A key is split on non-alphanumeric runes, so
+// "sails.sid" matches "sid" while "consideration" does not.
+var sensitiveBodySegments = map[string]bool{
+	"cookie":        true,
+	"cookies":       true,
+	"authorization": true,
+	"auth":          true,
+	"token":         true,
+	"session":       true,
+	"sessionid":     true,
+	"sessionkey":    true,
+	"sid":           true,
+	"wmsession":     true,
+	"csrf":          true,
+	"csrftoken":     true,
+	"secret":        true,
+	"password":      true,
+	"passwd":        true,
+	"apikey":        true,
+}
+
+// Body redaction patterns: JSON string fields, header-like lines, key=value
+// pairs and auth credentials. They mirror the header redactor's key list and
+// add the session-id and bearer-token shapes a body carries.
+var (
+	bodyJSONPair   = regexp.MustCompile(`"([^"\\\r\n]{1,80})"\s*:\s*"((?:[^"\\]|\\.)*)"`)
+	bodyHeaderLine = regexp.MustCompile(`(?m)^[ \t]*([A-Za-z0-9_.\-]{1,80})[ \t]*:[ \t]*([^\r\n]+)$`)
+	bodyKeyValue   = regexp.MustCompile(`(?i)\b([A-Za-z0-9_.\-]{1,80})=([^&;,\s"']+)`)
+	bodyAuthToken  = regexp.MustCompile(`(?i)\b(Bearer|Basic)(\s+)([A-Za-z0-9._~+/=\-]{4,1000})`)
+)
+
+// redactBody replaces sensitive values in a text body while keeping their keys.
+// It reports how many values it replaced. keep skips redaction entirely.
+func redactBody(body string, keep bool) (string, int) {
+	if keep || body == "" {
+		return body, 0
+	}
+	count := 0
+	body = redactBodyMatches(body, bodyJSONPair, 1, 2, isSensitiveBodyKey, &count)
+	body = redactBodyMatches(body, bodyHeaderLine, 1, 2, isSensitiveBodyKey, &count)
+	body = redactBodyMatches(body, bodyKeyValue, 1, 2, isSensitiveBodyKey, &count)
+	body = redactBodyMatches(body, bodyAuthToken, 1, 3, alwaysSensitive, &count)
+	return body, count
+}
+
+// redactBodyMatches rewrites every match whose key group is sensitive, keeping
+// the text before and after the value group intact.
+func redactBodyMatches(
+	s string,
+	re *regexp.Regexp,
+	keyGroup, valueGroup int,
+	sensitive func(string) bool,
+	count *int,
+) string {
+	locs := re.FindAllStringSubmatchIndex(s, -1)
+	if len(locs) == 0 {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	last := 0
+	for _, loc := range locs {
+		b.WriteString(s[last:loc[0]])
+		key := s[loc[2*keyGroup]:loc[2*keyGroup+1]]
+		if sensitive(key) {
+			vStart, vEnd := loc[2*valueGroup], loc[2*valueGroup+1]
+			b.WriteString(s[loc[0]:vStart])
+			b.WriteString(redactedValue)
+			b.WriteString(s[vEnd:loc[1]])
+			*count += 1
+		} else {
+			b.WriteString(s[loc[0]:loc[1]])
+		}
+		last = loc[1]
+	}
+	b.WriteString(s[last:])
+	return b.String()
+}
+
+// isSensitiveBodyKey reports whether a body key holds a secret, comparing whole
+// segments so a substring such as "sid" inside "consideration" never matches.
+func isSensitiveBodyKey(key string) bool {
+	k := strings.ToLower(strings.TrimSpace(strings.Trim(key, `"';`)))
+	if sensitiveHeaders[k] {
+		return true
+	}
+	for _, seg := range strings.FieldsFunc(k, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}) {
+		if sensitiveBodySegments[seg] {
+			return true
+		}
+	}
+	return false
+}
+
+// alwaysSensitive marks an auth credential value for redaction.
+func alwaysSensitive(string) bool { return true }
 
 // isReplayRedirect reports whether status is a redirect a replay follows.
 func isReplayRedirect(status int) bool {
@@ -495,10 +673,10 @@ type replayPayload struct {
 	Truncated bool
 }
 
-// readReplayBody reads and closes a response body, capping it at replayBodyCap
-// and switching binary content to base64.
-func readReplayBody(resp *http.Response) (replayPayload, error) {
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, replayBodyCap+1))
+// readReplayBody reads and closes a response body, capping it at limit and
+// switching binary content to base64.
+func readReplayBody(resp *http.Response, limit int64) (replayPayload, error) {
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	closeErr := resp.Body.Close()
 	if err != nil {
 		return replayPayload{}, fmt.Errorf("read body: %w", err)
@@ -506,7 +684,7 @@ func readReplayBody(resp *http.Response) (replayPayload, error) {
 	if closeErr != nil {
 		return replayPayload{}, fmt.Errorf("close body: %w", closeErr)
 	}
-	raw, truncated := capReplayBody(raw)
+	raw, truncated := capReplayBody(raw, limit)
 	out := replayPayload{
 		Bytes:     int64(len(raw)),
 		Truncated: truncated,
@@ -519,13 +697,13 @@ func readReplayBody(resp *http.Response) (replayPayload, error) {
 	return out, nil
 }
 
-// capReplayBody cuts raw to replayBodyCap on a rune boundary, reporting whether
-// it had to cut.
-func capReplayBody(raw []byte) ([]byte, bool) {
-	if len(raw) <= replayBodyCap {
+// capReplayBody cuts raw to limit on a rune boundary, reporting whether it had
+// to cut.
+func capReplayBody(raw []byte, limit int64) ([]byte, bool) {
+	if int64(len(raw)) <= limit {
 		return raw, false
 	}
-	end := replayBodyCap
+	end := int(limit)
 	for end > 0 && !utf8.RuneStart(raw[end]) {
 		end--
 	}

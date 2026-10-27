@@ -57,6 +57,7 @@ func main() {
 	mgr := browsers.NewManager(
 		browsers.WithPersistentDefault(false),
 		browsers.WithBrowserTTL(ttl),
+		browsers.WithLogger(browsers.NewLogger(os.Stderr, nil)),
 	)
 	defer mgr.Shutdown(context.Background()) // graceful teardown (best-effort)
 

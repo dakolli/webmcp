@@ -2,11 +2,37 @@ package cmd
 
 import (
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	mcpServer "webmcp/pkg/mcp/server"
 )
+
+// TestServeLoggerWritesToServeLog pins the production wiring: the serve loop's
+// logger appends the manager's close line to the serve log file under
+// $XDG_STATE_HOME/web-cli.
+func TestServeLoggerWritesToServeLog(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", dir)
+
+	logger, closeLog := serveLogger()
+	defer closeLog()
+
+	logger.Info("browsers: browser closed", "reason", "browser_close")
+
+	data, err := os.ReadFile(filepath.Join(dir, "web-cli", "serve.log"))
+	if err != nil {
+		t.Fatalf("read serve log: %v", err)
+	}
+	if !strings.Contains(string(data), "browsers: browser closed") {
+		t.Fatalf("serve log = %q, want the browser close line", data)
+	}
+	if !strings.Contains(string(data), "reason=browser_close") {
+		t.Fatalf("serve log = %q, want the close reason", data)
+	}
+}
 
 // TestServeLaunchesDefaultBrowser pins the WEB-139 split: only the plain human
 // daemon pre-launches browser-1, while `serve mcp` starts no browser at all

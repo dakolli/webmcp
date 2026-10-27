@@ -1,11 +1,13 @@
 package browsers
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -142,19 +144,21 @@ func TestReadReplayBody(t *testing.T) {
 	tests := []struct {
 		name      string
 		body      string
+		limit     int64
 		wantBody  string
 		wantBytes int64
 		wantCut   bool
 		wantB64   bool
 	}{
-		{name: "plain text", body: "hello", wantBody: "hello", wantBytes: 5},
-		{name: "binary is base64", body: "\xff\xfe", wantBytes: 2, wantB64: true},
-		{name: "oversized body is capped", body: strings.Repeat("a", replayBodyCap+10), wantBody: strings.Repeat("a", replayBodyCap), wantBytes: replayBodyCap, wantCut: true},
+		{name: "plain text", body: "hello", limit: replayBodyCap, wantBody: "hello", wantBytes: 5},
+		{name: "binary is base64", body: "\xff\xfe", limit: replayBodyCap, wantBytes: 2, wantB64: true},
+		{name: "oversized body is capped at the ceiling", body: strings.Repeat("a", replayBodyCap+10), limit: replayBodyCap, wantBody: strings.Repeat("a", replayBodyCap), wantBytes: replayBodyCap, wantCut: true},
+		{name: "requested cap is honoured", body: "0123456789", limit: 4, wantBody: "0123", wantBytes: 4, wantCut: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			resp := &http.Response{Body: io.NopCloser(strings.NewReader(tt.body))}
-			got, err := readReplayBody(resp)
+			got, err := readReplayBody(resp, tt.limit)
 			if err != nil {
 				t.Fatalf("readReplayBody() error = %v", err)
 			}
@@ -176,7 +180,7 @@ func TestReadReplayBody(t *testing.T) {
 
 func TestCapReplayBodyRuneBoundary(t *testing.T) {
 	raw := append([]byte(strings.Repeat("a", replayBodyCap-1)), []byte("é")...)
-	cut, truncated := capReplayBody(raw)
+	cut, truncated := capReplayBody(raw, replayBodyCap)
 	if !truncated {
 		t.Fatal("capReplayBody() truncated = false, want true")
 	}
@@ -185,5 +189,144 @@ func TestCapReplayBodyRuneBoundary(t *testing.T) {
 	}
 	if !utf8.Valid(cut) {
 		t.Fatal("capReplayBody() cut a rune in half")
+	}
+}
+
+func TestReplayBodyLimit(t *testing.T) {
+	tests := []struct {
+		name      string
+		requested int64
+		want      int64
+	}{
+		{name: "zero uses the ceiling", requested: 0, want: replayBodyCap},
+		{name: "negative uses the ceiling", requested: -1, want: replayBodyCap},
+		{name: "above the ceiling is clamped", requested: replayBodyCap + 1, want: replayBodyCap},
+		{name: "below the ceiling is honoured", requested: 4096, want: 4096},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := replayBodyLimit(tt.requested); got != tt.want {
+				t.Fatalf("replayBodyLimit(%d) = %d, want %d", tt.requested, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestReplayResultAlwaysEmitsEnvelopeFields pins that a clean replay always
+// carries truncated, chain and body_redactions, and that an echoed cookie is
+// redacted while bytes stays readable.
+func TestReplayResultAlwaysEmitsEnvelopeFields(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"cookie":"wmsession=abc123def456","ok":true}`)),
+	}
+	got, err := replayResult(
+		resp,
+		[]ReplayHop{{Status: 200, URL: "https://example.test/"}},
+		ReplaySent{Method: "GET", URL: "https://example.test/"},
+		false,
+		time.Now(),
+		replayBodyCap,
+	)
+	if err != nil {
+		t.Fatalf("replayResult() error = %v", err)
+	}
+	if strings.Contains(got.Body, "abc123def456") {
+		t.Fatalf("replayResult() body leaks the cookie: %q", got.Body)
+	}
+	if !strings.Contains(got.Body, redactedValue) {
+		t.Fatalf("replayResult() body = %q, want the redaction marker", got.Body)
+	}
+	if got.BodyRedactions != 1 {
+		t.Fatalf("replayResult() body_redactions = %d, want 1", got.BodyRedactions)
+	}
+	if got.Bytes <= 0 {
+		t.Fatalf("replayResult() bytes = %d, want readable", got.Bytes)
+	}
+
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal replay result: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("unmarshal replay result: %v", err)
+	}
+	for _, key := range []string{"truncated", "chain", "body_redactions", "bytes"} {
+		if _, ok := doc[key]; !ok {
+			t.Fatalf("replay result is missing %q: %s", key, raw)
+		}
+	}
+	if truncated, _ := doc["truncated"].(bool); truncated {
+		t.Fatalf("clean replay truncated = %v, want false", doc["truncated"])
+	}
+	chain, ok := doc["chain"].([]any)
+	if !ok {
+		t.Fatalf("clean replay chain = %v, want an array", doc["chain"])
+	}
+	if len(chain) != 0 {
+		t.Fatalf("clean replay chain = %v, want []", chain)
+	}
+}
+
+// TestRedactBody pins the body redactor against the shapes a replay echoes back:
+// a JSON cookie field, a session-id object key, a bearer token and a form pair.
+func TestRedactBody(t *testing.T) {
+	tests := []struct {
+		name      string
+		body      string
+		want      string
+		wantCount int
+		keep      bool
+	}{
+		{
+			name:      "JSON cookie value becomes redacted",
+			body:      `{"cookie":"wmsession=abc123def456; sails.sid=s%3Asecret"}`,
+			want:      `{"cookie":"<redacted>"}`,
+			wantCount: 1,
+		},
+		{
+			name:      "JSON session key becomes redacted",
+			body:      `{"cookies":{"wmsession":"abc123def456"},"ok":true}`,
+			want:      `{"cookies":{"wmsession":"<redacted>"},"ok":true}`,
+			wantCount: 1,
+		},
+		{
+			name:      "bearer token is redacted",
+			body:      `{"note":"sent Authorization: Bearer abc123xyz"}`,
+			want:      `{"note":"sent Authorization: Bearer <redacted>"}`,
+			wantCount: 1,
+		},
+		{
+			name:      "form session pair is redacted and ordinary pairs survive",
+			body:      `wmsession=abc123def456&page=2`,
+			want:      `wmsession=<redacted>&page=2`,
+			wantCount: 1,
+		},
+		{
+			name:      "keep leaves the body alone",
+			body:      `{"cookie":"wmsession=abc123def456"}`,
+			want:      `{"cookie":"wmsession=abc123def456"}`,
+			wantCount: 0,
+			keep:      true,
+		},
+		{
+			name:      "ordinary JSON is untouched",
+			body:      `{"consideration":"none","url":"https://example.com/a?x=1"}`,
+			want:      `{"consideration":"none","url":"https://example.com/a?x=1"}`,
+			wantCount: 0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, count := redactBody(tt.body, tt.keep)
+			if got != tt.want {
+				t.Fatalf("redactBody() = %q, want %q", got, tt.want)
+			}
+			if count != tt.wantCount {
+				t.Fatalf("redactBody() count = %d, want %d", count, tt.wantCount)
+			}
+		})
 	}
 }

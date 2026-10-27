@@ -2,6 +2,7 @@ package browsers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os/exec"
@@ -56,6 +57,11 @@ type Browser struct {
 	rod *rod.Browser
 	// pages maps page IDs to their live pages.
 	pages map[PageID]*Page
+	// popups tracks the targets this browser wrapped (normal pages and popups,
+	// keyed by CDP target id) and the waiters blocked on WaitOpen. Only the
+	// root browser uses it; a clone's tracker stays zero. Guarded by the root's
+	// mu.
+	popups popupTracker
 	// identities maps identity names to live incognito clones. Only a root
 	// browser owns a non-nil registry; a clone's map is nil. Guarded by the
 	// root's mu and cleared by its Close.
@@ -639,6 +645,7 @@ func (b *Browser) Launch(ctx context.Context) error {
 	b.rod = rb
 	b.profileDir = profileDir
 	b.mu.Unlock()
+	b.startTargetTracking()
 	return nil
 }
 
@@ -691,6 +698,9 @@ func (b *Browser) NewPage(
 		if err := b.CheckScope(url); err != nil {
 			return nil, err
 		}
+	}
+	if err := b.checkPageCap(); err != nil {
+		return nil, err
 	}
 
 	// Create the tab with rod's own pipeline (Browser.Page: Target.createTarget
@@ -816,6 +826,7 @@ func (b *Browser) NewPage(
 		}
 	}
 
+	targetID := p.TargetID
 	pageID := b.mintPageID()
 	b.mu.Lock()
 	page.ID = pageID
@@ -824,6 +835,7 @@ func (b *Browser) NewPage(
 	b.pages[pageID] = page
 	b.mu.Unlock()
 	b.root().touch()
+	b.root().trackTarget(page, targetID)
 	return page, nil
 }
 
@@ -874,6 +886,7 @@ func (b *Browser) Page(ctx context.Context, id PageID) (*Page, error) {
 	if err := probePage(p); err != nil {
 		// The tab is dead: evict it (WEB-39 TOCTOU-safe capture pattern).
 		var handle *rod.Page
+		evicted := false
 		if unlock, locked := p.TryLock(); locked {
 			owner.mu.Lock()
 			if cur, ok := owner.pages[id]; ok && cur == p {
@@ -881,9 +894,13 @@ func (b *Browser) Page(ctx context.Context, id PageID) (*Page, error) {
 				handle = p.Rod
 				p.Rod = nil
 				delete(owner.pages, id)
+				evicted = true
 			}
 			owner.mu.Unlock()
 			unlock()
+		}
+		if evicted {
+			owner.forgetTarget(p)
 		}
 		if handle != nil {
 			owner.stopProxyAuth(handle)
@@ -1136,7 +1153,35 @@ func (b *Browser) ClosePage(ctx context.Context, id PageID) error {
 // closePage performs ClosePage and reports whether the tab handle was released.
 // A false result with a nil error means an operation still held the page: the
 // registry entry was removed and the tab is left to the browser teardown.
-func (b *Browser) closePage(ctx context.Context, id PageID) (released bool, err error) {
+func (b *Browser) closePage(ctx context.Context, id PageID) (bool, error) {
+	return b.closePageTree(ctx, id, make(map[PageID]bool))
+}
+
+// closePageTree closes id and every popup opened by it, recursively, so an
+// orphan target never outlives its opener. seen keeps a shared close request
+// from visiting a page twice.
+func (b *Browser) closePageTree(
+	ctx context.Context,
+	id PageID,
+	seen map[PageID]bool,
+) (released bool, err error) {
+	for _, pid := range b.popupTree(id) {
+		if seen[pid] {
+			continue
+		}
+		seen[pid] = true
+		closed, closeErr := b.closeOnePage(ctx, pid)
+		if pid == id {
+			released = closed
+		}
+		err = errors.Join(err, closeErr)
+	}
+	return released, err
+}
+
+// closeOnePage closes one page, removing it from its owning browser's registry
+// and releasing its tab. It does not cascade to popups.
+func (b *Browser) closeOnePage(ctx context.Context, id PageID) (released bool, err error) {
 	owner, p, ok := b.lookupPage(id)
 	if !ok {
 		return false, fmt.Errorf("browsers: page %q not found", id)
@@ -1147,6 +1192,7 @@ func (b *Browser) closePage(ctx context.Context, id PageID) (released bool, err 
 		delete(owner.pages, id)
 	}
 	owner.mu.Unlock()
+	owner.forgetTarget(p)
 	b.root().touch()
 
 	unlock, locked := p.TryLock()
@@ -1211,9 +1257,14 @@ func (b *Browser) Close(ctx context.Context) error {
 	b.authPages = make(map[*rod.Page]*proxyAuthPage)
 	headerCleanups := b.headerCleanups
 	b.headerCleanups = make(map[*rod.Page]func())
+	targetStop := b.popups.stop
+	b.stopTargetTrackingLocked()
 	rb := b.rod
 	b.rod = nil
 	b.mu.Unlock()
+	if targetStop != nil {
+		targetStop()
+	}
 
 	// Identity contexts are disposed first: each clone owns a separate cookie
 	// jar and tab set, so its Close is the only clean way to release them. A

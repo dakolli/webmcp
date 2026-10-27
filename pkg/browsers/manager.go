@@ -29,6 +29,19 @@ type BrowserID string
 // ErrUnknownBrowser reports that a browser id does not match a live browser.
 var ErrUnknownBrowser = errors.New("unknown browser")
 
+// errManagerShutdown reports a create or open against a terminated manager.
+var errManagerShutdown = errors.New("browsers: manager has been shut down")
+
+// Browser close reasons recorded on the audit log line. A browser can leave the
+// live registry by an explicit close, the idle sweep, a crashed Chromium
+// process, or manager shutdown; the reason makes a vanished browser traceable.
+const (
+	closeReasonExplicit = "browser_close"
+	closeReasonSweep    = "idle_sweep"
+	closeReasonCrash    = "crash"
+	closeReasonShutdown = "shutdown"
+)
+
 // PageLookupKind classifies why a page id did not resolve for the caller.
 type PageLookupKind string
 
@@ -333,6 +346,25 @@ func WithLogger(logger *slog.Logger) Option {
 	}
 }
 
+// NewLogger builds the logger every production entry point installs on a
+// Manager with WithLogger: structured text records go to sink, and when console
+// is non-nil each record is mirrored there too so a foreground run shows it
+// while the log file keeps it. Unlike the engine's default discard logger, the
+// result accepts info records, so a wired manager can never lose a browser
+// close reason.
+func NewLogger(sink, console io.Writer) *slog.Logger {
+	if sink == nil {
+		sink = io.Discard
+	}
+	writers := []io.Writer{sink}
+	if console != nil {
+		writers = append(writers, console)
+	}
+	return slog.New(slog.NewTextHandler(io.MultiWriter(writers...), &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+}
+
 // Manager owns the live Browsers of one daemon.
 //
 // Lifecycle:
@@ -351,6 +383,10 @@ type Manager struct {
 	browsers map[BrowserID]*Browser
 	// nextBrowserID is the counter used to mint fresh BrowserIDs.
 	nextBrowserID int
+	// flights holds the single in-flight create per launch key. Concurrent
+	// callers with the same key join the leader's flight instead of launching a
+	// second Chromium; guarded by mu. The leader deletes its entry on completion.
+	flights map[launchKey]*createFlight
 	// relaunched is set when the manager observed a Browser's Chromium
 	// process die and (re)started it.
 	relaunched bool
@@ -443,6 +479,7 @@ func NewManager(opts ...Option) *Manager {
 	m := &Manager{
 		browsers:      make(map[BrowserID]*Browser),
 		nextBrowserID: 1,
+		flights:       make(map[launchKey]*createFlight),
 		stealth:       true,
 		persist:       true,
 		ttl:           defaultTTL,
@@ -571,6 +608,15 @@ type Created struct {
 	Reused  bool
 }
 
+// createFlight is one in-flight create shared by every caller with the same
+// launch key. The leader writes result and err, then closes done; each follower
+// waits on done and reads the fields with the close as its happens-before edge.
+type createFlight struct {
+	done   chan struct{}
+	result Created
+	err    error
+}
+
 // CreateBrowser creates and launches a new Browser instance with custom options
 // (e.g. WithBin, WithProfileDir, WithHeadless, WithStealth). It is the
 // compatibility form of Create that drops the reuse flag.
@@ -585,17 +631,74 @@ func (m *Manager) CreateBrowser(ctx context.Context, opts ...Option) (BrowserID,
 //
 // Creation is idempotent: when a live browser already matches the same owner
 // and canonical launch options (see launchKey), that browser is returned with
-// Reused set instead of minting a new id. The owner comes from WithOwner when
-// given, then from the identity on ctx (see WithOwnerKey), then from
-// UnownedOwner. A live browser already holding the resolved profile directory
-// fails the create before any Chromium launch.
+// Reused set instead of minting a new id. Concurrent creates with the same key
+// join one single-flight: the leader launches while followers wait for its
+// result, so one owner and one option set always map to one browser. No lock is
+// held across the Chromium launch.
+//
+// The owner comes from WithOwner when given, then from the identity on ctx (see
+// WithOwnerKey), then from UnownedOwner. A live browser already holding the
+// resolved profile directory fails the create before any Chromium launch.
 func (m *Manager) Create(ctx context.Context, opts ...Option) (Created, error) {
+	effective, defaultProfileDir, defaultPersist, err := m.createOptions(opts)
+	if err != nil {
+		return Created{}, err
+	}
+	owner := effective.owner
+	if owner == "" {
+		owner = OwnerFrom(ctx)
+	}
+	key := launchKeyOf(owner, effective)
+	if effective.proxy != "" {
+		if _, _, err := parseProxy(effective.proxy); err != nil {
+			return Created{}, err
+		}
+	}
+
+	if b := m.reusableBrowser(ctx, key); b != nil {
+		return Created{ID: b.id, Browser: b, Reused: true}, nil
+	}
+
+	flight, leader, err := m.joinCreate(key)
+	if err != nil {
+		return Created{}, err
+	}
+	if !leader {
+		select {
+		case <-flight.done:
+			created := flight.result
+			if flight.err == nil {
+				created.Reused = true
+			}
+			return created, flight.err
+		case <-ctx.Done():
+			return Created{}, ctx.Err()
+		}
+	}
+
+	created, err := m.launchCreatedBrowser(
+		ctx,
+		effective,
+		owner,
+		SessionOwnerFrom(ctx),
+		key,
+		defaultProfileDir,
+		defaultPersist,
+	)
+	m.finishCreate(key, flight, created, err)
+	return created, err
+}
+
+// createOptions snapshots the manager's launch defaults under the lock and
+// applies the per-call options over them. It fails when the manager is shut
+// down. The returned profile fields are the manager defaults Create needs to
+// resolve the profile after the id is minted.
+func (m *Manager) createOptions(opts []Option) (*Manager, string, bool, error) {
 	m.mu.Lock()
 	if m.shutdown {
 		m.mu.Unlock()
-		return Created{}, errors.New("browsers: manager has been shut down")
+		return nil, "", false, errManagerShutdown
 	}
-
 	effective := &Manager{
 		headless:     m.headless,
 		stealth:      m.stealth,
@@ -618,18 +721,51 @@ func (m *Manager) Create(ctx context.Context, opts ...Option) (Created, error) {
 	for _, o := range opts {
 		o(effective)
 	}
-	owner := effective.owner
-	if owner == "" {
-		owner = OwnerFrom(ctx)
-	}
-	sessionOwner := SessionOwnerFrom(ctx)
-	key := launchKeyOf(owner, effective)
-	if effective.proxy != "" {
-		if _, _, err := parseProxy(effective.proxy); err != nil {
-			return Created{}, err
-		}
-	}
+	return effective, defaultProfileDir, defaultPersist, nil
+}
 
+// joinCreate returns the in-flight create for key. The first caller becomes the
+// leader and must launch; later callers wait on the shared done channel. The
+// lock is held only to inspect and record the flight, never across a launch.
+func (m *Manager) joinCreate(key launchKey) (*createFlight, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.shutdown {
+		return nil, false, errManagerShutdown
+	}
+	if flight, ok := m.flights[key]; ok {
+		return flight, false, nil
+	}
+	flight := &createFlight{done: make(chan struct{})}
+	m.flights[key] = flight
+	return flight, true, nil
+}
+
+// finishCreate publishes the leader's outcome to every follower and retires the
+// flight under the manager lock, so a later create starts a fresh flight.
+func (m *Manager) finishCreate(key launchKey, flight *createFlight, created Created, err error) {
+	m.mu.Lock()
+	flight.result = created
+	flight.err = err
+	if m.flights[key] == flight {
+		delete(m.flights, key)
+	}
+	close(flight.done)
+	m.mu.Unlock()
+}
+
+// launchCreatedBrowser reuses a matching live browser or launches and registers
+// a fresh one. It is the leader-only body of Create: the caller owns the flight
+// for key, so no concurrent create with the same options can run it. The
+// Chromium launch happens with no manager lock held.
+func (m *Manager) launchCreatedBrowser(
+	ctx context.Context,
+	effective *Manager,
+	owner, sessionOwner string,
+	key launchKey,
+	defaultProfileDir string,
+	defaultPersist bool,
+) (Created, error) {
 	if b := m.reusableBrowser(ctx, key); b != nil {
 		return Created{ID: b.id, Browser: b, Reused: true}, nil
 	}
@@ -688,7 +824,7 @@ func (m *Manager) Create(ctx context.Context, opts ...Option) (Created, error) {
 	if m.shutdown {
 		m.mu.Unlock()
 		_ = b.Close(ctx)
-		return Created{}, errors.New("browsers: manager has been shut down")
+		return Created{}, errManagerShutdown
 	}
 	m.browsers[id] = b
 	m.startSweeperLocked()
@@ -726,6 +862,7 @@ func (m *Manager) reusableBrowser(ctx context.Context, key launchKey) *Browser {
 		}
 		m.mu.Unlock()
 		if dead {
+			m.logBrowserClosed(candidate, closeReasonCrash)
 			_ = candidate.Close(ctx)
 		}
 		return nil
@@ -801,7 +938,7 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 	m.mu.Lock()
 	if m.shutdown {
 		m.mu.Unlock()
-		return nil, errors.New("browsers: manager has been shut down")
+		return nil, errManagerShutdown
 	}
 
 	if b, ok := m.browsers[id]; ok {
@@ -814,6 +951,7 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 		delete(m.browsers, id)
 		m.relaunched = true
 		m.mu.Unlock()
+		m.logBrowserClosed(b, closeReasonCrash)
 		_ = b.Close(ctx)
 	} else {
 		m.mu.Unlock()
@@ -901,7 +1039,7 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 	if m.shutdown {
 		m.mu.Unlock()
 		_ = b.Close(ctx)
-		return nil, errors.New("browsers: manager has been shut down")
+		return nil, errManagerShutdown
 	}
 	if winner, ok := m.browsers[id]; ok {
 		m.mu.Unlock()
@@ -1032,6 +1170,7 @@ func (m *Manager) Browser(id BrowserID) (*Browser, error) {
 			m.stopSweeperLocked()
 		}
 		m.mu.Unlock()
+		m.logBrowserClosed(target, closeReasonCrash)
 		closeCtx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 		defer cancel()
 		_ = target.Close(closeCtx)
@@ -1534,9 +1673,39 @@ func pageIDsOrNone(ids []PageID) string {
 	return strings.Join(parts, ", ")
 }
 
+// logBrowserClosed records why a browser left the live registry. The reason
+// distinguishes an explicit close, the idle sweep, a crashed Chromium process
+// and shutdown, so a browser that vanished mid-run is never silent. Close
+// reasons log at info and crashes at warn. The sink is the manager logger
+// installed with WithLogger (NewLogger for production); the default discards.
+func (m *Manager) logBrowserClosed(b *Browser, reason string, attrs ...slog.Attr) {
+	level := slog.LevelInfo
+	if reason == closeReasonCrash {
+		level = slog.LevelWarn
+	}
+	base := []slog.Attr{
+		slog.String("browser_id", string(b.id)),
+		slog.String("reason", reason),
+		slog.String("owner", b.OwnerLabel()),
+	}
+	m.logger.LogAttrs(
+		context.Background(),
+		level,
+		"browsers: browser closed",
+		append(base, attrs...)...,
+	)
+}
+
 // CloseBrowser closes a specific Browser by BrowserID and all of its pages.
-// If id is empty, it closes ALL open browsers.
+// If id is empty, it closes ALL open browsers. Each close is recorded on the
+// manager log with reason browser_close.
 func (m *Manager) CloseBrowser(ctx context.Context, id BrowserID) error {
+	return m.closeBrowser(ctx, id, closeReasonExplicit)
+}
+
+// closeBrowser implements CloseBrowser with an explicit audit reason so
+// shutdown records itself distinctly from a caller-driven close.
+func (m *Manager) closeBrowser(ctx context.Context, id BrowserID, reason string) error {
 	m.mu.Lock()
 	if id == "" {
 		m.stopSweeperLocked()
@@ -1545,6 +1714,7 @@ func (m *Manager) CloseBrowser(ctx context.Context, id BrowserID) error {
 		m.mu.Unlock()
 		var firstErr error
 		for _, b := range targets {
+			m.logBrowserClosed(b, reason)
 			if err := b.Close(ctx); err != nil && firstErr == nil {
 				firstErr = err
 			}
@@ -1564,6 +1734,7 @@ func (m *Manager) CloseBrowser(ctx context.Context, id BrowserID) error {
 	}
 	m.mu.Unlock()
 
+	m.logBrowserClosed(b, reason)
 	return b.Close(ctx)
 }
 
@@ -1578,7 +1749,7 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	m.shutdown = true
 	m.mu.Unlock()
 
-	err := m.CloseBrowser(ctx, "")
+	err := m.closeBrowser(ctx, "", closeReasonShutdown)
 	m.cancelBase()
 	return err
 }
@@ -1681,11 +1852,7 @@ func (m *Manager) sweepIdleBrowser(ctx context.Context, b *Browser, ttl time.Dur
 	err := b.Close(closeCtx)
 	cancel()
 
-	m.logger.Info("sweeper: closed idle browser",
-		slog.String("browser_id", string(b.id)),
-		slog.String("owner", b.OwnerLabel()),
-		slog.Duration("idle_for", idle),
-	)
+	m.logBrowserClosed(b, closeReasonSweep, slog.Duration("idle_for", idle))
 	if err != nil {
 		m.logger.Warn("sweeper: failed to close idle browser",
 			slog.String("browser_id", string(b.id)),
@@ -1722,6 +1889,8 @@ func (m *Manager) sweepIdleOwnerPages(ctx context.Context, b *Browser, ttl time.
 		}
 	}
 	b.mu.Unlock()
+
+	idle = b.withPopupTree(idle)
 
 	for _, id := range idle {
 		var handle *rod.Page

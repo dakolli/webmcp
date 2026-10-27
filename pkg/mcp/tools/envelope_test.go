@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-rod/rod"
 
@@ -142,6 +144,11 @@ func TestClassifyError(t *testing.T) {
 			want: errInvalidArgs,
 		},
 		{
+			name: "page limit is invalid args",
+			err:  &browsers.PageLimitError{Browser: "browser-1", Count: 20, Limit: 20},
+			want: errInvalidArgs,
+		},
+		{
 			name: "element not found typed",
 			err:  fmt.Errorf("page_act: %w", &rod.ElementNotFoundError{}),
 			want: errElementNotFound,
@@ -272,6 +279,13 @@ func TestClassifyErrorPrecedence(t *testing.T) {
 			if got, _ := classifyError(tt.err, challengeState{}); got != tt.want {
 				t.Fatalf("classifyError() = %q, want %q", got, tt.want)
 			}
+			out, err := failResult(tt.err)
+			if err != nil {
+				t.Fatalf("failResult() error = %v", err)
+			}
+			if env := mustEnvelope(t, out); env.Error == nil || env.Error.Type != tt.want {
+				t.Fatalf("failResult() type = %v, want %q", env.Error, tt.want)
+			}
 		})
 	}
 }
@@ -344,7 +358,11 @@ func TestAntiBotMarkersArePinned(t *testing.T) {
 		"attention required",
 		"unusual traffic",
 		"just a moment",
-		"challenge",
+		"challenge required",
+		"verify you are human",
+		"checking your browser",
+		"bot detection",
+		"ddos protection",
 	}
 	for _, marker := range markers {
 		t.Run(marker, func(t *testing.T) {
@@ -352,6 +370,133 @@ func TestAntiBotMarkersArePinned(t *testing.T) {
 				t.Fatalf("classifyError(%q) = %q, want %q", marker, got, errAntiBot)
 			}
 		})
+	}
+}
+
+// TestChallengeURLIsNotAntiBot pins the false-positive fix: the word "challenge"
+// inside a URL is not a bot signal.
+func TestChallengeURLIsNotAntiBot(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "replay ambiguity naming a challenge URL is invalid args",
+			err: fmt.Errorf("page_act: %w", fmt.Errorf(
+				"%w: target %q matches 2 network entries — pass a seq or a longer URL substring: seq=1 GET https://site.test/challenge, seq=2 GET https://site.test/challenge/verify",
+				browsers.ErrReplayTargetAmbiguous,
+				"site.test",
+			)),
+			want: errInvalidArgs,
+		},
+		{
+			name: "replay transport failure naming a challenge URL is nav_failed",
+			err: fmt.Errorf("page_act: %w", &browsers.ReplayTransportError{
+				Method: "GET",
+				URL:    "https://site.test/challenge",
+				Budget: 30 * time.Second,
+				Err:    errors.New("dial tcp: connection refused"),
+			}),
+			want: errNavFailed,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got, _ := classifyError(tt.err, challengeState{}); got != tt.want {
+				t.Fatalf("classifyError() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestClassifyReplayErrors pins the type-first replay classification: an
+// ambiguous or missing target is invalid_args, and a transport failure is a
+// timeout or a failed navigation.
+func TestClassifyReplayErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "ambiguous target",
+			err:  fmt.Errorf("page_act: %w: target %q matches 2 network entries: seq=1 GET https://a.test/x, seq=2 GET https://a.test/x/y", browsers.ErrReplayTargetAmbiguous, "a.test"),
+			want: errInvalidArgs,
+		},
+		{
+			name: "missing target",
+			err:  fmt.Errorf("page_act: %w: no network entry matches target %q", browsers.ErrReplayTargetNotFound, "nope"),
+			want: errInvalidArgs,
+		},
+		{
+			name: "replay timeout is a timeout",
+			err: fmt.Errorf("page_act: %w", &browsers.ReplayTransportError{
+				Method: "GET",
+				URL:    "https://slow.test/",
+				Budget: 30 * time.Second,
+				Err:    fmt.Errorf("Get %q: %w", "https://slow.test/", context.DeadlineExceeded),
+			}),
+			want: errTimeout,
+		},
+		{
+			name: "replay transport failure is nav_failed",
+			err: fmt.Errorf("page_act: %w", &browsers.ReplayTransportError{
+				Method: "GET",
+				URL:    "https://down.test/",
+				Budget: 30 * time.Second,
+				Err:    errors.New("dial tcp: no such host"),
+			}),
+			want: errNavFailed,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got, _ := classifyError(tt.err, challengeState{}); got != tt.want {
+				t.Fatalf("classifyError() = %q, want %q", got, tt.want)
+			}
+			out, err := failResult(tt.err)
+			if err != nil {
+				t.Fatalf("failResult() error = %v", err)
+			}
+			env := mustEnvelope(t, out)
+			if env.Error == nil || env.Error.Type != tt.want {
+				t.Fatalf("failResult() error branch = %+v, want type %q", env.Error, tt.want)
+			}
+		})
+	}
+}
+
+// TestPageLimitEnvelopeIsInvalidArgs pins the WEB-188 cap contract: the 21st
+// page is invalid_args naming the browser and cap with a session_close hint,
+// never the page_closed reopen hint.
+func TestPageLimitEnvelopeIsInvalidArgs(t *testing.T) {
+	err := fmt.Errorf("fetch_page: %w", &browsers.PageLimitError{
+		Browser: "browser-1",
+		Count:   20,
+		Limit:   20,
+	})
+	out, marshalErr := failResult(err)
+	if marshalErr != nil {
+		t.Fatalf("failResult() error = %v", marshalErr)
+	}
+	env := mustEnvelope(t, out)
+	if env.Error == nil {
+		t.Fatal("envelope has no error branch")
+	}
+	if env.Error.Type != errInvalidArgs {
+		t.Fatalf("type = %q, want %q", env.Error.Type, errInvalidArgs)
+	}
+	for _, want := range []string{"browser browser-1", "20 live pages", "max 20"} {
+		if !strings.Contains(env.Error.Message, want) {
+			t.Fatalf("message = %q, want it to contain %q", env.Error.Message, want)
+		}
+	}
+	if !strings.Contains(env.Error.Hint, "session_close") {
+		t.Fatalf("hint = %q, want it to say session_close", env.Error.Hint)
+	}
+	if strings.Contains(env.Error.Hint, "fetch_page") {
+		t.Fatalf("hint = %q, want no fetch_page reopen advice", env.Error.Hint)
 	}
 }
 

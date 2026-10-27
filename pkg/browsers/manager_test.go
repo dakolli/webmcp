@@ -1,11 +1,15 @@
 package browsers
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -899,5 +903,133 @@ func TestResolvePageSingleBrowser(t *testing.T) {
 	}
 	if got != alice {
 		t.Fatalf("resolvePage(page-1) = %s, want %s", got.id, alice.id)
+	}
+}
+
+// TestConcurrentCreatesShareOneBrowser pins the single-flight create: N callers
+// with one owner and one option set launch exactly one browser and all receive
+// the same browser id.
+func TestConcurrentCreatesShareOneBrowser(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := NewManager(WithTTL(0), WithBrowserTTL(0), WithPersistentDefault(false))
+	m.probe = func(*Browser) error { return nil }
+	var launches atomic.Int64
+	m.launch = func(context.Context, *Browser) error {
+		launches.Add(1)
+		time.Sleep(20 * time.Millisecond)
+		return nil
+	}
+
+	const callers = 10
+	ctx := WithExplicitOwner(context.Background(), "scraper-a")
+	results := make([]Created, callers)
+	errs := make([]error, callers)
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for i := range callers {
+		go func() {
+			defer wg.Done()
+			results[i], errs[i] = m.Create(ctx)
+		}()
+	}
+	wg.Wait()
+
+	for i := range callers {
+		if errs[i] != nil {
+			t.Fatalf("caller %d: Create: %v", i, errs[i])
+		}
+		if results[i].ID != results[0].ID {
+			t.Fatalf("caller %d got %q, want the shared %q", i, results[i].ID, results[0].ID)
+		}
+	}
+	if got := launches.Load(); got != 1 {
+		t.Fatalf("Chromium launches = %d, want exactly 1", got)
+	}
+	if got := len(m.Browsers()); got != 1 {
+		t.Fatalf("live browsers = %d, want 1", got)
+	}
+}
+
+// TestBrowserCloseLogsReason pins the audit line that explains why a browser
+// left the registry: a crashed process, the idle sweep, or an explicit close.
+func TestBrowserCloseLogsReason(t *testing.T) {
+	newLogger := func() (*slog.Logger, *bytes.Buffer) {
+		buf := &bytes.Buffer{}
+		return slog.New(slog.NewTextHandler(buf, nil)), buf
+	}
+
+	t.Run("crash", func(t *testing.T) {
+		logger, buf := newLogger()
+		m := NewManager(WithTTL(0), WithBrowserTTL(0), WithLogger(logger))
+		m.probe = func(*Browser) error { return errors.New("cdp websocket closed") }
+		m.browsers[DefaultBrowserID] = NewBrowser(DefaultBrowserID, m.baseCtx, false, false, "", "")
+
+		if _, err := m.Browser(DefaultBrowserID); err == nil {
+			t.Fatal("Browser() error = nil, want the died error")
+		}
+		assertLogLine(t, buf, "browser_id=browser-1", "reason=crash", "level=WARN")
+	})
+
+	t.Run("idle sweep", func(t *testing.T) {
+		logger, buf := newLogger()
+		const ttl = time.Minute
+		m := NewManager(WithTTL(0), WithBrowserTTL(ttl), WithLogger(logger))
+		b := NewBrowser("browser-2", m.baseCtx, false, false, "", "")
+		b.lastAccess = time.Now().Add(-2 * ttl)
+		m.browsers[b.id] = b
+
+		m.sweepOnce(context.Background())
+		assertLogLine(t, buf, "browser_id=browser-2", "reason=idle_sweep", "level=INFO")
+	})
+
+	t.Run("explicit close", func(t *testing.T) {
+		logger, buf := newLogger()
+		m := NewManager(WithTTL(0), WithBrowserTTL(0), WithLogger(logger))
+		m.browsers["browser-3"] = NewBrowser("browser-3", m.baseCtx, false, false, "", "")
+
+		if err := m.CloseBrowser(context.Background(), "browser-3"); err != nil {
+			t.Fatalf("CloseBrowser: %v", err)
+		}
+		assertLogLine(t, buf, "browser_id=browser-3", "reason=browser_close", "level=INFO")
+	})
+}
+
+// TestNewLoggerAcceptsInfo pins that the production constructor installs a real
+// handler: the engine default discards, so a wired manager must never drop the
+// close line.
+func TestNewLoggerAcceptsInfo(t *testing.T) {
+	var buf bytes.Buffer
+	logger := NewLogger(&buf, nil)
+	if !logger.Enabled(context.Background(), slog.LevelInfo) {
+		t.Fatal("NewLogger handler rejects info records (discard handler)")
+	}
+	logger.Info("browsers: browser closed", "reason", "browser_close")
+	if !strings.Contains(buf.String(), "reason=browser_close") {
+		t.Fatalf("log = %q, want the close reason", buf.String())
+	}
+}
+
+// TestClosedBrowserEmitsReasonWithProductionLogger pins the wired end-to-end
+// path: a browser closed through the manager records the audit line when the
+// production constructor supplies the logger.
+func TestClosedBrowserEmitsReasonWithProductionLogger(t *testing.T) {
+	var buf bytes.Buffer
+	m := NewManager(WithTTL(0), WithBrowserTTL(0), WithLogger(NewLogger(&buf, nil)))
+	m.browsers["browser-9"] = NewBrowser("browser-9", m.baseCtx, false, false, "", "")
+
+	if err := m.CloseBrowser(context.Background(), "browser-9"); err != nil {
+		t.Fatalf("CloseBrowser: %v", err)
+	}
+	assertLogLine(t, &buf, "browsers: browser closed", "browser_id=browser-9", "reason=browser_close")
+}
+
+// assertLogLine fails when buf does not contain every wanted substring.
+func assertLogLine(t *testing.T, buf *bytes.Buffer, wants ...string) {
+	t.Helper()
+	line := buf.String()
+	for _, want := range wants {
+		if !strings.Contains(line, want) {
+			t.Fatalf("log = %q, want it to contain %q", line, want)
+		}
 	}
 }

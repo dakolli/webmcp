@@ -99,7 +99,9 @@ var notInteractableMarkers = []string{
 	"not interactable",
 }
 
-// antiBotMarkers identify a bot challenge from the error prose.
+// antiBotMarkers identify a bot challenge from the error prose. A bare
+// "challenge" is deliberately absent: it appears in ordinary URLs and replay
+// targets, so only multi-word challenge signals count.
 var antiBotMarkers = []string{
 	"access to this page has been denied",
 	"access denied",
@@ -107,7 +109,11 @@ var antiBotMarkers = []string{
 	"attention required",
 	"unusual traffic",
 	"just a moment",
-	"challenge",
+	"challenge required",
+	"verify you are human",
+	"checking your browser",
+	"bot detection",
+	"ddos protection",
 }
 
 // antiBotPageMarkers identify a bot challenge from the live page title or URL.
@@ -205,6 +211,8 @@ func classifyError(err error, ch challengeState) (string, string) {
 		closeCanceled  *rod.PageCloseCanceledError
 		navigation     *rod.NavigationError
 		lookup         *browsers.PageLookupError
+		replay         *browsers.ReplayTransportError
+		pageLimit      *browsers.PageLimitError
 	)
 
 	switch {
@@ -212,8 +220,18 @@ func classifyError(err error, ch challengeState) (string, string) {
 		return errInvalidArgs, "this session id needs a browser — pass browser_id or owner to choose the browser that holds it"
 	case errors.As(err, &lookup):
 		return errNotFound, "the session is not in that browser or owner — call session_list for the live ids, or pass the matching browser_id or owner"
+	case errors.As(err, &pageLimit):
+		return errInvalidArgs, "the browser is at its page cap — call session_close on a session you no longer need, then retry"
 	case errors.Is(err, browsers.ErrUnknownBrowser):
 		return errInvalidArgs, "that browser_id is not live — call browser_list for the running ids and pass one of them"
+	case errors.Is(err, browsers.ErrReplayTargetAmbiguous),
+		errors.Is(err, browsers.ErrReplayTargetNotFound):
+		return errInvalidArgs, hintFor(errInvalidArgs)
+	case errors.As(err, &replay):
+		if replay.TimedOut() {
+			return errTimeout, "the replay exceeded its fixed 30s budget — the target is slow or wedged; retry or replay a lighter entry"
+		}
+		return errNavFailed, "the replay transport failed — verify the URL is reachable and the host's DNS and TLS trust are correct, then retry"
 	case containsAny(msg, invalidArgsMarkers):
 		return errInvalidArgs, hintFor(errInvalidArgs)
 	case errors.As(err, &missingElement) || containsAny(msg, elementNotFoundMarkers):

@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
@@ -419,6 +421,40 @@ func serveLaunchesDefaultBrowser(opts serveRunOptions) bool {
 	return opts.mcpPort == 0
 }
 
+// serveLogger builds the manager's production logger for one serve run. It
+// always appends structured lines to the serve log file and mirrors them to
+// stderr unless stderr already IS that file, which is the daemon child the
+// spawner points at the log. A log file that cannot be opened degrades to
+// stderr so serve still starts. The returned cleanup closes the log file and
+// must run after the manager's Shutdown so the shutdown reason is recorded.
+func serveLogger() (*slog.Logger, func()) {
+	fallback := browsers.NewLogger(os.Stderr, nil)
+	path, err := serveLogPath()
+	if err != nil {
+		return fallback, func() {}
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return fallback, func() {}
+	}
+	console := os.Stderr
+	if sameFile(os.Stderr, file) {
+		console = nil
+	}
+	return browsers.NewLogger(file, console), func() { _ = file.Close() }
+}
+
+// sameFile reports whether both handles refer to the same underlying file, so a
+// daemon child whose stderr is already the serve log is not written twice.
+func sameFile(a, b *os.File) bool {
+	ai, aerr := a.Stat()
+	bi, berr := b.Stat()
+	if aerr != nil || berr != nil {
+		return false
+	}
+	return os.SameFile(ai, bi)
+}
+
 // runServeForeground runs the long-lived serve loop in this process: it binds
 // the IPC socket, optionally starts the MCP HTTP server on opts.mcpPort
 // in-process, opens the persistent default browser for a plain `serve`, and
@@ -431,11 +467,14 @@ func runServeForeground(ctx context.Context, opts serveRunOptions) error {
 	// forgotten close must not leak a profile into the config dir. A named
 	// --profile, or the plain human daemon, pins a persistent profile instead.
 	agentPool := opts.mcpPort != 0
+	logger, closeLog := serveLogger()
+	defer closeLog()
 	managerOpts := []browsers.Option{
 		browsers.WithHeadless(opts.headless),
 		browsers.WithStealth(opts.stealth),
 		browsers.WithBin(opts.bin),
 		browsers.WithPersistentDefault(!agentPool),
+		browsers.WithLogger(logger),
 	}
 	if profileDir, err := config.ResolveProfilePath(opts.profile); err != nil {
 		return fmt.Errorf("serve: resolve profile path: %w", err)
