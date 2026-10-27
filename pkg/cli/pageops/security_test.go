@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-rod/rod/lib/proto"
+
 	"webmcp/pkg/browsers"
 )
 
@@ -267,85 +269,183 @@ var securityCORSPair = map[string]string{
 	"Access-Control-Allow-Credentials": "true",
 }
 
+// securityCheckByID returns the check with id and whether the audit emitted it.
+func securityCheckByID(checks []securityCheck, id string) (securityCheck, bool) {
+	for _, c := range checks {
+		if c.ID == id {
+			return c, true
+		}
+	}
+	return securityCheck{}, false
+}
+
+// TestSecuritySingleHeaderKeepsItsVerdict proves one copy of a header is judged
+// exactly as before, with no conflict finding invented for it.
+func TestSecuritySingleHeaderKeepsItsVerdict(t *testing.T) {
+	checks := securityHeaderChecks(securityProbe{Scheme: "https"}, map[string]string{
+		"X-Content-Type-Options": "nosniff",
+	}, true, false)
+	check, ok := securityCheckByID(checks, "x_content_type_options")
+	if !ok {
+		t.Fatal("missing x_content_type_options check")
+	}
+	if check.Status != "ok" || check.Evidence != "nosniff" {
+		t.Errorf("check = %+v, want an ok nosniff verdict", check)
+	}
+	if _, ok := securityCheckByID(checks, "header_conflict"); ok {
+		t.Error("a single header produced a header_conflict finding")
+	}
+}
+
+// TestSecurityRepeatedEqualHeaderCollapses proves a header sent twice with the
+// same value is judged once, exactly like a single copy.
+func TestSecurityRepeatedEqualHeaderCollapses(t *testing.T) {
+	single := securityHeaderChecks(securityProbe{Scheme: "https"}, map[string]string{
+		"X-Content-Type-Options": "nosniff",
+	}, true, false)
+	repeated := securityHeaderChecks(securityProbe{Scheme: "https"}, map[string]string{
+		"X-Content-Type-Options": "nosniff\nnosniff",
+	}, true, false)
+	check, ok := securityCheckByID(repeated, "x_content_type_options")
+	if !ok {
+		t.Fatal("missing x_content_type_options check")
+	}
+	if check.Status != "ok" {
+		t.Errorf("status = %q, want ok (detail %q)", check.Status, check.Detail)
+	}
+	if _, ok := securityCheckByID(repeated, "header_conflict"); ok {
+		t.Error("an equal repeat produced a header_conflict finding")
+	}
+	if !slices.Equal(single, repeated) {
+		t.Error("an equal repeat produced a different report from a single header")
+	}
+}
+
+// TestSecurityDifferingRepeatedHeaderNamesBothValues proves two different
+// values for a single-valued header become one named conflict finding that
+// quotes both values, never a wrong-value verdict.
+func TestSecurityDifferingRepeatedHeaderNamesBothValues(t *testing.T) {
+	tests := []struct {
+		name    string
+		header  string
+		values  string
+		checkID string
+	}{
+		{"x-content-type-options", "X-Content-Type-Options", "nosniff\ntext/html", "x_content_type_options"},
+		{"x-frame-options", "X-Frame-Options", "DENY\nSAMEORIGIN", "x_frame_options"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			headers := map[string]string{tt.header: tt.values}
+			checks := securityHeaderChecks(securityProbe{Scheme: "https"}, headers, true, false)
+			conflict, ok := securityCheckByID(checks, "header_conflict")
+			if !ok {
+				t.Fatal("missing header_conflict finding")
+			}
+			if conflict.Status != "warn" {
+				t.Errorf("status = %q, want warn", conflict.Status)
+			}
+			for _, v := range strings.Split(tt.values, "\n") {
+				if !strings.Contains(conflict.Evidence, v) {
+					t.Errorf("evidence %q does not name %q", conflict.Evidence, v)
+				}
+			}
+			check, ok := securityCheckByID(checks, tt.checkID)
+			if !ok {
+				t.Fatalf("missing %s check", tt.checkID)
+			}
+			if strings.Contains(check.Detail, "must be") {
+				t.Errorf("%s detail %q calls one of the values wrong", tt.checkID, check.Detail)
+			}
+			again := securityHeaderChecks(securityProbe{Scheme: "https"}, headers, true, false)
+			if !slices.Equal(checks, again) {
+				t.Error("two audits of the same headers produced different findings")
+			}
+		})
+	}
+}
+
 // TestSecurityAuditScopesNetworkToCurrentDocument proves the audit cannot cite
-// an earlier navigation's requests: only the document request that produced the
-// audited page and the requests after it supply evidence.
+// another document's requests: the engine marks the current top-level document
+// request, and only that entry and the requests after it supply evidence.
 func TestSecurityAuditScopesNetworkToCurrentDocument(t *testing.T) {
 	tests := []struct {
 		name       string
-		pageURL    string
 		ring       []browsers.NetworkEntry
+		wantDoc    string
 		wantCORS   string
 		wantMixed  string
 		wantAbsent []string
 	}{
 		{
-			name:    "second host after a POST",
-			pageURL: "https://new.test/",
+			name: "second navigation to a new host",
 			ring: []browsers.NetworkEntry{
 				{Seq: 1, Method: "POST", Type: "Document", URL: "https://old.test/post"},
 				{Seq: 2, Type: "XHR", URL: "https://old.test/api", RespHeaders: securityCORSPair},
 				{Seq: 3, Type: "Image", URL: "http://old.test/favicon.ico"},
-				{Seq: 4, Type: "Document", URL: "https://new.test/"},
+				{Seq: 4, Type: "Document", URL: "https://new.test/", TopDocument: true},
 				{Seq: 5, Type: "XHR", URL: "https://new.test/api", RespHeaders: securityCORSPair},
 			},
+			wantDoc:    "https://new.test/",
 			wantCORS:   "https://new.test/api",
 			wantMixed:  "",
 			wantAbsent: []string{"old.test"},
 		},
 		{
-			name:    "same origin second navigation",
-			pageURL: "https://same.test/b",
+			name: "two navigations on one origin",
 			ring: []browsers.NetworkEntry{
 				{Seq: 1, Type: "Document", URL: "https://same.test/a"},
 				{Seq: 2, Type: "XHR", URL: "https://same.test/a/api", RespHeaders: securityCORSPair},
 				{Seq: 3, Type: "Script", URL: "http://same.test/a/app.js"},
-				{Seq: 4, Type: "Document", URL: "https://same.test/b"},
+				{Seq: 4, Type: "Document", URL: "https://same.test/b", TopDocument: true},
 				{Seq: 5, Type: "XHR", URL: "https://same.test/b/api", RespHeaders: securityCORSPair},
 			},
+			wantDoc:    "https://same.test/b",
 			wantCORS:   "https://same.test/b/api",
 			wantMixed:  "",
 			wantAbsent: []string{"https://same.test/a"},
 		},
 		{
-			name:    "fragment in the audited URL",
-			pageURL: "https://frag.test/page#section",
+			name: "same-origin route change keeps the loaded document",
 			ring: []browsers.NetworkEntry{
-				{Seq: 1, Type: "Document", URL: "https://old.test/"},
-				{Seq: 2, Type: "Document", URL: "https://frag.test/page"},
-				{Seq: 3, Type: "XHR", URL: "https://frag.test/api", RespHeaders: securityCORSPair},
-			},
-			wantCORS:   "https://frag.test/api",
-			wantMixed:  "",
-			wantAbsent: []string{"old.test"},
-		},
-		{
-			name:    "client-side route change keeps the loaded document",
-			pageURL: "https://spa.test/dashboard",
-			ring: []browsers.NetworkEntry{
-				{Seq: 1, Type: "Document", URL: "https://spa.test/"},
+				{Seq: 1, Type: "Document", URL: "https://spa.test/", TopDocument: true},
 				{Seq: 2, Type: "XHR", URL: "https://spa.test/api/me", RespHeaders: securityCORSPair},
 			},
+			wantDoc:   "https://spa.test/",
 			wantCORS:  "https://spa.test/api/me",
 			wantMixed: "",
 		},
 		{
-			name:    "same-origin iframe does not move the boundary",
-			pageURL: "https://app.test/",
+			name: "same-origin iframe loading the same URL does not move the boundary",
 			ring: []browsers.NetworkEntry{
-				{Seq: 1, Type: "Document", URL: "https://app.test/"},
+				{Seq: 1, Type: "Document", URL: "https://app.test/", TopDocument: true},
 				{Seq: 2, Type: "XHR", URL: "https://app.test/api", RespHeaders: securityCORSPair},
-				{Seq: 3, Type: "Document", URL: "https://app.test/widget"},
+				{Seq: 3, Type: "Document", URL: "https://app.test/"},
 			},
+			wantDoc:   "https://app.test/",
 			wantCORS:  "https://app.test/api",
+			wantMixed: "",
+		},
+		{
+			name: "bfcache restore marks the restored older document",
+			ring: []browsers.NetworkEntry{
+				{Seq: 1, Type: "Document", URL: "https://cache.test/a", TopDocument: true},
+				{Seq: 2, Type: "XHR", URL: "https://cache.test/a/api", RespHeaders: securityCORSPair},
+				{Seq: 3, Type: "Document", URL: "https://cache.test/b"},
+			},
+			wantDoc:   "https://cache.test/a",
+			wantCORS:  "https://cache.test/a/api",
 			wantMixed: "",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, scoped, found := securityDocumentRing(tt.ring, tt.pageURL)
+			doc, scoped, found := securityDocumentRing(tt.ring)
 			if !found {
-				t.Fatalf("securityDocumentRing(%q) did not find the audited document", tt.pageURL)
+				t.Fatal("securityDocumentRing did not find the marked document")
+			}
+			if doc.URL != tt.wantDoc {
+				t.Errorf("document = %q, want %q", doc.URL, tt.wantDoc)
 			}
 			cors := securityCORSCheck(scoped)
 			mixed := securityMixedContentCheck(securityProbe{Scheme: "https"}, scoped)
@@ -360,10 +460,10 @@ func TestSecurityAuditScopesNetworkToCurrentDocument(t *testing.T) {
 			}
 			for _, absent := range tt.wantAbsent {
 				if strings.Contains(cors.Evidence, absent) {
-					t.Errorf("cors evidence %q cites the previous document (%q)", cors.Evidence, absent)
+					t.Errorf("cors evidence %q cites another document (%q)", cors.Evidence, absent)
 				}
 				if strings.Contains(mixed.Evidence, absent) {
-					t.Errorf("mixed_content evidence %q cites the previous document (%q)", mixed.Evidence, absent)
+					t.Errorf("mixed_content evidence %q cites another document (%q)", mixed.Evidence, absent)
 				}
 			}
 			if cors2 := securityCORSCheck(scoped); !slices.Equal([]securityCheck{cors}, []securityCheck{cors2}) {
@@ -373,18 +473,16 @@ func TestSecurityAuditScopesNetworkToCurrentDocument(t *testing.T) {
 	}
 }
 
-// TestSecurityAuditEmptyRingHasEmptyEvidence proves a ring with nothing for the
-// audited document yields empty evidence instead of an older page's request.
+// TestSecurityAuditEmptyRingHasEmptyEvidence proves a ring with no marked
+// current document yields empty evidence instead of another page's request.
 func TestSecurityAuditEmptyRingHasEmptyEvidence(t *testing.T) {
 	tests := []struct {
-		name    string
-		pageURL string
-		ring    []browsers.NetworkEntry
+		name string
+		ring []browsers.NetworkEntry
 	}{
-		{name: "empty ring", pageURL: "https://new.test/"},
+		{name: "empty ring"},
 		{
-			name:    "only an older document's requests",
-			pageURL: "https://new.test/",
+			name: "only an unmarked older document",
 			ring: []browsers.NetworkEntry{
 				{Seq: 1, Method: "POST", Type: "Document", URL: "https://old.test/post"},
 				{Seq: 2, Type: "XHR", URL: "https://old.test/api", RespHeaders: securityCORSPair},
@@ -394,9 +492,9 @@ func TestSecurityAuditEmptyRingHasEmptyEvidence(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			doc, scoped, found := securityDocumentRing(tt.ring, tt.pageURL)
+			doc, scoped, found := securityDocumentRing(tt.ring)
 			if found {
-				t.Fatalf("securityDocumentRing found a document for %q", tt.pageURL)
+				t.Fatal("securityDocumentRing found a document without a marker")
 			}
 			if doc.URL != "" || len(scoped) != 0 {
 				t.Fatalf("securityDocumentRing returned doc %q and %d scoped entries", doc.URL, len(scoped))
@@ -413,5 +511,94 @@ func TestSecurityAuditEmptyRingHasEmptyEvidence(t *testing.T) {
 				t.Errorf("evidence = %q, %q; want empty", cors.Evidence, mixed.Evidence)
 			}
 		})
+	}
+}
+
+// TestSecurityCookieSameSiteMatrix pins every SameSite state the audit can meet:
+// an absent attribute is missing, an explicit None is its own cross-site finding,
+// Lax and Strict pass, and an unknown value is reported raw rather than as
+// missing. Each cookie always emits the flags finding first, so the report count
+// and order stay fixed.
+func TestSecurityCookieSameSiteMatrix(t *testing.T) {
+	tests := []struct {
+		name       string
+		sameSite   proto.NetworkCookieSameSite
+		wantID     string
+		wantStatus string
+		wantQuote  string
+		wantDetail string
+	}{
+		{"absent is missing", "", "cookie:sid:samesite_missing", "warn", "", "missing SameSite"},
+		{"none is sent cross-site", proto.NetworkCookieSameSiteNone, "cookie:sid:samesite_none", "warn", "SameSite=None", "cross-site"},
+		{"lax passes", proto.NetworkCookieSameSiteLax, "cookie:sid:samesite_lax", "ok", "SameSite=Lax", ""},
+		{"strict passes", proto.NetworkCookieSameSiteStrict, "cookie:sid:samesite_strict", "ok", "SameSite=Strict", ""},
+		{"unknown reports its raw value", "bogus", "cookie:sid:samesite_unknown", "warn", "SameSite=bogus", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cookie := proto.NetworkCookie{
+				Name:     "sid",
+				Domain:   "example.test",
+				HTTPOnly: true,
+				Secure:   true,
+				SameSite: tt.sameSite,
+			}
+			checks := securityCookieChecks(&cookie)
+			if len(checks) != 2 {
+				t.Fatalf("got %d checks, want the flags finding and the SameSite finding", len(checks))
+			}
+			if checks[0].ID != "cookie:sid" || checks[0].Status != "ok" {
+				t.Errorf("flags finding = %+v, want an ok cookie:sid check", checks[0])
+			}
+			sameSite := checks[1]
+			if sameSite.ID != tt.wantID {
+				t.Errorf("id = %q, want %q", sameSite.ID, tt.wantID)
+			}
+			if sameSite.Status != tt.wantStatus {
+				t.Errorf("status = %q, want %q (detail %q)", sameSite.Status, tt.wantStatus, sameSite.Detail)
+			}
+			if tt.wantQuote != "" && !strings.Contains(sameSite.Evidence, tt.wantQuote) {
+				t.Errorf("evidence = %q, want it to quote %q", sameSite.Evidence, tt.wantQuote)
+			}
+			if tt.wantDetail != "" && !strings.Contains(sameSite.Detail, tt.wantDetail) {
+				t.Errorf("detail = %q, want it to name %q", sameSite.Detail, tt.wantDetail)
+			}
+			if tt.sameSite != "" && strings.Contains(sameSite.Detail, "missing") {
+				t.Errorf("%q is present but the detail calls it missing: %q", tt.sameSite, sameSite.Detail)
+			}
+			again := securityCookieChecks(&cookie)
+			if !slices.Equal(checks, again) {
+				t.Error("two audits of the same cookie produced different findings")
+			}
+		})
+	}
+}
+
+// TestSecurityCookiePass proves a cookie carrying Lax, HttpOnly and Secure yields
+// only ok findings, with no missing-flag warning.
+func TestSecurityCookiePass(t *testing.T) {
+	checks := securityCookieChecks(&proto.NetworkCookie{
+		Name:     "sid",
+		Domain:   "example.test",
+		HTTPOnly: true,
+		Secure:   true,
+		SameSite: proto.NetworkCookieSameSiteLax,
+	})
+	if len(checks) != 2 {
+		t.Fatalf("got %d checks, want 2", len(checks))
+	}
+	if checks[0].ID != "cookie:sid" {
+		t.Errorf("first check = %q, want the flags finding", checks[0].ID)
+	}
+	if checks[1].ID != "cookie:sid:samesite_lax" {
+		t.Errorf("second check = %q, want the SameSite finding", checks[1].ID)
+	}
+	for _, c := range checks {
+		if c.Status != "ok" {
+			t.Errorf("%s status = %q, want ok (detail %q)", c.ID, c.Status, c.Detail)
+		}
+		if strings.Contains(c.Detail, "missing") {
+			t.Errorf("%s detail = %q, want no missing-flag warning", c.ID, c.Detail)
+		}
 	}
 }

@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/url"
+	"slices"
 	"sort"
 	"strings"
 
@@ -127,9 +127,9 @@ type securityReport struct {
 // check reads truth the browser already holds — observed response headers from
 // the audited document's own requests in the page's network ring, the cookie
 // jar for the current URL and one DOM evaluation — so the audit never reloads
-// or probes the site. The ring spans navigations, so the audit locates the
-// document request that produced the current page and ignores everything
-// captured before it; it never clears the ring.
+// or probes the site. The ring spans navigations, so the audit starts at the
+// entry the engine marked as the current top-level document and ignores
+// everything captured before it; it never clears the ring.
 func PageSecurity(ctx context.Context, p *browsers.Page) (string, error) {
 	p.Lock()
 	defer p.Unlock()
@@ -148,7 +148,7 @@ func PageSecurity(ctx context.Context, p *browsers.Page) (string, error) {
 	}
 
 	ring, _ := p.NetworkEntries()
-	doc, entries, found := securityDocumentRing(ring, probe.URL)
+	doc, entries, found := securityDocumentRing(ring)
 	headers := doc.RespHeaders
 	cut := found && doc.RespHeadersTruncated
 	cookies, cookiesOmitted := pageCookieChecks(pc, probe.URL, probe.Cookies)
@@ -192,38 +192,18 @@ func securityOmitted(probe securityProbe) int {
 	return omitted
 }
 
-// securityDocumentRing locates the audited document in the cumulative network
-// ring and returns its document request plus the requests observed after it.
-// The ring spans navigations, so every entry before that boundary belongs to an
-// earlier document and is excluded. found is false when the audited document's
-// own request is no longer in the ring; the callers then report empty evidence
-// instead of borrowing an older page's requests.
+// securityDocumentRing returns the entry the engine marked as the audited
+// page's current top-level document, plus every request observed from it
+// onward. The marker comes from the browser's frame and loader identity, so the
+// boundary holds across navigations, a same-origin route change and a
+// same-origin iframe without matching URLs. found is false when the document
+// request is no longer in the ring; the callers then report empty evidence
+// instead of borrowing another document's requests.
 func securityDocumentRing(
 	entries []browsers.NetworkEntry,
-	pageURL string,
 ) (doc browsers.NetworkEntry, scoped []browsers.NetworkEntry, found bool) {
-	target := securityDocumentURL(pageURL)
-	origin := securityURLOrigin(target)
-	if target == "" {
-		return browsers.NetworkEntry{}, nil, false
-	}
 	for i := len(entries) - 1; i >= 0; i-- {
-		if entries[i].Type != string(proto.NetworkResourceTypeDocument) {
-			continue
-		}
-		if securityDocumentURL(entries[i].URL) != target {
-			continue
-		}
-		return entries[i], entries[i:], true
-	}
-	if origin == "" {
-		return browsers.NetworkEntry{}, nil, false
-	}
-	for i := len(entries) - 1; i >= 0; i-- {
-		if entries[i].Type != string(proto.NetworkResourceTypeDocument) {
-			continue
-		}
-		if securityURLOrigin(securityDocumentURL(entries[i].URL)) != origin {
+		if !entries[i].TopDocument {
 			continue
 		}
 		return entries[i], entries[i:], true
@@ -231,39 +211,96 @@ func securityDocumentRing(
 	return browsers.NetworkEntry{}, nil, false
 }
 
-// securityDocumentURL drops a URL's fragment so the audited page address
-// compares equal to the document request that produced it, which never carries
-// the fragment.
-func securityDocumentURL(raw string) string {
-	if i := strings.IndexByte(raw, '#'); i >= 0 {
-		return raw[:i]
-	}
-	return raw
+// securityHeadersRead lists, lowercased, every response header the audit reads.
+// Each must carry one value: the audit judges that value, so different values
+// for one name are reported as a conflict rather than as a wrong value.
+var securityHeadersRead = []string{
+	"content-security-policy",
+	"content-security-policy-report-only",
+	"strict-transport-security",
+	"x-frame-options",
+	"x-content-type-options",
+	"referrer-policy",
+	"permissions-policy",
+	"cross-origin-opener-policy",
+	"access-control-allow-origin",
+	"access-control-allow-credentials",
 }
 
-// securityURLOrigin returns the scheme and host of raw, or an empty string when
-// it has neither. The audited URL and its document request share an origin even
-// when a client-side route change moved the page path, so the origin is the
-// fallback key: the newest document request of one origin is the newest load of
-// that origin, and an evicted newer load would have evicted every older entry
-// with it.
-func securityURLOrigin(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return ""
-	}
-	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host)
-}
-
-// headerValue returns the value of name from a header map, matching the name
-// case-insensitively because CDP preserves the wire casing.
-func headerValue(headers map[string]string, name string) string {
-	for k, v := range headers {
-		if strings.EqualFold(k, name) {
-			return v
+// splitHeaderValues splits one captured header value into the distinct values
+// it carried, in wire order. Chrome joins repeated header fields with a
+// newline, so equal copies collapse to one and differing copies stay separate.
+func splitHeaderValues(raw string) []string {
+	var values []string
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if !slices.Contains(values, line) {
+			values = append(values, line)
 		}
 	}
-	return ""
+	return values
+}
+
+// matchingHeaderKeys returns the keys that name the header case-insensitively,
+// sorted so a map carrying two casings resolves deterministically.
+func matchingHeaderKeys(headers map[string]string, name string) []string {
+	var keys []string
+	for k := range headers {
+		if strings.EqualFold(k, name) {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// headerValues returns the distinct values the named header carried, merging
+// case variants and collapsing equal copies. Differing copies keep wire order.
+func headerValues(headers map[string]string, name string) []string {
+	var values []string
+	for _, k := range matchingHeaderKeys(headers, name) {
+		for _, v := range splitHeaderValues(headers[k]) {
+			if !slices.Contains(values, v) {
+				values = append(values, v)
+			}
+		}
+	}
+	return values
+}
+
+// headerValue returns the value the audit judges for name: the only value a
+// repeated equal header carried, or the first value when the copies differ.
+// securityHeaderConflictChecks names the disagreement separately, so no check
+// ever sees the newline-joined string Chrome produces for a repeated header.
+func headerValue(headers map[string]string, name string) string {
+	values := headerValues(headers, name)
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
+}
+
+// securityHeaderConflictChecks reports every header the audit reads that
+// arrived with different values, naming all of them. It returns nothing when
+// no header conflicts, so an ordinary response keeps its check count.
+func securityHeaderConflictChecks(headers map[string]string) []securityCheck {
+	var offenders []string
+	for _, name := range securityHeadersRead {
+		values := headerValues(headers, name)
+		if len(values) < 2 {
+			continue
+		}
+		offenders = append(offenders, name+": "+strings.Join(values, " | "))
+	}
+	if len(offenders) == 0 {
+		return nil
+	}
+	return []securityCheck{securityFinding(
+		"header_conflict",
+		"every header the audit reads carries one value",
+		"%d header(s) that must hold one value arrived with different values; send one value, or repeat the same value — the audit reads the first",
+		offenders,
+	)}
 }
 
 // hstsDisabled reports whether a Strict-Transport-Security value sets max-age=0,
@@ -304,6 +341,8 @@ func securityHeaderChecks(
 			Detail: "the captured response headers were truncated at 32 headers / 4 KB, so a header reported absent below may have been dropped at capture",
 		})
 	}
+
+	checks = append(checks, securityHeaderConflictChecks(headers)...)
 
 	csp := headerValue(headers, "content-security-policy")
 	metaCSP := strings.TrimSpace(probe.MetaCSP)
@@ -383,15 +422,24 @@ func securityHeaderChecks(
 		})
 	}
 
+	xctoValues := headerValues(headers, "x-content-type-options")
 	xcto := strings.TrimSpace(headerValue(headers, "x-content-type-options"))
-	if strings.EqualFold(xcto, "nosniff") {
+	switch {
+	case len(xctoValues) > 1:
+		checks = append(checks, securityCheck{
+			ID:       "x_content_type_options",
+			Status:   "info",
+			Evidence: strings.Join(xctoValues, " | "),
+			Detail:   "X-Content-Type-Options arrived with different values, so no single value can be judged; header_conflict names them",
+		})
+	case strings.EqualFold(xcto, "nosniff"):
 		checks = append(checks, securityCheck{
 			ID:       "x_content_type_options",
 			Status:   "ok",
 			Evidence: xcto,
 			Detail:   "X-Content-Type-Options is nosniff",
 		})
-	} else {
+	default:
 		detail := "X-Content-Type-Options is absent — add nosniff so browsers stop sniffing scripts and styles"
 		if xcto != "" {
 			detail = "X-Content-Type-Options is " + xcto + " — it must be nosniff"
@@ -915,8 +963,9 @@ func securityHSTSCheck(scheme, value string) securityCheck {
 }
 
 // pageCookieChecks audits the flags of every cookie the browser would send to
-// pageURL. readable is the document.cookie fallback used when the cookie API is
-// unavailable; omitted counts cookies cut by securityMaxItems.
+// pageURL, sorted by name and domain so two audits emit the same order. readable
+// is the document.cookie fallback used when the cookie API is unavailable;
+// omitted counts cookies cut by securityMaxItems.
 func pageCookieChecks(pc *rod.Page, pageURL, readable string) (checks []securityCheck, omitted int) {
 	res, err := proto.NetworkGetCookies{Urls: []string{pageURL}}.Call(pc)
 	if err != nil {
@@ -941,33 +990,80 @@ func pageCookieChecks(pc *rod.Page, pageURL, readable string) (checks []security
 		}}, 0
 	}
 
-	checks = make([]securityCheck, 0, len(cookies))
+	checks = make([]securityCheck, 0, 2*len(cookies))
 	for _, c := range cookies {
-		var missing []string
-		if !c.HTTPOnly {
-			missing = append(missing, "HttpOnly")
-		}
-		if !c.Secure {
-			missing = append(missing, "Secure")
-		}
-		sameSite := string(c.SameSite)
-		if c.SameSite != proto.NetworkCookieSameSiteStrict && c.SameSite != proto.NetworkCookieSameSiteLax {
-			missing = append(missing, "SameSite")
-		}
-		check := securityCheck{
-			ID:       "cookie:" + c.Name,
-			Status:   "ok",
-			Evidence: fmt.Sprintf("%s (domain=%s) HttpOnly=%t Secure=%t SameSite=%q", c.Name, c.Domain, c.HTTPOnly, c.Secure, sameSite),
-			Detail:   "HttpOnly, Secure and SameSite are set",
-		}
-		if len(missing) > 0 {
-			check.Status = "warn"
-			check.Detail = "missing cookie flags: " + strings.Join(missing, ", ") +
-				" — set HttpOnly so scripts cannot read the cookie, Secure so it is never sent over http, and SameSite to stop cross-site sends"
-		}
-		checks = append(checks, check)
+		checks = append(checks, securityCookieChecks(c)...)
 	}
 	return checks, omitted
+}
+
+// securityCookieChecks audits one cookie, returning its HttpOnly/Secure finding
+// followed by its SameSite finding. The two are always emitted in that order so
+// a cookie set never changes the check count or order between audits.
+func securityCookieChecks(c *proto.NetworkCookie) []securityCheck {
+	var missing []string
+	if !c.HTTPOnly {
+		missing = append(missing, "HttpOnly")
+	}
+	if !c.Secure {
+		missing = append(missing, "Secure")
+	}
+	flags := securityCheck{
+		ID:       "cookie:" + c.Name,
+		Status:   "ok",
+		Evidence: fmt.Sprintf("%s (domain=%s) HttpOnly=%t Secure=%t SameSite=%q", c.Name, c.Domain, c.HTTPOnly, c.Secure, string(c.SameSite)),
+		Detail:   "HttpOnly and Secure are set",
+	}
+	if len(missing) > 0 {
+		flags.Status = "warn"
+		flags.Detail = "missing cookie flags: " + strings.Join(missing, ", ") +
+			" — set HttpOnly so scripts cannot read the cookie and Secure so it is never sent over http"
+	}
+	return []securityCheck{flags, securitySameSiteCheck(c.Name, string(c.SameSite))}
+}
+
+// securitySameSiteCheck names the SameSite state the cookie actually carries. An
+// empty value means the attribute is absent, which is not the same as an explicit
+// None; None gets its own finding because the browser sends that cookie on
+// cross-site requests. An unrecognised value is reported raw, never as missing.
+func securitySameSiteCheck(name, value string) securityCheck {
+	base := "cookie:" + name + ":samesite"
+	switch {
+	case value == "":
+		return securityCheck{
+			ID:     base + "_missing",
+			Status: "warn",
+			Detail: "missing SameSite — browsers then apply their own default, so the site does not control cross-site sends; set SameSite=Lax or Strict",
+		}
+	case strings.EqualFold(value, string(proto.NetworkCookieSameSiteNone)):
+		return securityCheck{
+			ID:       base + "_none",
+			Status:   "warn",
+			Evidence: "SameSite=" + value,
+			Detail:   "SameSite=None sends the cookie on cross-site requests, so any origin the browser loads can carry it; use Lax or Strict unless the cookie is genuinely needed cross-site",
+		}
+	case strings.EqualFold(value, string(proto.NetworkCookieSameSiteLax)):
+		return securityCheck{
+			ID:       base + "_lax",
+			Status:   "ok",
+			Evidence: "SameSite=" + value,
+			Detail:   "SameSite=Lax withholds the cookie from cross-site subrequests and most cross-site navigations",
+		}
+	case strings.EqualFold(value, string(proto.NetworkCookieSameSiteStrict)):
+		return securityCheck{
+			ID:       base + "_strict",
+			Status:   "ok",
+			Evidence: "SameSite=" + value,
+			Detail:   "SameSite=Strict withholds the cookie from every cross-site request",
+		}
+	default:
+		return securityCheck{
+			ID:       base + "_unknown",
+			Status:   "warn",
+			Evidence: "SameSite=" + value,
+			Detail:   "SameSite=" + value + " is not a value browsers recognise, so the cookie's cross-site behavior is undefined; send Lax, Strict or None",
+		}
+	}
 }
 
 // readableCookieChecks falls back to the document.cookie names when the cookie

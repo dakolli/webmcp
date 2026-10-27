@@ -112,6 +112,64 @@ func TestEncodeEntryShape(t *testing.T) {
 	}
 }
 
+// TestEncodeDocumentIdentity pins the custom CDP identity fields and proves an
+// entry recorded before them still exports: an empty frame or loader id is
+// simply omitted, never an encode failure.
+func TestEncodeDocumentIdentity(t *testing.T) {
+	t.Run("identity and current-document marker are exported", func(t *testing.T) {
+		entries := []browsers.NetworkEntry{{
+			Method:      "GET",
+			URL:         "https://example.test/",
+			Status:      200,
+			Seq:         1,
+			FrameID:     "frame-top",
+			LoaderID:    "loader-1",
+			TopDocument: true,
+		}}
+		raw, err := Encode(PageInfo{Title: "Identity"}, entries, Options{})
+		if err != nil {
+			t.Fatalf("Encode() error = %v", err)
+		}
+		var doc map[string]any
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			t.Fatalf("HAR is not valid JSON: %v", err)
+		}
+		entry := firstObject(t, object(t, doc, "log"), "entries")
+		if entry["_frameId"] != "frame-top" {
+			t.Errorf("_frameId = %v, want frame-top", entry["_frameId"])
+		}
+		if entry["_loaderId"] != "loader-1" {
+			t.Errorf("_loaderId = %v, want loader-1", entry["_loaderId"])
+		}
+		if entry["_topDocument"] != true {
+			t.Errorf("_topDocument = %v, want true", entry["_topDocument"])
+		}
+	})
+
+	t.Run("empty identity is omitted", func(t *testing.T) {
+		entries := []browsers.NetworkEntry{{
+			Method: "GET",
+			URL:    "https://example.test/old",
+			Status: 200,
+			Seq:    1,
+		}}
+		raw, err := Encode(PageInfo{Title: "Legacy"}, entries, Options{})
+		if err != nil {
+			t.Fatalf("Encode() error = %v", err)
+		}
+		var doc map[string]any
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			t.Fatalf("HAR is not valid JSON: %v", err)
+		}
+		entry := firstObject(t, object(t, doc, "log"), "entries")
+		for _, key := range []string{"_frameId", "_loaderId", "_topDocument"} {
+			if _, ok := entry[key]; ok {
+				t.Errorf("%s is present on an entry with no identity", key)
+			}
+		}
+	})
+}
+
 // TestEncodeCommentStatesRedactionTruth pins the provenance comment: Cookie and
 // Set-Cookie are absent because Chrome omits them from CDP events, while the
 // two headers that do appear are redacted.

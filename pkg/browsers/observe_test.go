@@ -8,6 +8,117 @@ import (
 	"github.com/ysmood/gson"
 )
 
+func TestObserverDocumentIdentity(t *testing.T) {
+	const (
+		topFrame   = proto.PageFrameID("frame-top")
+		childFrame = proto.PageFrameID("frame-child")
+	)
+
+	request := func(
+		id proto.NetworkRequestID,
+		frame proto.PageFrameID,
+		loader proto.NetworkLoaderID,
+		kind proto.NetworkResourceType,
+		url string,
+	) *proto.NetworkRequestWillBeSent {
+		return &proto.NetworkRequestWillBeSent{
+			RequestID: id,
+			FrameID:   frame,
+			LoaderID:  loader,
+			Type:      kind,
+			Request:   &proto.NetworkRequest{Method: "GET", URL: url},
+			Timestamp: 1,
+		}
+	}
+	marked := func(t *testing.T, entries []NetworkEntry) []string {
+		t.Helper()
+		urls := make([]string, 0, 1)
+		for _, e := range entries {
+			if e.TopDocument {
+				urls = append(urls, e.URL)
+			}
+		}
+		return urls
+	}
+
+	t.Run("two navigations mark only the newest document", func(t *testing.T) {
+		page := &Page{observer: newPageObserver()}
+		page.observer.topFrameID = topFrame
+		page.observer.recordRequest(request("doc-1", topFrame, "loader-1", proto.NetworkResourceTypeDocument, "https://site.test/a"))
+		page.observer.recordRequest(request("xhr-1", topFrame, "loader-1", proto.NetworkResourceTypeXHR, "https://site.test/a/api"))
+		page.observer.recordRequest(request("doc-2", topFrame, "loader-2", proto.NetworkResourceTypeDocument, "https://site.test/b"))
+		page.observer.recordRequest(request("xhr-2", topFrame, "loader-2", proto.NetworkResourceTypeXHR, "https://site.test/b/api"))
+
+		entries, _ := page.NetworkEntries()
+		got := marked(t, entries)
+		if len(got) != 1 || got[0] != "https://site.test/b" {
+			t.Fatalf("top document entries = %v, want only the second navigation", got)
+		}
+		if entries[2].FrameID != string(topFrame) || entries[2].LoaderID != "loader-2" {
+			t.Fatalf("entry identity = frame %q loader %q, want frame-top/loader-2", entries[2].FrameID, entries[2].LoaderID)
+		}
+	})
+
+	t.Run("same-origin route change keeps the loaded document", func(t *testing.T) {
+		page := &Page{observer: newPageObserver()}
+		page.observer.topFrameID = topFrame
+		page.observer.recordRequest(request("doc-1", topFrame, "loader-1", proto.NetworkResourceTypeDocument, "https://spa.test/"))
+		page.observer.recordRequest(request("xhr-1", topFrame, "loader-1", proto.NetworkResourceTypeXHR, "https://spa.test/api/me"))
+
+		entries, _ := page.NetworkEntries()
+		got := marked(t, entries)
+		if len(got) != 1 || got[0] != "https://spa.test/" {
+			t.Fatalf("top document entries = %v, want the single loaded document", got)
+		}
+	})
+
+	t.Run("same-origin iframe loading the same URL does not move the boundary", func(t *testing.T) {
+		page := &Page{observer: newPageObserver()}
+		page.observer.topFrameID = topFrame
+		page.observer.recordRequest(request("doc-1", topFrame, "loader-1", proto.NetworkResourceTypeDocument, "https://app.test/"))
+		page.observer.recordFrameNavigated(&proto.PageFrameNavigated{
+			Frame: &proto.PageFrame{ID: childFrame, ParentID: topFrame, LoaderID: "loader-child", URL: "https://app.test/"},
+			Type:  proto.PageNavigationTypeNavigation,
+		})
+		page.observer.recordRequest(request("doc-2", childFrame, "loader-child", proto.NetworkResourceTypeDocument, "https://app.test/"))
+
+		entries, _ := page.NetworkEntries()
+		got := marked(t, entries)
+		if len(got) != 1 {
+			t.Fatalf("top document entries = %v, want one", got)
+		}
+		if entries[0].FrameID != string(topFrame) || entries[0].LoaderID != "loader-1" {
+			t.Fatalf("marked entry = frame %q loader %q, want the top document", entries[0].FrameID, entries[0].LoaderID)
+		}
+	})
+
+	t.Run("bfcache restore resolves to the restored document", func(t *testing.T) {
+		page := &Page{observer: newPageObserver()}
+		page.observer.topFrameID = topFrame
+		page.observer.recordRequest(request("doc-1", topFrame, "loader-1", proto.NetworkResourceTypeDocument, "https://site.test/a"))
+		page.observer.recordRequest(request("doc-2", topFrame, "loader-2", proto.NetworkResourceTypeDocument, "https://site.test/b"))
+		page.observer.recordFrameNavigated(&proto.PageFrameNavigated{
+			Frame: &proto.PageFrame{ID: topFrame, LoaderID: "loader-1", URL: "https://site.test/a"},
+			Type:  proto.PageNavigationTypeBackForwardCacheRestore,
+		})
+
+		entries, _ := page.NetworkEntries()
+		got := marked(t, entries)
+		if len(got) != 1 || got[0] != "https://site.test/a" {
+			t.Fatalf("top document entries = %v, want the restored document", got)
+		}
+	})
+
+	t.Run("empty identity marks nothing", func(t *testing.T) {
+		page := &Page{observer: newPageObserver()}
+		page.observer.recordRequest(request("doc-1", "", "", proto.NetworkResourceTypeDocument, "https://site.test/"))
+		entries, _ := page.NetworkEntries()
+		if got := marked(t, entries); len(got) != 0 {
+			t.Fatalf("top document entries = %v, want none without frame identity", got)
+		}
+	})
+}
+
 func TestObserverRingAndRequestJoin(t *testing.T) {
 	t.Run("redirect hops keep one entry and join the final response", func(t *testing.T) {
 		page := &Page{observer: newPageObserver()}

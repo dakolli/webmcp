@@ -57,6 +57,19 @@ type NetworkEntry struct {
 	Intercepted string `json:"intercepted,omitempty"`
 	// InterceptRuleID names the rule that resolved the request in flight.
 	InterceptRuleID string `json:"intercept_rule_id,omitempty"`
+	// FrameID is the CDP frame that issued the request, empty when CDP did not
+	// report one (a worker request carries no frame).
+	FrameID string `json:"frame_id,omitempty"`
+	// LoaderID is the CDP loader of the frame's document at request time, empty
+	// when CDP did not report one. Every request the document starts shares the
+	// document's loader.
+	LoaderID string `json:"loader_id,omitempty"`
+	// TopDocument marks the document request that produced the page's current
+	// top-level document. Exactly one entry carries it, and it is decided from
+	// the browser's frame and loader identity, so a consumer can find the
+	// current document boundary without matching URLs. Absent when that request
+	// has left the ring.
+	TopDocument bool `json:"top_document,omitempty"`
 
 	requestID   proto.NetworkRequestID
 	requestedAt proto.MonotonicTime
@@ -140,6 +153,12 @@ type pageObserver struct {
 	sockets map[proto.NetworkRequestID]*webSocketSocket
 	// secrets keeps sensitive header values instead of redacting them.
 	secrets bool
+	// topFrameID is the page's main frame. It is stable for the life of the tab.
+	topFrameID proto.PageFrameID
+	// topLoaderID is the loader of the document the top frame is showing now. It
+	// changes on navigation and on a BFCache restore, so it names the current
+	// document rather than the last one a URL heuristic would pick.
+	topLoaderID proto.NetworkLoaderID
 }
 
 // newPageObserver returns an observer whose rings are bounded to the capture caps.
@@ -194,6 +213,9 @@ func (o *pageObserver) recordRequest(e *proto.NetworkRequestWillBeSent) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	headers, cut := redactHeaders(e.Request.Headers, o.secrets)
+	if e.Type == proto.NetworkResourceTypeDocument && o.isTopFrame(e.FrameID) && e.LoaderID != "" {
+		o.topLoaderID = e.LoaderID
+	}
 	i := o.indexOfRequest(e.RequestID)
 	if e.RedirectResponse == nil {
 		if i >= 0 {
@@ -202,6 +224,8 @@ func (o *pageObserver) recordRequest(e *proto.NetworkRequestWillBeSent) {
 			entry.URL = cutString(e.Request.URL, networkURLLimit)
 			entry.ReqHeaders = headers
 			entry.ReqHeadersTruncated = cut
+			entry.FrameID = string(e.FrameID)
+			entry.LoaderID = string(e.LoaderID)
 			if e.Type != "" {
 				entry.Type = string(e.Type)
 			}
@@ -219,9 +243,60 @@ func (o *pageObserver) recordRequest(e *proto.NetworkRequestWillBeSent) {
 		Seq:                 o.netSeq,
 		ReqHeaders:          headers,
 		ReqHeadersTruncated: cut,
+		FrameID:             string(e.FrameID),
+		LoaderID:            string(e.LoaderID),
 		requestID:           e.RequestID,
 		requestedAt:         e.Timestamp,
 	})
+}
+
+// isTopFrame reports whether frame is the page's main frame. An empty frame id
+// is unknown, never the top frame. The caller holds o.mu.
+func (o *pageObserver) isTopFrame(frame proto.PageFrameID) bool {
+	return o.topFrameID != "" && frame == o.topFrameID
+}
+
+// recordFrameNavigated tracks the document the top frame is showing. A frame
+// navigation is the only signal for a BFCache restore, which fires no request,
+// so the loader is taken from the frame itself; child frames are ignored so an
+// iframe that loads the page's own URL cannot move the top-document boundary.
+func (o *pageObserver) recordFrameNavigated(e *proto.PageFrameNavigated) {
+	if e.Frame == nil {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if e.Frame.ParentID != "" {
+		return
+	}
+	if o.topFrameID == "" {
+		o.topFrameID = e.Frame.ID
+	}
+	if e.Frame.ID != o.topFrameID || e.Frame.LoaderID == "" {
+		return
+	}
+	o.topLoaderID = e.Frame.LoaderID
+}
+
+// markTopDocument flags the newest Document request that belongs to the loader
+// the top frame is showing now. Frame and loader identity come from CDP, so an
+// earlier navigation, a same-origin route change and a same-origin iframe all
+// resolve to the same entry a URL match could only guess. The caller holds o.mu.
+func (o *pageObserver) markTopDocument(entries []NetworkEntry) {
+	if o.topFrameID == "" || o.topLoaderID == "" {
+		return
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		entry := &entries[i]
+		if entry.Type != string(proto.NetworkResourceTypeDocument) {
+			continue
+		}
+		if entry.FrameID != string(o.topFrameID) || entry.LoaderID != string(o.topLoaderID) {
+			continue
+		}
+		entry.TopDocument = true
+		return
+	}
 }
 
 // recordResponse joins the response status, MIME type, resource type and
@@ -298,6 +373,7 @@ func (o *pageObserver) recordIntercept(e *proto.FetchRequestPaused, rule Interce
 			Seq:             o.netSeq,
 			Intercepted:     rule.Action,
 			InterceptRuleID: rule.ID,
+			FrameID:         string(e.FrameID),
 			requestID:       id,
 		}
 		markIntercepted(&entry, rule)
@@ -466,7 +542,9 @@ func stringifyArgs(page *rod.Page, args []*proto.RuntimeRemoteObject) string {
 }
 
 // NetworkEntries returns a copy of the observed network entries, oldest first,
-// plus the number dropped by the ring bound.
+// plus the number dropped by the ring bound. The entry for the page's current
+// top-level document is marked on the copy, so the boundary reflects the live
+// document at read time and never mutates the ring.
 func (p *Page) NetworkEntries() ([]NetworkEntry, int) {
 	o := p.observer
 	if o == nil {
@@ -474,7 +552,9 @@ func (p *Page) NetworkEntries() ([]NetworkEntry, int) {
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	return o.net.take(), int(o.net.dropped)
+	out := o.net.take()
+	o.markTopDocument(out)
+	return out, int(o.net.dropped)
 }
 
 // CaptureSecrets controls whether headers captured from now on keep the values
@@ -639,7 +719,8 @@ func (p *Page) ClearCapture() CaptureCounts {
 }
 
 // startObservation arms network, console and WebSocket capture on the page's
-// own context. It runs in the pre-registration window, so no page lock is
+// own context, plus the frame navigation events that identify the current
+// top-level document. It runs in the pre-registration window, so no page lock is
 // needed. Capture is strictly best-effort: a failed enable silences one stream
 // but never fails page creation.
 func (p *Page) startObservation() {
@@ -647,6 +728,7 @@ func (p *Page) startObservation() {
 		return
 	}
 	o := newPageObserver()
+	o.topFrameID = p.Rod.FrameID
 	p.observer = o
 
 	capturePage, cancel := p.Rod.WithCancel()
@@ -655,12 +737,14 @@ func (p *Page) startObservation() {
 	_ = proto.NetworkEnable{}.Call(capturePage)
 	_ = proto.RuntimeEnable{}.Call(capturePage)
 	_ = proto.LogEnable{}.Call(capturePage)
+	_ = proto.PageEnable{}.Call(capturePage)
 
 	stop := capturePage.EachEvent(
 		func(e *proto.NetworkRequestWillBeSent) { o.recordRequest(e) },
 		func(e *proto.NetworkResponseReceived) { o.recordResponse(e) },
 		func(e *proto.NetworkLoadingFinished) { o.recordFinished(e) },
 		func(e *proto.NetworkLoadingFailed) { o.recordFailed(e) },
+		func(e *proto.PageFrameNavigated) { o.recordFrameNavigated(e) },
 		func(e *proto.RuntimeConsoleAPICalled) { o.recordConsole(e, capturePage) },
 		func(e *proto.RuntimeExceptionThrown) { o.recordException(e) },
 		func(e *proto.LogEntryAdded) { o.recordLogEntry(e) },

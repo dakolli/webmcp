@@ -86,6 +86,15 @@ type Entry struct {
 	Response        Response `json:"response"`
 	Cache           Cache    `json:"cache"`
 	Timings         Timings  `json:"timings"`
+	// FrameID is the CDP frame that issued the request. It is a project custom
+	// field, emitted only when CDP reported one.
+	FrameID string `json:"_frameId,omitempty"`
+	// LoaderID is the CDP loader of that frame's document. It is a project
+	// custom field, emitted only when CDP reported one.
+	LoaderID string `json:"_loaderId,omitempty"`
+	// TopDocument marks the request that produced the page's current top-level
+	// document, emitted only on that entry. It is a project custom field.
+	TopDocument bool `json:"_topDocument,omitempty"`
 }
 
 // Request describes the outgoing request.
@@ -253,7 +262,10 @@ func comment(limit, capDropped, ringDropped int) string {
 		"records monotonic timestamps only. time is the measured total and is " +
 		"reported as timings.wait; unmeasured phases are -1. Cap " +
 		strconv.Itoa(limit) + " bytes. A redirect hop is its own entry, with " +
-		"response.redirectURL set from the hop's Location header."
+		"response.redirectURL set from the hop's Location header. _frameId and " +
+		"_loaderId carry the CDP document identity when the browser reported " +
+		"it, and _topDocument marks the request for the page's current " +
+		"top-level document."
 	if capDropped > 0 {
 		c += " Truncated: the " + strconv.Itoa(capDropped) +
 			" oldest entries were dropped to fit the size cap."
@@ -278,6 +290,9 @@ func buildEntry(started string, e browsers.NetworkEntry) Entry {
 		Pageref:         pageID,
 		StartedDateTime: started,
 		Time:            timeMS,
+		FrameID:         e.FrameID,
+		LoaderID:        e.LoaderID,
+		TopDocument:     e.TopDocument,
 		Request: Request{
 			Method:      e.Method,
 			URL:         e.URL,
