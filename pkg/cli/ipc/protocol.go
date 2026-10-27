@@ -65,19 +65,10 @@ const (
 	CodeServerError = -32000
 )
 
-// pageActActions lists page.act's actions in schema order, mirroring the MCP
-// page_act action enum so every surface speaks one vocabulary. The handler
-// validation and the unknown-action error both read it.
-var pageActActions = []string{
-	"click", "input", "type", "press_key", "click_at", "hover_at",
-	"drag_and_drop", "upload_file", "eval", "navigate",
-	"back", "forward", "reload", "hover", "scroll", "select",
-	"wait", "set_viewport", "emulate", "clear_logs",
-	"sinks_install", "sinks_clear", "replay", "inject_canary",
-	"postmessage_install", "postmessage_clear", "post_message",
-	"wait_open", "intercept_add", "intercept_list", "intercept_clear",
-	"auth_save", "auth_restore", "auth_list", "replay_fuzz", "poc_bundle",
-}
+// pageActActions lists page.act's actions in schema order, taken from the
+// pageops action table so the handler validation, the unknown-action error and
+// every other surface speak one vocabulary.
+var pageActActions = pageops.ActionNames()
 
 // ValidPageActAction reports whether action is a supported page.act action.
 func ValidPageActAction(action string) bool {

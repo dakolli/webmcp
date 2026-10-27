@@ -56,6 +56,22 @@ const defaultPageOpTimeout = 30 * time.Second
 // whole call budget.
 const inputAckTimeout = 2 * time.Second
 
+// dispatchActions lists the action names the CLI (pkg/cli/cmd) and IPC
+// (pkg/cli/ipc) dispatch paths handle, including auth_list, which both surfaces
+// resolve before the main switch because it needs no live page. The action
+// table is the source of truth; actions_test.go asserts this mirror stays in
+// lockstep so an action cannot exist on only one side.
+var dispatchActions = []string{
+	"click", "input", "type", "press_key", "click_at", "hover_at",
+	"drag_and_drop", "upload_file", "eval", "navigate",
+	"back", "forward", "reload", "hover", "scroll", "select",
+	"wait", "set_viewport", "emulate", "clear_logs",
+	"sinks_install", "sinks_clear", "replay", "inject_canary",
+	"postmessage_install", "postmessage_clear", "post_message",
+	"wait_open", "intercept_add", "intercept_list", "intercept_clear",
+	"auth_save", "auth_restore", "auth_list", "replay_fuzz", "poc_bundle",
+}
+
 // resolveSelector resolves one CSS selector without rod's unbounded retry: a
 // selector that matches nothing returns the typed *rod.ElementNotFoundError
 // immediately instead of burning the whole call budget and surfacing as a

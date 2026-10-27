@@ -49,28 +49,27 @@ func TestSurfaceVocabularyParity(t *testing.T) {
 	})
 
 	ipcActions := ipc.PageActActions()
+	tableActions := pageops.ActionNames()
 	t.Run("actions", func(t *testing.T) {
 		for _, action := range mcpActions {
-			cliOK, ipcOK := actionVocab[action], slices.Contains(ipcActions, action)
-			if cliOK != ipcOK {
-				t.Errorf("MCP action %q is wired on one surface only (CLI=%v IPC=%v)", action, cliOK, ipcOK)
-			}
-			if !cliOK {
-				t.Errorf("MCP action %q is missing from the CLI and IPC vocabularies", action)
-				continue
-			}
-			if _, ok := actPayloadSpecs[action]; !ok {
-				t.Errorf("CLI action %q has no positional payload spec", action)
-			}
-		}
-		for action := range actionVocab {
-			if !slices.Contains(mcpActions, action) {
-				t.Errorf("CLI action %q has no MCP page_act action", action)
+			if !slices.Contains(tableActions, action) {
+				t.Errorf("MCP action %q is missing from the pageops action table", action)
 			}
 		}
 		for _, action := range ipcActions {
+			if !slices.Contains(tableActions, action) {
+				t.Errorf("IPC action %q is missing from the pageops action table", action)
+			}
+		}
+		for _, action := range tableActions {
 			if !slices.Contains(mcpActions, action) {
-				t.Errorf("IPC action %q has no MCP page_act action", action)
+				t.Errorf("action table row %q has no MCP page_act action", action)
+			}
+			if !slices.Contains(ipcActions, action) {
+				t.Errorf("action table row %q has no IPC page.act action", action)
+			}
+			if _, ok := actPayloadSpecs[action]; !ok {
+				t.Errorf("action table row %q has no positional payload spec", action)
 			}
 		}
 	})

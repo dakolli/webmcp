@@ -16,6 +16,7 @@ import (
 
 	"webmcp/pkg/browsers"
 	"webmcp/pkg/cli/ipc"
+	"webmcp/pkg/cli/pageops"
 )
 
 // whatVocab is the fetch-aspect vocabulary shared by `page fetch` parsing and
@@ -30,21 +31,13 @@ var whatVocab = map[string]bool{
 	"sinks": true, "postmessage": true, "har": true, "websocket": true,
 }
 
-// actionVocab is the page-act action vocabulary shared by `page act` parsing
-// and the page-id resolution nudge: `page act <arg>` whose first arg is one of
-// these words is an action, not a page id.
-var actionVocab = map[string]bool{
-	"click": true, "input": true, "type": true, "press_key": true,
-	"click_at": true, "hover_at": true, "drag_and_drop": true,
-	"upload_file": true, "eval": true, "navigate": true, "back": true,
-	"forward": true, "reload": true, "hover": true, "scroll": true,
-	"select": true, "wait": true, "set_viewport": true, "emulate": true,
-	"clear_logs": true, "sinks_install": true, "sinks_clear": true,
-	"replay": true, "inject_canary": true, "postmessage_install": true,
-	"postmessage_clear": true, "post_message": true, "wait_open": true,
-	"intercept_add": true, "intercept_list": true, "intercept_clear": true,
-	"auth_save": true, "auth_restore": true, "auth_list": true,
-	"replay_fuzz": true, "poc_bundle": true,
+// isAction reports whether name is a page-act action, accepting the CLI dashed
+// spelling. It exposes the shared pageops action table to `page act` parsing
+// and the page-id resolution nudge: `page act <arg>` whose first arg is an
+// action is an action, not a page id.
+func isAction(name string) bool {
+	_, ok := pageops.LookupAction(name)
+	return ok
 }
 
 // actPayloadSpecs maps each page act action to its positional payload slots,
@@ -392,7 +385,7 @@ func noOpenPagesErr(label string) error {
 // links is an aspect, not an id).
 func unresolvedPageErr(id string, pages []browsers.PageInfo, label string) error {
 	msg := fmt.Sprintf("%s: page %q not found — open pages:\n%s", label, id, pageRows(pages))
-	if whatVocab[id] || actionVocab[id] {
+	if whatVocab[id] || isAction(id) {
 		msg += fmt.Sprintf("\n%q is an aspect, not a page id — try 'web-cli %s [id] %s'", id, label, id)
 	}
 	return errors.New(msg)
@@ -574,7 +567,7 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 	switch {
 	case len(args) == 0:
 		// Flags supply everything; positionals win only when present.
-	case actionVocab[canonicalAction(args[0])]:
+	case isAction(canonicalAction(args[0])):
 		a.action = canonicalAction(args[0])
 		haveAction = true
 		payload = args[1:]
@@ -852,12 +845,8 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 // its underscore form when that is a known action.
 func canonicalAction(action string) string {
 	action = strings.TrimSpace(action)
-	if actionVocab[action] {
-		return action
-	}
-	underscored := strings.ReplaceAll(action, "-", "_")
-	if actionVocab[underscored] {
-		return underscored
+	if a, ok := pageops.LookupAction(action); ok {
+		return a.Name
 	}
 	return action
 }

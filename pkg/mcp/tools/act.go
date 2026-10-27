@@ -22,18 +22,10 @@ const defaultActTimeout = 30 * time.Second
 // be set to the same duration and fire first.
 const waitSleepMargin = 5 * time.Second
 
-// actActionNames lists page_act's actions in schema order. The schema enum and
-// the unknown-action error both read it so the two cannot drift.
-var actActionNames = []string{
-	"click", "input", "type", "press_key", "click_at", "hover_at",
-	"drag_and_drop", "upload_file", "eval", "navigate",
-	"back", "forward", "reload", "hover", "scroll", "select",
-	"wait", "set_viewport", "emulate", "clear_logs",
-	"sinks_install", "sinks_clear", "replay", "inject_canary",
-	"postmessage_install", "postmessage_clear", "post_message",
-	"wait_open", "intercept_add", "intercept_list", "intercept_clear",
-	"auth_save", "auth_restore", "auth_list", "replay_fuzz", "poc_bundle",
-}
+// actActionNames is page_act's action vocabulary in schema order, taken from
+// the pageops action table so the schema enum and the unknown-action error
+// cannot drift from the CLI and IPC surfaces.
+var actActionNames = pageops.ActionNames()
 
 // actActionList renders actActionNames for an error message.
 func actActionList() string {
