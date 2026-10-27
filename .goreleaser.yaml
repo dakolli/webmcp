@@ -1,11 +1,6 @@
 # GoReleaser v2 configuration for the canonical `browser` binary.
 version: 2
 
-before:
-  hooks:
-    - go mod tidy
-    - go test ./...
-
 builds:
   - id: browser
     main: ./cmd/browser
@@ -69,7 +64,7 @@ changelog:
       order: 5
 
 release:
-  draft: true
+  draft: false
   prerelease: auto
   name_template: "v{{ .Version }}"
 
