@@ -21,8 +21,9 @@ The live schema is `code://pkg/mcp/tools/page.go#L90`. The aspect registry is `c
 | `target` | string | no | — | Resource URL for `css`/`js`. For `body`: a `seq` number or a substring of the request URL, newest match wins. |
 | `full_page` | boolean | no | `false` | Capture the whole scrollable page. Only `screenshot` uses it. |
 | `include_values` | boolean | no | `false` | With `what=storage`, return real cookie and storage values instead of `<redacted>`. `true` exposes live session tokens. |
+| `timeout_ms` | integer | no | `30000` | Bound for the whole call. Clamped to 1..120000. A full-page screenshot keeps its 90 s floor unless you pass a larger value. |
 
-The live `what` enum has 20 values, in registration order: `html`, `text`, `links`, `meta`, `dom`, `css`, `js`, `screenshot`, `interactives`, `a11y`, `network`, `console`, `body`, `article`, `marks`, `security`, `storage`, `sinks`, `postmessage`, `har`. The tool has no `timeout_ms` input, every call has a fixed 30 second bound, and a full-page screenshot gets its own 90 second budget.
+The live `what` enum has 22 values, in registration order: `html`, `dom`, `text`, `css`, `js`, `links`, `screenshot`, `meta`, `interactives`, `a11y`, `network`, `body`, `console`, `article`, `tables`, `forms`, `marks`, `security`, `sinks`, `postmessage`, `storage`, `har`. `timeout_ms` defaults to 30000 and clamps to 1..120000.
 
 ## Returns
 
@@ -44,6 +45,8 @@ The live `what` enum has 20 values, in registration order: `html`, `text`, `link
 | `body` | JSON `{seq,method,url,status,content_type,bytes,truncated}` plus `body` or `base64`. | no | **no** |
 | `console` | JSON `{entries,count,dropped,truncated}`. | no | **no** |
 | `article` | JSON `{title,byline?,excerpt?,text,words,truncated,url}`. | no | **no** |
+| `tables` | JSON `{tables:[{index,caption,headers,rows,span_info,selector}],count,truncated}`. `rows` is a list of string lists. `span_info` lists `{row,col,colspan,rowspan}`. Caps are 20 tables, 500 rows and 50 columns. | no | **no** |
+| `forms` | JSON `{forms:[{index,action,method,enctype,fields,submits,csrf_candidates}],count,truncated}`. A field holds `name`, `type`, `label`, `required`, `has_value`, `options[]`, `selector`. A control value never appears. A submit holds `name`, `type`, `label`, `selector`. A CSRF candidate holds `name`, `selector`, `match`. | no | **no** |
 | `marks` | One text block `{marks,viewport_width,viewport_height,truncated}`, then one PNG image block. | no | **no** |
 | `security` | JSON `{url,checks:[{id,status,evidence,detail}],count,truncated}`. | no | **no** |
 | `sinks` | JSON `{installed,hits:[{source,sink,context,value,value_cut?,stack?,selector?,ts}],dropped,truncated}`. | no | **no** |
@@ -87,8 +90,7 @@ Every handle has the form `g<document>-b<backendNodeId>`, for example `gy1g0vstq
 
 ### Caps
 
-- Caps: `interactives` 200 entries, `a11y` 400 nodes, `article` 40000 runes, `marks` 60 viewport boxes, and `network`/`console` 200-entry rings that emit the newest 100. A `truncated` count reports the rest, and `dropped` counts true ring loss.
-
+- Caps: `interactives` 200 entries, `a11y` 400 nodes, `article` 40000 runes, `marks` 60 viewport boxes, `tables` 20 tables/500 rows/50 columns, `forms` 20 forms/500 fields/100 options/50 submits/50 CSRF candidates, and `network`/`console` 200-entry rings that emit the newest 100. A `truncated` count reports the rest, and `dropped` counts true ring loss.
 ### Network and console capture
 
 Capture starts before the first document loads. Both rings are cumulative from page creation. `clear_logs` (a `page_act` action) empties both rings and resets `dropped`, for example `{"network":39,"console":0}`. The `seq` counter does not reset. The recipe is `clear_logs`, then one action, then read.
@@ -153,9 +155,7 @@ The ring holds 100 messages per window. One read emits the newest 100 across the
 
 ### Screenshots and timeouts
 
-`screenshot` returns PNG only, as an image block plus a metadata text block. There is no format input. `full_page: false` captures the visible viewport. `full_page: true` captures the whole scrollable page on a 90 second budget that is independent of the 30 second bound, and a very tall page can still time out. Large images are not cut by `max_bytes` — a 400x300 full-page capture produced over 87 KB of base64. Prefer a small viewport for `marks`.
-
-With `--bind 0.0.0.0`, the server prints `http://[::]:<port>`. Put a reachable host in the client URL.
+`screenshot` returns PNG only, as an image block plus a metadata text block. There is no format input. `full_page: false` captures the visible viewport. `full_page: true` captures the whole scrollable page and keeps a 90 s floor unless `timeout_ms` is larger. `timeout_ms` bounds every call, defaults to 30000, and clamps to 1..120000. A timeout names the aspect and the value, for example `page_fetch: what="screenshot" timed out after 30s (timeout_ms=30000, max 120000) …`. Large images are not cut by `max_bytes`. Prefer a small viewport for `marks`.
 
 ## Truncation matrix
 
@@ -164,7 +164,7 @@ With `--bind 0.0.0.0`, the server prints `http://[::]:<port>`. Put a reachable h
 | `html`, `text`, `css`, `js` | Cut on a rune boundary. A note is appended. | No. A `css`/`js` list is cut inside its JSON. | Text note |
 | `dom`, `links` | Array root becomes an envelope object. | Yes | `truncated: true`, `omitted` |
 | `meta` | Object keeps its fields, its first array field shrinks. | Yes | `truncated: true`, `omitted` |
-| `screenshot`, `interactives`, `a11y`, `network`, `body`, `console`, `article`, `marks`, `security`, `sinks`, `postmessage`, `storage`, `har` | Not cut. | Yes | Shape's own `truncated` or `count` |
+| `screenshot`, `interactives`, `a11y`, `network`, `body`, `console`, `article`, `tables`, `forms`, `marks`, `security`, `sinks`, `postmessage`, `storage`, `har` | Not cut. | Yes | Shape's own `truncated` or `count` |
 
 The text note is exact: `… (truncated at max_bytes=600 bytes; raise max_bytes — dom/links/meta do not use selector)`. The array envelope is `{"items":[...],"max_bytes":N,"omitted":N,"truncated":true}`.
 
@@ -205,7 +205,7 @@ Recovery: re-read `what=network` for the current `seq` values, then read the bod
 
 - 2026-10-25 — `meta`, `text` with selector, `css` with `target`, `interactives`, `network`, `body`, `network` header redaction, and the unknown-`what` failure. Commit `819ba12`.
 - 2026-10-26 — `security` on `https://go.dev/` returned `count: 20`, `truncated: 0`. Failure envelopes for `unknown what` and a no-match selector were recorded live. The no-match selector returned `element_not_found`.
-- 2026-10-26 — `sinks` on `https://www.postgresql.org/`: `sinks_install` returned `{"installed":true}`, the arm survived a full navigation, `sinks_clear` returned `{"cleared":N}`, and 250 hits reported `hits:100`, `dropped:50`, `truncated:100`. A `postmessage` read on https://www.python.org/ returned the message list, `frames:[{url,probed}]`, and `target=clear` returned `{"cleared":N}`.
+- 2026-10-26 — `tables` and `forms` on a live page. `forms` reported `has_value:false`, then `has_value:true` after an input, and never returned the value. `timeout_ms` bounded a slow read and the failure named `what` and the value.
 
 ## When not to use it
 

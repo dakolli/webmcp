@@ -8,7 +8,7 @@ ids, live URLs, titles, and contexts.
 ## What it does
 
 `session_list` reads the live page maps of every live browser and identity. It returns them
-under `data`. Each entry holds a page `id`, `url`, and `context`, plus `title` and `stale` when
+under `data`. Each entry holds a page `id`, `url`, `context`, and `opener`, plus `title` and `stale` when
 present.
 
 A session is one browser tab. The id is the address that `page_fetch`, `page_act`, and
@@ -53,8 +53,9 @@ On success `data` is an array of page objects. Live result:
 | `title` | string | The live document title. Omitted when empty. |
 | `stale` | boolean | Present when the live URL and title could not be read. `url` then holds the last known value. |
 | `context` | string | The incognito identity that owns the page. `default` is the browser's own cookie jar. |
+| `opener` | string | The id of the page that opened this popup. Absent for a top-level page. |
 
-The code emits `id`, `url`, `context`, and optional `title` and `stale`. It emits no timestamp.
+The code emits `id`, `url`, `context`, `opener`, and optional `title` and `stale`. It emits no timestamp.
 Source: `code://pkg/browsers/session.go#L156-L171`. `title` is omitted when the live title is
 empty, and `stale` when the tab was read live.
 
@@ -84,6 +85,7 @@ An empty array means no live browser holds a page.
   result. Each result is a live snapshot.
 - **No browser id in the result.** The array holds pages, not browsers. Use
   `browser_list` to map a page to its browser.
+- **Popups.** A page opened by a `target="_blank"` link or `window.open` carries `opener`. Closing the opener closes its popups. A browser holds at most 20 pages, popups included.
 
 ## Failure modes and recovery
 

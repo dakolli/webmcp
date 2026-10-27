@@ -29,7 +29,7 @@ Expect `{"session_id":"page-1","title":"httpbin.org/forms/post","html_bytes":140
 {"tool":"page_act","arguments":{"session_id":"page-1","action":"wait","wait_mode":"load","timeout_ms":1000}}
 ```
 
-Expect `set input … value="Ada Lovelace"`, `set input … value="555-0100"`, `typed … value=" EXT"`, `{"name":"Ada Lovelace","tel":"555-0100 EXT"}`, then the redirect delta inside one `data` string, then `waited for "load"`. `input` replaces, `type` appends at the caret.
+Expect `set input selector="input[name=\"custname\"]" length=12`, `set input selector="input[name=\"custtel\"]" length=8`, `typed selector="input[name=\"custtel\"]" length=4`, then the eval result `{"name":"Ada Lovelace","tel":"555-0100 EXT"}` proving the field state, then the redirect delta inside one `data` string, then `waited for "load"`. Neither confirmation echoes the value. `input` replaces, `type` appends at the caret.
 
 ## 3. select and upload_file
 
@@ -132,7 +132,7 @@ An ambiguous replay URL substring anchors the failure path (tested live on 2026-
 ```
 
 ```json
-{"ok":false,"error":{"type":"unknown","message":"page_act: replay: target \"news.ycombinator.com/news\" matches 2 network entries — pass a seq or a longer URL substring: seq=1 GET https://news.ycombinator.com/news; seq=2 GET https://news.ycombinator.com/news.css?EieZrD3Ae1qf3cIQQaRb"}}
+{"ok":false,"error":{"type":"invalid_args","message":"page_act: replay: target \"news.ycombinator.com/news\" matches 2 network entries — pass a seq or a longer URL substring: seq=1 GET https://news.ycombinator.com/news; seq=2 GET https://news.ycombinator.com/news.css?EieZrD3Ae1qf3cIQQaRb"}}
 ```
 
 ```json

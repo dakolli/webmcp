@@ -1,14 +1,18 @@
 # web-mcp Makefile
 # test        — run the full Go test suite
 # install     — stop any running serve daemon, then build and install the browser
-#               binary onto PATH (go install ./cmd/browser)
+#               binary onto PATH (go install ./cmd/browser), then print the live
+#               tool schema
 # install-dev — DESTRUCTIVE: stop the daemon, wipe the config dir (profiles,
 #               config.json, proxy.json → saved logins and proxy credentials),
-#               reinstall, then relaunch the MCP/SSE server on PORT
+#               reinstall, then relaunch the MCP/SSE server on PORT and print the
+#               live tool schema
+# schema      — print the tool schema of the LIVE server (starts a temporary one
+#               when nothing listens on PORT)
 # launch      — stop any running serve daemon, then start the MCP/SSE server
 #               daemonized on PORT (default 4089)
 
-.PHONY: test install install-dev launch stop guard-config
+.PHONY: test install install-dev schema launch stop guard-config
 
 # PORT is the shared MCP/SSE port for launch and the install-dev relaunch.
 PORT ?= 4099
@@ -28,8 +32,23 @@ stop:
 test:
 	go test ./...
 
+# schema — print the property names and types of every tool on the LIVE server.
+# A client caches tools/list for the whole session, so a rebuilt server shows
+# fields that the client never learns. This target asks the server itself. The
+# output is the truth: a name here and missing in your client means a stale
+# client cache. With nothing listening, the target starts a temporary server on
+# a private socket, reads it, and stops it.
+schema:
+	@out="$$(./scripts/live-schema.sh '$(PORT)')"; \
+	if command -v jq >/dev/null 2>&1; then \
+		printf '%s' "$$out" | jq -r '.result.tools[] | .name + ": " + ([.inputSchema.properties // {} | to_entries[] | .key + ":" + (.value.type // "?")] | join(", "))'; \
+	else \
+		printf '%s\n' "$$out"; \
+	fi
+
 install: stop
 	go install ./cmd/browser
+	@$(MAKE) --no-print-directory schema
 
 # guard-config — refuse an install-dev wipe when the target is not safely under
 # $HOME. Runs before stop so nothing is disturbed on a refusal.
@@ -54,6 +73,7 @@ install-dev: guard-config stop
 	go install ./cmd/browser
 	browser serve mcp --port "$(PORT)"
 	@echo "MCP SSE endpoint is at http://127.0.0.1:$(PORT)/sse"
+	@$(MAKE) --no-print-directory schema
 
 launch: stop
 	browser serve mcp --port "$(PORT)"

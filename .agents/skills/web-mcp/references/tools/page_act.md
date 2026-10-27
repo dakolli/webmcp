@@ -8,7 +8,7 @@ Interact with a live page that `fetch_page` opened.
 
 `page_act` performs one action in an open session. The `session_id` picks the tab, the
 `action` field picks the operation. Actions cover clicking, typing, keys, mouse
-coordinates, drag, upload, JavaScript, navigation, waiting, emulation, log clearing, replaying a captured network request, sink control, canary injection, and postMessage capture and sending.
+coordinates, drag, upload, JavaScript, navigation, waiting, waiting for a popup, emulation, log clearing, replaying a captured network request, sink control, canary injection, and postMessage capture and sending.
 
 The confirmation rides the result envelope: the full reply is `{"ok":true,"data":<payload>}`. See
 `SKILL.md` for the envelope rules and the `{"ok":false,"error":…}` shape. The payload is one short
@@ -32,6 +32,7 @@ session held outside the declared `owner` is refused as `not_found`. Actions ign
 | `target` | string | `replay` | — | Captured network entry: a `seq` number or a substring of the request URL. |
 | `method` | string | `replay` (optional) | — | HTTP method override, for example `PUT`. Omit to keep the captured method. |
 | `headers` | object | `replay` (optional) | — | Per-header overrides. Each named header replaces the captured value, others keep theirs. |
+| `max_bytes` | integer | `replay` (optional) | `262144` | Cap on the returned replay body. Larger values are clamped. A cut body returns `truncated:true`. |
 | `key` | string | `press_key` | — | Key or combo, for example `Enter` or `Control+A`. `value` is a fallback. |
 | `button` | string | no | `left` | `left`, `right`, or `middle` for `click` and `click_at`. |
 | `click_count` | integer | no | `1` | Click count for `click` and `click_at`. `2` is a double click. |
@@ -53,8 +54,8 @@ session held outside the declared `owner` is refused as `not_found`. Actions ign
 | `action` | Required arguments | Effect | Return text | State delta |
 | :--- | :--- | :--- | :--- | :--- |
 | `click` | `selector` or `handle` | Waits for the element to be interactable, then clicks. | `clicked selector="…"` | Yes, when navigation commits. |
-| `input` | `selector` or `handle`, `value` | Selects all text, then types. The field ends exactly as `value`. | `set input selector="…" value="…"` | No. |
-| `type` | `selector` or `handle`, `value` | Focuses, then inserts at the caret. It does not clear. | `typed selector="…" value="…"` | No. |
+| `input` | `selector` or `handle`, `value` | Selects all text, then types. The field ends exactly as `value`. | `set input selector="…" length=N`, plus `value_redacted=true` for a password or hidden field. | No. |
+| `type` | `selector` or `handle`, `value` | Focuses, then inserts at the caret. It does not clear. | `typed selector="…" length=N`, plus `value_redacted=true` for a password or hidden field. | No. |
 | `press_key` | `key` (or `value`) | Presses a key or combo. Focuses a target when given. | `pressed key "Enter" in selector="…"` | Yes, if the key navigates. |
 | `click_at` | `x`, `y` | Moves the mouse to the point and clicks. | `clicked at (34.0, 33.0) button=left count=1` | Yes, if a click navigates. |
 | `hover_at` | `x`, `y` | Moves the mouse to the point. | `hovered at (512.0, 33.0)` | No. |
@@ -79,6 +80,7 @@ session held outside the declared `owner` is refused as `not_found`. Actions ign
 | `postmessage_install` | — | Arms the postMessage recorder on every reachable window. | `{"installed":true}` | No. |
 | `postmessage_clear` | — | Empties every recorder ring and resets `dropped`. | `{"cleared":N}` | No. |
 | `post_message` | `value` | Sends a message to `top` or the iframe in `target_selector`. Arms the recorder first. | `{origin,target}` | No. |
+| `wait_open` | — | Blocks until this page opens a popup or tab. | Compact JSON `{session_id,url,opener}`. | No. |
 
 A non-positive `click_count` becomes `1`. An unknown `button` is rejected before the click. The server rejects a missing `x` or `y` key for `click_at` and `hover_at`, and an explicit `0` is valid.
 
@@ -86,7 +88,7 @@ A non-positive `click_count` becomes `1`. An unknown `button` is rejected before
 
 The confirmation and the state delta arrive as one JSON string inside `data`. A live form submit on 2026-10-26 returned `{"ok":true,"data":"clicked selector=\"form button\"\n→ url=https://httpbin.org/post title=\"httpbin.org/post\""}`.
 The delta starts on a new line and lists only changed fields. `navigate` never appends one. `back` and `forward` do.
-`eval`, `clear_logs`, and `replay` return compact JSON in `data` instead of prose. A DOM node from `eval` comes back as `{}`.
+`eval`, `clear_logs`, `replay`, and `wait_open` return compact JSON in `data` instead of prose. A DOM node from `eval` comes back as `{}`.
 `click`, `click_at`, `press_key`, `upload_file`, `eval`, and `select` poll up to 900 ms for a navigation.
 
 ## Behavior and limits
@@ -99,7 +101,7 @@ The `g` token names the document that minted the handle. Any navigation, reload,
 
 ### Element actions
 
-`input` replaces the field contents: it selects all text first, then types `value`. `type` does not clear, it focuses the element and inserts at the caret. A live `input` of `555-0100` then a `type` of `" EXT"` produced `555-0100 EXT`.
+`input` replaces the field contents: it selects all text first, then types `value`. `type` does not clear, it focuses the element and inserts at the caret. A live `input` of `555-0100` then a `type` of `" EXT"` left the field at `555-0100 EXT`, confirmed by `eval`.
 Some controls reject synthetic text — a live `input` on `<input type="time">` left the value empty, so use `eval` to set those values.
 `click` and `wait` `interactable` check interactability, and `input` and `type` do not, so a hidden element can still receive text.
 
@@ -130,6 +132,10 @@ The source takes a `selector` (element center) or `x`/`y`, the target takes `tar
 
 `timeout_ms` defaults to `30000` and bounds the whole call. For `ms` mode the server adds a 5 second margin. If you omit `timeout_ms`, an `ms` wait sleeps 30 seconds, so always set it.
 
+### Popups
+
+`wait_open` blocks until the page opens a popup or new tab through a `target="_blank"` link or `window.open`. It returns `{session_id,url,opener}`. A popup opened before the call is returned once. `timeout_ms` bounds the wait. Closing the opener closes its popups. A browser holds at most 20 pages, popups included.
+
 ### Emulation and viewport
 
 `set_viewport` applies a manual override with DPR 1, and both values must be positive. `emulate` applies a go-rod preset with user agent, metrics, and touch, and a later `emulate` wins over an earlier `set_viewport`. Live result: `1024x768` then `IPadPro` gave `1024x1366` at DPR 2. `emulate` with `clear` resets the preset and drops a manual override. Apply emulation before layout work, because a metrics change can reflow the page.
@@ -142,48 +148,35 @@ The recipe is `clear_logs`, then one action, then `page_fetch` `network` or `con
 
 ### Sinks tracer and canary injection
 
-`sinks_install` arms the source-to-sink tracer on the page and returns `{"installed":true}`. A second call is a no-op. The arm step is opt-in because instrumentation wraps page setters and constructors and changes page behavior. The script survives a full navigation and re-arms before the new document's own scripts, but the hit ring is per document, so a navigation starts a fresh ring that the new document's own scripts can fill at once. A client-side route change keeps the ring.
-
-`inject_canary` proves sink reachability. It requires `sinks_install` first, and otherwise returns `page_act: inject_canary needs the sink tracer — run action "sinks_install" first` with error type `unknown`. It injects a `wm-canary-<8 hex>` value into `query`, `hash`, `postmessage`, and `name` — all four by default, `targets` narrows it — and returns `{canary, injected:[{target, where}], hits:[{sink, context, selector, value, stack}], installed}`. `query` appends `wmcanary` and reloads the document. `hash` does not reload. Work stops after 20 frames, and `injected.where` names each frame URL. A finding is one `hits[]` entry whose `value` contains the canary: the page passed attacker-controlled text into that sink. `selector` and `stack` are omitted when the sink has neither.
-
-`sinks_clear` empties the ring and resets `dropped`. It returns `{"cleared":N}` and returns `{"cleared":0}` on an unarmed page. Both actions take only `session_id` and `action`, and the CLI rejects a payload for either.
-
-Probe order: 1. `sinks_install`. 2. Send the payload with a navigation, a click, or `eval`, or run `inject_canary`. 3. Read `page_fetch what=sinks`, or read the `hits` that `inject_canary` already returned. 4. `sinks_clear` when done. Read the payload, caps, and unarmed shape in [page_fetch.md](page_fetch.md).
+`sinks_install` arms the tracer and returns `{"installed":true}`. `inject_canary` requires it first and otherwise returns `page_act: inject_canary needs the sink tracer — run action "sinks_install" first` (type `unknown`). Payloads, caps, and the unarmed shape are in [page_fetch.md](page_fetch.md), and the cross-cutting rule is in `SKILL.md`.
 
 ### postMessage recorder
 
-`postmessage_install` arms one capture-phase `message` listener per window and iframe, and re-arms before each later document, so the arm survives a full navigation. It never wraps `addEventListener`, so page listeners keep their identity. It takes no payload and returns `{"installed":true}`. A second call is a no-op.
-
-`postmessage_clear` empties every ring, resets `dropped`, and returns `{"cleared":N}`. An unarmed page returns `{"cleared":0}`. `post_message` arms the recorder first, then delivers `value` to `window.top` when `target_selector` is `top` or omitted, or to the `contentWindow` of the iframe matched by `target_selector`. A complete JSON object or array in `value` is delivered as that structure. Anything else is delivered as a string. `origin` is the target origin and defaults to `*`. It returns `{origin,target}`. Read the log with `page_fetch what=postmessage`.
+`postmessage_install`, `postmessage_clear`, and `post_message` are described in [page_fetch.md](page_fetch.md), with the cross-cutting rule in `SKILL.md`.
 
 ### Replay with what=network as the source
 
 `replay` resends one captured network entry through a real Go HTTP client, outside the browser (`code://pkg/browsers/replay.go#L112-L235`). It bypasses CORS, carries the page's cookies for the target host in a private jar without writing anything back, and never touches the live page. Recipe: read `page_fetch` `what=network`, pick one entry, then replay it.
 
-- `target` picks the entry: a `seq` number or a unique substring of the request URL. An ambiguous substring is refused with every candidate listed as `seq=N METHOD url`.
+- `target` picks the entry: a `seq` number or a unique substring of the request URL. An ambiguous substring is refused as `invalid_args` with every candidate listed as `seq=N METHOD url`.
 - `method` overrides the captured method when given. `headers` replaces captured headers per name, others keep theirs. Framing headers (`Host`, `Cookie`, `Connection`, `Accept-Encoding`, `Content-Length`, and kin) are never copied because the client owns them and the cookie jar owns `Cookie`.
 - `value` replaces the request body, but it is sent only when the `value` field itself is present. Without it the captured body is fetched from the browser, and a body the browser no longer retains reports `body_uncaptured: true` instead of being sent empty. `GET` and `HEAD` never send a body.
 - Each URL, redirects included, is checked against the browser's scope allowlist before any request runs (`code://pkg/mcp/tools/act.go#L352-L354`, `code://pkg/mcp/tools/act.go#L283`). Up to 5 redirects are followed and reported in `chain`, and a 301, 302, or 303 switches the next hop to `GET` and drops the body.
 
-The result is compact JSON inside `data` (`code://pkg/browsers/replay.go#L86-L110`), tested live on 2026-10-26 (body shortened):
+The result is compact JSON inside `data` (`code://pkg/browsers/replay.go#L86-L110`). See [page_act_example.md](../examples/page_act_example.md) §7 for the live replay result.
 
-```json
-{"ok":true,"data":{"status":200,"headers":{"Content-Type":["text/css; charset=utf-8"],"Server":["nginx"]},"body":"body  { font-family:Verdana, Geneva, sans-serif; … }","bytes":7418,"ms":63,"request":{"method":"GET","url":"https://news.ycombinator.com/news.css?EieZrD3Ae1qf3cIQQaRb","headers":{"Accept-Language":"en","Referer":"https://news.ycombinator.com/","User-Agent":"Mozilla/5.0 …"}}}}
-```
-
-Fields: `status`, `headers` (final response headers as string arrays), `body` for UTF-8 text or `base64` for binary, `bytes`, `truncated`, `body_uncaptured`, `ms`, `request` (first-hop method, url, and echoed headers), and `chain` (each hop's `status` and `url`, present when the replay followed a redirect). The response body is capped at 256 KB on a rune boundary — `truncated: true` marks the cut. Sensitive request and response header values (`Cookie`, `Set-Cookie`, `Authorization`, and kin) show `<redacted>` unless the page opted into secrets capture, and no surface exposes that switch. The whole replay is bounded by the call's `timeout_ms` deadline (engine cap 30 seconds).
+Fields: `status`, `headers` (final response headers as string arrays), `body` for UTF-8 text or `base64` for binary, `bytes`, `truncated`, `body_redactions`, `body_uncaptured`, `ms`, `request` (first-hop method, url, and echoed headers), and `chain` (each hop's `status` and `url`, always present and `[]` for a single hop). `truncated` and `chain` are always present. The response body is capped at 256 KB on a rune boundary, and `truncated: true` marks the cut. Sensitive request and response header values (`Cookie`, `Set-Cookie`, `Authorization`, and kin) show `<redacted>` unless the page opted into secrets capture, and no surface exposes that switch. Text-body secrets are replaced with `<redacted>` and counted in `body_redactions`. Binary bodies are not scanned. The whole replay is bounded by the call's `timeout_ms` deadline (engine cap 30 seconds).
 
 ### Session lifetime
 
-Pages expire after the idle TTL. A dead Chromium relaunches under the same browser id, and older
-session ids then fail. Confirm the page with `page_list`.
+Pages expire after the idle TTL, a dead Chromium relaunches under the same browser id, and older session ids then fail. Confirm the page with `page_list`.
 
 ## Failure modes and recovery
 
 An absent selector for `click`, `input`, `hover` or `select` fails immediately with type `element_not_found` and names the selector. It does not consume `timeout_ms`. Every error rides the envelope: `{"ok":false,"error":{"type":…,"message":…,"hint":…}}`. Read `message` first. The prefix `page_act: ` opens the message, and the table shows the message content. This tool can produce every type (`code://pkg/mcp/tools/envelope.go#L194-L227`). One live failure envelope, tested on 2026-10-26 against an ambiguous replay target:
 
 ```json
-{"ok":false,"error":{"type":"unknown","message":"page_act: replay: target \"news.ycombinator.com/news\" matches 2 network entries — pass a seq or a longer URL substring: seq=1 GET https://news.ycombinator.com/news; seq=2 GET https://news.ycombinator.com/news.css?EieZrD3Ae1qf3cIQQaRb"}}
+{"ok":false,"error":{"type":"invalid_args","message":"page_act: replay: target \"news.ycombinator.com/news\" matches 2 network entries — pass a seq or a longer URL substring: seq=1 GET https://news.ycombinator.com/news; seq=2 GET https://news.ycombinator.com/news.css?EieZrD3Ae1qf3cIQQaRb"}}
 ```
 
 | Situation | Message at `error.message` | Recovery |
@@ -200,7 +193,7 @@ An absent selector for `click`, `input`, `hover` or `select` fails immediately w
 | `set_viewport` without `viewport` | `page_act: set_viewport requires a viewport` | Pass `width` and `height`. |
 | Non-positive viewport | `page_act: viewport width and height must be positive` | Send positive integers. |
 | Unknown session | `page_act: session "page-999" not found` | Use `page_list` or `fetch_page`. |
-| Unknown action | `page_act: unknown action="konami" (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, inject_canary, postmessage_install, postmessage_clear, post_message)` | Use a listed action. |
+| Unknown action | `page_act: unknown action="konami" (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, inject_canary, postmessage_install, postmessage_clear, post_message, wait_open)` | Use a listed action. |
 | Unknown button | `page_act: click: unknown mouse button "back" (must be left, right, or middle)` | Use `left`, `right`, or `middle`. |
 | `upload_file` without paths | `page_act: upload_file: no file paths provided` | Pass `paths` or `value`. |
 | `interactable` without a target | `page_act: wait: interactable mode requires a selector or handle` | Add a target. |
@@ -216,6 +209,7 @@ An absent selector for `click`, `input`, `hover` or `select` fails immediately w
 | `inject_canary` before `sinks_install` | `page_act: inject_canary needs the sink tracer — run action "sinks_install" first` (`unknown`) | Run `sinks_install`, then retry. |
 | `post_message` without `value` | `page_act: post_message requires value (the message payload, e.g. {"t":"wm"})` | Add `value`. |
 | `post_message` bad target | `page_act: send postMessage: no element matched selector iframe#missing` or `page_act: send postMessage: element div#x is not a frame` | Pass a CSS selector for a live iframe, or `top`. |
+| `wait_open` timeout | The message names the opener session and the wait budget. | Click the link first, then raise `timeout_ms`. |
 | Closed page | `page_act: page session is closed` | Open a new session. |
 | `select` with an unknown value | `MCP error -32001: Request timed out` at the transport, not the envelope | Use an exact option `value`. A live test wedged the whole server until its browser was terminated. Treat as a defect. |
 
@@ -235,6 +229,7 @@ normal browsing, because instrumentation changes page behavior. Do not arm `post
 - 2026-10-26 — replay ambiguity failure on `https://news.ycombinator.com/news`, and submit-click with a state delta in `data`.
 - 2026-10-26 — `sinks_install`, a payload, and `page_fetch what=sinks` on `https://www.postgresql.org/`. The arm survived a full navigation and `sinks_clear` returned `{"cleared":N}`. `inject_canary` on `https://www.sqlite.org/index.html` returned the four-key result and `hits:[]`.
 - 2026-10-26 — `postmessage_install`, `post_message` to `top` and to an iframe, and `page_fetch what=postmessage` on https://www.python.org/. The read returned both messages with `origin` and `frames[].probed:true`.
+- 2026-10-26 — `wait_open` returned `{session_id,url,opener}` after a `target="_blank"` click. Closing the opener closed the popup. Replay redacted a text-body token and reported `body_redactions`. An ambiguous target returned `invalid_args` with the candidate seq values.
 
 ## Related tools
 

@@ -62,7 +62,7 @@ Install or refresh this skill with `browser skill <harness|path|.>`. With no arg
 ## Cross-cutting rules
 
 1. Call `browser_list` before you use a `browser_id`. Confirm the id and its `profile_dir`.
-2. If your client does not show `persist` or `owner`, reconnect it before you create a browser. Reconnect it when a cached `page_fetch` `what` enum lacks `har`, `postmessage`, `sinks`, or `storage`, because the live enum has 20 values. A cached client schema can also omit the new `browser_id` and `owner` inputs, so reconnect the client after a server build.
+2. If your client does not show `persist` or `owner`, reconnect it before you create a browser. Reconnect it when a cached `page_fetch` `what` enum lacks `har`, `postmessage`, `sinks`, `storage`, `tables`, or `forms`, because the live enum has 22 values. A cached client schema can also omit the new `browser_id` and `owner` inputs, so reconnect the client after a server build.
 3. Never close `browser-1` unless the user asks for a full reset. Never call `browser_close` with an empty `browser_id` in a shared session. A misspelled `browser` key is ignored and becomes an empty id. Use the exact key `browser_id`.
 4. Use one browser per agent and task. Page ids are unique per browser, so two owners can both hold `page-1`. With one live browser a bare id resolves. With two or more live browsers a bare id returns `invalid_args`, and the message names every browser and owner.
 5. `page_fetch`, `page_act`, and `session_close` take optional `browser_id` and `owner`. A session held outside the declared owner returns `not_found`, names the holder, and returns no content. Pass `browser_id` to cross on purpose.
@@ -78,6 +78,7 @@ Install or refresh this skill with `browser skill <harness|path|.>`. With no arg
 15. `browser_close` is not idempotent. A second close returns a not-found error. Check `browser_list` first.
 16. `page_act` `inject_canary` proves sink reachability. Run `sinks_install` first or it returns the guard error. It injects a `wm-canary-<8 hex>` value into `query`, `hash`, `postmessage`, and `name`, capped at 20 frames, and returns the `hits` whose value contains the canary.
 17. `page_act` `postmessage_install` arms a `message` recorder on every reachable window and returns `{"installed":true}`. Read it with `page_fetch` `what=postmessage`. Send with `post_message`, which takes `value`, `target_selector` (`top` or a CSS frame selector), and `origin` (default `*`). Clear with `postmessage_clear` or `target=clear`. The ring holds 100 messages per window and clips `data` at 500 runes. The read merges every window into one `messages` list, each entry carries `source_kind` (`window`, `frame`, `worker`, or `unknown`) as the only frame hint, and `frames` lists probed URLs only, with no per-frame ring or count, so a frame-targeted send cannot be attributed to a specific frame element from the payload alone.
+18. `page_act` `wait_open` returns the popup as `{session_id,url,opener}`. `page_list` and `session_list` carry `opener` on a popup. Closing the opener closes its popups. A browser holds at most 20 pages, popups included.
 
 ## Incognito identities
 
@@ -158,3 +159,4 @@ Keep these shapes in the rotation, with a new host each time:
 - Lifecycle, proxy, scope, headers, `what=body`, `what=security` and `page_act replay` are documented.
 - `sinks` is on the tool surface: `sinks_install` → `what=sinks` → `sinks_clear`. `inject_canary` is on the tool surface: `sinks_install` → `inject_canary` → `hits`.
 - `postmessage` is on the tool surface: `postmessage_install` → `what=postmessage` → `post_message` → `postmessage_clear`.
+- `tables`, `forms`, popups, `page_fetch` `timeout_ms`, and replay `body_redactions` are on the documented surface.

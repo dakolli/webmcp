@@ -102,7 +102,7 @@ Connect an MCP client:
 - Proxy support includes credentials, a bypass list, and `ignore_certs`.
 - Replay sends a captured request through Go. It carries the page cookies and follows redirects.
 
-### Reads: `page_fetch` has 19 aspects
+### Reads: `page_fetch` has 21 aspects
 
 - Document: `html`, `text`, `dom`, `links`, `meta`.
 - Sources: `css`, `js`, and `body` for one resource.
@@ -134,7 +134,8 @@ Connect an MCP client:
 - 8 error types: `invalid_args`, `element_not_found`, `not_interactable`, `anti_bot`, `page_closed`,
   `timeout`, `nav_failed`, `unknown`.
 - The CLI mirrors the tools and adds the daemon lifecycle.
-- IPC is JSON-RPC 2.0 over a Unix socket with mode `0600`.
+- IPC is JSON-RPC 2.0 over a Unix socket with mode `0600`. `page.fetch` gets a 180s per-request
+  budget so a raised `timeout_ms` survives the daemon; every other method stays at 30s.
 
 ### Security lane
 
@@ -217,7 +218,7 @@ asks for it.
 | `page_list` | List the pages of a browser with the live URL, title, and `context`. |
 | `session_list` | List all live sessions with the live URL, title, and `context`. |
 | `session_close` | Close one session. |
-| `page_fetch` | Read one aspect of a live page. |
+| `page_fetch` | Read one aspect of a live page. `timeout_ms` bounds the call (default 30000, clamped to 1..120000). |
 | `page_act` | Run one action on a live page. |
 
 Five MCP prompts are registered: `fetch_and_summarize`, `inspect_page_decomposition`,
@@ -226,8 +227,9 @@ template. It names the tools. You still call them.
 
 ## Page aspects
 
-`what` accepts 19 values. `selector` scopes `html` and `text`. `max_bytes` defaults to 50000.
-`full_page` applies to `screenshot`.
+`what` accepts 21 values. `selector` scopes `html` and `text`. `max_bytes` defaults to 50000.
+`full_page` applies to `screenshot`. `timeout_ms` bounds each call: it defaults to 30000 and is
+clamped to 1..120000. A full-page screenshot keeps a 90s floor unless `timeout_ms` is larger.
 
 | `what` | Returns |
 | :--- | :--- |
@@ -237,6 +239,8 @@ template. It names the tools. You still call them.
 | `network` | `{entries:[{method, url, type?, status?, mime?, bytes?, ms?, failed?, error?, seq}], count, dropped, truncated}`. Headers included. One entry per redirect hop. Newest 100 of a 200-entry ring. |
 | `console` | The same envelope over `{level, text, source?, line?, seq}`. |
 | `article` | `{title, byline?, excerpt?, text, words, truncated, url}` as markdown. Capped at 40000 runes. |
+| `tables` | `{tables:[{index, caption?, headers, rows, span_info, selector}], count, truncated}`. Capped at 20 tables and 500 rows per table. |
+| `forms` | `{forms:[{index, action, method, enctype, fields, submits, csrf_candidates}], count, truncated}`. Field values are never returned; only `has_value` and a hidden-token signal. |
 | `marks` | `{marks:[{index, role, text?, x, y, width, height}], viewport_width, viewport_height, truncated}` plus an annotated PNG. `x`/`y` are the top-left. Capped at 60 marks. |
 | `security` | `{checks:[{id, status, evidence, detail}], count}`. A passive audit. |
 | `sinks` | `{installed, hits:[{source, sink, context, value, stack, selector, ts}], dropped, truncated}`. Read-only. Capped at 100 hits from a 200-hit ring. |
@@ -293,6 +297,7 @@ browser page fetch last meta
 browser page fetch last interactives            # handles, roles, text, x/y
 browser page fetch last storage --include-values
 browser page fetch last security
+browser page fetch last screenshot --full-page --timeout-ms 60000
 browser page fetch https://app.test/login --identity attacker
 browser page act click ".titleline a"
 browser page act replay "api.example.com/session" --method PUT --value '{"role":"admin"}'
@@ -325,6 +330,9 @@ output.
 - `wait_for` defaults to `idle`. Use `load` or `stable` on a site with heavy JavaScript.
 - Output is capped at 50 KB by default. Narrow it with `selector` or `target`. Raise `max_bytes` for
   `dom`, `links` and `meta`.
+- `page_fetch` and `browser page fetch` accept `timeout_ms` / `--timeout-ms` (default 30000, clamped
+  to 1..120000). The daemon gives `page.fetch` a 180s transport budget, so a raised value is not cut
+  at 30s; every other IPC method keeps the 30s cap.
 - The server has no authentication, permissive CORS, and `eval` plus arbitrary `upload_file` paths.
   Treat the port as local-only.
 

@@ -2,12 +2,12 @@
 
 # page_list
 
-List the open pages of one browser. Return the id, live URL, title, and context of each page.
+List the open pages of one browser. Return the id, live URL, title, context, and opener of each page.
 
 ## What it does
 
 `page_list` reads the live page map of one browser. Its `data` payload is a JSON array.
-Each entry holds an `id`, `url`, and `context`, plus `title` and `stale` when present.
+Each entry holds an `id`, `url`, `context`, and `opener`, plus `title` and `stale` when present.
 
 Use it to audit tabs before you close them. Use it to recover a page id after a lost
 tool result. Use it to confirm that `fetch_page` created a page.
@@ -48,6 +48,7 @@ On success `data` is an array of page objects. Live result for a two-page browse
 | `title` | string | The live document title. Omitted when empty. |
 | `stale` | boolean | Present when the live URL and title could not be read. `url` then holds the last known value. |
 | `context` | string | The incognito identity that owns the page. `default` is the browser's own cookie jar. |
+| `opener` | string | The id of the page that opened this popup. Absent for a top-level page. |
 
 The source type is `PageInfo` at `code://pkg/browsers/session.go#L156-L171`. The browser
 sorts the array by `id` as text at `code://pkg/browsers/browser.go#L1058-L1073`.
@@ -68,6 +69,7 @@ sorts the array by `id` as text at `code://pkg/browsers/browser.go#L1058-L1073`.
 - The tool never launches Chromium. It calls `Manager.Browser`, not `Manager.Open`. Source: `code://pkg/browsers/manager.go#L946-L985`.
 - Test run: `page_list` with `browser-999` returned the unknown envelope below. It created no browser.
 - A dead Chromium is removed on the probe. The call then returns an `unknown` envelope whose message is `page_list: browsers: browser <id> died`.
+- **Popups.** A page opened by a `target="_blank"` link or `window.open` carries `opener`. Closing the opener closes its popups. A browser holds at most 20 pages, popups included.
 - The tool has no side effects on pages. It does not navigate, reload, or focus.
 - There is no status, timestamp, or `browser_id` field in an entry. `context` names
   the identity that owns the page.
@@ -137,8 +139,8 @@ the filter rule.
 `page_list` never launches a browser. It reports the browser you name. It is the safe
 choice when several browsers are live.
 
-Both tools return the same page objects under `data`. Both emit `id`, `url`, and `context`,
-plus `title` and `stale` when present. Neither emits a timestamp.
+Both tools return the same page objects under `data`. Both emit `id`, `url`, `context`, and
+`opener`, plus `title` and `stale` when present. Neither emits a timestamp.
 
 ## When to use it
 
