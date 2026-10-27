@@ -7,6 +7,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -41,6 +42,7 @@ var actionVocab = map[string]bool{
 	"clear_logs": true, "sinks_install": true, "sinks_clear": true,
 	"replay": true, "inject_canary": true, "postmessage_install": true,
 	"postmessage_clear": true, "post_message": true, "wait_open": true,
+	"intercept_add": true, "intercept_list": true, "intercept_clear": true,
 	"auth_save": true, "auth_restore": true, "auth_list": true,
 }
 
@@ -80,6 +82,9 @@ var actPayloadSpecs = map[string][]string{
 	"postmessage_clear":   {},
 	"post_message":        {"value"},
 	"wait_open":           {},
+	"intercept_add":       {"rules"},
+	"intercept_list":      {},
+	"intercept_clear":     {},
 	"auth_save":           {"site", "name"},
 	"auth_restore":        {"site", "name"},
 	"auth_list":           {"site"},
@@ -504,6 +509,7 @@ type actArgFlags struct {
 	height         int
 	paths          []string
 	targets        []string
+	rules          []browsers.InterceptRule
 	maxBytes       int64
 	valueSet       bool
 	force          bool
@@ -538,6 +544,7 @@ type actArgs struct {
 	height         int
 	paths          []string
 	targets        []string
+	rules          []browsers.InterceptRule
 	maxBytes       int64
 	valueSet       bool
 	force          bool
@@ -696,6 +703,12 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 		if len(payload) >= 1 {
 			a.value = payload[0]
 		}
+	case "intercept_add":
+		if len(payload) >= 1 {
+			if err := json.Unmarshal([]byte(payload[0]), &a.rules); err != nil {
+				return a, fmt.Errorf("page act: invalid arguments: %w", err)
+			}
+		}
 	case "auth_save", "auth_restore":
 		if len(payload) >= 1 {
 			a.site = payload[0]
@@ -760,6 +773,9 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 	}
 	if len(a.targets) == 0 {
 		a.targets = f.targets
+	}
+	if len(a.rules) == 0 {
+		a.rules = f.rules
 	}
 	if a.waitMode == "" {
 		a.waitMode = f.waitMode

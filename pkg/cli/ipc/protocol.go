@@ -40,7 +40,7 @@ const (
 	MethodPageList = "page.list"
 	// MethodPageFetch extracts any aspect in the shared pageops registry from a live page.
 	MethodPageFetch = "page.fetch"
-	// MethodPageAct performs an action on a live page (click/input/hover/scroll/select/eval/navigate/back/forward/reload/wait/set_viewport/emulate/clear_logs/sinks_install/sinks_clear/replay/inject_canary/postmessage_install/postmessage_clear/post_message/wait_open).
+	// MethodPageAct performs an action on a live page (click/input/hover/scroll/select/eval/navigate/back/forward/reload/wait/set_viewport/emulate/clear_logs/sinks_install/sinks_clear/replay/inject_canary/postmessage_install/postmessage_clear/post_message/wait_open/intercept_add/intercept_list/intercept_clear).
 	MethodPageAct = "page.act"
 	// MethodPageClose closes an open page.
 	MethodPageClose = "page.close"
@@ -75,7 +75,8 @@ var pageActActions = []string{
 	"wait", "set_viewport", "emulate", "clear_logs",
 	"sinks_install", "sinks_clear", "replay", "inject_canary",
 	"postmessage_install", "postmessage_clear", "post_message",
-	"wait_open", "auth_save", "auth_restore", "auth_list",
+	"wait_open", "intercept_add", "intercept_list", "intercept_clear",
+	"auth_save", "auth_restore", "auth_list",
 }
 
 // ValidPageActAction reports whether action is a supported page.act action.
@@ -178,12 +179,19 @@ type BrowserOpenParams struct {
 	// Headers are request headers sent with every request from every page of
 	// this browser, the first navigation included.
 	Headers map[string]string `json:"headers,omitempty"`
-	// Scope is the navigation allowlist: bare hosts (which cover subdomains),
+	// Scope is the request allowlist: bare hosts (which cover subdomains),
 	// leading "*." globs, "host:port" entries, or "*" for all. Empty means no
-	// limit unless ScopeStrict is set.
+	// limit unless ScopeStrict is set. It covers navigation, replay, every
+	// redirect hop and intercepted subresources.
 	Scope []string `json:"scope,omitempty"`
-	// ScopeStrict makes an empty allowlist deny every navigation.
+	// ScopeStrict makes an empty allowlist deny every request.
 	ScopeStrict *bool `json:"scope_strict,omitempty"`
+	// RPS is the per-host sustained request rate. Absent keeps the manager
+	// default (DefaultRateRPS).
+	RPS *float64 `json:"rps,omitempty"`
+	// Burst is the per-host token bucket depth. Absent keeps the manager
+	// default (DefaultRateBurst).
+	Burst *int `json:"burst,omitempty"`
 }
 
 // BrowserOpenResult is the result of browser.open.
@@ -196,10 +204,12 @@ type BrowserOpenResult struct {
 	Persist bool `json:"persist"`
 	// TTL is the idle timeout that closes the browser ("0s" when disabled).
 	TTL string `json:"ttl"`
-	// Scope is the navigation allowlist state ("open" when unrestricted).
+	// Scope is the request allowlist state ("open" when unrestricted).
 	Scope string `json:"scope"`
-	// ScopeStrict reports whether an empty allowlist denies every navigation.
+	// ScopeStrict reports whether an empty allowlist denies every request.
 	ScopeStrict bool `json:"scope_strict"`
+	// Limits is the effective per-host request policy.
+	Limits browsers.LimitReport `json:"limits"`
 }
 
 // BrowserCloseParams carries the browser.close parameters. purge deletes the
@@ -358,7 +368,7 @@ type PageFetchResult struct {
 // press_key|click_at|hover_at|drag_and_drop|upload_file|eval|navigate|back|
 // forward|reload|hover|scroll|select|wait|set_viewport|emulate|clear_logs|
 // sinks_install|sinks_clear|replay|inject_canary|postmessage_install|postmessage_clear|
-// post_message|auth_save|auth_restore|auth_list; selector/handle/value/key/button/click_count/x/y/
+// post_message|intercept_add|intercept_list|intercept_clear|auth_save|auth_restore|auth_list; selector/handle/value/key/button/click_count/x/y/
 // target_x/target_y/target_selector/origin/paths/targets are the per-action
 // payloads (handle wins over selector for element actions); viewport carries the
 // target size for set_viewport and device the preset for emulate; timeout_ms
@@ -376,7 +386,10 @@ type PageFetchResult struct {
 // postMessage recorder and returns {"installed":true}; postmessage_clear empties
 // its rings and returns {"cleared":N}; post_message takes value (the payload),
 // optional target_selector ("top" or an iframe CSS selector) and origin (target
-// origin, default "*") and returns {origin,target}.
+// origin, default "*") and returns {origin,target}. intercept_add takes rules (a
+// JSON array of {id,url_pattern,method,action,headers,status,body,delay_ms}) and
+// returns the active rules plus a count; intercept_list returns them redacted;
+// intercept_clear removes every rule and returns {rules_removed,active}.
 type PageActParams struct {
 	// SessionID identifies the live page to act on.
 	SessionID string `json:"session_id"`
@@ -458,6 +471,9 @@ type PageActParams struct {
 	Name string `json:"name,omitempty"`
 	// Force lets auth_restore proceed across a user-agent mismatch.
 	Force bool `json:"force,omitempty"`
+	// Rules are the request rules for intercept_add: each matches requests in
+	// order, the first match wins, and a request matching none continues.
+	Rules []browsers.InterceptRule `json:"rules,omitempty"`
 }
 
 // PageActResult is the result of page.act.

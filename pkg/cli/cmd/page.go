@@ -414,6 +414,7 @@ func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 		origin         string
 		paths          []string
 		targets        []string
+		rules          []browsers.InterceptRule
 		waitMode       string
 		timeoutMS      int
 		width, height  int
@@ -433,7 +434,8 @@ func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 hover_at, drag_and_drop, upload_file, hover, scroll, select, eval, navigate, back,
 forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install,
 sinks_clear, replay, inject_canary, postmessage_install, postmessage_clear,
-post_message, wait_open) and prints the confirmation. The page id
+post_message, wait_open, intercept_add, intercept_list, intercept_clear) and
+prints the confirmation. The page id
 is optional when only one page is open; 'last' means the most recently opened page;
 a bare number resolves to page-N.
 Positional payloads fill each action's fields — flags remain as fallbacks.
@@ -473,6 +475,9 @@ redirect it is rejected as stale, so re-fetch before acting.
   postmessage_clear   (none)
   post_message  [value]   (target frame via --target-selector, default top; origin via --origin)
   wait_open    (none)     (block until this page opens a popup; --timeout-ms bounds the wait)
+  intercept_add [rules]   (JSON array of {id,url_pattern,method,action,headers,status,body,delay_ms})
+  intercept_list (none)
+  intercept_clear (none)
   back/forward/reload    (none)
   type         [selector] [text]
 
@@ -508,7 +513,14 @@ the captured method, headers and body, and an omitted --value keeps the captured
 body. The result is the same compact JSON the MCP page_act replay action returns
 ({status, headers, body|base64, bytes, truncated, body_redactions, ms, request,
 chain}) with sensitive headers redacted and the body capped at 256 KB.
-auth_save captures the live page's cookies for --site plus local storage, session
+intercept_add arms a page-scoped in-flight request interceptor: rules is a JSON
+array of {id, url_pattern, method, action, headers, status, body, delay_ms} where
+action is block, allow, rewrite or fulfill, url_pattern is a wildcard glob like
+*api*, and a request matching no rule continues immediately. Interception is
+opt-in, changes page behaviour and disables caching; max 50 rules per page.
+intercept_list prints the page's rules with sensitive header values redacted;
+intercept_clear removes every rule, continues any paused request and disables
+interception; rules never outlive the page. auth_save captures the live page's cookies for --site plus local storage, session
 storage and IndexedDB database/store names, and persists them under --name; it
 returns counts only and never prints a cookie or storage value. Snapshots are
 stored unencrypted in the local 0600 state database, so treat that file as a
@@ -555,6 +567,7 @@ needs no page.`,
 			value, key, button, clickCount = parsed.value, parsed.key, parsed.button, parsed.clickCount
 			targetSelector, origin, paths, waitMode, device = parsed.targetSelector, parsed.origin, parsed.paths, parsed.waitMode, parsed.device
 			targets = parsed.targets
+			rules = parsed.rules
 			x, y, targetX, targetY = parsed.x, parsed.y, parsed.targetX, parsed.targetY
 			width, height = parsed.width, parsed.height
 			target, method, headers, maxBytes = parsed.target, parsed.method, parsed.headers, parsed.maxBytes
@@ -613,6 +626,9 @@ needs no page.`,
 				if name == "" {
 					return fmt.Errorf("page act: %s requires name (the snapshot name, e.g. main)", action)
 				}
+			}
+			if action == "intercept_add" && len(rules) == 0 {
+				return fmt.Errorf(`page act: intercept_add requires rules (e.g. [{"url_pattern":"*api*","action":"block"}])`)
 			}
 			headerMap, err := parseHeaderFlags(headers)
 			if err != nil {
@@ -681,6 +697,7 @@ needs no page.`,
 					MaxBytes:       maxBytes,
 					Paths:          paths,
 					Targets:        targets,
+					Rules:          rules,
 					TimeoutMS:      timeoutMS,
 					WaitMode:       waitMode,
 					Viewport:       vp,
@@ -792,6 +809,12 @@ needs no page.`,
 				out, err = pageops.PageAuthSave(ctx, p, site, name)
 			case "auth_restore":
 				out, err = pageops.PageAuthRestore(ctx, p, site, name, force)
+			case "intercept_add":
+				out, err = pageops.PageInterceptAdd(ctx, p, rules)
+			case "intercept_list":
+				out, err = pageops.PageInterceptList(ctx, p)
+			case "intercept_clear":
+				out, err = pageops.PageInterceptClear(ctx, p)
 			}
 			if err != nil {
 				return fmt.Errorf("page act: %w", err)
@@ -805,7 +828,7 @@ needs no page.`,
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to act on (optional with one page open; 'last'; or a bare number)")
-	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, inject_canary, postmessage_install, postmessage_clear, post_message, wait_open, auth_save, auth_restore, auth_list")
+	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, inject_canary, postmessage_install, postmessage_clear, post_message, wait_open, intercept_add, intercept_list, intercept_clear, auth_save, auth_restore, auth_list")
 	cmd.Flags().StringVar(&selector, "selector", "", "CSS selector targeting the element (element actions)")
 	cmd.Flags().StringVar(&handle, "handle", "", "element handle from page fetch (g<document>-b<backendNodeId>, scoped to its document); wins over --selector (element actions)")
 	cmd.Flags().StringVar(&value, "value", "", "value for eval (JS function), input (text), type (text), navigate (URL), select (option value), or inject_canary (custom canary)")

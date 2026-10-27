@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"path/filepath"
 	"reflect"
@@ -44,14 +45,6 @@ func TestSurfaceVocabularyParity(t *testing.T) {
 		}
 	})
 
-	// intercept_* are landing with WEB-194's observer work: until that ticket
-	// wires the CLI and IPC surfaces they may be absent from both, but never
-	// from only one. replay (WEB-112) is fully wired and is not exempt.
-	pending := map[string]bool{
-		"intercept_add":   true,
-		"intercept_list":  true,
-		"intercept_clear": true,
-	}
 	ipcActions := ipc.PageActActions()
 	t.Run("actions", func(t *testing.T) {
 		for _, action := range mcpActions {
@@ -60,9 +53,7 @@ func TestSurfaceVocabularyParity(t *testing.T) {
 				t.Errorf("MCP action %q is wired on one surface only (CLI=%v IPC=%v)", action, cliOK, ipcOK)
 			}
 			if !cliOK {
-				if !pending[action] {
-					t.Errorf("MCP action %q is missing from the CLI and IPC vocabularies", action)
-				}
+				t.Errorf("MCP action %q is missing from the CLI and IPC vocabularies", action)
 				continue
 			}
 			if _, ok := actPayloadSpecs[action]; !ok {
@@ -138,6 +129,81 @@ func TestParseActArgsReplay(t *testing.T) {
 				t.Errorf("parseActArgs(%v, %+v) = %+v, want %+v", tt.args, tt.flags, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestParseActArgsInterception pins the interception argument mapping: a bare
+// action word is never read as a page id, and intercept_add parses its rules
+// payload into the same typed rules the MCP action decodes.
+func TestParseActArgsInterception(t *testing.T) {
+	rules := `[{"url_pattern":"*api*","action":"block"}]`
+	tests := []struct {
+		name  string
+		args  []string
+		flags actArgFlags
+		want  actArgs
+	}{
+		{
+			name: "bare intercept_list is the action, not an id",
+			args: []string{"intercept_list"},
+			want: actArgs{action: "intercept_list"},
+		},
+		{
+			name: "bare intercept_clear is the action, not an id",
+			args: []string{"intercept_clear"},
+			want: actArgs{action: "intercept_clear"},
+		},
+		{
+			name: "id plus intercept_list",
+			args: []string{"12", "intercept_list"},
+			want: actArgs{id: "12", action: "intercept_list"},
+		},
+		{
+			name: "intercept_add parses its rules payload",
+			args: []string{"intercept_add", rules},
+			want: actArgs{
+				action: "intercept_add",
+				rules:  []browsers.InterceptRule{{URLPattern: "*api*", Action: "block"}},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseActArgs(tt.args, tt.flags)
+			if err != nil {
+				t.Fatalf("parseActArgs(%v) error = %v, want nil", tt.args, err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("parseActArgs(%v) = %+v, want %+v", tt.args, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBrowserCreateRateFlagsReachDaemon pins the daemon path for the per-host
+// rate budget: --rps and --burst ride browser.open as explicit values, and an
+// absent flag stays absent so the engine defaults apply.
+func TestBrowserCreateRateFlagsReachDaemon(t *testing.T) {
+	path, captured := startCapturingBrowserOpenServer(t)
+	cmd := NewBrowserCreateCmd(nil)
+	cmd.Flags().String("socket", "", "")
+	cmd.SetArgs([]string{"--socket", path, "--rps", "2.5", "--burst", "4"})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("browser create: %v", err)
+	}
+
+	select {
+	case params := <-captured:
+		if params.RPS == nil || *params.RPS != 2.5 {
+			t.Errorf("wire rps = %v, want 2.5", params.RPS)
+		}
+		if params.Burst == nil || *params.Burst != 4 {
+			t.Errorf("wire burst = %v, want 4", params.Burst)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the fake server saw no browser.open request")
 	}
 }
 
@@ -376,6 +442,64 @@ func startCapturingActServer(t *testing.T) (string, <-chan ipc.PageActParams) {
 				default:
 				}
 				_, _ = c.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"data":"ok"}}` + "\n"))
+			}(conn)
+		}
+	}()
+	return path, captured
+}
+
+// startCapturingBrowserOpenServer listens on a temp unix socket and reports the
+// browser.open params of the first real request. It answers the client's ping
+// probe and the create call so browser create stays on the daemon path.
+func startCapturingBrowserOpenServer(t *testing.T) (string, <-chan ipc.BrowserOpenParams) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "cli.sock")
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen %s: %v", path, err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+
+	captured := make(chan ipc.BrowserOpenParams, 1)
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+				line, err := bufio.NewReader(c).ReadBytes('\n')
+				if err != nil {
+					return
+				}
+				var req ipc.Request
+				if json.Unmarshal(line, &req) != nil {
+					return
+				}
+				var result any
+				switch req.Method {
+				case ipc.MethodBrowserOpen:
+					var params ipc.BrowserOpenParams
+					if json.Unmarshal(req.Params, &params) == nil {
+						select {
+						case captured <- params:
+						default:
+						}
+					}
+					result = ipc.BrowserOpenResult{
+						BrowserID: "browser-1",
+						Limits:    browsers.LimitReport{RPS: 2.5, Burst: 4},
+					}
+				default:
+					result = ipc.PingResult{OK: true}
+				}
+				resp, err := json.Marshal(ipc.Response{JSONRPC: "2.0", ID: req.ID, Result: result})
+				if err != nil {
+					return
+				}
+				_, _ = c.Write(append(resp, '\n'))
 			}(conn)
 		}
 	}()

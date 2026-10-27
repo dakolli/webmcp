@@ -187,6 +187,22 @@ func (s *Server) handleBrowserOpen(ctx context.Context, params json.RawMessage) 
 	if p.ScopeStrict != nil {
 		opts = append(opts, browsers.WithScopeStrict(*p.ScopeStrict))
 	}
+	if p.RPS != nil || p.Burst != nil {
+		limit := browsers.RateLimit{
+			RPS:   browsers.DefaultRateRPS,
+			Burst: browsers.DefaultRateBurst,
+		}
+		if p.RPS != nil {
+			limit.RPS = *p.RPS
+		}
+		if p.Burst != nil {
+			limit.Burst = *p.Burst
+		}
+		if err := limit.Validate(); err != nil {
+			return nil, &Error{Code: CodeInvalidParams, Message: err.Error()}
+		}
+		opts = append(opts, browsers.WithRateLimit(limit))
+	}
 	if p.Headless != nil {
 		opts = append(opts, browsers.WithHeadless(*p.Headless))
 	}
@@ -220,6 +236,7 @@ func browserOpenResult(b *browsers.Browser) BrowserOpenResult {
 		TTL:         info.TTL,
 		Scope:       info.Scope,
 		ScopeStrict: info.ScopeStrict,
+		Limits:      info.Limits,
 	}
 }
 
@@ -491,9 +508,9 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 // live page — click, input, type, press_key, click_at, hover_at, drag_and_drop,
 // upload_file, hover, scroll, select, eval, navigate, back, forward, reload,
 // wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay,
-// inject_canary, postmessage_install, postmessage_clear, post_message or
-// wait_open — mirroring the CLI page act command. An unknown action is a
-// -32602 invalid-params error.
+// inject_canary, postmessage_install, postmessage_clear, post_message,
+// intercept_add, intercept_list, intercept_clear or wait_open — mirroring the
+// CLI page act command. An unknown action is a -32602 invalid-params error.
 func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any, *Error) {
 	p, rpcErr := decodeParams[PageActParams](params)
 	if rpcErr != nil {
@@ -583,6 +600,12 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		}
 		if err := browsers.ValidateDeviceName(p.Device); err != nil {
 			return nil, &Error{Code: CodeInvalidParams, Message: fmt.Sprintf("page.act: %v", err)}
+		}
+	}
+	if p.Action == "intercept_add" && len(p.Rules) == 0 {
+		return nil, &Error{
+			Code:    CodeInvalidParams,
+			Message: `page.act: intercept_add requires rules (e.g. [{"url_pattern":"*api*","action":"block"}])`,
 		}
 	}
 
@@ -689,6 +712,12 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		out, err = pageops.PageAuthSave(ctx, page, p.Site, p.Name)
 	case "auth_restore":
 		out, err = pageops.PageAuthRestore(ctx, page, p.Site, p.Name, p.Force)
+	case "intercept_add":
+		out, err = pageops.PageInterceptAdd(ctx, page, p.Rules)
+	case "intercept_list":
+		out, err = pageops.PageInterceptList(ctx, page)
+	case "intercept_clear":
+		out, err = pageops.PageInterceptClear(ctx, page)
 	}
 	if err != nil {
 		return nil, serverError(err)

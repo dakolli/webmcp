@@ -460,11 +460,14 @@ func printBrowserEntries(w io.Writer, entries []ipc.BrowserEntry) {
 // NewBrowserCreateCmd constructs the "browser create" command: launches a new
 // browser process with optional custom binary (--bin), profile (--profile),
 // persistence (--persist), owner label (--owner), window position
-// (--position), and headless mode (--headless).
+// (--position), headless mode (--headless), and a per-host rate budget
+// (--rps/--burst).
 func NewBrowserCreateCmd(mgr *browsers.Manager) *cobra.Command {
 	var bin, profile, position, proxy, proxyBypass, owner string
 	var headers, scope []string
 	var persist, ignoreCerts, headless, scopeStrict bool
+	var rps float64
+	var burst int
 	cmd := &cobra.Command{
 		Use:   "create",
 		Short: "Create and launch a new browser instance",
@@ -497,17 +500,23 @@ http://127.0.0.1:8080. --proxy-bypass lists comma-separated hosts that skip it.
 every page of this browser, the first navigation included. Both flags are
 repeatable: --header X-Bug-Bounty=me --header X-Team=red.
 
---scope HOST (repeatable) sets the navigation allowlist: a bare host covers its
+--scope HOST (repeatable) sets the request allowlist: a bare host covers its
 subdomains, '*.example.com' works, 'host:port' is accepted, and '*' allows all.
-No --scope means no limit; --scope-strict with no --scope denies every
-navigation. Scope applies to navigation, not to subresources or redirects, so a
-redirect can still land on an out-of-scope host.`,
+No --scope means no limit; --scope-strict with no --scope denies every request.
+Scope covers navigation, replay, every redirect hop and intercepted
+subresources: an out-of-scope request is refused before it is sent.
+
+--rps and --burst set the per-host request budget. --rps is the sustained
+requests per second (default 5) and --burst is the token bucket depth (default
+10). Every engine-issued request waits for a token; a request whose deadline
+cannot fit the wait fails as a timeout naming the host and the remaining wait.`,
 		Example: `  browser create --owner scraper-a
   browser create --headless
   browser create --persist --profile audit
   browser create --proxy http://127.0.0.1:8080 --ignore-certs
   browser create --proxy 127.0.0.1:8080 --proxy-bypass localhost,*.internal
-  browser create --header X-Bug-Bounty=me --scope example.com --scope '*.iana.org'`,
+  browser create --header X-Bug-Bounty=me --scope example.com --scope '*.iana.org'
+  browser create --scope example.com --rps 2 --burst 4`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx, cancel := context.WithTimeout(cmdCtx(cmd), 30*time.Second)
 			defer cancel()
@@ -548,12 +557,19 @@ redirect can still land on an out-of-scope host.`,
 				if cmd.Flags().Changed("scope-strict") {
 					params.ScopeStrict = &scopeStrict
 				}
+				if cmd.Flags().Changed("rps") {
+					params.RPS = &rps
+				}
+				if cmd.Flags().Changed("burst") {
+					params.Burst = &burst
+				}
 				var res ipc.BrowserOpenResult
 				if err := cl.Call(ctx, ipc.MethodBrowserOpen, params, &res); err != nil {
 					return fmt.Errorf("browser create: %w", err)
 				}
-				fmt.Printf("browser_id: %s (owner: %s, persist: %t, ttl: %s, scope: %s, scope_strict: %t)\n",
-					res.BrowserID, res.Owner, res.Persist, res.TTL, res.Scope, res.ScopeStrict)
+				fmt.Printf("browser_id: %s (owner: %s, persist: %t, ttl: %s, scope: %s, scope_strict: %t, limits: %g/%d)\n",
+					res.BrowserID, res.Owner, res.Persist, res.TTL, res.Scope, res.ScopeStrict,
+					res.Limits.RPS, res.Limits.Burst)
 				return nil
 			}
 			printServeHint(cmd)
@@ -592,6 +608,22 @@ redirect can still land on an out-of-scope host.`,
 			if cmd.Flags().Changed("scope-strict") {
 				opts = append(opts, browsers.WithScopeStrict(scopeStrict))
 			}
+			if cmd.Flags().Changed("rps") || cmd.Flags().Changed("burst") {
+				limit := browsers.RateLimit{
+					RPS:   browsers.DefaultRateRPS,
+					Burst: browsers.DefaultRateBurst,
+				}
+				if cmd.Flags().Changed("rps") {
+					limit.RPS = rps
+				}
+				if cmd.Flags().Changed("burst") {
+					limit.Burst = burst
+				}
+				if err := limit.Validate(); err != nil {
+					return fmt.Errorf("browser create: %w", err)
+				}
+				opts = append(opts, browsers.WithRateLimit(limit))
+			}
 			id, b, err := mgr.CreateBrowser(ctx, opts...)
 			if err != nil {
 				return fmt.Errorf("browser create: %w", err)
@@ -603,6 +635,7 @@ redirect can still land on an out-of-scope host.`,
 				fmt.Sprintf("ttl: %s", info.TTL),
 				fmt.Sprintf("scope: %s", info.Scope),
 				fmt.Sprintf("scope_strict: %t", info.ScopeStrict),
+				fmt.Sprintf("limits: %g/%d", info.Limits.RPS, info.Limits.Burst),
 			}
 			if info.Bin != "" {
 				details = append(details, "bin: "+info.Bin)
@@ -627,8 +660,10 @@ redirect can still land on an out-of-scope host.`,
 	cmd.Flags().BoolVar(&ignoreCerts, "ignore-certs", false, "accept invalid TLS certificates (e.g. an intercept proxy's MITM CA); independent of --proxy")
 	cmd.Flags().BoolVar(&headless, "headless", false, "launch Chromium with no window (joins the create key; default is headful)")
 	cmd.Flags().StringArrayVar(&headers, "header", nil, "request header NAME=VALUE sent with every request from every page (repeatable)")
-	cmd.Flags().StringArrayVar(&scope, "scope", nil, "navigation allowlist entry: host (covers subdomains), '*.example.com', 'host:port' or '*' (repeatable; empty = no limit)")
-	cmd.Flags().BoolVar(&scopeStrict, "scope-strict", false, "deny every navigation when --scope is empty")
+	cmd.Flags().StringArrayVar(&scope, "scope", nil, "request allowlist entry: host (covers subdomains), '*.example.com', 'host:port' or '*' (repeatable; empty = no limit)")
+	cmd.Flags().BoolVar(&scopeStrict, "scope-strict", false, "deny every request when --scope is empty")
+	cmd.Flags().Float64Var(&rps, "rps", browsers.DefaultRateRPS, "per-host sustained request rate in requests per second (default 5)")
+	cmd.Flags().IntVar(&burst, "burst", browsers.DefaultRateBurst, "per-host token bucket depth, i.e. requests allowed at once before the rps pace applies (default 10)")
 	return cmd
 }
 
