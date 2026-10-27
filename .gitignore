@@ -20,3 +20,4 @@ smoketest.md
 .opencode/*
 dist/
 .release/
+.live-schema.json
