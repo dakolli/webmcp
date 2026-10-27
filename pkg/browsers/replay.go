@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -27,8 +28,9 @@ const (
 )
 
 // ErrReplayTargetAmbiguous reports a target that matched more than one captured
-// entry. The message lists every candidate.
-var ErrReplayTargetAmbiguous = errors.New("replay target is ambiguous")
+// entry. The message lists every candidate. Callers prefix the action that
+// produced it, so replay and replay_fuzz stay distinguishable.
+var ErrReplayTargetAmbiguous = errors.New("target is ambiguous")
 
 // ErrReplayTargetNotFound reports a target that matched no captured entry.
 var ErrReplayTargetNotFound = errors.New("replay target was not found")
@@ -59,6 +61,9 @@ var replayDroppedHeaders = map[string]bool{
 type ReplaySpec struct {
 	// Target is a network sequence number or a unique substring of the captured URL.
 	Target string
+	// URL overrides the captured request URL when non-empty. Scope and the host
+	// limiter apply to the override exactly as to the captured URL.
+	URL string
 	// Method overrides the captured request method when non-empty.
 	Method string
 	// Headers overrides captured request headers; names are case-insensitive.
@@ -67,6 +72,9 @@ type ReplaySpec struct {
 	Body string
 	// BodySet makes Body authoritative, including an explicitly empty body.
 	BodySet bool
+	// Cookies overrides the named cookies for the target host after the page's
+	// own cookies are loaded; a nil map keeps only the page's cookies.
+	Cookies map[string]string
 	// CheckScope authorizes a URL before a replay requests it. The surface
 	// wires the manager's scope check here; nil skips the check.
 	CheckScope func(rawURL string) error
@@ -107,6 +115,9 @@ type ReplayResult struct {
 	Base64 string `json:"base64,omitempty"`
 	// Bytes is the size of the returned payload after the cap.
 	Bytes int64 `json:"bytes"`
+	// BodyBytes is the full response body size measured before the cap, so a
+	// capped body never looks like a small response.
+	BodyBytes int64 `json:"body_bytes"`
 	// Truncated reports a payload cut at the requested cap.
 	Truncated bool `json:"truncated"`
 	// BodyRedactions counts every body value replaced with <redacted>,
@@ -187,18 +198,25 @@ func (p *Page) Replay(ctx context.Context, spec ReplaySpec) (ReplayResult, error
 	entries, _ := p.NetworkEntries()
 	entry, err := matchReplayEntry(entries, spec.Target)
 	if err != nil {
-		return ReplayResult{}, err
+		return ReplayResult{}, fmt.Errorf("replay: %w", err)
 	}
-	target, err := url.Parse(entry.URL)
+	return p.replayEntry(ctx, entry, spec)
+}
+
+// replayEntry resends one already-resolved captured entry under spec. It is the
+// shared execution seam: Replay resolves one entry and calls it, and a fuzz
+// matrix calls it once per variant without resolving the target again.
+func (p *Page) replayEntry(
+	ctx context.Context,
+	entry NetworkEntry,
+	spec ReplaySpec,
+) (ReplayResult, error) {
+	if spec.URL != "" {
+		entry.URL = spec.URL
+	}
+	target, err := replayTargetURL(entry)
 	if err != nil {
-		return ReplayResult{}, fmt.Errorf("replay: captured URL %q is not parseable: %w", entry.URL, err)
-	}
-	if target.Scheme != "http" && target.Scheme != "https" {
-		return ReplayResult{}, fmt.Errorf(
-			"replay: captured URL %s uses scheme %q — only http and https requests can be replayed",
-			entry.URL,
-			target.Scheme,
-		)
+		return ReplayResult{}, err
 	}
 	method, err := replayMethod(entry.Method, spec.Method)
 	if err != nil {
@@ -223,7 +241,9 @@ func (p *Page) Replay(ctx context.Context, spec ReplaySpec) (ReplayResult, error
 		}
 		jar.SetCookies(target, cookies)
 	}
+	jar.SetCookies(target, replayOverrideCookies(spec.Cookies))
 
+	budget := replayBudget(ctx)
 	ctx, cancel := context.WithTimeout(ctx, replayTimeout)
 	defer cancel()
 	client := &http.Client{
@@ -257,7 +277,7 @@ func (p *Page) Replay(ctx context.Context, spec ReplaySpec) (ReplayResult, error
 			return ReplayResult{}, &ReplayTransportError{
 				Method: curMethod,
 				URL:    curURL,
-				Budget: replayTimeout,
+				Budget: budget,
 				Err:    err,
 			}
 		}
@@ -351,6 +371,18 @@ func matchReplayEntry(entries []NetworkEntry, target string) (NetworkEntry, erro
 	}
 }
 
+// replayBudget reports the request budget that actually applies: replayTimeout
+// unless the caller's deadline is sooner.
+func replayBudget(ctx context.Context) time.Duration {
+	budget := replayTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > 0 && remaining < budget {
+			budget = remaining
+		}
+	}
+	return budget
+}
+
 // replayMethod resolves the method to send, uppercasing the captured value and
 // refusing a blank override.
 func replayMethod(captured, override string) (string, error) {
@@ -415,6 +447,9 @@ func (p *Page) requestPostData(ctx context.Context, entry NetworkEntry) (string,
 	}
 	res, err := proto.NetworkGetRequestPostData{RequestID: entry.requestID}.Call(p.Rod.Context(ctx))
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", false, fmt.Errorf("replay: read captured request body: %w", ctxErr)
+		}
 		return "", false, nil
 	}
 	return res.PostData, true, nil
@@ -471,6 +506,42 @@ func replayHopAuthorize(
 		)
 	}
 	return nil
+}
+
+// replayTargetURL parses a captured URL and refuses a scheme a replay cannot
+// send.
+func replayTargetURL(entry NetworkEntry) (*url.URL, error) {
+	target, err := url.Parse(entry.URL)
+	if err != nil {
+		return nil, fmt.Errorf("replay: captured URL %q is not parseable: %w", entry.URL, err)
+	}
+	if target.Scheme != "http" && target.Scheme != "https" {
+		return nil, fmt.Errorf(
+			"replay: captured URL %s uses scheme %q — only http and https requests can be replayed",
+			entry.URL,
+			target.Scheme,
+		)
+	}
+	return target, nil
+}
+
+// replayOverrideCookies converts a cookie override map into host-only cookies
+// for the target jar so a variant can set one cookie without touching the
+// page's jar.
+func replayOverrideCookies(overrides map[string]string) []*http.Cookie {
+	if len(overrides) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(overrides))
+	for name := range overrides {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]*http.Cookie, 0, len(names))
+	for _, name := range names {
+		out = append(out, &http.Cookie{Name: name, Value: overrides[name], Path: "/"})
+	}
+	return out
 }
 
 // replayCookies reads the page's cookies applicable to the target URL under the
@@ -576,6 +647,7 @@ func replayResult(
 		Body:      payload.Body,
 		Base64:    payload.Base64,
 		Bytes:     payload.Bytes,
+		BodyBytes: payload.FullBytes,
 		Truncated: payload.Truncated,
 		MS:        time.Since(start).Milliseconds(),
 		Request:   sent,
@@ -630,16 +702,24 @@ type replayPayload struct {
 	Body      string
 	Base64    string
 	Bytes     int64
+	FullBytes int64
 	Truncated bool
 }
 
-// readReplayBody reads and closes a response body, capping it at limit and
-// switching binary content to base64.
+// readReplayBody reads and closes a response body. It measures the true body
+// size by draining the rest of the stream, then caps only the returned payload
+// at limit and switches binary content to base64.
 func readReplayBody(resp *http.Response, limit int64) (replayPayload, error) {
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	fullBytes := int64(len(raw))
+	if readErr == nil && fullBytes > limit {
+		rest, copyErr := io.Copy(io.Discard, resp.Body)
+		fullBytes += rest
+		readErr = copyErr
+	}
 	closeErr := resp.Body.Close()
-	if err != nil {
-		return replayPayload{}, fmt.Errorf("read body: %w", err)
+	if readErr != nil {
+		return replayPayload{}, fmt.Errorf("read body: %w", readErr)
 	}
 	if closeErr != nil {
 		return replayPayload{}, fmt.Errorf("close body: %w", closeErr)
@@ -647,6 +727,7 @@ func readReplayBody(resp *http.Response, limit int64) (replayPayload, error) {
 	raw, truncated := capReplayBody(raw, limit)
 	out := replayPayload{
 		Bytes:     int64(len(raw)),
+		FullBytes: fullBytes,
 		Truncated: truncated,
 	}
 	if utf8.Valid(raw) {
