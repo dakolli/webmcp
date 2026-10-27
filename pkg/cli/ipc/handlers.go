@@ -23,7 +23,58 @@ const (
 	// maxPageFetchTimeout caps page.fetch's timeout_ms. It stays below the
 	// 180s page.fetch transport budget in server.go.
 	maxPageFetchTimeout = 120 * time.Second
+	// DefaultPageActTimeout bounds page.act when timeout_ms is absent.
+	DefaultPageActTimeout = 30 * time.Second
+	// PageActReadGrace is how long the client's socket read outlasts the action
+	// deadline. It belongs to the transport only: the action itself runs on the
+	// caller's exact deadline, and the grace stops a completed action from being
+	// reported as an IPC i/o timeout while its response is in flight.
+	PageActReadGrace = 15 * time.Second
+	// waitSleepMargin gives the wait action's "ms" sleep room to finish. Its
+	// timeout_ms is the sleep duration itself, so the action budget needs a
+	// cushion past it or the context expires at the same instant as the timer.
+	// It mirrors the MCP page_act budget, so both surfaces mean the same thing.
+	waitSleepMargin = 5 * time.Second
 )
+
+// PageActTimeout resolves page.act's action deadline: absent (0 or negative)
+// uses DefaultPageActTimeout and a supplied value is used as-is.
+func PageActTimeout(ms int) time.Duration {
+	if ms <= 0 {
+		return DefaultPageActTimeout
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// PageActBudget returns the action context budget for one page.act call: the
+// caller's timeout_ms for every action, plus waitSleepMargin for the wait
+// action's "ms" sleep, whose timeout_ms is the sleep duration itself. It
+// mirrors the MCP page_act budget so the two surfaces mean the same thing by
+// timeout_ms.
+func PageActBudget(action, waitMode string, ms int) time.Duration {
+	budget := PageActTimeout(ms)
+	if action == "wait" && (waitMode == "" || waitMode == "ms") {
+		budget += waitSleepMargin
+	}
+	return budget
+}
+
+// PageActReadTimeout returns the client's socket read budget for an action
+// whose deadline is action: the deadline plus PageActReadGrace. It always
+// outlasts PageActBudget, so a fired action is never reported as an i/o timeout.
+func PageActReadTimeout(action time.Duration) time.Duration {
+	return action + PageActReadGrace
+}
+
+// pageActDeadlineNote marks a completed action that overran its own deadline,
+// so its result is returned instead of being converted into a failure.
+func pageActDeadlineNote(elapsed, deadline time.Duration) string {
+	return fmt.Sprintf(
+		"\n(completed after its deadline: %s elapsed, deadline %s)",
+		elapsed.Round(time.Millisecond),
+		deadline,
+	)
+}
 
 // pageFetchTimeout resolves page.fetch's timeout_ms: absent (0 or negative)
 // uses the 30s default and a supplied value is clamped to 1ms..120s.
@@ -508,8 +559,8 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 // live page — click, input, type, press_key, click_at, hover_at, drag_and_drop,
 // upload_file, hover, scroll, select, eval, navigate, back, forward, reload,
 // wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay,
-// inject_canary, postmessage_install, postmessage_clear, post_message,
-// intercept_add, intercept_list, intercept_clear or wait_open — mirroring the
+// replay_fuzz, inject_canary, postmessage_install, postmessage_clear,
+// post_message, intercept_add, intercept_list, intercept_clear or wait_open — mirroring the
 // CLI page act command. An unknown action is a -32602 invalid-params error.
 func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any, *Error) {
 	p, rpcErr := decodeParams[PageActParams](params)
@@ -575,6 +626,20 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 			}
 		}
 	}
+	if p.Action == "replay_fuzz" {
+		if p.Target == "" {
+			return nil, &Error{
+				Code:    CodeInvalidParams,
+				Message: "page.act: replay_fuzz requires target=<seq> or target=<url substring> from page_fetch what=network",
+			}
+		}
+		if p.MaxBytes < 0 {
+			return nil, &Error{
+				Code:    CodeInvalidParams,
+				Message: "page.act: replay_fuzz max_bytes must be >= 0",
+			}
+		}
+	}
 	if p.Action == "wait" {
 		if err := pageops.ValidateWait(p.WaitMode); err != nil {
 			return nil, &Error{Code: CodeInvalidParams, Message: fmt.Sprintf("page.act: %v", err)}
@@ -608,6 +673,15 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 			Message: `page.act: intercept_add requires rules (e.g. [{"url_pattern":"*api*","action":"block"}])`,
 		}
 	}
+
+	actionTimeout := PageActTimeout(p.TimeoutMS)
+	actionCtx, cancel := context.WithTimeout(ctx, PageActBudget(p.Action, p.WaitMode, p.TimeoutMS))
+	defer cancel()
+	if p.Raw {
+		actionCtx = browsers.WithRawCall(actionCtx)
+	}
+	ctx = actionCtx
+	start := time.Now()
 
 	page, err := s.mgr.Page(
 		ctx,
@@ -692,6 +766,16 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 				return s.mgr.CheckPageScope(browsers.PageID(p.SessionID), rawURL)
 			},
 		})
+	case "replay_fuzz":
+		var fuzz browsers.FuzzResult
+		fuzz, err = page.ReplayFuzz(ctx, p.FuzzSpec(func(rawURL string) error {
+			return s.mgr.CheckPageScope(browsers.PageID(p.SessionID), rawURL)
+		}))
+		if err == nil {
+			var data []byte
+			data, err = json.Marshal(fuzz)
+			out = string(data)
+		}
 	case "inject_canary":
 		out, err = pageops.PageCanaryInject(ctx, page, p.Targets, p.Value)
 	case "postmessage_install":
@@ -725,6 +809,9 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 	if stateErr == nil {
 		after := pageops.PageStateAfterAct(ctx, page, p.Action, before)
 		out += pageops.ActStateDeltaFor(p.Action, before, after)
+	}
+	if elapsed := time.Since(start); elapsed > actionTimeout {
+		out += pageActDeadlineNote(elapsed, actionTimeout)
 	}
 	return PageActResult{Data: out}, nil
 }

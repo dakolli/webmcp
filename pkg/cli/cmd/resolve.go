@@ -44,6 +44,7 @@ var actionVocab = map[string]bool{
 	"postmessage_clear": true, "post_message": true, "wait_open": true,
 	"intercept_add": true, "intercept_list": true, "intercept_clear": true,
 	"auth_save": true, "auth_restore": true, "auth_list": true,
+	"replay_fuzz": true,
 }
 
 // actPayloadSpecs maps each page act action to its positional payload slots,
@@ -88,6 +89,7 @@ var actPayloadSpecs = map[string][]string{
 	"auth_save":           {"site", "name"},
 	"auth_restore":        {"site", "name"},
 	"auth_list":           {"site"},
+	"replay_fuzz":         {"target"},
 }
 
 // resolvePageID resolves a user-supplied page id (possibly empty) to a live
@@ -498,6 +500,9 @@ type actArgFlags struct {
 	target         string
 	method         string
 	headers        []string
+	points         []string
+	payloads       []string
+	strategy       string
 	site           string
 	name           string
 	x              float64
@@ -533,6 +538,9 @@ type actArgs struct {
 	target         string
 	method         string
 	headers        []string
+	points         []browsers.FuzzPoint
+	payloads       []string
+	strategy       string
 	site           string
 	name           string
 	x              float64
@@ -565,15 +573,15 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 	switch {
 	case len(args) == 0:
 		// Flags supply everything; positionals win only when present.
-	case actionVocab[args[0]]:
-		a.action = args[0]
+	case actionVocab[canonicalAction(args[0])]:
+		a.action = canonicalAction(args[0])
 		haveAction = true
 		payload = args[1:]
 	default:
 		a.id = args[0]
 		haveID = true
 		if len(args) >= 2 {
-			a.action = args[1]
+			a.action = canonicalAction(args[1])
 			haveAction = true
 			payload = args[2:]
 		}
@@ -699,6 +707,10 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 		if len(payload) >= 1 {
 			a.target = payload[0]
 		}
+	case "replay_fuzz":
+		if len(payload) >= 1 {
+			a.target = payload[0]
+		}
 	case "post_message":
 		if len(payload) >= 1 {
 			a.value = payload[0]
@@ -729,6 +741,7 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 	if !haveAction {
 		a.action = f.action
 	}
+	a.action = canonicalAction(a.action)
 	if a.selector == "" {
 		a.selector = f.selector
 	}
@@ -749,6 +762,21 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 	}
 	if len(a.headers) == 0 {
 		a.headers = f.headers
+	}
+	if a.action == "replay_fuzz" {
+		if len(a.points) == 0 {
+			points, err := parseFuzzPoints(f.points)
+			if err != nil {
+				return a, err
+			}
+			a.points = points
+		}
+		if len(a.payloads) == 0 {
+			a.payloads = f.payloads
+		}
+	}
+	if a.strategy == "" {
+		a.strategy = f.strategy
 	}
 	if a.maxBytes == 0 {
 		a.maxBytes = f.maxBytes
@@ -812,4 +840,69 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 		return a, fmt.Errorf("page act: action %q takes no payload; got --value %q", a.action, a.value)
 	}
 	return a, nil
+}
+
+// canonicalAction maps a CLI action spelling to the shared MCP/IPC name. An
+// exact vocabulary match wins; a hyphen spelling such as replay-fuzz maps to
+// its underscore form when that is a known action.
+func canonicalAction(action string) string {
+	action = strings.TrimSpace(action)
+	if actionVocab[action] {
+		return action
+	}
+	underscored := strings.ReplaceAll(action, "-", "_")
+	if actionVocab[underscored] {
+		return underscored
+	}
+	return action
+}
+
+// parseFuzzPoints builds replay_fuzz injection points from --points values.
+// Each value is either a JSON {"param":...,"location":...} object or a
+// param:location pair such as q:query.
+func parseFuzzPoints(values []string) ([]browsers.FuzzPoint, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	points := make([]browsers.FuzzPoint, 0, len(values))
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if strings.HasPrefix(value, "{") {
+			var point browsers.FuzzPoint
+			if err := json.Unmarshal([]byte(value), &point); err != nil {
+				return nil, fmt.Errorf(
+					"page act: replay_fuzz --points %q is not a valid {param,location} object: %w",
+					raw,
+					err,
+				)
+			}
+			points = append(points, point)
+			continue
+		}
+		param, location, ok := strings.Cut(value, ":")
+		param, location = strings.TrimSpace(param), strings.TrimSpace(location)
+		if !ok || param == "" || location == "" {
+			return nil, fmt.Errorf(
+				`page act: replay_fuzz --points %q must be param:location (e.g. q:query) or a JSON {"param":...,"location":...} object`,
+				raw,
+			)
+		}
+		points = append(points, browsers.FuzzPoint{
+			Param:    param,
+			Location: browsers.FuzzLocation(location),
+		})
+	}
+	return points, nil
+}
+
+// fuzzSpec projects the parsed replay_fuzz arguments onto the engine's FuzzSpec.
+func (a actArgs) fuzzSpec(checkScope func(rawURL string) error) browsers.FuzzSpec {
+	return browsers.FuzzSpec{
+		Target:     a.target,
+		Strategy:   browsers.FuzzStrategy(a.strategy),
+		Points:     a.points,
+		Payloads:   a.payloads,
+		MaxBytes:   a.maxBytes,
+		CheckScope: checkScope,
+	}
 }

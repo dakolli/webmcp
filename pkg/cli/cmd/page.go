@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -25,6 +26,18 @@ const (
 	// call open indefinitely.
 	maxPageTimeoutMS = 120_000
 )
+
+// rawActionsEnabled reports whether WEB_MCP_RAW_ACTIONS is set in this CLI
+// process. A serve daemon reads its own environment, so the client must read
+// the hatch itself and forward the intent over the socket.
+func rawActionsEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(browsers.RawActionsEnv))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
 
 // pageFetchTimeout resolves page fetch's --timeout-ms: absent (0 or negative)
 // uses the 30s default and a supplied value is clamped to 1ms..120s.
@@ -63,7 +76,7 @@ resolve only against that browser and an unknown id fails with the live ids.
 Subcommands:
   list   List the browser's open pages (id, url)
   fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, console, body, article, tables, forms, marks, security, storage, sinks, postmessage, har); a URL opens a new page first
-  act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, inject_canary, wait_open, auth_save, auth_restore, auth_list)
+  act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, replay_fuzz, inject_canary, wait_open, auth_save, auth_restore, auth_list)
   auth   Save, restore or list named auth snapshots (counts only, never values)
   close  Close an open page
 
@@ -392,9 +405,9 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 // newPageActCmd builds `page act`: it performs an action on a live page —
 // click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file,
 // hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport,
-// emulate, clear_logs, sinks_install, sinks_clear, replay, inject_canary,
-// postmessage_install, postmessage_clear, post_message and wait_open (mirroring
-// the MCP page_act surface).
+// emulate, clear_logs, sinks_install, sinks_clear, replay, replay_fuzz,
+// inject_canary, postmessage_install, postmessage_clear, post_message and
+// wait_open (mirroring the MCP page_act surface).
 func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 	var (
 		id             string
@@ -422,10 +435,16 @@ func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 		target         string
 		method         string
 		headers        []string
+		pointFlags     []string
+		payloadFlags   []string
+		strategy       string
+		points         []browsers.FuzzPoint
+		payloads       []string
 		site           string
 		name           string
 		force          bool
 		maxBytes       int64
+		raw            bool
 	)
 	cmd := &cobra.Command{
 		Use:   "act [id] [action] [payload...]",
@@ -433,7 +452,7 @@ func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 		Long: `Performs an action on a live page (click, input, type, press_key, click_at,
 hover_at, drag_and_drop, upload_file, hover, scroll, select, eval, navigate, back,
 forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install,
-sinks_clear, replay, inject_canary, postmessage_install, postmessage_clear,
+sinks_clear, replay, replay_fuzz, inject_canary, postmessage_install, postmessage_clear,
 post_message, wait_open, intercept_add, intercept_list, intercept_clear) and
 prints the confirmation. The page id
 is optional when only one page is open; 'last' means the most recently opened page;
@@ -447,6 +466,17 @@ Element actions also accept --handle from page fetch interactives/dom/links/a11y
 --handle g3k9x2ab-b6; when both --handle and --selector are given, the handle wins.
 A handle is scoped to the document that minted it: after a navigation, reload or
 redirect it is rejected as stale, so re-fetch before acting.
+Pointer and keyboard actions (click, click_at, input, hover, hover_at,
+press_key) are humanized by default: the pointer steps to the target with small
+jitter and a randomized 100-500 ms pause precedes and follows the action. The
+pause is skipped when it would not fit --timeout-ms, so the action never
+overruns its deadline. Pass --raw, set WEB_MCP_RAW_ACTIONS=1, or start the
+serve daemon with raw actions enabled to make them instant. eval and navigate
+never pause.
+
+--timeout-ms bounds the action itself, exactly as timeout_ms does over MCP.
+Behind a running serve process the socket read gets a separate grace, which only
+prevents a false transport timeout; it never extends the action.
 
   [id] [action] [payload...]   e.g. "12 click \"#submit\"", "last eval '() => document.title'"
 
@@ -470,6 +500,7 @@ redirect it is rejected as stale, so re-fetch before acting.
   sinks_install (none)
   sinks_clear  (none)
   replay       [target]   (target via --target; overrides via --method, --header, --value, --max-bytes)
+  replay_fuzz  [target]   (matrix via --points, --payloads, --strategy; alias: replay-fuzz)
   inject_canary [canary]  (optional custom value; targets via --targets)
   postmessage_install (none)
   postmessage_clear   (none)
@@ -513,6 +544,22 @@ the captured method, headers and body, and an omitted --value keeps the captured
 body. The result is the same compact JSON the MCP page_act replay action returns
 ({status, headers, body|base64, bytes, truncated, body_redactions, ms, request,
 chain}) with sensitive headers redacted and the body capped at 256 KB.
+replay_fuzz (alias replay-fuzz) runs a bounded matrix of variants over one
+captured network entry: --target uses replay's seq-or-URL-substring rule,
+--points is repeatable (param:location, e.g. q:query, or a JSON
+{"param":...,"location":...} object; location is query, body, header or
+cookie), --payloads is repeatable (the same raw strings replay sends), and
+--strategy is sniper (one point at a time, points*payloads requests; default),
+pitchfork (nth point with nth payload) or clusterbomb (every combination,
+payloads^points). The size is computed and refused before any request: at most
+100 matrix requests (the baseline probe is extra), 20 points, 50 payloads and
+200 runes each, with 5 requests in flight and 10s each. It sends one unmodified
+baseline first and prints {runs:[{seq,payload,point,status,ms,bytes,body_cut,
+body_redactions}], summary:{baseline:{status,bytes,ms}, anomalies:[{seq,rule,
+why}]}}; the rules are status_changed, size_delta (>10% either way) and
+time_delta (>3x either way). Example: 3 points with 4 payloads under sniper
+sends 12 requests; 5 points with 3 payloads under clusterbomb computes 243 and
+is refused with that size and the 100 bound.
 intercept_add arms a page-scoped in-flight request interceptor: rules is a JSON
 array of {id, url_pattern, method, action, headers, status, body, delay_ms} where
 action is block, allow, rewrite or fulfill, url_pattern is a wildcard glob like
@@ -538,6 +585,8 @@ needs no page.`,
   web-cli page act last eval '() => document.title'         # run JS on the latest page
   web-cli page act last replay /api/user --method PUT --value '{"id":2}'  # replay with an edited body
   web-cli page act last replay --target /api/user --header X-Env=staging  # header override, same target
+  web-cli page act last replay-fuzz /api/search --points q:query --payloads a --payloads b  # 2 sniper runs
+  web-cli page act last replay-fuzz /api/user --points id:body --payloads 1 --payloads 2 --strategy clusterbomb
   web-cli page act last clear_logs  # reset all three buffers, print {network,console,websocket} counts
   web-cli page act last sinks_install  # arm the source-to-sink tracer
   web-cli page act last sinks_clear    # empty the tracer ring, print {cleared}
@@ -557,6 +606,7 @@ needs no page.`,
 				paths: paths, targets: targets, waitMode: waitMode, device: device, x: x, y: y,
 				targetX: targetX, targetY: targetY, width: width, height: height,
 				target: target, method: method, headers: headers, maxBytes: maxBytes,
+				points: pointFlags, payloads: payloadFlags, strategy: strategy,
 				site: site, name: name, force: force,
 				valueSet: cmd.Flags().Changed("value"),
 			})
@@ -571,19 +621,17 @@ needs no page.`,
 			x, y, targetX, targetY = parsed.x, parsed.y, parsed.targetX, parsed.targetY
 			width, height = parsed.width, parsed.height
 			target, method, headers, maxBytes = parsed.target, parsed.method, parsed.headers, parsed.maxBytes
+			points, payloads, strategy = parsed.points, parsed.payloads, parsed.strategy
 			site, name, force = parsed.site, parsed.name, parsed.force
 			valueSet := parsed.valueSet
 
-			// Enforce an explicit per-call timeout so a wedged page (or a
-			// stuck wait) cannot block the CLI: default 30s, honoring
-			// --timeout-ms. The derived ctx flows through every pageops helper
-			// below (mirrors the MCP page_act per-call timeout).
-			timeout := defaultCmdTimeout
-			if timeoutMS > 0 {
-				timeout = time.Duration(timeoutMS) * time.Millisecond
-			}
-			ctx, cancel := context.WithTimeout(cmdCtx(cmd), timeout)
+			actionTimeout := ipc.PageActTimeout(timeoutMS)
+			ctx, cancel := context.WithTimeout(cmdCtx(cmd), ipc.PageActBudget(action, waitMode, timeoutMS))
 			defer cancel()
+			rawIntent := raw || rawActionsEnabled()
+			if rawIntent {
+				ctx = browsers.WithRawCall(ctx)
+			}
 
 			if !ipc.ValidPageActAction(action) {
 				return fmt.Errorf("page act: unknown action=%q (must be one of %s)", action, ipc.PageActActionList())
@@ -617,6 +665,14 @@ needs no page.`,
 				}
 				if maxBytes < 0 {
 					return fmt.Errorf("page act: replay max_bytes must be >= 0")
+				}
+			}
+			if action == "replay_fuzz" {
+				if target == "" {
+					return fmt.Errorf("page act: replay_fuzz requires target=<seq> or target=<url substring> from page_fetch what=network")
+				}
+				if maxBytes < 0 {
+					return fmt.Errorf("page act: replay_fuzz max_bytes must be >= 0")
 				}
 			}
 			if action == "auth_save" || action == "auth_restore" {
@@ -665,12 +721,14 @@ needs no page.`,
 			}
 			if cl := dialServe(cmd); cl != nil {
 				defer cl.Close()
-				rid, err := resolvePageID(ctx, mgr, cl, browserID, owner, id, "page act")
+				readCtx, cancelRead := context.WithTimeout(cmdCtx(cmd), ipc.PageActReadTimeout(actionTimeout))
+				defer cancelRead()
+				rid, err := resolvePageID(readCtx, mgr, cl, browserID, owner, id, "page act")
 				if err != nil {
 					return err
 				}
 				reportBrowserTarget(cmd, browserID)
-				return pageActViaIPC(ctx, cl, &ipc.PageActParams{
+				return pageActViaIPC(readCtx, cl, &ipc.PageActParams{
 					SessionID:      rid,
 					BrowserID:      browserID,
 					Owner:          owner,
@@ -691,6 +749,9 @@ needs no page.`,
 					Target:         target,
 					Method:         method,
 					Headers:        headerMap,
+					Points:         points,
+					Payloads:       payloads,
+					Strategy:       browsers.FuzzStrategy(strategy),
 					Site:           site,
 					Name:           name,
 					Force:          force,
@@ -698,7 +759,8 @@ needs no page.`,
 					Paths:          paths,
 					Targets:        targets,
 					Rules:          rules,
-					TimeoutMS:      timeoutMS,
+					Raw:            rawIntent,
+					TimeoutMS:      int(actionTimeout / time.Millisecond),
 					WaitMode:       waitMode,
 					Viewport:       vp,
 					Device:         device,
@@ -766,7 +828,7 @@ needs no page.`,
 			case "select":
 				out, err = pageops.PageSelect(ctx, p, handle, selector, value)
 			case "wait":
-				out, err = pageops.PageWait(ctx, p, waitMode, handle, selector, timeout)
+				out, err = pageops.PageWait(ctx, p, waitMode, handle, selector, actionTimeout)
 			case "set_viewport":
 				out, err = pageops.PageSetViewport(ctx, p, width, height)
 			case "emulate":
@@ -789,6 +851,16 @@ needs no page.`,
 						return mgr.CheckPageScope(browsers.PageID(rid), rawURL)
 					},
 				})
+			case "replay_fuzz":
+				var fuzz browsers.FuzzResult
+				fuzz, err = p.ReplayFuzz(ctx, parsed.fuzzSpec(func(rawURL string) error {
+					return mgr.CheckPageScope(browsers.PageID(rid), rawURL)
+				}))
+				if err == nil {
+					var data []byte
+					data, err = json.Marshal(fuzz)
+					out = string(data)
+				}
 			case "inject_canary":
 				out, err = pageops.PageCanaryInject(ctx, p, targets, value)
 			case "postmessage_install":
@@ -828,7 +900,7 @@ needs no page.`,
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to act on (optional with one page open; 'last'; or a bare number)")
-	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, inject_canary, postmessage_install, postmessage_clear, post_message, wait_open, intercept_add, intercept_list, intercept_clear, auth_save, auth_restore, auth_list")
+	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, replay_fuzz, inject_canary, postmessage_install, postmessage_clear, post_message, wait_open, intercept_add, intercept_list, intercept_clear, auth_save, auth_restore, auth_list")
 	cmd.Flags().StringVar(&selector, "selector", "", "CSS selector targeting the element (element actions)")
 	cmd.Flags().StringVar(&handle, "handle", "", "element handle from page fetch (g<document>-b<backendNodeId>, scoped to its document); wins over --selector (element actions)")
 	cmd.Flags().StringVar(&value, "value", "", "value for eval (JS function), input (text), type (text), navigate (URL), select (option value), or inject_canary (custom canary)")
@@ -846,9 +918,13 @@ needs no page.`,
 	cmd.Flags().StringVar(&target, "target", "", "replay target: a seq number or a substring of the captured request URL (read the ring with 'page fetch <id> network')")
 	cmd.Flags().StringVar(&method, "method", "", "HTTP method override for replay (e.g. PUT, PATCH); omit to keep the captured method")
 	cmd.Flags().StringArrayVar(&headers, "header", nil, "replay header override NAME=VALUE (repeatable); omitted headers keep their captured values")
-	cmd.Flags().Int64Var(&maxBytes, "max-bytes", 0, "cap the replay response body in bytes (0 = the engine's 256 KB ceiling)")
+	cmd.Flags().StringArrayVar(&pointFlags, "points", nil, "replay_fuzz injection point, repeatable: param:location (e.g. q:query) or a JSON {\"param\":...,\"location\":...} object; location is query, body, header or cookie")
+	cmd.Flags().StringArrayVar(&payloadFlags, "payloads", nil, "replay_fuzz payload value (repeatable); the same raw strings replay sends as a body/value")
+	cmd.Flags().StringVar(&strategy, "strategy", "sniper", "replay_fuzz strategy: sniper (one point at a time), pitchfork (nth point with nth payload) or clusterbomb (every combination)")
+	cmd.Flags().Int64Var(&maxBytes, "max-bytes", 0, "cap the replay response body in bytes (0 = the engine's 256 KB ceiling); with replay_fuzz it caps each run body")
 	cmd.Flags().StringVar(&waitMode, "wait", "ms", "wait mode (wait action): load, idle, stable, interactable (needs --selector or --handle), ms (sleep --timeout-ms; default ms)")
-	cmd.Flags().IntVar(&timeoutMS, "timeout-ms", 30000, "per-action timeout in milliseconds (default 30000)")
+	cmd.Flags().IntVar(&timeoutMS, "timeout-ms", 30000, "action deadline in milliseconds (default 30000); it bounds the action, and a separate socket-read grace only prevents false transport errors")
+	cmd.Flags().BoolVar(&raw, "raw", false, "skip humanized pointer/keyboard timing for this call (instant moves, no pre/post pause); the same switch is available process-wide via WEB_MCP_RAW_ACTIONS=1")
 	cmd.Flags().StringVar(&browserID, "browser", "", "browser_id to resolve the page inside that browser only (use when more than one browser is live)")
 	cmd.Flags().StringVar(&owner, "owner", "", "owner label restricting the lookup to browsers with that owner (1-64 chars: A-Z, a-z, 0-9, '.', '_', '-')")
 	cmd.Flags().IntVar(&width, "width", 0, "target viewport width in CSS pixels (set_viewport action)")

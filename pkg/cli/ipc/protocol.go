@@ -40,7 +40,7 @@ const (
 	MethodPageList = "page.list"
 	// MethodPageFetch extracts any aspect in the shared pageops registry from a live page.
 	MethodPageFetch = "page.fetch"
-	// MethodPageAct performs an action on a live page (click/input/hover/scroll/select/eval/navigate/back/forward/reload/wait/set_viewport/emulate/clear_logs/sinks_install/sinks_clear/replay/inject_canary/postmessage_install/postmessage_clear/post_message/wait_open/intercept_add/intercept_list/intercept_clear).
+	// MethodPageAct performs an action on a live page (click/input/hover/scroll/select/eval/navigate/back/forward/reload/wait/set_viewport/emulate/clear_logs/sinks_install/sinks_clear/replay/replay_fuzz/inject_canary/postmessage_install/postmessage_clear/post_message/wait_open/intercept_add/intercept_list/intercept_clear).
 	MethodPageAct = "page.act"
 	// MethodPageClose closes an open page.
 	MethodPageClose = "page.close"
@@ -76,7 +76,7 @@ var pageActActions = []string{
 	"sinks_install", "sinks_clear", "replay", "inject_canary",
 	"postmessage_install", "postmessage_clear", "post_message",
 	"wait_open", "intercept_add", "intercept_list", "intercept_clear",
-	"auth_save", "auth_restore", "auth_list",
+	"auth_save", "auth_restore", "auth_list", "replay_fuzz",
 }
 
 // ValidPageActAction reports whether action is a supported page.act action.
@@ -367,7 +367,7 @@ type PageFetchResult struct {
 // PageActParams carries the page.act parameters. action ∈ click|input|type|
 // press_key|click_at|hover_at|drag_and_drop|upload_file|eval|navigate|back|
 // forward|reload|hover|scroll|select|wait|set_viewport|emulate|clear_logs|
-// sinks_install|sinks_clear|replay|inject_canary|postmessage_install|postmessage_clear|
+// sinks_install|sinks_clear|replay|replay_fuzz|inject_canary|postmessage_install|postmessage_clear|
 // post_message|intercept_add|intercept_list|intercept_clear|auth_save|auth_restore|auth_list; selector/handle/value/key/button/click_count/x/y/
 // target_x/target_y/target_selector/origin/paths/targets are the per-action
 // payloads (handle wins over selector for element actions); viewport carries the
@@ -377,7 +377,10 @@ type PageFetchResult struct {
 // (default ms). replay resends one captured network entry: target selects it by
 // seq or URL substring, method/headers override the captured request, value
 // replaces the captured body when value_set is true (or value is non-empty), and
-// max_bytes caps the returned body. clear_logs, sinks_install, sinks_clear, postmessage_install and
+// max_bytes caps the returned body. replay_fuzz runs a bounded matrix over that
+// captured entry: points/payloads/strategy define the variants, the size is
+// computed and refused before any request (100-request bound), and the result
+// is the engine's {runs,summary} envelope. clear_logs, sinks_install, sinks_clear, postmessage_install and
 // postmessage_clear take no required payload: clear_logs empties both log
 // buffers and returns the cleared counts; sinks_install arms the source-to-sink
 // tracer and returns {"installed":true}; sinks_clear empties its ring and
@@ -410,16 +413,26 @@ type PageActParams struct {
 	// absent body from an intentionally empty one. Empty Value with ValueSet
 	// false keeps the captured replay body.
 	ValueSet bool `json:"value_set,omitempty"`
-	// Target selects the captured network entry a replay resends: a seq number
-	// or a substring of its request URL.
+	// Target selects the captured network entry replay resends or replay_fuzz
+	// runs its matrix over: a seq number or a substring of its request URL.
 	Target string `json:"target,omitempty"`
 	// Method overrides the captured request method for replay.
 	Method string `json:"method,omitempty"`
 	// Headers overrides captured request headers for replay; each named header
 	// replaces its captured value.
 	Headers map[string]string `json:"headers,omitempty"`
+	// Points are the replay_fuzz injection points: each param is injected at its
+	// location (query, body, header or cookie) in the captured request.
+	Points []browsers.FuzzPoint `json:"points,omitempty"`
+	// Payloads are the replay_fuzz values injected at each point, in plan order.
+	Payloads []string `json:"payloads,omitempty"`
+	// Strategy selects how replay_fuzz pairs points with payloads: sniper (one
+	// point at a time), pitchfork (nth point with nth payload) or clusterbomb
+	// (every combination). Empty defaults to sniper.
+	Strategy browsers.FuzzStrategy `json:"strategy,omitempty"`
 	// MaxBytes caps the replay response body in bytes; 0 uses the engine's
-	// 256 KB ceiling and larger values are clamped to it.
+	// 256 KB ceiling and larger values are clamped to it. With replay_fuzz it
+	// caps each run body.
 	MaxBytes int64 `json:"max_bytes,omitempty"`
 	// Selector targets an element for element actions.
 	Selector string `json:"selector,omitempty"`
@@ -453,8 +466,16 @@ type PageActParams struct {
 	// Targets is the list of canary injection points for inject_canary:
 	// query, hash, postmessage, name (empty means all four).
 	Targets []string `json:"targets,omitempty"`
-	// TimeoutMS bounds the action in milliseconds (0 → server default 30000);
-	// the wait action's "ms" mode sleeps for this long.
+	// Raw disables humanized pointer and keyboard timing for this call, carrying
+	// the CLI client's intent to the serve process (which cannot see the
+	// client's environment). Absent keeps the serve process's default: its own
+	// WEB_MCP_RAW_ACTIONS environment hatch or the browser's configured raw mode.
+	Raw bool `json:"raw,omitempty"`
+	// TimeoutMS bounds the action in milliseconds (0 → server default 30000),
+	// exactly as it does over MCP; the wait action's "ms" mode sleeps for this
+	// long. Behind the daemon the socket read carries a separate grace, so a
+	// completed action is never reported as a transport timeout — the action
+	// itself never gets extra time.
 	TimeoutMS int `json:"timeout_ms,omitempty"`
 	// WaitMode selects the readiness level the wait action waits for:
 	// "load" | "idle" | "stable" | "interactable" | "ms" (default "ms").
@@ -474,6 +495,19 @@ type PageActParams struct {
 	// Rules are the request rules for intercept_add: each matches requests in
 	// order, the first match wins, and a request matching none continues.
 	Rules []browsers.InterceptRule `json:"rules,omitempty"`
+}
+
+// FuzzSpec projects the replay_fuzz wire fields onto the engine's FuzzSpec.
+// checkScope authorizes each URL before a variant request leaves.
+func (p PageActParams) FuzzSpec(checkScope func(rawURL string) error) browsers.FuzzSpec {
+	return browsers.FuzzSpec{
+		Target:     p.Target,
+		Strategy:   p.Strategy,
+		Points:     p.Points,
+		Payloads:   p.Payloads,
+		MaxBytes:   p.MaxBytes,
+		CheckScope: checkScope,
+	}
 }
 
 // PageActResult is the result of page.act.

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -129,6 +130,141 @@ func TestParseActArgsReplay(t *testing.T) {
 				t.Errorf("parseActArgs(%v, %+v) = %+v, want %+v", tt.args, tt.flags, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestParseActArgsReplayFuzz pins the replay_fuzz argument mapping: the
+// replay-fuzz alias and the underscore action both resolve, --points accepts
+// the param:location and JSON shapes, and a positional target wins over --target.
+func TestParseActArgsReplayFuzz(t *testing.T) {
+	tests := []struct {
+		name  string
+		args  []string
+		flags actArgFlags
+		want  actArgs
+	}{
+		{
+			name: "hyphen alias with flags",
+			args: []string{"replay-fuzz", "/api/search"},
+			flags: actArgFlags{
+				points:   []string{"q:query", "id:body"},
+				payloads: []string{"a", "b"},
+				strategy: "sniper",
+			},
+			want: actArgs{
+				action: "replay_fuzz",
+				target: "/api/search",
+				points: []browsers.FuzzPoint{
+					{Param: "q", Location: browsers.FuzzQuery},
+					{Param: "id", Location: browsers.FuzzBody},
+				},
+				payloads: []string{"a", "b"},
+				strategy: "sniper",
+			},
+		},
+		{
+			name: "id plus underscore action and JSON point",
+			args: []string{"12", "replay_fuzz", "/api/login"},
+			flags: actArgFlags{
+				points:   []string{`{"param":"X-Env","location":"header"}`},
+				payloads: []string{"staging"},
+				strategy: "pitchfork",
+			},
+			want: actArgs{
+				id:     "12",
+				action: "replay_fuzz",
+				target: "/api/login",
+				points: []browsers.FuzzPoint{
+					{Param: "X-Env", Location: browsers.FuzzHeader},
+				},
+				payloads: []string{"staging"},
+				strategy: "pitchfork",
+			},
+		},
+		{
+			name: "flag-only arguments",
+			flags: actArgFlags{
+				id:       "page-1",
+				action:   "replay_fuzz",
+				target:   "/api/user",
+				points:   []string{"session:cookie"},
+				payloads: []string{"a"},
+				strategy: "clusterbomb",
+			},
+			want: actArgs{
+				id:     "page-1",
+				action: "replay_fuzz",
+				target: "/api/user",
+				points: []browsers.FuzzPoint{
+					{Param: "session", Location: browsers.FuzzCookie},
+				},
+				payloads: []string{"a"},
+				strategy: "clusterbomb",
+			},
+		},
+		{
+			name:  "positional target wins over the flag",
+			args:  []string{"replay-fuzz", "/api/search"},
+			flags: actArgFlags{target: "/other", points: []string{"q:query"}, payloads: []string{"a"}},
+			want: actArgs{
+				action: "replay_fuzz",
+				target: "/api/search",
+				points: []browsers.FuzzPoint{
+					{Param: "q", Location: browsers.FuzzQuery},
+				},
+				payloads: []string{"a"},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseActArgs(tt.args, tt.flags)
+			if err != nil {
+				t.Fatalf("parseActArgs(%v, %+v) error = %v, want nil", tt.args, tt.flags, err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("parseActArgs(%v, %+v) = %+v, want %+v", tt.args, tt.flags, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestActArgsFuzzSpec pins the CLI-to-engine mapping: the merged arguments
+// become the engine's FuzzSpec with the strategy cast to its typed enum.
+func TestActArgsFuzzSpec(t *testing.T) {
+	a := actArgs{
+		target:   "/api/search",
+		strategy: "clusterbomb",
+		points: []browsers.FuzzPoint{
+			{Param: "q", Location: browsers.FuzzQuery},
+		},
+		payloads: []string{"a", "b"},
+		maxBytes: 4096,
+	}
+	got := a.fuzzSpec(nil)
+	want := browsers.FuzzSpec{
+		Target:   "/api/search",
+		Strategy: browsers.FuzzClusterbomb,
+		Points:   []browsers.FuzzPoint{{Param: "q", Location: browsers.FuzzQuery}},
+		Payloads: []string{"a", "b"},
+		MaxBytes: 4096,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("fuzzSpec() = %+v, want %+v", got, want)
+	}
+}
+
+// TestPageActReplayFuzzFlags pins the CLI surface: the fuzz matrix rides
+// --points/--payloads/--strategy and the strategy defaults to sniper.
+func TestPageActReplayFuzzFlags(t *testing.T) {
+	cmd := newPageActCmd(nil)
+	for _, name := range []string{"points", "payloads", "strategy"} {
+		if cmd.Flags().Lookup(name) == nil {
+			t.Errorf("page act is missing --%s for replay_fuzz", name)
+		}
+	}
+	if flag := cmd.Flags().Lookup("strategy"); flag != nil && flag.DefValue != "sniper" {
+		t.Errorf("--strategy default = %q, want sniper", flag.DefValue)
 	}
 }
 
@@ -264,6 +400,147 @@ func TestPageActViaIPCForwardsReplay(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("the fake server saw no page.act request")
 	}
+}
+
+// TestPageActForwardsRawIntent pins the daemon path: --raw and the CLI's own
+// WEB_MCP_RAW_ACTIONS hatch both ride page.act as raw, while an unset client
+// leaves raw absent so the daemon's default applies.
+func TestPageActForwardsRawIntent(t *testing.T) {
+	tests := []struct {
+		name    string
+		env     string
+		rawFlag bool
+		want    bool
+	}{
+		{name: "raw flag", rawFlag: true, want: true},
+		{name: "env hatch", env: "1", want: true},
+		{name: "default leaves raw absent", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(browsers.RawActionsEnv, tt.env)
+			path, captured := startPageActDaemon(t)
+			cmd := newPageActCmd(nil)
+			cmd.Flags().String("socket", path, "")
+			args := []string{"click", "#submit"}
+			if tt.rawFlag {
+				args = append(args, "--raw")
+			}
+			cmd.SetArgs(args)
+			cmd.SetOut(io.Discard)
+			cmd.SetErr(io.Discard)
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("page act: %v", err)
+			}
+
+			select {
+			case params := <-captured:
+				if params.Raw != tt.want {
+					t.Errorf("wire raw = %v, want %v", params.Raw, tt.want)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("the fake daemon saw no page.act request")
+			}
+		})
+	}
+}
+
+// TestPageActForwardsShortTimeoutUnchanged pins the daemon path: --timeout-ms
+// reaches page.act as the caller's value, with no client-side grace added.
+func TestPageActForwardsShortTimeoutUnchanged(t *testing.T) {
+	path, captured := startPageActDaemon(t)
+	cmd := newPageActCmd(nil)
+	cmd.Flags().String("socket", path, "")
+	cmd.SetArgs([]string{"click", "#submit", "--timeout-ms", "1"})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("page act: %v", err)
+	}
+
+	select {
+	case params := <-captured:
+		if params.TimeoutMS != 1 {
+			t.Errorf("wire timeout_ms = %d, want 1", params.TimeoutMS)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the fake daemon saw no page.act request")
+	}
+}
+
+// TestPageActTimeoutHelp pins the documented meaning of --timeout-ms: it bounds
+// the action, while the read grace exists only to prevent false transport
+// errors.
+func TestPageActTimeoutHelp(t *testing.T) {
+	cmd := newPageActCmd(nil)
+	flag := cmd.Flags().Lookup("timeout-ms")
+	if flag == nil {
+		t.Fatal("page act is missing --timeout-ms")
+	}
+	for _, want := range []string{"bounds the action", "grace"} {
+		if !strings.Contains(flag.Usage, want) {
+			t.Errorf("--timeout-ms help = %q, want it to mention %q", flag.Usage, want)
+		}
+	}
+}
+
+// startPageActDaemon answers the calls the CLI makes on the daemon path (ping,
+// browser.list and page.act) and reports the page.act params it received.
+func startPageActDaemon(t *testing.T) (string, <-chan ipc.PageActParams) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "cli.sock")
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen %s: %v", path, err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+
+	captured := make(chan ipc.PageActParams, 1)
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+				line, err := bufio.NewReader(c).ReadBytes('\n')
+				if err != nil {
+					return
+				}
+				var req ipc.Request
+				if json.Unmarshal(line, &req) != nil {
+					return
+				}
+				var result any
+				switch req.Method {
+				case ipc.MethodBrowserList:
+					result = ipc.BrowserListResult{Browsers: []ipc.BrowserEntry{{
+						BrowserID: "browser-1",
+						Pages:     []browsers.PageInfo{{ID: "page-1", URL: "https://a.test/"}},
+					}}}
+				case ipc.MethodPageAct:
+					var params ipc.PageActParams
+					if json.Unmarshal(req.Params, &params) == nil {
+						select {
+						case captured <- params:
+						default:
+						}
+					}
+					result = ipc.PageActResult{Data: "ok"}
+				default:
+					result = ipc.PingResult{OK: true}
+				}
+				resp, err := json.Marshal(ipc.Response{JSONRPC: "2.0", ID: req.ID, Result: result})
+				if err != nil {
+					return
+				}
+				_, _ = c.Write(append(resp, '\n'))
+			}(conn)
+		}
+	}()
+	return path, captured
 }
 
 // TestPageListRowReportsOpener pins the listing format: a top-level page keeps
