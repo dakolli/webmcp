@@ -30,6 +30,7 @@ var actActionNames = []string{
 	"wait", "set_viewport", "emulate", "clear_logs",
 	"sinks_install", "sinks_clear", "replay", "inject_canary",
 	"postmessage_install", "postmessage_clear", "post_message",
+	"wait_open",
 }
 
 // actActionList renders actActionNames for an error message.
@@ -73,8 +74,10 @@ func (t *Act) Description() string {
 		"sinks_clear (empties the tracer ring and returns {\"cleared\":N}), or " +
 		"replay (resends one captured network entry through a Go HTTP client — bypasses CORS, " +
 		"carries the page's cookies for the target host without writing any back, follows up to 5 " +
-		"redirects, and returns {status,headers,body,bytes,truncated,ms,request,chain} with " +
-		"sensitive response headers redacted), or " +
+		"redirects, and returns {status,headers,body,bytes,truncated,body_redactions,ms,request,chain} " +
+		"with sensitive response headers and text-body secrets (cookies, authorization, session ids, " +
+		"bearer tokens) replaced by <redacted>; body_redactions counts them, max_bytes caps the body " +
+		"at a 256 KB ceiling, and truncated/chain are always present), or " +
 		"inject_canary (proves sink reachability: injects a unique wm-canary-<8 hex> value into " +
 		"query, hash, postmessage and name — the default set, or pass targets to narrow it — and " +
 		"returns {canary, injected:[{target, where}], hits:[{sink, context, selector, value, stack}], " +
@@ -91,13 +94,19 @@ func (t *Act) Description() string {
 		"returns an error instead of falling back to top; origin is the target origin, default " +
 		"\"*\"; it arms the recorder first so the delivery can be read back, and returns " +
 		"{origin,target}. A value that is a complete JSON object or array is delivered as that " +
-		"structure, anything else as a string). " +
+		"structure, anything else as a string), or " +
+		"wait_open (block until this page opens a popup or new tab — a target=\"_blank\" link " +
+		"or window.open — and return {session_id,url,opener} for the new page; a popup opened " +
+		"before the call is returned immediately, each popup is reported once, and timeout_ms " +
+		"bounds the wait. Use the returned session_id with page_fetch/page_act). " +
 		"Pass session_id plus action=... and any required parameters. When more than " +
 		"one browser is live, pass browser_id or owner to declare which browser holds " +
 		"the session; with one live browser both may be omitted, and a session held " +
 		"outside the declared owner is refused as not_found. Element actions take a selector " +
 		"or a stable handle from page_fetch (handle wins when both are given). A selector that " +
 		"matches nothing returns error.type=element_not_found and does not wait for timeout_ms. " +
+		"input and type never echo the value: the result reports the target and the value's rune " +
+		"length, plus value_redacted=true for a password or hidden field. " +
 		"Logs are cumulative " +
 		"from page creation, so call clear_logs right before the step whose traffic/logs you want to " +
 		"observe, then read page_fetch what=network|console and filter client-side." +
@@ -124,7 +133,7 @@ func (t *Act) InputSchema() models.InputSchema {
 			"action": map[string]any{
 				"type":        "string",
 				"enum":        append([]string(nil), actActionNames...),
-				"description": "The interaction to perform: click (selector), input (set field text), type (keystrokes), press_key (key/combo e.g. Enter, Escape, Control+A), click_at/hover_at ({x, y} coordinates), drag_and_drop (from {x,y}/selector to {target_x,target_y}/target_selector), upload_file (set file input paths), eval (run JS), navigate (URL), back/forward/reload, hover (selector), scroll (x/y), select (option value), wait (readiness mode), set_viewport (W x H), emulate (device preset), clear_logs (empty both log buffers; no parameters; returns {\"network\":N,\"console\":M} cleared counts), sinks_install (arm the source-to-sink tracer; no parameters; returns {\"installed\":true}; capture is opt-in, changes page behavior, survives client-side route changes and full navigations while its per-document ring resets on a full navigation; read it with page_fetch what=sinks, which is read-only and never arms capture), sinks_clear (empty the tracer ring; no parameters; returns {\"cleared\":N}), replay (resend one captured network entry; needs target, optionally method, headers and value; returns {status,headers,body,bytes,truncated,ms,request,chain}), inject_canary (inject a canary into query/hash/postmessage/name — default all four, narrow with targets — and return {canary, injected:[{target, where}], hits:[{sink, context, selector, value, stack}], installed}; requires sinks_install first; query reloads, hash does not; capped at 20 frames), postmessage_install (arm the postMessage recorder: one capture-phase listener per window and iframe without wrapping addEventListener, so page listeners keep their identity; no parameters; returns {\"installed\":true}; read it with page_fetch what=postmessage), postmessage_clear (empty every recorder ring; no parameters; returns {\"cleared\":N}), post_message (deliver value to window.top/self/parent when target_selector is \"top\", \"self\", \"parent\" or omitted, or to the contentWindow of the <iframe>/<frame> matched by any other target_selector; a selector that is not a frame errors instead of falling back to top; origin is the target origin, default \"*\"; arms the recorder first and returns {origin,target}). Logs are cumulative from page creation — filter client-side or clear_logs right before the step under observation.",
+				"description": "The interaction to perform: click (selector), input (set field text; the result reports the target and rune length, never the value, plus value_redacted=true for a password or hidden field), type (keystrokes, same result rule as input), press_key (key/combo e.g. Enter, Escape, Control+A), click_at/hover_at ({x, y} coordinates), drag_and_drop (from {x,y}/selector to {target_x,target_y}/target_selector), upload_file (set file input paths), eval (run JS), navigate (URL), back/forward/reload, hover (selector), scroll (x/y), select (option value), wait (readiness mode), set_viewport (W x H), emulate (device preset), clear_logs (empty both log buffers; no parameters; returns {\"network\":N,\"console\":M} cleared counts), sinks_install (arm the source-to-sink tracer; no parameters; returns {\"installed\":true}; capture is opt-in, changes page behavior, survives client-side route changes and full navigations while its per-document ring resets on a full navigation; read it with page_fetch what=sinks, which is read-only and never arms capture), sinks_clear (empty the tracer ring; no parameters; returns {\"cleared\":N}), replay (resend one captured network entry; needs target, optionally method, headers, value and max_bytes; returns {status,headers,body,bytes,truncated,body_redactions,ms,request,chain} with sensitive headers and text-body secrets redacted and truncated/chain always present), inject_canary (inject a canary into query/hash/postmessage/name — default all four, narrow with targets — and return {canary, injected:[{target, where}], hits:[{sink, context, selector, value, stack}], installed}; requires sinks_install first; query reloads, hash does not; capped at 20 frames), postmessage_install (arm the postMessage recorder: one capture-phase listener per window and iframe without wrapping addEventListener, so page listeners keep their identity; no parameters; returns {\"installed\":true}; read it with page_fetch what=postmessage), postmessage_clear (empty every recorder ring; no parameters; returns {\"cleared\":N}), post_message (deliver value to window.top/self/parent when target_selector is \"top\", \"self\", \"parent\" or omitted, or to the contentWindow of the <iframe>/<frame> matched by any other target_selector; a selector that is not a frame errors instead of falling back to top; origin is the target origin, default \"*\"; arms the recorder first and returns {origin,target}), wait_open (block until this page opens a popup or new tab — target=\"_blank\" or window.open — and return {session_id,url,opener}; timeout_ms bounds the wait; a popup opened before the call is returned immediately). Logs are cumulative from page creation — filter client-side or clear_logs right before the step under observation.",
 			},
 			"selector": map[string]any{
 				"type":        "string",
@@ -136,7 +145,7 @@ func (t *Act) InputSchema() models.InputSchema {
 			},
 			"value": map[string]any{
 				"type":        "string",
-				"description": "Payload value for input/type (text), press_key (key combo fallback), eval (JS source), navigate (URL), select (option value), or upload_file (single path fallback). For replay it replaces the request body; omit it to send no body. For inject_canary it is the custom canary value; omit it to mint wm-canary-<8 hex>.",
+				"description": "Payload value for input/type (text; the result never echoes it), press_key (key combo fallback), eval (JS source), navigate (URL), select (option value), or upload_file (single path fallback). For replay it replaces the request body; omit it to send no body. For inject_canary it is the custom canary value; omit it to mint wm-canary-<8 hex>.",
 			},
 			"targets": map[string]any{
 				"type":  "array",
@@ -205,6 +214,12 @@ func (t *Act) InputSchema() models.InputSchema {
 				"additionalProperties": map[string]any{"type": "string"},
 				"description":          "Header overrides for replay: each named header replaces the captured value; omitted headers keep theirs.",
 			},
+			"max_bytes": map[string]any{
+				"type": "integer",
+				"description": "Optional cap on the returned replay body in bytes; the ceiling is 262144 (256 KB) " +
+					"and larger requests are clamped. A body over the cap returns truncated:true with bytes " +
+					"still reporting the returned size. Ignored by actions other than replay.",
+			},
 			"paths": map[string]any{
 				"type":        "array",
 				"items":       map[string]any{"type": "string"},
@@ -259,6 +274,7 @@ type actArgs struct {
 	Targets        []string           `json:"targets"`
 	Method         string             `json:"method"`
 	Headers        map[string]string  `json:"headers"`
+	MaxBytes       int64              `json:"max_bytes"`
 	Paths          []string           `json:"paths"`
 	TimeoutMS      int                `json:"timeout_ms"`
 	WaitMode       string             `json:"wait_mode"`
@@ -297,6 +313,9 @@ func (a *actArgs) validate(provided map[string]json.RawMessage) error {
 	case "replay":
 		if a.Target == "" {
 			return fmt.Errorf("replay requires target=<seq> or target=<url substring> from page_fetch what=network")
+		}
+		if a.MaxBytes < 0 {
+			return fmt.Errorf("replay max_bytes must be >= 0")
 		}
 	}
 	return nil
@@ -421,11 +440,12 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 	case "replay":
 		_, bodySet := provided["value"]
 		out, err = pageops.PageReplay(ctx, p, pageops.ReplayRequest{
-			Target:  a.Target,
-			Method:  a.Method,
-			Headers: a.Headers,
-			Body:    a.Value,
-			BodySet: bodySet,
+			Target:   a.Target,
+			Method:   a.Method,
+			Headers:  a.Headers,
+			Body:     a.Value,
+			BodySet:  bodySet,
+			MaxBytes: a.MaxBytes,
 			CheckScope: func(rawURL string) error {
 				return t.mgr.CheckPageScope(a.SessionID, rawURL)
 			},
@@ -438,6 +458,14 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 		out, err = pageops.PagePostMessageClear(ctx, p)
 	case "post_message":
 		out, err = pageops.PagePostMessageSend(ctx, p, a.Value, a.TargetSelector, a.Origin)
+	case "wait_open":
+		var popup browsers.Popup
+		popup, err = t.mgr.WaitOpen(ctx, a.SessionID, browsers.BrowserID(a.BrowserID), a.Owner)
+		if err == nil {
+			var data []byte
+			data, err = json.Marshal(popup)
+			out = string(data)
+		}
 	default:
 		return failResult(fmt.Errorf("page_act: unknown action=%q (must be one of %s)", a.Action, actActionList()))
 	}

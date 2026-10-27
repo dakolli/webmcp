@@ -2,6 +2,7 @@ package tools
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"image"
@@ -9,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"webmcp/pkg/mcp/models"
 )
@@ -136,6 +138,73 @@ func TestPageFetchPostMessage(t *testing.T) {
 		if !strings.Contains(propDesc, want) {
 			t.Errorf("what schema description is missing %q", want)
 		}
+	}
+}
+
+// TestPageFetchTimeout pins the timeout_ms contract: the schema advertises it,
+// the argument decodes, absent values fall back to 30s, and supplied values
+// clamp to 1..120000.
+func TestPageFetchTimeout(t *testing.T) {
+	prop, ok := (&Page{}).InputSchema().Properties["timeout_ms"].(map[string]any)
+	if !ok {
+		t.Fatal("timeout_ms schema property is missing")
+	}
+	if def, ok := prop["default"].(int); !ok || def != 30000 {
+		t.Errorf("timeout_ms default = %v, want 30000", prop["default"])
+	}
+
+	var a pageFetchArgs
+	if err := decodeArgs("page_fetch", json.RawMessage(
+		`{"session_id":"page-1","what":"dom","timeout_ms":45000}`,
+	), &a); err != nil {
+		t.Fatalf("decodeArgs() error = %v", err)
+	}
+	if a.TimeoutMS != 45000 {
+		t.Errorf("timeout_ms = %d, want 45000", a.TimeoutMS)
+	}
+
+	tests := []struct {
+		in   int
+		want int
+	}{
+		{0, 30000},
+		{-5, 30000},
+		{1, 1},
+		{60000, 60000},
+		{120000, 120000},
+		{500000, 120000},
+	}
+	for _, tt := range tests {
+		if got := clampTimeoutMS(tt.in); got != tt.want {
+			t.Errorf("clampTimeoutMS(%d) = %d, want %d", tt.in, got, tt.want)
+		}
+	}
+
+	desc := (&Page{}).Description()
+	if strings.Contains(desc, "timeout_ms is not supported") {
+		t.Error("page_fetch description still says timeout_ms is unsupported")
+	}
+	if !strings.Contains(desc, "timeout_ms") {
+		t.Error("page_fetch description does not mention timeout_ms")
+	}
+}
+
+// TestPageFetchTimeoutErrorNamesAspectAndValue pins the timeout message: it
+// names the aspect and the budget the aspect actually ran under.
+func TestPageFetchTimeoutErrorNamesAspectAndValue(t *testing.T) {
+	a := pageFetchArgs{What: "screenshot", FullPage: true, TimeoutMS: 60000}
+	err := timeoutError(a, aspectBudget(a, 60*time.Second), context.DeadlineExceeded)
+	for _, want := range []string{`what="screenshot"`, "1m30s", "timeout_ms=60000"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("timeout error = %q, want it to contain %q", err.Error(), want)
+		}
+	}
+
+	if got := aspectBudget(a, 30*time.Second); got != fullPageScreenshotTimeout {
+		t.Errorf("full-page budget = %s, want the 90s floor", got)
+	}
+	if got := aspectBudget(a, 120*time.Second); got != 120*time.Second {
+		t.Errorf("full-page budget = %s, want the caller's 120s", got)
 	}
 }
 

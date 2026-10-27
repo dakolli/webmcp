@@ -105,6 +105,12 @@ func init() {
 	registerAspect("article", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
 		return pageops.PageArticle(ctx, p)
 	}, truncationNone)
+	registerAspect("tables", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
+		return pageops.PageTables(ctx, p)
+	}, truncationNone)
+	registerAspect("forms", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
+		return pageops.PageForms(ctx, p)
+	}, truncationNone)
 	registerAspect("marks", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
 		return pageops.PageMarks(ctx, p)
 	}, truncationNone)

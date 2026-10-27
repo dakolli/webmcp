@@ -20,6 +20,24 @@ import (
 // larger line ends the connection (bufio.Scanner cannot recover mid-line).
 const maxMessageBytes = 1 << 20
 
+const (
+	// defaultRequestTimeout bounds every method except page.fetch.
+	defaultRequestTimeout = 30 * time.Second
+	// pageFetchRequestTimeout gives page.fetch room for a caller-supplied
+	// timeout_ms (clamped to 120s) plus browser work, so a large value is not
+	// cut at 30s behind the daemon.
+	pageFetchRequestTimeout = 180 * time.Second
+)
+
+// requestTimeout returns the per-request deadline for method: page.fetch gets
+// the longer transport budget, every other method keeps the 30s bound.
+func requestTimeout(method string) time.Duration {
+	if method == MethodPageFetch {
+		return pageFetchRequestTimeout
+	}
+	return defaultRequestTimeout
+}
+
 // DefaultSocketPath returns the default unix socket path: $XDG_RUNTIME_DIR/
 // web-mcp.sock when XDG_RUNTIME_DIR is set and the directory exists, else
 // ~/.web-mcp.sock, else .web-mcp.sock in the current directory (when the home
@@ -222,7 +240,7 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		s.untrack(conn)
 	}()
 
-	// connCtx outlives the request so the 30s per-request timeout derives from
+	// connCtx outlives the request so the per-request timeout derives from
 	// it; cancelling connCtx (ctx done) aborts any in-flight request.
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -245,11 +263,11 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	// EOF (or scanner.Err() — e.g. ErrTooLong) closes the connection via defer.
 }
 
-// dispatch runs one request against the method handlers under a 30s per-call
-// timeout (mirroring defaultCmdTimeout and the MCP tools), then encodes one
-// response line. Notifications (nil ID) are executed but get no response.
+// dispatch runs one request against the method handlers under the per-method
+// timeout (page.fetch 180s, every other method 30s), then encodes one response
+// line. Notifications (nil ID) are executed but get no response.
 func (s *Server) dispatch(connCtx context.Context, conn net.Conn, req Request) {
-	rctx, cancel := context.WithTimeout(connCtx, 30*time.Second)
+	rctx, cancel := context.WithTimeout(connCtx, requestTimeout(req.Method))
 	defer cancel()
 
 	result, rpcErr := s.handle(rctx, req)

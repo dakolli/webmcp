@@ -286,6 +286,18 @@ func TestParseActArgs(t *testing.T) {
 			actArgFlags{id: "page-1", action: "postmessage_clear"},
 			actArgs{id: "page-1", action: "postmessage_clear"},
 		},
+		{
+			"id + wait_open takes no payload",
+			[]string{"12", "wait_open"},
+			actArgFlags{},
+			actArgs{id: "12", action: "wait_open"},
+		},
+		{
+			"action-first wait_open with flag id",
+			[]string{"wait_open"},
+			actArgFlags{id: "page-1"},
+			actArgs{id: "page-1", action: "wait_open"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -396,6 +408,12 @@ func TestParseActArgsErrors(t *testing.T) {
 			[]string{"12", "post_message", "one", "two"},
 			actArgFlags{},
 			`page act: action "post_message" takes at most 1 positional arg ([value]); got 2`,
+		},
+		{
+			"wait_open no positional payload",
+			[]string{"12", "wait_open", "3000"},
+			actArgFlags{},
+			`page act: action "wait_open" takes no positional args; got 1`,
 		},
 		{
 			"scroll partial payload",

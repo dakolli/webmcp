@@ -9,12 +9,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"webmcp/pkg/browsers"
 )
 
 // TestServerPingRoundTrip pins the exact ping wire shape: a request id 1 ping
@@ -266,7 +269,7 @@ func TestServerBadParamsPageFetchUnknownWhat(t *testing.T) {
 	if resp.Error == nil || resp.Error.Code != CodeInvalidParams {
 		t.Fatalf("error = %+v, want code %d (-32602)", resp.Error, CodeInvalidParams)
 	}
-	if want := `page.fetch: unknown what="bogus" (must be one of html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, marks, security, storage, sinks, postmessage, har)`; resp.Error.Message != want {
+	if want := `page.fetch: unknown what="bogus" (must be one of html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, tables, forms, marks, security, storage, sinks, postmessage, har)`; resp.Error.Message != want {
 		t.Errorf("error message = %q, want %q", resp.Error.Message, want)
 	}
 }
@@ -300,6 +303,105 @@ func TestServerPageFetchAcceptsSharedAspects(t *testing.T) {
 			}
 			if strings.Contains(resp.Error.Message, "unknown what") {
 				t.Errorf("message = %q, want the aspect rejected only after validation", resp.Error.Message)
+			}
+		})
+	}
+}
+
+// TestServerPageActAcceptsWaitOpen pins that wait_open passes action validation:
+// the stub has no live page, so the call must fail later with a -32000 engine
+// error, never -32602.
+func TestServerPageActAcceptsWaitOpen(t *testing.T) {
+	path := startServer(t, newStubServer())
+	conn := dialRaw(t, path)
+	r := bufio.NewReader(conn)
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+
+	req := `{"jsonrpc":"2.0","id":1,"method":"page.act","params":{"session_id":"page-1","action":"wait_open"}}` + "\n"
+	if _, err := conn.Write([]byte(req)); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	line := readLineFrom(t, r)
+	var resp Response
+	if err := json.Unmarshal(line, &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Error == nil {
+		t.Fatal("error = nil, want the stub's missing-page error")
+	}
+	if resp.Error.Code != CodeServerError {
+		t.Fatalf("code = %d (%q), want %d (-32000); wait_open must pass validation", resp.Error.Code, resp.Error.Message, CodeServerError)
+	}
+}
+
+// TestRequestTimeoutPerMethod pins the per-method IPC budget: page.fetch gets
+// 180s so a raised timeout_ms survives the daemon, every other method keeps the
+// 30s bound.
+func TestRequestTimeoutPerMethod(t *testing.T) {
+	if got := requestTimeout(MethodPageFetch); got != 180*time.Second {
+		t.Errorf("page.fetch budget = %s, want 180s", got)
+	}
+	for _, method := range []string{MethodPageAct, MethodPageOpen, MethodPing} {
+		if got := requestTimeout(method); got != 30*time.Second {
+			t.Errorf("%s budget = %s, want 30s", method, got)
+		}
+	}
+}
+
+// deadlineManager records the deadline the page.fetch handler applied before
+// it reaches the engine, so the timeout_ms wiring is observable without a live
+// page.
+type deadlineManager struct {
+	*stubbedManager
+	budget time.Duration
+}
+
+func (m *deadlineManager) Page(
+	ctx context.Context,
+	_ browsers.PageID,
+	_ browsers.BrowserID,
+	_ string,
+) (*browsers.Page, error) {
+	if dl, ok := ctx.Deadline(); ok {
+		m.budget = time.Until(dl)
+	}
+	return nil, errors.New("stub: no live page")
+}
+
+// TestPageFetchTimeoutReachesHandler pins that timeout_ms is applied to the
+// page.fetch context: 60000 becomes ~60s (not the 30s default), absent gives
+// 30s, and an oversized value clamps to 120s.
+func TestPageFetchTimeoutReachesHandler(t *testing.T) {
+	tests := []struct {
+		name    string
+		timeout int
+		want    time.Duration
+	}{
+		{"explicit 60s", 60000, 60 * time.Second},
+		{"absent default", 0, 30 * time.Second},
+		{"clamped 500s", 500000, 120 * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stub := &deadlineManager{stubbedManager: &stubbedManager{
+				browser: browsers.NewBrowser("browser-1", context.Background(), false, false, "", ""),
+			}}
+			path := startServer(t, newServer(stub))
+			c, err := Dial(path)
+			if err != nil {
+				t.Fatalf("Dial: %v", err)
+			}
+			err = c.Call(context.Background(), MethodPageFetch, PageFetchParams{
+				SessionID: "page-1",
+				What:      "dom",
+				TimeoutMS: tt.timeout,
+			}, nil)
+			var se *ServerError
+			if !errors.As(err, &se) {
+				t.Fatalf("Call error = %v, want the stub's server error", err)
+			}
+			if stub.budget < tt.want-2*time.Second || stub.budget > tt.want+2*time.Second {
+				t.Errorf("handler budget = %s, want ~%s", stub.budget, tt.want)
 			}
 		})
 	}

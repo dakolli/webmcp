@@ -17,6 +17,39 @@ import (
 // mirroring browser_create's rule.
 var ownerPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
+const (
+	// defaultPageFetchTimeout bounds page.fetch when timeout_ms is absent.
+	defaultPageFetchTimeout = 30 * time.Second
+	// maxPageFetchTimeout caps page.fetch's timeout_ms. It stays below the
+	// 180s page.fetch transport budget in server.go.
+	maxPageFetchTimeout = 120 * time.Second
+)
+
+// pageFetchTimeout resolves page.fetch's timeout_ms: absent (0 or negative)
+// uses the 30s default and a supplied value is clamped to 1ms..120s.
+func pageFetchTimeout(ms int) time.Duration {
+	if ms <= 0 {
+		return defaultPageFetchTimeout
+	}
+	d := time.Duration(ms) * time.Millisecond
+	if d > maxPageFetchTimeout {
+		return maxPageFetchTimeout
+	}
+	return d
+}
+
+// pageFetchTimeoutMessage names the aspect and the budget used so a timeout
+// behind the daemon is actionable.
+func pageFetchTimeoutMessage(what string, budget time.Duration) string {
+	return fmt.Sprintf(
+		"page.fetch: what=%q timed out after %s (timeout_ms=%d, max %d) — raise --timeout-ms or narrow the selector",
+		what,
+		budget,
+		int(budget/time.Millisecond),
+		int(maxPageFetchTimeout/time.Millisecond),
+	)
+}
+
 // NormalizeOwner trims and validates a caller-supplied owner label, returning
 // "" when none was supplied. The rule and error match browser_create's.
 func NormalizeOwner(owner string) (string, error) {
@@ -62,6 +95,12 @@ type manager interface {
 		browserID browsers.BrowserID,
 		owner string,
 	) (browsers.PageClose, error)
+	WaitOpen(
+		ctx context.Context,
+		opener browsers.PageID,
+		browserID browsers.BrowserID,
+		owner string,
+	) (browsers.Popup, error)
 	CheckPageScope(id browsers.PageID, rawURL string) error
 }
 
@@ -409,6 +448,10 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 		return nil, &Error{Code: CodeInvalidParams, Message: fmt.Sprintf("page.fetch: %v", err)}
 	}
 
+	timeout := pageFetchTimeout(p.TimeoutMS)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	page, err := s.mgr.Page(
 		ctx,
 		browsers.PageID(p.SessionID),
@@ -432,6 +475,13 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 		MaxBytes:      maxBytes,
 	})
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) ||
+			errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, &Error{
+				Code:    CodeServerError,
+				Message: pageFetchTimeoutMessage(p.What, timeout),
+			}
+		}
 		return nil, serverError(err)
 	}
 	return PageFetchResult{Data: out}, nil
@@ -440,8 +490,9 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 // handlePageAct implements page.act: it performs the requested action on a
 // live page — click, input, type, press_key, click_at, hover_at, drag_and_drop,
 // upload_file, hover, scroll, select, eval, navigate, back, forward, reload,
-// wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear or
-// inject_canary — mirroring the CLI page act command. An unknown action is a
+// wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear,
+// inject_canary, postmessage_install, postmessage_clear, post_message or
+// wait_open — mirroring the CLI page act command. An unknown action is a
 // -32602 invalid-params error.
 func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any, *Error) {
 	p, rpcErr := decodeParams[PageActParams](params)
@@ -454,12 +505,10 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 	if p.Action == "" {
 		return nil, &Error{Code: CodeInvalidParams, Message: `page.act: missing required param "action"`}
 	}
-	switch p.Action {
-	case "click", "input", "type", "press_key", "click_at", "hover_at", "drag_and_drop", "upload_file", "eval", "navigate", "back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport", "emulate", "clear_logs", "sinks_install", "sinks_clear", "inject_canary", "postmessage_install", "postmessage_clear", "post_message":
-	default:
+	if !ValidPageActAction(p.Action) {
 		return nil, &Error{
 			Code:    CodeInvalidParams,
-			Message: fmt.Sprintf("page.act: unknown action=%q (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, inject_canary, postmessage_install, postmessage_clear, post_message)", p.Action),
+			Message: fmt.Sprintf("page.act: unknown action=%q (must be one of %s)", p.Action, PageActActionList()),
 		}
 	}
 	if p.Action == "eval" && p.Value == "" {
@@ -581,6 +630,14 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		out, err = pageops.PagePostMessageClear(ctx, page)
 	case "post_message":
 		out, err = pageops.PagePostMessageSend(ctx, page, p.Value, p.TargetSelector, p.Origin)
+	case "wait_open":
+		var popup browsers.Popup
+		popup, err = s.mgr.WaitOpen(ctx, browsers.PageID(p.SessionID), browsers.BrowserID(p.BrowserID), p.Owner)
+		if err == nil {
+			var data []byte
+			data, err = json.Marshal(popup)
+			out = string(data)
+		}
 	}
 	if err != nil {
 		return nil, serverError(err)

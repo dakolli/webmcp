@@ -23,7 +23,10 @@ import (
 var whatVocab = map[string]bool{
 	"html": true, "text": true, "links": true, "meta": true,
 	"dom": true, "css": true, "js": true, "screenshot": true,
-	"interactives": true, "sinks": true, "postmessage": true,
+	"interactives": true, "a11y": true, "network": true,
+	"console": true, "body": true, "article": true, "tables": true,
+	"forms": true, "marks": true, "security": true, "storage": true,
+	"sinks": true, "postmessage": true, "har": true,
 }
 
 // actionVocab is the page-act action vocabulary shared by `page act` parsing
@@ -37,7 +40,7 @@ var actionVocab = map[string]bool{
 	"select": true, "wait": true, "set_viewport": true, "emulate": true,
 	"clear_logs": true, "sinks_install": true, "sinks_clear": true,
 	"inject_canary": true, "postmessage_install": true,
-	"postmessage_clear": true, "post_message": true,
+	"postmessage_clear": true, "post_message": true, "wait_open": true,
 }
 
 // actPayloadSpecs maps each page act action to its positional payload slots,
@@ -74,6 +77,7 @@ var actPayloadSpecs = map[string][]string{
 	"postmessage_install": {},
 	"postmessage_clear":   {},
 	"post_message":        {"value"},
+	"wait_open":           {},
 }
 
 // resolvePageID resolves a user-supplied page id (possibly empty) to a live
@@ -382,11 +386,12 @@ func unresolvedPageErr(id string, pages []browsers.PageInfo, label string) error
 }
 
 // pageRows renders the open pages as "  id\turl" lines for resolution error
-// messages, mirroring `page list` output (tab-separated, no trailing newline).
+// messages, mirroring `page list` output including the opener column on a
+// popup (tab-separated, no trailing newline).
 func pageRows(pages []browsers.PageInfo) string {
 	var b strings.Builder
 	for _, p := range pages {
-		fmt.Fprintf(&b, "  %s\t%s\n", p.ID, p.URL)
+		fmt.Fprintf(&b, "  %s\n", pageListRow(p))
 	}
 	return strings.TrimRight(b.String(), "\n")
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/png"
@@ -14,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"webmcp/pkg/browsers"
+	"webmcp/pkg/cli/pageops"
 	"webmcp/pkg/mcp/models"
 )
 
@@ -22,10 +24,15 @@ import (
 // with a narrower selector or a higher max_bytes.
 const defaultMaxBytes = 50_000
 
-// defaultPageTimeout bounds the whole page_fetch call when the caller does not
-// provide one: a hung page (or a wedged CDP connection) must not block the
-// server. Every extraction inherits this bound through pageops.
-const defaultPageTimeout = 30 * time.Second
+const (
+	// defaultPageTimeout bounds the whole page_fetch call when the caller does
+	// not provide one: a hung page (or a wedged CDP connection) must not block
+	// the server. Every extraction inherits this bound through pageops.
+	defaultPageTimeout = 30 * time.Second
+	// maxPageTimeoutMS caps timeout_ms so a caller cannot pin a page call open
+	// indefinitely. The IPC page.fetch budget is 180s, leaving headroom.
+	maxPageTimeoutMS = 120_000
+)
 
 // Page implements the "page_fetch" tool: it reads any aspect of a LIVE page
 // that was previously opened with fetch_page. The session_id from fetch_page
@@ -128,17 +135,20 @@ func (t *Page) Description() string {
 		"(instead of the resource list), full_page to capture the whole " +
 		"scrollable page in a screenshot (default: visible viewport; full-page " +
 		"captures of tall/heavy pages get an extended internal budget of ~90s " +
-		"and may still time out on extreme pages), and max_bytes to cap the " +
-		"response size. A selector that matches nothing returns element_not_found naming the " +
-		"selector. Each aspect is capped at a fixed 30s per-call timeout " +
-		"(full-page screenshots ~90s); timeout_ms is not supported on this tool. " +
-		"Example: { \"session_id\": \"page-1\", \"what\": \"dom\", \"max_bytes\": 8000 }." +
+		"and may still time out on extreme pages), max_bytes to cap the " +
+		"response size, and timeout_ms to bound the call (default 30000, " +
+		"clamped to 1..120000; a full-page screenshot keeps its 90s floor " +
+		"unless you ask for more). A selector that matches nothing returns " +
+		"element_not_found naming the selector. Example: " +
+		"{ \"session_id\": \"page-1\", \"what\": \"dom\", \"max_bytes\": 8000 } or " +
+		"{ \"session_id\": \"page-1\", \"what\": \"screenshot\", \"full_page\": true, " +
+		"\"timeout_ms\": 60000 }." +
 		resultEnvelopeDoc
 }
 
 // InputSchema returns the JSON Schema for page_fetch's arguments: a required
-// session_id and what, plus optional selector, target, max_bytes, full_page and
-// include_values.
+// session_id and what, plus optional selector, target, max_bytes, timeout_ms,
+// full_page and include_values.
 func (t *Page) InputSchema() models.InputSchema {
 	return models.InputSchema{
 		Type: "object",
@@ -168,6 +178,11 @@ func (t *Page) InputSchema() models.InputSchema {
 				"type":        "integer",
 				"default":     defaultMaxBytes,
 				"description": "Maximum response size in bytes (default 50000).",
+			},
+			"timeout_ms": map[string]any{
+				"type":        "integer",
+				"default":     int(defaultPageTimeout / time.Millisecond),
+				"description": "Per-call timeout in milliseconds (default 30000, clamped to 1..120000). A full-page screenshot keeps its 90s capture floor unless timeout_ms is larger.",
 			},
 			"full_page": map[string]any{
 				"type":        "boolean",
@@ -202,6 +217,9 @@ type pageFetchArgs struct {
 	Selector string `json:"selector"`
 	// MaxBytes caps the response size (default defaultMaxBytes).
 	MaxBytes int `json:"max_bytes"`
+	// TimeoutMS bounds the whole extraction in milliseconds (absent or
+	// non-positive → 30000, clamped to 1..120000).
+	TimeoutMS int `json:"timeout_ms"`
 	// FullPage captures the entire scrollable page instead of the visible
 	// viewport (screenshot only; zero value = viewport-only capture).
 	FullPage bool `json:"full_page"`
@@ -232,8 +250,10 @@ func (t *Page) Execute(ctx context.Context, args json.RawMessage) (string, error
 	if a.MaxBytes <= 0 {
 		a.MaxBytes = defaultMaxBytes
 	}
+	a.TimeoutMS = clampTimeoutMS(a.TimeoutMS)
+	timeout := time.Duration(a.TimeoutMS) * time.Millisecond
 
-	ctx, cancel := context.WithTimeout(ctx, defaultPageTimeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	p, err := t.mgr.Page(ctx, a.SessionID, browsers.BrowserID(a.BrowserID), a.Owner)
@@ -250,8 +270,16 @@ func (t *Page) Execute(ctx context.Context, args json.RawMessage) (string, error
 		))
 	}
 
-	out, err := asp.read(ctx, p, a)
+	out, err := readAspect(ctx, p, a, asp)
 	if err != nil {
+		budget := aspectBudget(a, timeout)
+		timedOut := errors.Is(err, context.DeadlineExceeded)
+		if !timedOut && budget <= timeout {
+			timedOut = errors.Is(ctx.Err(), context.DeadlineExceeded)
+		}
+		if timedOut {
+			return failResultForPage(ctx, p, timeoutError(a, budget, err))
+		}
 		return failResultForPage(ctx, p, fmt.Errorf("page_fetch: %w", err))
 	}
 
@@ -270,6 +298,53 @@ func (t *Page) Execute(ctx context.Context, args json.RawMessage) (string, error
 	default:
 		return okResult(t.truncate(out, a.MaxBytes))
 	}
+}
+
+// clampTimeoutMS normalizes the caller's timeout_ms: an absent value (0 or
+// negative) becomes the 30s default and a supplied value is clamped to
+// 1..120000.
+func clampTimeoutMS(ms int) int {
+	if ms <= 0 {
+		return int(defaultPageTimeout / time.Millisecond)
+	}
+	if ms > maxPageTimeoutMS {
+		return maxPageTimeoutMS
+	}
+	return ms
+}
+
+// readAspect dispatches one aspect read. A full-page screenshot keeps the
+// registry's 90s capture floor, unless the caller asked for longer, in which
+// case the caller's budget governs the capture.
+func readAspect(
+	ctx context.Context,
+	p *browsers.Page,
+	a pageFetchArgs,
+	asp aspectEntry,
+) (string, error) {
+	if a.What == "screenshot" && a.FullPage &&
+		time.Duration(a.TimeoutMS)*time.Millisecond > fullPageScreenshotTimeout {
+		return pageops.PageScreenshot(ctx, p, true)
+	}
+	return asp.read(ctx, p, a)
+}
+
+// aspectBudget is the effective deadline an aspect ran under, for the timeout
+// message: a full-page screenshot never gets less than its 90s capture floor.
+func aspectBudget(a pageFetchArgs, timeout time.Duration) time.Duration {
+	if a.What == "screenshot" && a.FullPage && timeout < fullPageScreenshotTimeout {
+		return fullPageScreenshotTimeout
+	}
+	return timeout
+}
+
+// timeoutError names the aspect, the effective budget and the caller's
+// timeout_ms so a timeout failure is actionable without guessing.
+func timeoutError(a pageFetchArgs, budget time.Duration, err error) error {
+	return fmt.Errorf(
+		"page_fetch: what=%q timed out after %s (timeout_ms=%d, max %d) — raise timeout_ms, narrow the selector, or the page is wedged: %w",
+		a.What, budget, a.TimeoutMS, maxPageTimeoutMS, err,
+	)
 }
 
 // truncate caps s at maxBytes bytes, cutting on a UTF-8 rune boundary so the

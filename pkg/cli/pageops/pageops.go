@@ -738,6 +738,12 @@ var aspectEntries = []aspectEntry{
 	{name: "article", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
 		return PageArticle(ctx, p)
 	}},
+	{name: "tables", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
+		return PageTables(ctx, p)
+	}},
+	{name: "forms", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
+		return PageForms(ctx, p)
+	}},
 	{name: "marks", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
 		return PageMarks(ctx, p)
 	}},
@@ -1969,9 +1975,42 @@ func PageUploadFile(
 	return fmt.Sprintf("uploaded files %v to selector=%q", paths, selector), nil
 }
 
+// hidesTypedValue reports whether el is a control whose content Chrome masks or
+// never renders, so an action confirmation must not describe its value.
+func hidesTypedValue(el *rod.Element) bool {
+	attr, err := el.Attribute("type")
+	if err != nil || attr == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(*attr)) {
+	case "password", "hidden":
+		return true
+	}
+	return false
+}
+
+// inputConfirmation renders an input/type confirmation without the typed value:
+// it reports the target and the value's rune length, and adds
+// value_redacted=true for a password or hidden field.
+func inputConfirmation(
+	verb, handle, selector, value string,
+	secret bool,
+) string {
+	target := fmt.Sprintf("selector=%q", selector)
+	if handle != "" {
+		target = fmt.Sprintf("handle=%q", handle)
+	}
+	line := fmt.Sprintf("%s %s length=%d", verb, target, utf8.RuneCountInString(value))
+	if secret {
+		line += " value_redacted=true"
+	}
+	return line
+}
+
 // PageInput sets the value of the element targeted by handle or selector: it
 // selects all existing text (el.SelectAllText) then types value via rod's
-// Input, so the field ends up exactly value.
+// Input, so the field ends up exactly value. The confirmation reports the
+// target and the value's rune length only, never the value itself.
 func PageInput(
 	ctx context.Context,
 	p *browsers.Page,
@@ -1990,22 +2029,22 @@ func PageInput(
 	if err != nil {
 		return "", actionError("input", handle, selector, err)
 	}
+	secret := hidesTypedValue(el)
 	if err := el.SelectAllText(); err != nil {
 		return "", targetFailure("input", handle, selector, err)
 	}
 	if err := el.Input(value); err != nil {
 		return "", targetFailure("input", handle, selector, err)
 	}
-	if handle != "" {
-		return fmt.Sprintf("set input handle=%q value=%q", handle, value), nil
-	}
-	return fmt.Sprintf("set input selector=%q value=%q", selector, value), nil
+	return inputConfirmation("set input", handle, selector, value, secret), nil
 }
 
 // PageType types keystrokes into the element targeted by handle or selector
 // without clearing it — unlike PageInput (the input action selects all text
 // first), type is Focus + InsertText: it focuses the element (scrolling it into
-// view by user gesture) and pastes value at the current caret position.
+// view by user gesture) and pastes value at the current caret position. The
+// confirmation reports the target and the value's rune length only, never the
+// value itself.
 func PageType(
 	ctx context.Context,
 	p *browsers.Page,
@@ -2026,16 +2065,14 @@ func PageType(
 	if err != nil {
 		return "", actionError("type", handle, selector, err)
 	}
+	secret := hidesTypedValue(el)
 	if err := el.Focus(); err != nil {
 		return "", targetFailure("type", handle, selector, err)
 	}
 	if err := page.InsertText(value); err != nil {
 		return "", fmt.Errorf("type: %w", err)
 	}
-	if handle != "" {
-		return fmt.Sprintf("typed handle=%q value=%q", handle, value), nil
-	}
-	return fmt.Sprintf("typed selector=%q value=%q", selector, value), nil
+	return inputConfirmation("typed", handle, selector, value, secret), nil
 }
 
 // PageHover moves the mouse over the element targeted by handle or selector,

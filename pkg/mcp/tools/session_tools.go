@@ -39,7 +39,8 @@ func (t *SessionClose) Description() string {
 		"is resolved from the live browser registry without probing the tab, then closed through the " +
 		"browser that owns it, without launching a browser. A page an operation " +
 		"still holds is evicted from the session registry after a short bound, " +
-		"and its tab is left to the browser teardown. The session_id becomes " +
+		"and its tab is left to the browser teardown. Closing a page that opened " +
+		"popups also closes those popups. The session_id becomes " +
 		"invalid afterwards. Use session_list to see which sessions are still " +
 		"open; an unknown id fails and names the live ids. This never launches a " +
 		"browser and never touches a browser that does not own the session. " +
@@ -133,9 +134,11 @@ func (t *SessionList) Name() string {
 // Description returns a customer/LLM-facing description of session_list.
 func (t *SessionList) Description() string {
 	return "Lists every live browser session across every live browser and " +
-		"identity as a JSON array. Each entry is {id, url, context, title?, " +
-		"stale?}: url and title are read from the live tab, so they follow " +
-		"navigations and redirects; context is the incognito identity " +
+		"identity as a JSON array. Each entry is {id, url, opener?, context, " +
+		"title?, stale?}: url and title are read from the live tab, so they " +
+		"follow navigations and redirects; opener is the id of the page that " +
+		"opened this popup (a target=\"_blank\" link or window.open), absent for " +
+		"a top-level page; context is the incognito identity " +
 		"('default' for the browser's own cookie jar); stale marks an entry " +
 		"whose tab was busy or unreadable, in which case url is the last known " +
 		"value. Use it to see which fetch_page sessions are still open before " +

@@ -31,6 +31,8 @@ func TestActValidateRequiredArgs(t *testing.T) {
 		{name: "replay missing target", args: `{"action":"replay"}`, wantErr: "replay requires target"},
 		{name: "replay with URL substring", args: `{"action":"replay","target":"/api/user"}`},
 		{name: "replay with seq and overrides", args: `{"action":"replay","target":"12","method":"PUT","headers":{"X-Test":"1"},"value":"{}"}`},
+		{name: "replay with max_bytes", args: `{"action":"replay","target":"12","max_bytes":4096}`},
+		{name: "replay negative max_bytes", args: `{"action":"replay","target":"12","max_bytes":-1}`, wantErr: "max_bytes must be >= 0"},
 		{name: "back needs nothing", args: `{"action":"back"}`},
 		{name: "sinks_install needs nothing", args: `{"action":"sinks_install"}`},
 		{name: "sinks_clear needs nothing", args: `{"action":"sinks_clear"}`},
@@ -41,6 +43,8 @@ func TestActValidateRequiredArgs(t *testing.T) {
 		{name: "post_message missing value", args: `{"action":"post_message"}`, wantErr: "post_message requires value"},
 		{name: "post_message with value", args: `{"action":"post_message","value":"{\"t\":\"wm\"}"}`},
 		{name: "post_message with frame and origin", args: `{"action":"post_message","value":"hi","target_selector":"iframe#w","origin":"https://w.example"}`},
+		{name: "wait_open needs nothing", args: `{"action":"wait_open"}`},
+		{name: "wait_open with timeout", args: `{"action":"wait_open","timeout_ms":5000}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -66,6 +70,39 @@ func TestActValidateRequiredArgs(t *testing.T) {
 				t.Fatalf("validate() = %q, want substring %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// TestReplaySurface pins the replay contract an agent reads from the tool: the
+// body cap is optional with a 256 KB ceiling, and the result always carries
+// truncated, chain and body_redactions.
+func TestReplaySurface(t *testing.T) {
+	schema := (&Act{}).InputSchema()
+
+	maxBytes, ok := schema.Properties["max_bytes"].(map[string]any)
+	if !ok {
+		t.Fatal("max_bytes schema property is missing")
+	}
+	desc, _ := maxBytes["description"].(string)
+	for _, want := range []string{"262144", "truncated", "bytes"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("max_bytes description is missing %q: %q", want, desc)
+		}
+	}
+
+	action, ok := schema.Properties["action"].(map[string]any)
+	if !ok {
+		t.Fatal("action schema property is missing")
+	}
+	propDesc, _ := action["description"].(string)
+	toolDesc := (&Act{}).Description()
+	for _, want := range []string{"body_redactions", "truncated", "chain", "max_bytes"} {
+		if !strings.Contains(propDesc, want) {
+			t.Errorf("action schema description is missing %q", want)
+		}
+		if !strings.Contains(toolDesc, want) {
+			t.Errorf("page_act description is missing %q", want)
+		}
 	}
 }
 
@@ -163,6 +200,37 @@ func TestPostMessageActions(t *testing.T) {
 
 	if got := actActionList(); !strings.Contains(got, "postmessage_install, postmessage_clear, post_message") {
 		t.Errorf("actActionList() = %q, want the postMessage actions", got)
+	}
+}
+
+// TestWaitOpenAction pins the wait_open surface: it is advertised in the schema
+// enum, the action description and the tool description, and it needs no
+// payload beyond session_id and action.
+func TestWaitOpenAction(t *testing.T) {
+	action, ok := (&Act{}).InputSchema().Properties["action"].(map[string]any)
+	if !ok {
+		t.Fatal("action schema property is missing")
+	}
+	enum, ok := action["enum"].([]string)
+	if !ok {
+		t.Fatal("action schema property has no enum")
+	}
+	if !slices.Contains(enum, "wait_open") {
+		t.Fatalf("action enum = %v, want wait_open included", enum)
+	}
+
+	propDesc, _ := action["description"].(string)
+	toolDesc := (&Act{}).Description()
+	for _, want := range []string{"wait_open", "session_id", "opener"} {
+		if !strings.Contains(propDesc, want) {
+			t.Errorf("action schema description is missing %q", want)
+		}
+		if !strings.Contains(toolDesc, want) {
+			t.Errorf("page_act description is missing %q", want)
+		}
+	}
+	if got := actActionList(); !strings.Contains(got, "wait_open") {
+		t.Errorf("actActionList() = %q, want wait_open", got)
 	}
 }
 

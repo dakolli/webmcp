@@ -18,6 +18,7 @@ type ReplayRequest struct {
 	Headers    map[string]string
 	Body       string
 	BodySet    bool
+	MaxBytes   int64
 	CheckScope func(rawURL string) error
 }
 
@@ -31,6 +32,7 @@ func PageReplay(ctx context.Context, p *browsers.Page, req ReplayRequest) (strin
 		Headers:    req.Headers,
 		Body:       req.Body,
 		BodySet:    req.BodySet,
+		MaxBytes:   req.MaxBytes,
 		CheckScope: req.CheckScope,
 	})
 	if err != nil {

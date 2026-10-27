@@ -4,6 +4,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -15,10 +16,27 @@ import (
 	"webmcp/pkg/cli/pageops"
 )
 
-// defaultCmdTimeout bounds every page subcommand so a hung page (or a
-// first-run Chromium download) cannot block the CLI. Mirrors the 30s per-call
-// timeout the MCP tools enforce (pkg/mcp/tools/fetch.go).
-const defaultCmdTimeout = 30 * time.Second
+const (
+	// defaultCmdTimeout bounds every page subcommand so a hung page (or a
+	// first-run Chromium download) cannot block the CLI. Mirrors the 30s
+	// per-call timeout the MCP tools enforce (pkg/mcp/tools/fetch.go).
+	defaultCmdTimeout = 30 * time.Second
+	// maxPageTimeoutMS caps page fetch's --timeout-ms so a caller cannot pin a
+	// call open indefinitely.
+	maxPageTimeoutMS = 120_000
+)
+
+// pageFetchTimeout resolves page fetch's --timeout-ms: absent (0 or negative)
+// uses the 30s default and a supplied value is clamped to 1ms..120s.
+func pageFetchTimeout(ms int) time.Duration {
+	if ms <= 0 {
+		return defaultCmdTimeout
+	}
+	if ms > maxPageTimeoutMS {
+		return time.Duration(maxPageTimeoutMS) * time.Millisecond
+	}
+	return time.Duration(ms) * time.Millisecond
+}
 
 // NewPageCmd constructs the "page" command tree — list, fetch, act and close —
 // mirroring the MCP page_list / page_fetch / page_act / session_close tools
@@ -44,8 +62,8 @@ resolve only against that browser and an unknown id fails with the live ids.
 
 Subcommands:
   list   List the browser's open pages (id, url)
-  fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, console, body, article, marks, security, storage, sinks, postmessage, har); a URL opens a new page first
-  act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, inject_canary)
+  fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, console, body, article, tables, forms, marks, security, storage, sinks, postmessage, har); a URL opens a new page first
+  act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, inject_canary, wait_open)
   close  Close an open page
 
 Run a subcommand with --help for its flags and examples.`,
@@ -118,7 +136,7 @@ which sessions are still alive before acting on or closing them.`,
 				return nil
 			}
 			for _, p := range pages {
-				fmt.Printf("%s\t%s\n", p.ID, p.URL)
+				fmt.Println(pageListRow(p))
 			}
 			return nil
 		},
@@ -141,13 +159,14 @@ func newPageFetchCmd(mgr *browsers.Manager) *cobra.Command {
 		maxBytes      int
 		includeValues bool
 		identity      string
+		timeoutMS     int
 	)
 	cmd := &cobra.Command{
 		Use:   "fetch [id|url] [what]",
 		Short: "Extract an aspect of a live page",
 		Long: `Extracts an aspect of a live page (html, text, links, meta, dom, css,
-js, screenshot, interactives, a11y, network, console, body, article, marks,
-security, storage, sinks, postmessage, har) and prints it. The page id is optional when
+js, screenshot, interactives, a11y, network, console, body, article, tables,
+forms, marks, security, storage, sinks, postmessage, har) and prints it. The page id is optional when
 only one page is open; 'last' means the most recently opened page; a bare number
 resolves to page-N. A URL in the [id] slot opens a NEW page for it first —
 creating the browser if needed, exactly like 'web-cli fetch <url>' — and then
@@ -159,8 +178,8 @@ dance).
   [url]   an absolute URL (contains "://") to open in a new page first, then
           extract the aspect — mirrors 'web-cli fetch <url>' (wait: idle)
   [what]  the aspect to extract: html, text, links, meta, dom, css, js,
-          screenshot, interactives, a11y, network, console, body, article, marks,
-          security, storage, sinks, postmessage, har (default: text)
+          screenshot, interactives, a11y, network, console, body, article, tables,
+          forms, marks, security, storage, sinks, postmessage, har (default: text)
 
   --id <session>     the page/session id (the positional [id] wins when both
                      are given; never treated as a URL)
@@ -174,8 +193,11 @@ dance).
   --include-values   with --what storage, print real cookie and storage values
                      instead of <redacted> (exposes live session tokens)
   --max-bytes <n>    cap output size (default 50000; screenshots,
-                     interactives, a11y, network, console, body, article,
-                     marks, security, sinks and postmessage are never truncated)
+                     interactives, a11y, network, console, body, article, tables,
+                     forms, marks, security, sinks and postmessage are never truncated)
+  --timeout-ms <n>   per-call timeout in milliseconds (default 30000, clamped
+                     to 1..120000); a full-page screenshot keeps a 90s floor
+                     unless you ask for more
   --identity <name>  open the URL in an incognito identity inside the target
                      browser (default "default"): a new name is created on
                      first use, and identities keep separate cookies/storage
@@ -186,8 +208,8 @@ dance).
                      chars: A-Z, a-z, 0-9, '.', '_', '-'). A page held by
                      another owner is refused, never returned.
 
-links, meta, dom, interactives, a11y, network, console, body, article, marks,
-security, sinks and postmessage print JSON, mirroring the MCP page_fetch shapes. article is the readable prose body as
+links, meta, dom, interactives, a11y, network, console, body, article, tables,
+forms, marks, security, sinks and postmessage print JSON, mirroring the MCP page_fetch shapes. article is the readable prose body as
 markdown ({title, byline?, excerpt?, text, words, truncated, url}); prefer it
 over text when you want the article rather than the whole page. marks is the
 numbered overlay ({marks:[{index, role, text?, x, y, width, height}], screenshot,
@@ -219,6 +241,7 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
   web-cli page fetch 12 article                         # readable body as markdown
   web-cli page fetch 12 marks                           # numbered boxes + annotated screenshot
   web-cli page fetch last screenshot --full-page        # full-page capture of the latest page
+  web-cli page fetch last screenshot --full-page --timeout-ms 60000  # give a heavy capture 60s
   web-cli page fetch last a11y                          # semantic roles + names + handles
   web-cli page fetch last network  # last 100 network requests + dropped count
   web-cli page fetch last body --target /api/orders  # newest matching API body
@@ -229,7 +252,8 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
   web-cli page fetch https://hackernews.com links       # open + extract in one step`,
 		Args: cobra.MaximumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx, cancel := context.WithTimeout(cmdCtx(cmd), defaultCmdTimeout)
+			timeout := pageFetchTimeout(timeoutMS)
+			ctx, cancel := context.WithTimeout(cmdCtx(cmd), timeout)
 			defer cancel()
 
 			if browserID == "" {
@@ -284,14 +308,14 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 						return fmt.Errorf("page fetch: %w", err)
 					}
 					reportBrowserTarget(cmd, browserID)
-					return pageFetchViaIPC(cmd, ctx, cl, summary.SessionID, browserID, owner, what, selector, target, fullPage, maxBytes, includeValues)
+					return pageFetchViaIPC(cmd, ctx, cl, summary.SessionID, browserID, owner, what, selector, target, fullPage, maxBytes, int(timeout/time.Millisecond), includeValues)
 				}
 				rid, err := resolvePageID(ctx, mgr, cl, browserID, owner, id, "page fetch")
 				if err != nil {
 					return err
 				}
 				reportBrowserTarget(cmd, browserID)
-				return pageFetchViaIPC(cmd, ctx, cl, rid, browserID, owner, what, selector, target, fullPage, maxBytes, includeValues)
+				return pageFetchViaIPC(cmd, ctx, cl, rid, browserID, owner, what, selector, target, fullPage, maxBytes, int(timeout/time.Millisecond), includeValues)
 			}
 			printServeHint(cmd)
 
@@ -350,12 +374,13 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to fetch (optional with one page open; 'last'; or a bare number)")
-	cmd.Flags().StringVar(&what, "what", "", "aspect to extract: html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, marks, security, storage, sinks, postmessage, har (default text)")
+	cmd.Flags().StringVar(&what, "what", "", "aspect to extract: html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, tables, forms, marks, security, storage, sinks, postmessage, har (default text)")
 	cmd.Flags().StringVar(&selector, "selector", "", "optional CSS selector scoping html/text extraction")
 	cmd.Flags().StringVar(&target, "target", "", "resource URL for one css/js resource, or seq/URL substring selecting one network body (with --what body)")
 	cmd.Flags().BoolVar(&fullPage, "full-page", false, "capture the entire scrollable page instead of the visible viewport (screenshot only)")
 	cmd.Flags().BoolVar(&includeValues, "include-values", false, "with --what storage, print real cookie and localStorage/sessionStorage values instead of <redacted> (exposes live tokens)")
 	cmd.Flags().IntVar(&maxBytes, "max-bytes", pageops.DefaultPageMaxBytes, "maximum output size in bytes (default 50000)")
+	cmd.Flags().IntVar(&timeoutMS, "timeout-ms", 30000, "per-call timeout in milliseconds (default 30000, clamped to 1..120000)")
 	cmd.Flags().StringVar(&identity, "identity", "", "incognito identity for a URL open (default \"default\"); a new name is created on first use, cookies/storage stay separate")
 	cmd.Flags().StringVar(&browserID, "browser", "", "browser_id to resolve the page inside that browser only (use when more than one browser is live)")
 	cmd.Flags().StringVar(&owner, "owner", "", "owner label restricting the lookup to browsers with that owner (1-64 chars: A-Z, a-z, 0-9, '.', '_', '-')")
@@ -365,8 +390,8 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 // newPageActCmd builds `page act`: it performs an action on a live page —
 // click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file,
 // hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport,
-// emulate, clear_logs, sinks_install, sinks_clear and inject_canary (mirroring
-// the MCP page_act surface).
+// emulate, clear_logs, sinks_install, sinks_clear, inject_canary, postmessage_install,
+// postmessage_clear, post_message and wait_open (mirroring the MCP page_act surface).
 func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 	var (
 		id             string
@@ -397,8 +422,8 @@ func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 		Long: `Performs an action on a live page (click, input, type, press_key, click_at,
 hover_at, drag_and_drop, upload_file, hover, scroll, select, eval, navigate, back,
 forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install,
-sinks_clear, inject_canary, postmessage_install, postmessage_clear, post_message)
-and prints the confirmation. The page id
+sinks_clear, inject_canary, postmessage_install, postmessage_clear, post_message,
+wait_open) and prints the confirmation. The page id
 is optional when only one page is open; 'last' means the most recently opened page;
 a bare number resolves to page-N.
 Positional payloads fill each action's fields — flags remain as fallbacks.
@@ -436,6 +461,7 @@ redirect it is rejected as stale, so re-fetch before acting.
   postmessage_install (none)
   postmessage_clear   (none)
   post_message  [value]   (target frame via --target-selector, default top; origin via --origin)
+  wait_open    (none)     (block until this page opens a popup; --timeout-ms bounds the wait)
   back/forward/reload    (none)
   type         [selector] [text]
 
@@ -458,7 +484,10 @@ window.top (--target-selector top or omitted) or to the contentWindow of the
 iframe named by --target-selector, using --origin as the target origin (default
 "*"), arms the recorder first, and prints {origin,target}. A value that is a
 complete JSON object or array is delivered as that structure; anything else is
-delivered as a string.`,
+delivered as a string. wait_open blocks until this page opens a popup (a
+target="_blank" link or window.open) and prints {session_id,url,opener};
+--timeout-ms bounds the wait, and a popup opened before the call returns at
+once.`,
 		Example: `  web-cli page act click "#submit"                          # click on the single open page
   web-cli page act 12 input "#search" "pizza"               # type into a search box
   web-cli page act 12 press_key "Enter"                     # press Enter key
@@ -473,7 +502,8 @@ delivered as a string.`,
   web-cli page act last postmessage_install  # arm the postMessage recorder
   web-cli page act last post_message '{"t":"wm"}'  # send to window.top, read with 'page fetch last postmessage'
   web-cli page act last post_message '{"t":"wm"}' --target-selector "iframe#widget" --origin https://widget.example
-  web-cli page act last postmessage_clear  # empty every recorder ring, print {cleared}`,
+  web-cli page act last postmessage_clear  # empty every recorder ring, print {cleared}
+  web-cli page act last wait_open  # block until the page opens a popup, print {session_id,url,opener}`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Positional args win over the --flags; payload counts are
 			// validated here, before any browser work.
@@ -504,10 +534,8 @@ delivered as a string.`,
 			ctx, cancel := context.WithTimeout(cmdCtx(cmd), timeout)
 			defer cancel()
 
-			switch action {
-			case "click", "input", "type", "press_key", "click_at", "hover_at", "drag_and_drop", "upload_file", "eval", "navigate", "back", "forward", "reload", "hover", "scroll", "select", "wait", "set_viewport", "emulate", "clear_logs", "sinks_install", "sinks_clear", "inject_canary", "postmessage_install", "postmessage_clear", "post_message":
-			default:
-				return fmt.Errorf("page act: unknown action=%q (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, inject_canary, postmessage_install, postmessage_clear, post_message)", action)
+			if !ipc.ValidPageActAction(action) {
+				return fmt.Errorf("page act: unknown action=%q (must be one of %s)", action, ipc.PageActActionList())
 			}
 
 			if action == "set_viewport" && (width <= 0 || height <= 0) {
@@ -638,6 +666,14 @@ delivered as a string.`,
 				out, err = pageops.PagePostMessageClear(ctx, p)
 			case "post_message":
 				out, err = pageops.PagePostMessageSend(ctx, p, value, targetSelector, origin)
+			case "wait_open":
+				var popup browsers.Popup
+				popup, err = mgr.WaitOpen(ctx, browsers.PageID(rid), browsers.BrowserID(browserID), owner)
+				if err == nil {
+					var data []byte
+					data, err = json.Marshal(popup)
+					out = string(data)
+				}
 			}
 			if err != nil {
 				return fmt.Errorf("page act: %w", err)
@@ -651,7 +687,7 @@ delivered as a string.`,
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to act on (optional with one page open; 'last'; or a bare number)")
-	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, inject_canary, postmessage_install, postmessage_clear, post_message")
+	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, inject_canary, postmessage_install, postmessage_clear, post_message, wait_open")
 	cmd.Flags().StringVar(&selector, "selector", "", "CSS selector targeting the element (element actions)")
 	cmd.Flags().StringVar(&handle, "handle", "", "element handle from page fetch (g<document>-b<backendNodeId>, scoped to its document); wins over --selector (element actions)")
 	cmd.Flags().StringVar(&value, "value", "", "value for eval (JS function), input (text), type (text), navigate (URL), select (option value), or inject_canary (custom canary)")
@@ -774,14 +810,25 @@ func pageListViaIPC(cmd *cobra.Command, ctx context.Context, cl *ipc.Client, bro
 		return nil
 	}
 	for _, p := range pages {
-		fmt.Printf("%s\t%s\n", p.ID, p.URL)
+		fmt.Println(pageListRow(p))
 	}
 	return nil
 }
 
+// pageListRow renders one page listing row: its id and live URL, plus the
+// opener id when the page is a popup. Both the in-process and daemon page list
+// paths print it, and page-id resolution errors reuse it for their page rows.
+func pageListRow(p browsers.PageInfo) string {
+	row := fmt.Sprintf("%s\t%s", p.ID, p.URL)
+	if p.Opener != "" {
+		row += "\topener=" + string(p.Opener)
+	}
+	return row
+}
+
 // pageFetchViaIPC implements `page fetch` against a live serve process: it
-// forwards the extraction (and the --target/--full-page params) to page.fetch
-// (the server truncates to max_bytes itself) and prints the data
+// forwards the extraction (and the --target/--full-page/--timeout-ms params)
+// to page.fetch (the server truncates to max_bytes itself) and prints the data
 // byte-identically to the in-process path. The CLI's --max-bytes 0 means "no
 // truncation" (pageops.PageTruncate returns s unchanged), which the wire
 // contract cannot express (0 → the server default), so it is forwarded as an
@@ -793,6 +840,7 @@ func pageFetchViaIPC(
 	id, browserID, owner, what, selector, target string,
 	fullPage bool,
 	maxBytes int,
+	timeoutMS int,
 	includeValues bool,
 ) error {
 	if maxBytes <= 0 {
@@ -808,6 +856,7 @@ func pageFetchViaIPC(
 		Target:        target,
 		FullPage:      fullPage,
 		MaxBytes:      maxBytes,
+		TimeoutMS:     timeoutMS,
 		IncludeValues: includeValues,
 	}, &res); err != nil {
 		return fmt.Errorf("page fetch: %w", err)

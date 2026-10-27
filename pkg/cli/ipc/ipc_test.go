@@ -33,6 +33,9 @@ type stubbedManager struct {
 	pruneErr error
 	purged   []browsers.BrowserID
 	pruneN   int
+	// popup is what WaitOpen returns when waitErr is nil.
+	popup   browsers.Popup
+	waitErr error
 }
 
 // Open implements manager.
@@ -120,6 +123,19 @@ func (s *stubbedManager) ClosePage(
 
 // CheckPageScope implements manager: the stub has no allowlist.
 func (s *stubbedManager) CheckPageScope(browsers.PageID, string) error { return nil }
+
+// WaitOpen implements manager: the stub returns the configured popup.
+func (s *stubbedManager) WaitOpen(
+	context.Context,
+	browsers.PageID,
+	browsers.BrowserID,
+	string,
+) (browsers.Popup, error) {
+	if s.waitErr != nil {
+		return browsers.Popup{}, s.waitErr
+	}
+	return s.popup, nil
+}
 
 // newStubServer returns a Server wired to a stub manager whose Browser is
 // unlaunched and empty (no pages) — safe for any wire-contract test.

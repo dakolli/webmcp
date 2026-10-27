@@ -8,6 +8,7 @@ package ipc
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 
 	"webmcp/pkg/browsers"
@@ -39,7 +40,7 @@ const (
 	MethodPageList = "page.list"
 	// MethodPageFetch extracts any aspect in the shared pageops registry from a live page.
 	MethodPageFetch = "page.fetch"
-	// MethodPageAct performs an action on a live page (click/input/hover/scroll/select/eval/navigate/back/forward/reload/wait/set_viewport/emulate/clear_logs/sinks_install/sinks_clear/inject_canary/postmessage_install/postmessage_clear/post_message).
+	// MethodPageAct performs an action on a live page (click/input/hover/scroll/select/eval/navigate/back/forward/reload/wait/set_viewport/emulate/clear_logs/sinks_install/sinks_clear/inject_canary/postmessage_install/postmessage_clear/post_message/wait_open).
 	MethodPageAct = "page.act"
 	// MethodPageClose closes an open page.
 	MethodPageClose = "page.close"
@@ -63,6 +64,39 @@ const (
 	// CodeServerError: reserved for implementation-defined server errors (-32000).
 	CodeServerError = -32000
 )
+
+// pageActActions lists page.act's actions in schema order, mirroring the MCP
+// page_act action enum so every surface speaks one vocabulary. The handler
+// validation and the unknown-action error both read it.
+var pageActActions = []string{
+	"click", "input", "type", "press_key", "click_at", "hover_at",
+	"drag_and_drop", "upload_file", "eval", "navigate",
+	"back", "forward", "reload", "hover", "scroll", "select",
+	"wait", "set_viewport", "emulate", "clear_logs",
+	"sinks_install", "sinks_clear", "inject_canary",
+	"postmessage_install", "postmessage_clear", "post_message",
+	"wait_open",
+}
+
+// ValidPageActAction reports whether action is a supported page.act action.
+func ValidPageActAction(action string) bool {
+	for _, name := range pageActActions {
+		if name == action {
+			return true
+		}
+	}
+	return false
+}
+
+// PageActActions returns a copy of page.act's supported action names.
+func PageActActions() []string {
+	return append([]string(nil), pageActActions...)
+}
+
+// PageActActionList renders the supported page.act actions for an error message.
+func PageActActionList() string {
+	return strings.Join(pageActActions, ", ")
+}
 
 // Request is a JSON-RPC 2.0 request object. Params is kept raw so each handler
 // decodes exactly the params struct of its method; a request with a nil ID is
@@ -272,7 +306,8 @@ type PageListResult struct {
 // css/js resource's content, or with what=body selects one observed response by
 // seq or URL substring; full_page captures the whole scrollable page in a
 // screenshot; max_bytes caps the returned data (default pageops.DefaultPageMaxBytes),
-// except for the aspects that self-cap; include_values returns real cookie and
+// except for the aspects that self-cap; timeout_ms bounds the whole extraction
+// (default 30000, clamped to 1..120000); include_values returns real cookie and
 // storage values with what=storage instead of <redacted>. network/console return
 // {entries,count,dropped,truncated} over the newest 100 buffered entries;
 // capture is cumulative from page creation, so clear with page.act clear_logs
@@ -300,6 +335,10 @@ type PageFetchParams struct {
 	FullPage bool `json:"full_page,omitempty"`
 	// MaxBytes caps the returned data size (0 → DefaultPageMaxBytes).
 	MaxBytes int `json:"max_bytes,omitempty"`
+	// TimeoutMS bounds the whole extraction in milliseconds (0 → 30000,
+	// clamped to 1..120000). page.fetch gets a 180s transport budget so a
+	// raised value survives the daemon.
+	TimeoutMS int `json:"timeout_ms,omitempty"`
 	// IncludeValues returns real cookie and storage values with what=storage
 	// instead of the literal <redacted>; it exposes live session tokens.
 	IncludeValues bool `json:"include_values,omitempty"`
@@ -338,9 +377,10 @@ type PageActParams struct {
 	BrowserID string `json:"browser_id,omitempty"`
 	// Owner optionally restricts the lookup to browsers with that owner.
 	Owner string `json:"owner,omitempty"`
-	// Action is the action to perform (including clear_logs, sinks_install and
-	// sinks_clear, which take no payload; they return {"network":N,"console":M},
-	// {"installed":true} and {"cleared":N} respectively).
+	// Action is the action to perform (including clear_logs, sinks_install,
+	// sinks_clear and wait_open, which take no payload; clear_logs returns
+	// {"network":N,"console":M}, sinks_install {"installed":true}, sinks_clear
+	// {"cleared":N} and wait_open {session_id,url,opener}).
 	Action string `json:"action"`
 	// Value is the payload: a JS function for eval, text for input/type, URL for
 	// navigate, an option value for select, fallback key for press_key, or single path for upload_file.
