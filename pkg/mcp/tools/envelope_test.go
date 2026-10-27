@@ -303,7 +303,7 @@ func TestClassifyError(t *testing.T) {
 			if got == errUnknown && hint != "" {
 				t.Fatalf("unknown hint = %q, want none", hint)
 			}
-			if got != errUnknown && hint == "" {
+			if got != errUnknown && got != errInvalidArgs && hint == "" {
 				t.Fatalf("%s hint = empty, want a remediation", got)
 			}
 		})
@@ -712,6 +712,69 @@ func TestSpecificHintBeatsGenericHint(t *testing.T) {
 	if !strings.Contains(gotHint, "50") {
 		t.Fatalf("hint = %q, want the payload bound", gotHint)
 	}
+}
+
+// TestInvalidArgsHintOnlyForDecodeFailures pins that a prose-marked invalid_args
+// refusal carries no generic schema hint, while a decode failure still does, and
+// that a prose refusal's own Hint() wins over the generic sentence.
+func TestInvalidArgsHintOnlyForDecodeFailures(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		wantHint string
+	}{
+		{
+			name:     "prose path refusal omits the generic hint",
+			err:      errors.New(`page_act: poc_bundle: "_trash/x" must be absolute`),
+			wantHint: "",
+		},
+		{
+			name:     "prose refusal keeps its own hint",
+			err:      hintedArgsError{msg: `page_act: poc_bundle: "/tmp/x" is not empty — pass a new directory`},
+			wantHint: "pass an absolute directory that does not exist yet",
+		},
+		{
+			name:     "type mismatch keeps the schema hint",
+			err:      errors.New(`browser_create: "ignore_certs" must be a boolean (true or false), but the request sent the string "yes".`),
+			wantHint: hintFor(errInvalidArgs),
+		},
+		{
+			name:     "structured decode failure keeps the schema hint",
+			err:      errors.New(`page_act: invalid arguments: json: cannot unmarshal number into Go struct field args.timeout_ms`),
+			wantHint: hintFor(errInvalidArgs),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, err := failResult(tt.err)
+			if err != nil {
+				t.Fatalf("failResult() error = %v", err)
+			}
+			env := mustEnvelope(t, out)
+			if env.Error == nil {
+				t.Fatal("envelope has no error branch")
+			}
+			if env.Error.Type != errInvalidArgs {
+				t.Fatalf("type = %q, want %q", env.Error.Type, errInvalidArgs)
+			}
+			if env.Error.Hint != tt.wantHint {
+				t.Fatalf("hint = %q, want %q", env.Error.Hint, tt.wantHint)
+			}
+			if tt.wantHint == "" && strings.Contains(out, `"hint"`) {
+				t.Fatalf("payload = %s, want the hint field omitted", out)
+			}
+		})
+	}
+}
+
+type hintedArgsError struct {
+	msg string
+}
+
+func (e hintedArgsError) Error() string { return e.msg }
+
+func (e hintedArgsError) Hint() string {
+	return "pass an absolute directory that does not exist yet"
 }
 
 func mustEnvelope(t *testing.T, out string) resultEnvelope {

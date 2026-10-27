@@ -119,6 +119,15 @@ var invalidArgsMarkers = []string{
 	"intercept: rule",
 }
 
+// decodeArgsMarkers identify a failure raised while decoding or validating
+// tool arguments, where the generic schema hint is the real remediation. Every
+// other invalid_args marker is a runtime refusal whose own message already
+// states the fix, so it carries no generic hint.
+var decodeArgsMarkers = []string{
+	"invalid arguments",
+	"but the request sent",
+}
+
 // handleArgsMarkers identify a handle that this document did not mint. Both
 // fixes are the same: re-read the page for a fresh handle, or use a selector.
 var handleArgsMarkers = []string{
@@ -319,7 +328,10 @@ func classifyErrorType(err error, ch challengeState) (string, string) {
 		}
 		return errNavFailed, "the replay transport failed — verify the URL is reachable and the host's DNS and TLS trust are correct, then retry"
 	case containsAny(msg, invalidArgsMarkers):
-		return errInvalidArgs, hintFor(errInvalidArgs)
+		if containsAny(msg, decodeArgsMarkers) {
+			return errInvalidArgs, hintFor(errInvalidArgs)
+		}
+		return errInvalidArgs, ""
 	case errors.As(err, &missingElement) || containsAny(msg, elementNotFoundMarkers):
 		return errElementNotFound, hintFor(errElementNotFound)
 	case errors.As(err, &notClickable) || containsAny(msg, notInteractableMarkers):
