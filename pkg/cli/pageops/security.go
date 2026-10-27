@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 
@@ -124,8 +125,11 @@ type securityReport struct {
 // PageSecurity returns a passive security audit of the live page as
 // {"url","checks":[{id,status,evidence,detail}],"count","truncated"}. Every
 // check reads truth the browser already holds — observed response headers from
-// the page's network ring, the cookie jar for the current URL and one DOM
-// evaluation — so the audit never reloads or probes the site.
+// the audited document's own requests in the page's network ring, the cookie
+// jar for the current URL and one DOM evaluation — so the audit never reloads
+// or probes the site. The ring spans navigations, so the audit locates the
+// document request that produced the current page and ignores everything
+// captured before it; it never clears the ring.
 func PageSecurity(ctx context.Context, p *browsers.Page) (string, error) {
 	p.Lock()
 	defer p.Unlock()
@@ -143,8 +147,10 @@ func PageSecurity(ctx context.Context, p *browsers.Page) (string, error) {
 		return "", fmt.Errorf("decode security probe: %w", err)
 	}
 
-	entries, _ := p.NetworkEntries()
-	headers, found, cut := securityDocumentHeaders(entries)
+	ring, _ := p.NetworkEntries()
+	doc, entries, found := securityDocumentRing(ring, probe.URL)
+	headers := doc.RespHeaders
+	cut := found && doc.RespHeadersTruncated
 	cookies, cookiesOmitted := pageCookieChecks(pc, probe.URL, probe.Cookies)
 
 	checks := securityHeaderChecks(probe, headers, found, cut)
@@ -186,16 +192,67 @@ func securityOmitted(probe securityProbe) int {
 	return omitted
 }
 
-// securityDocumentHeaders returns the newest observed document response's
-// headers. found is false when the document request is no longer in the ring;
-// cut reports a header set the engine bounded at capture.
-func securityDocumentHeaders(entries []browsers.NetworkEntry) (headers map[string]string, found, cut bool) {
-	for i := len(entries) - 1; i >= 0; i-- {
-		if entries[i].Type == string(proto.NetworkResourceTypeDocument) {
-			return entries[i].RespHeaders, true, entries[i].RespHeadersTruncated
-		}
+// securityDocumentRing locates the audited document in the cumulative network
+// ring and returns its document request plus the requests observed after it.
+// The ring spans navigations, so every entry before that boundary belongs to an
+// earlier document and is excluded. found is false when the audited document's
+// own request is no longer in the ring; the callers then report empty evidence
+// instead of borrowing an older page's requests.
+func securityDocumentRing(
+	entries []browsers.NetworkEntry,
+	pageURL string,
+) (doc browsers.NetworkEntry, scoped []browsers.NetworkEntry, found bool) {
+	target := securityDocumentURL(pageURL)
+	origin := securityURLOrigin(target)
+	if target == "" {
+		return browsers.NetworkEntry{}, nil, false
 	}
-	return nil, false, false
+	for i := len(entries) - 1; i >= 0; i-- {
+		if entries[i].Type != string(proto.NetworkResourceTypeDocument) {
+			continue
+		}
+		if securityDocumentURL(entries[i].URL) != target {
+			continue
+		}
+		return entries[i], entries[i:], true
+	}
+	if origin == "" {
+		return browsers.NetworkEntry{}, nil, false
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		if entries[i].Type != string(proto.NetworkResourceTypeDocument) {
+			continue
+		}
+		if securityURLOrigin(securityDocumentURL(entries[i].URL)) != origin {
+			continue
+		}
+		return entries[i], entries[i:], true
+	}
+	return browsers.NetworkEntry{}, nil, false
+}
+
+// securityDocumentURL drops a URL's fragment so the audited page address
+// compares equal to the document request that produced it, which never carries
+// the fragment.
+func securityDocumentURL(raw string) string {
+	if i := strings.IndexByte(raw, '#'); i >= 0 {
+		return raw[:i]
+	}
+	return raw
+}
+
+// securityURLOrigin returns the scheme and host of raw, or an empty string when
+// it has neither. The audited URL and its document request share an origin even
+// when a client-side route change moved the page path, so the origin is the
+// fallback key: the newest document request of one origin is the newest load of
+// that origin, and an evicted newer load would have evicted every older entry
+// with it.
+func securityURLOrigin(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host)
 }
 
 // headerValue returns the value of name from a header map, matching the name
@@ -238,7 +295,7 @@ func securityHeaderChecks(
 		checks = append(checks, securityCheck{
 			ID:     "headers",
 			Status: "info",
-			Detail: "the document response is no longer in the network ring (newest 200 requests), so every header below reads as absent — re-open the page to audit headers without guessing",
+			Detail: "the audited document's response is not in the network ring (newest 200 requests, spanning navigations), so every header below reads as absent — re-open the page to audit headers without guessing",
 		})
 	case cut:
 		checks = append(checks, securityCheck{
@@ -939,7 +996,8 @@ func readableCookieChecks(readable string, err error) []securityCheck {
 	return checks
 }
 
-// securityMixedContentCheck flags plain-http requests observed on an https page.
+// securityMixedContentCheck flags plain-http requests the audited document made
+// from an https page. entries must already be scoped to that document.
 func securityMixedContentCheck(probe securityProbe, entries []browsers.NetworkEntry) securityCheck {
 	if probe.Scheme != "https" {
 		return securityCheck{
@@ -956,7 +1014,7 @@ func securityMixedContentCheck(probe securityProbe, entries []browsers.NetworkEn
 	}
 	return securityFinding(
 		"mixed_content",
-		"no http:// subresources were observed",
+		"no http:// subresources were observed for this document",
 		"%d request(s) used plain http on an https page (blocked or downgraded by the browser); load every subresource over https",
 		offenders,
 	)
@@ -1028,14 +1086,15 @@ func securityContentChecks(probe securityProbe) []securityCheck {
 	return checks
 }
 
-// securityCORSCheck flags an observed response that pairs a wildcard origin with
-// credentials, a combination browsers reject.
+// securityCORSCheck flags a response the audited document observed that pairs a
+// wildcard origin with credentials, a combination browsers reject. entries must
+// already be scoped to that document.
 func securityCORSCheck(entries []browsers.NetworkEntry) securityCheck {
 	if len(entries) == 0 {
 		return securityCheck{
 			ID:     "cors",
 			Status: "info",
-			Detail: "no network responses have been observed yet",
+			Detail: "no requests belonging to the audited document have been observed (the network ring spans navigations, so an earlier page's requests are ignored)",
 		}
 	}
 	var offenders []string

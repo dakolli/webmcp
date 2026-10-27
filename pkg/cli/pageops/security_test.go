@@ -4,6 +4,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"webmcp/pkg/browsers"
 )
 
 // cspBypassIDs pins the probe order and count so the report stays deterministic.
@@ -255,5 +257,161 @@ func TestCSPSourceHost(t *testing.T) {
 		if _, got := cspBypassHostFor(tt.host); got != tt.want {
 			t.Errorf("cspBypassHostFor(%q) matched = %t, want %t", tt.host, got, tt.want)
 		}
+	}
+}
+
+// securityCORSPair is the wildcard-origin-plus-credentials combination the CORS
+// check flags.
+var securityCORSPair = map[string]string{
+	"Access-Control-Allow-Origin":      "*",
+	"Access-Control-Allow-Credentials": "true",
+}
+
+// TestSecurityAuditScopesNetworkToCurrentDocument proves the audit cannot cite
+// an earlier navigation's requests: only the document request that produced the
+// audited page and the requests after it supply evidence.
+func TestSecurityAuditScopesNetworkToCurrentDocument(t *testing.T) {
+	tests := []struct {
+		name       string
+		pageURL    string
+		ring       []browsers.NetworkEntry
+		wantCORS   string
+		wantMixed  string
+		wantAbsent []string
+	}{
+		{
+			name:    "second host after a POST",
+			pageURL: "https://new.test/",
+			ring: []browsers.NetworkEntry{
+				{Seq: 1, Method: "POST", Type: "Document", URL: "https://old.test/post"},
+				{Seq: 2, Type: "XHR", URL: "https://old.test/api", RespHeaders: securityCORSPair},
+				{Seq: 3, Type: "Image", URL: "http://old.test/favicon.ico"},
+				{Seq: 4, Type: "Document", URL: "https://new.test/"},
+				{Seq: 5, Type: "XHR", URL: "https://new.test/api", RespHeaders: securityCORSPair},
+			},
+			wantCORS:   "https://new.test/api",
+			wantMixed:  "",
+			wantAbsent: []string{"old.test"},
+		},
+		{
+			name:    "same origin second navigation",
+			pageURL: "https://same.test/b",
+			ring: []browsers.NetworkEntry{
+				{Seq: 1, Type: "Document", URL: "https://same.test/a"},
+				{Seq: 2, Type: "XHR", URL: "https://same.test/a/api", RespHeaders: securityCORSPair},
+				{Seq: 3, Type: "Script", URL: "http://same.test/a/app.js"},
+				{Seq: 4, Type: "Document", URL: "https://same.test/b"},
+				{Seq: 5, Type: "XHR", URL: "https://same.test/b/api", RespHeaders: securityCORSPair},
+			},
+			wantCORS:   "https://same.test/b/api",
+			wantMixed:  "",
+			wantAbsent: []string{"https://same.test/a"},
+		},
+		{
+			name:    "fragment in the audited URL",
+			pageURL: "https://frag.test/page#section",
+			ring: []browsers.NetworkEntry{
+				{Seq: 1, Type: "Document", URL: "https://old.test/"},
+				{Seq: 2, Type: "Document", URL: "https://frag.test/page"},
+				{Seq: 3, Type: "XHR", URL: "https://frag.test/api", RespHeaders: securityCORSPair},
+			},
+			wantCORS:   "https://frag.test/api",
+			wantMixed:  "",
+			wantAbsent: []string{"old.test"},
+		},
+		{
+			name:    "client-side route change keeps the loaded document",
+			pageURL: "https://spa.test/dashboard",
+			ring: []browsers.NetworkEntry{
+				{Seq: 1, Type: "Document", URL: "https://spa.test/"},
+				{Seq: 2, Type: "XHR", URL: "https://spa.test/api/me", RespHeaders: securityCORSPair},
+			},
+			wantCORS:  "https://spa.test/api/me",
+			wantMixed: "",
+		},
+		{
+			name:    "same-origin iframe does not move the boundary",
+			pageURL: "https://app.test/",
+			ring: []browsers.NetworkEntry{
+				{Seq: 1, Type: "Document", URL: "https://app.test/"},
+				{Seq: 2, Type: "XHR", URL: "https://app.test/api", RespHeaders: securityCORSPair},
+				{Seq: 3, Type: "Document", URL: "https://app.test/widget"},
+			},
+			wantCORS:  "https://app.test/api",
+			wantMixed: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, scoped, found := securityDocumentRing(tt.ring, tt.pageURL)
+			if !found {
+				t.Fatalf("securityDocumentRing(%q) did not find the audited document", tt.pageURL)
+			}
+			cors := securityCORSCheck(scoped)
+			mixed := securityMixedContentCheck(securityProbe{Scheme: "https"}, scoped)
+			if cors.ID != "cors" || mixed.ID != "mixed_content" {
+				t.Fatalf("check ids = %q, %q; want cors, mixed_content", cors.ID, mixed.ID)
+			}
+			if cors.Evidence != tt.wantCORS {
+				t.Errorf("cors evidence = %q, want %q", cors.Evidence, tt.wantCORS)
+			}
+			if mixed.Evidence != tt.wantMixed {
+				t.Errorf("mixed_content evidence = %q, want %q", mixed.Evidence, tt.wantMixed)
+			}
+			for _, absent := range tt.wantAbsent {
+				if strings.Contains(cors.Evidence, absent) {
+					t.Errorf("cors evidence %q cites the previous document (%q)", cors.Evidence, absent)
+				}
+				if strings.Contains(mixed.Evidence, absent) {
+					t.Errorf("mixed_content evidence %q cites the previous document (%q)", mixed.Evidence, absent)
+				}
+			}
+			if cors2 := securityCORSCheck(scoped); !slices.Equal([]securityCheck{cors}, []securityCheck{cors2}) {
+				t.Error("two audits of the same ring produced different cors findings")
+			}
+		})
+	}
+}
+
+// TestSecurityAuditEmptyRingHasEmptyEvidence proves a ring with nothing for the
+// audited document yields empty evidence instead of an older page's request.
+func TestSecurityAuditEmptyRingHasEmptyEvidence(t *testing.T) {
+	tests := []struct {
+		name    string
+		pageURL string
+		ring    []browsers.NetworkEntry
+	}{
+		{name: "empty ring", pageURL: "https://new.test/"},
+		{
+			name:    "only an older document's requests",
+			pageURL: "https://new.test/",
+			ring: []browsers.NetworkEntry{
+				{Seq: 1, Method: "POST", Type: "Document", URL: "https://old.test/post"},
+				{Seq: 2, Type: "XHR", URL: "https://old.test/api", RespHeaders: securityCORSPair},
+				{Seq: 3, Type: "Image", URL: "http://old.test/favicon.ico"},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc, scoped, found := securityDocumentRing(tt.ring, tt.pageURL)
+			if found {
+				t.Fatalf("securityDocumentRing found a document for %q", tt.pageURL)
+			}
+			if doc.URL != "" || len(scoped) != 0 {
+				t.Fatalf("securityDocumentRing returned doc %q and %d scoped entries", doc.URL, len(scoped))
+			}
+			cors := securityCORSCheck(scoped)
+			mixed := securityMixedContentCheck(securityProbe{Scheme: "https"}, scoped)
+			if cors.Status != "info" {
+				t.Errorf("cors status = %q, want info", cors.Status)
+			}
+			if mixed.Status != "ok" {
+				t.Errorf("mixed_content status = %q, want ok", mixed.Status)
+			}
+			if cors.Evidence != "" || mixed.Evidence != "" {
+				t.Errorf("evidence = %q, %q; want empty", cors.Evidence, mixed.Evidence)
+			}
+		})
 	}
 }
