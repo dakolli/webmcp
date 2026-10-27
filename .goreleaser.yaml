@@ -1,0 +1,80 @@
+# GoReleaser v2 configuration for the canonical `browser` binary.
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - id: browser
+    main: ./cmd/browser
+    binary: browser
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -X webmcp/pkg/version.Version={{ .Version }}
+      - -X webmcp/pkg/version.Commit={{ .Commit }}
+      - -X webmcp/pkg/version.Date={{ .Date }}
+
+archives:
+  - id: browser
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: "browser_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs\\(skill\\)"
+      - "^Merge "
+      - "^Merge pull request"
+  groups:
+    - title: Features
+      regexp: "^feat(\\([^)]*\\))?!?:"
+      order: 0
+    - title: Bug fixes
+      regexp: "^fix(\\([^)]*\\))?!?:"
+      order: 1
+    - title: Performance
+      regexp: "^perf(\\([^)]*\\))?!?:"
+      order: 2
+    - title: Refactoring
+      regexp: "^refactor(\\([^)]*\\))?!?:"
+      order: 3
+    - title: Documentation
+      regexp: "^docs(\\([^)]*\\))?!?:"
+      order: 4
+    - title: Other
+      regexp: "^(chore|ci|build|test)(\\([^)]*\\))?!?:"
+      order: 5
+
+release:
+  draft: true
+  prerelease: auto
+  name_template: "v{{ .Version }}"
+
+snapshot:
+  name_template: "{{ incpatch .Version }}-next"
+
+announce:
+  skip: "true"

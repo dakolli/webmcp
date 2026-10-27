@@ -16,11 +16,10 @@ import (
 	"unicode/utf8"
 
 	"webmcp/pkg/browsers"
+	"webmcp/pkg/version"
 )
 
 const (
-	// pocBundleVersion is the web-mcp version written into meta.json.
-	pocBundleVersion = "0.1.0"
 	// pocFileMaxBytes caps every text artifact at 2 MB; the screenshot is the
 	// documented exception because image size scales with the viewport.
 	pocFileMaxBytes = 2 << 20
@@ -56,6 +55,16 @@ type PocBundleResult struct {
 	Files []PocFile `json:"files"`
 	// Omitted are the artifacts or values left out.
 	Omitted []PocOmission `json:"omitted"`
+}
+
+// pocVersion is the build identity written into a bundle: the stamped release
+// version, or version.String() for a dev build so evidence names the build
+// instead of claiming a release.
+func pocVersion() string {
+	if version.Version == "dev" {
+		return version.String()
+	}
+	return version.Version
 }
 
 // pocMeta is the meta.json document.
@@ -231,7 +240,7 @@ func bundlePoc(
 		Title:         title,
 		Timestamp:     stamp,
 		Finding:       finding,
-		WebMCPVersion: pocBundleVersion,
+		WebMCPVersion: pocVersion(),
 		SessionID:     src.sessionID(),
 	}, "", "  ")
 	if err != nil {
@@ -570,7 +579,7 @@ func pocReadme(finding, pageURL, stamp string, files []PocFile) []byte {
 	fmt.Fprintf(&b, "# %s\n\n", finding)
 	fmt.Fprintf(&b, "- URL: %s\n", pageURL)
 	fmt.Fprintf(&b, "- Captured: %s\n", stamp)
-	fmt.Fprintf(&b, "- web-mcp: %s\n\n", pocBundleVersion)
+	fmt.Fprintf(&b, "- web-mcp: %s\n\n", pocVersion())
 	b.WriteString("| File | Bytes |\n")
 	b.WriteString("| :--- | ---: |\n")
 	for _, f := range files {

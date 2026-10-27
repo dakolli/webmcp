@@ -8,6 +8,7 @@ ipc-guide.md
 /_trash
 lane-planning.md
 /_examples
+/.release/
 smoketest.md
 /docs
 # Browser profile runtime artifacts (profiles launched into the workspace root)

@@ -41,6 +41,7 @@ import (
 	"webmcp/pkg/cli/cmd"
 	"webmcp/pkg/config"
 	"webmcp/pkg/store"
+	"webmcp/pkg/version"
 )
 
 func main() {
@@ -66,6 +67,8 @@ func main() {
 	defer mgr.Shutdown(context.Background()) // graceful teardown (best-effort)
 
 	root := cmd.NewRootCmd(mgr)
+	root.Version = version.String()
+	root.SetVersionTemplate("{{.Version}}\n")
 	root.AddCommand(newStoreCmd())
 	if err := root.ExecuteContext(ctx); err != nil {
 		os.Exit(1)

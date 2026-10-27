@@ -11,11 +11,23 @@
 #               when nothing listens on PORT)
 # launch      — stop any running serve daemon, then start the MCP/SSE server
 #               daemonized on PORT (default 4089)
+# version     — print the latest release tag and the next patch/minor/major
+# notes       — group the commits since the last tag (or the whole history when
+#               there is none) into .release/notes.md
+# changelog   — append the same grouped content to .release/CHANGELOG-fragment.md
+# release-dry — build every release artifact locally (snapshot, no upload)
+# bump        — create the next annotated tag locally and print the push command
+# release     — build a DRAFT GitHub release; never pushes, never publishes
+# tools       — print the install commands for goreleaser and git-cliff
 
-.PHONY: test install install-dev schema launch stop guard-config
+.PHONY: test install install-dev schema launch stop guard-config \
+	version notes changelog release-dry bump release tools
 
 # PORT is the shared MCP/SSE port for launch and the install-dev relaunch.
 PORT ?= 4099
+
+# PART selects the version component bumped by the bump target.
+PART ?= patch
 
 # CONFIG_DIR is the browser-mcp config directory install-dev wipes. Every path
 # in that recipe is quoted and the recipe refuses to run when the directory is
@@ -91,3 +103,95 @@ fetch-example:
 	FILENAME=$$(basename "$$RAW_URL"); \
 	echo "Downloading $$FILENAME into ./examples/..."; \
 	curl -sSL "$$RAW_URL" -o "examples/$$FILENAME" && echo "Successfully saved examples/$$FILENAME"
+
+# version — print the latest tag and the next patch, minor and major versions.
+version:
+	@tag="$$(git describe --tags --abbrev=0 2>/dev/null || printf 'v0.0.0')"; \
+	version="$${tag#v}"; \
+	major="$${version%%.*}"; \
+	rest="$${version#*.}"; \
+	minor="$${rest%%.*}"; \
+	patch="$${rest#*.}"; \
+	printf 'latest: %s\n' "$$tag"; \
+	printf 'patch:  v%s.%s.%s\n' "$$major" "$$minor" "$$((patch + 1))"; \
+	printf 'minor:  v%s.%s.0\n' "$$major" "$$((minor + 1))"; \
+	printf 'major:  v%s.0.0\n' "$$((major + 1))"
+
+# notes — write .release/notes.md from the commits since the last tag, grouped by
+# prefix. With no tag yet the whole history is the first release.
+notes:
+	@set -eu; \
+	tag="$$(git describe --tags --abbrev=0 2>/dev/null || true)"; \
+	if [ -n "$$tag" ]; then \
+		range="$$tag..HEAD"; \
+	else \
+		range="HEAD"; \
+		printf '%s\n' "no previous tag: this covers the whole history"; \
+	fi; \
+	mkdir -p .release; \
+	{ \
+		printf '# Release notes\n\n## Summary\n\n## Highlights\n\n'; \
+		git log --no-merges --pretty=format:'%s' "$$range" | awk ' \
+			{ \
+				subject = $$0; \
+				prefix = subject; \
+				sub(/[(!:].*/, "", prefix); \
+				if (prefix == "docs" && subject ~ /^docs\(skill\)/) next; \
+				if (prefix == "feat") group = "Features"; \
+				else if (prefix == "fix") group = "Bug fixes"; \
+				else if (prefix == "perf") group = "Performance"; \
+				else if (prefix == "refactor") group = "Refactoring"; \
+				else if (prefix == "docs") group = "Documentation"; \
+				else group = "Other"; \
+				if (!(group in printed)) { if (started) print ""; print "## " group; printed[group] = 1; started = 1 } \
+				print "- " subject; \
+			}'; \
+	} > .release/notes.md; \
+	printf 'wrote %s\n' .release/notes.md
+
+# changelog — append the same grouped content to .release/CHANGELOG-fragment.md.
+changelog: notes
+	@cat .release/notes.md >> .release/CHANGELOG-fragment.md
+	@printf 'appended to %s\n' .release/CHANGELOG-fragment.md
+
+# release-dry — build every artifact locally with goreleaser --snapshot; uploads nothing.
+release-dry:
+	@if ! command -v goreleaser >/dev/null 2>&1; then \
+		echo "release-dry: goreleaser not found — install it with: go install github.com/goreleaser/goreleaser/v2@v2.19.0" >&2; \
+		exit 1; \
+	fi
+	goreleaser release --snapshot --clean
+
+# bump — create the next annotated tag locally and print the push command.
+bump:
+	@sh scripts/bump.sh "$(PART)"
+
+# release — build a DRAFT GitHub release for VERSION; it never git-pushes and never publishes.
+release:
+	@if [ -z "$(VERSION)" ]; then \
+		echo "release: VERSION is required, e.g. make release VERSION=v0.1.0" >&2; \
+		exit 1; \
+	fi
+	@if [ -n "$$(git status --porcelain)" ]; then \
+		echo "release: dirty working tree — commit or stash first" >&2; \
+		git status --short >&2; \
+		exit 1; \
+	fi
+	@if ! git rev-parse -q --verify "refs/tags/$(VERSION)" >/dev/null; then \
+		echo "release: tag $(VERSION) does not exist — run 'make bump PART=patch' and push that tag first" >&2; \
+		exit 1; \
+	fi
+	@if [ ! -f .release/notes.md ]; then \
+		echo "release: .release/notes.md is missing — run 'make notes' and fill in Summary/Highlights" >&2; \
+		exit 1; \
+	fi
+	@if ! command -v goreleaser >/dev/null 2>&1; then \
+		echo "release: goreleaser not found — install it with: go install github.com/goreleaser/goreleaser/v2@v2.19.0" >&2; \
+		exit 1; \
+	fi
+	goreleaser release --clean --release-notes .release/notes.md
+
+# tools — print the install commands for the release tools; installs nothing.
+tools:
+	@printf '%s\n' 'go install github.com/goreleaser/goreleaser/v2@v2.19.0'
+	@printf '%s\n' 'cargo install git-cliff --locked   # git-cliff is Rust: no go install line exists'
