@@ -311,6 +311,46 @@ func TestEncodeRingLoss(t *testing.T) {
 	}
 }
 
+// TestEncodeUsesSharedRedactionRule pins that the HAR export reads the one
+// sensitive-key set the network ring and replay use, so the three surfaces
+// cannot drift: every canonical sensitive header is replaced in both
+// directions, and a neighbouring name is not.
+func TestEncodeUsesSharedRedactionRule(t *testing.T) {
+	respHeaders := func(name string) map[string]string {
+		return map[string]string{name: "secret-value", "Content-Type": "text/plain"}
+	}
+	for _, name := range browsers.SensitiveHeaderNames() {
+		t.Run(name, func(t *testing.T) {
+			entries := []browsers.NetworkEntry{{
+				Method:      "GET",
+				URL:         "https://example.test/",
+				Status:      200,
+				ReqHeaders:  map[string]string{name: "secret-value"},
+				RespHeaders: respHeaders(name),
+			}}
+			raw, err := Encode(PageInfo{Title: "Rule"}, entries, Options{})
+			if err != nil {
+				t.Fatalf("Encode() error = %v", err)
+			}
+			var doc map[string]any
+			if err := json.Unmarshal(raw, &doc); err != nil {
+				t.Fatalf("HAR is not valid JSON: %v", err)
+			}
+			entry := firstObject(t, object(t, doc, "log"), "entries")
+			request := object(t, entry, "request")
+			response := object(t, entry, "response")
+			assertRedacted(t, array(t, request, "headers"), name)
+			assertRedacted(t, array(t, response, "headers"), name)
+			if got := headerValue(array(t, response, "headers"), "Content-Type"); got != "text/plain" {
+				t.Fatalf("Content-Type = %q, want text/plain", got)
+			}
+		})
+	}
+	if browsers.IsSensitiveHeader("content-type") {
+		t.Fatal("content-type must not be sensitive")
+	}
+}
+
 func object(t *testing.T, parent map[string]any, key string) map[string]any {
 	t.Helper()
 	v, ok := parent[key].(map[string]any)
@@ -348,8 +388,8 @@ func requireKey(t *testing.T, obj map[string]any, key string) {
 func assertRedacted(t *testing.T, headers []any, name string) {
 	t.Helper()
 	got := headerValue(headers, name)
-	if got != redactedValue {
-		t.Errorf("%s header = %q, want %q", name, got, redactedValue)
+	if got != browsers.RedactedValue {
+		t.Errorf("%s header = %q, want %q", name, got, browsers.RedactedValue)
 	}
 }
 

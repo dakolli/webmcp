@@ -9,11 +9,9 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/go-rod/rod/lib/proto"
@@ -111,8 +109,13 @@ type ReplayResult struct {
 	Bytes int64 `json:"bytes"`
 	// Truncated reports a payload cut at the requested cap.
 	Truncated bool `json:"truncated"`
-	// BodyRedactions counts the body values replaced with <redacted>.
+	// BodyRedactions counts every body value replaced with <redacted>,
+	// including occurrences inside escaped JSON strings.
 	BodyRedactions int `json:"body_redactions"`
+	// BodyRedactionUnreached names an escaped form the body scan could not
+	// reach. It is absent when every occurrence was handled. Base64 payloads
+	// are never scanned.
+	BodyRedactionUnreached []string `json:"body_redaction_unreached,omitempty"`
 	// BodyUncaptured reports that the captured entry retained no request body
 	// and the caller supplied none, so the replay sent no payload.
 	BodyUncaptured bool `json:"body_uncaptured,omitempty"`
@@ -582,9 +585,24 @@ func replayResult(
 		result.Chain = chain
 	}
 	if result.Body != "" {
-		result.Body, result.BodyRedactions = redactBody(result.Body, keep)
+		redacted := redactTextBody(result.Body, keep)
+		result.Body = redacted.Body
+		result.BodyRedactions = redacted.Count
+		result.BodyRedactionUnreached = redacted.Unreached
+		if int64(len(result.Body)) > limit {
+			result.Body = capReplayText(result.Body, limit)
+			result.Bytes = int64(len(result.Body))
+			result.Truncated = true
+		}
 	}
 	return result, nil
+}
+
+// capReplayText cuts s to limit bytes on a rune boundary, for a body that grew
+// past the cap while redaction rewrote a value.
+func capReplayText(s string, limit int64) string {
+	cut, _ := capReplayBody([]byte(s), limit)
+	return string(cut)
 }
 
 // replayBodyLimit resolves the body cap: zero or anything above the ceiling
@@ -595,106 +613,6 @@ func replayBodyLimit(requested int64) int64 {
 	}
 	return requested
 }
-
-// sensitiveBodySegments lists, lowercased, the key segments whose body values
-// are replaced with redactedValue. A key is split on non-alphanumeric runes, so
-// "sails.sid" matches "sid" while "consideration" does not.
-var sensitiveBodySegments = map[string]bool{
-	"cookie":        true,
-	"cookies":       true,
-	"authorization": true,
-	"auth":          true,
-	"token":         true,
-	"session":       true,
-	"sessionid":     true,
-	"sessionkey":    true,
-	"sid":           true,
-	"wmsession":     true,
-	"csrf":          true,
-	"csrftoken":     true,
-	"secret":        true,
-	"password":      true,
-	"passwd":        true,
-	"apikey":        true,
-}
-
-// Body redaction patterns: JSON string fields, header-like lines, key=value
-// pairs and auth credentials. They mirror the header redactor's key list and
-// add the session-id and bearer-token shapes a body carries.
-var (
-	bodyJSONPair   = regexp.MustCompile(`"([^"\\\r\n]{1,80})"\s*:\s*"((?:[^"\\]|\\.)*)"`)
-	bodyHeaderLine = regexp.MustCompile(`(?m)^[ \t]*([A-Za-z0-9_.\-]{1,80})[ \t]*:[ \t]*([^\r\n]+)$`)
-	bodyKeyValue   = regexp.MustCompile(`(?i)\b([A-Za-z0-9_.\-]{1,80})=([^&;,\s"']+)`)
-	bodyAuthToken  = regexp.MustCompile(`(?i)\b(Bearer|Basic)(\s+)([A-Za-z0-9._~+/=\-]{4,1000})`)
-)
-
-// redactBody replaces sensitive values in a text body while keeping their keys.
-// It reports how many values it replaced. keep skips redaction entirely.
-func redactBody(body string, keep bool) (string, int) {
-	if keep || body == "" {
-		return body, 0
-	}
-	count := 0
-	body = redactBodyMatches(body, bodyJSONPair, 1, 2, isSensitiveBodyKey, &count)
-	body = redactBodyMatches(body, bodyHeaderLine, 1, 2, isSensitiveBodyKey, &count)
-	body = redactBodyMatches(body, bodyKeyValue, 1, 2, isSensitiveBodyKey, &count)
-	body = redactBodyMatches(body, bodyAuthToken, 1, 3, alwaysSensitive, &count)
-	return body, count
-}
-
-// redactBodyMatches rewrites every match whose key group is sensitive, keeping
-// the text before and after the value group intact.
-func redactBodyMatches(
-	s string,
-	re *regexp.Regexp,
-	keyGroup, valueGroup int,
-	sensitive func(string) bool,
-	count *int,
-) string {
-	locs := re.FindAllStringSubmatchIndex(s, -1)
-	if len(locs) == 0 {
-		return s
-	}
-	var b strings.Builder
-	b.Grow(len(s))
-	last := 0
-	for _, loc := range locs {
-		b.WriteString(s[last:loc[0]])
-		key := s[loc[2*keyGroup]:loc[2*keyGroup+1]]
-		if sensitive(key) {
-			vStart, vEnd := loc[2*valueGroup], loc[2*valueGroup+1]
-			b.WriteString(s[loc[0]:vStart])
-			b.WriteString(redactedValue)
-			b.WriteString(s[vEnd:loc[1]])
-			*count += 1
-		} else {
-			b.WriteString(s[loc[0]:loc[1]])
-		}
-		last = loc[1]
-	}
-	b.WriteString(s[last:])
-	return b.String()
-}
-
-// isSensitiveBodyKey reports whether a body key holds a secret, comparing whole
-// segments so a substring such as "sid" inside "consideration" never matches.
-func isSensitiveBodyKey(key string) bool {
-	k := strings.ToLower(strings.TrimSpace(strings.Trim(key, `"';`)))
-	if sensitiveHeaders[k] {
-		return true
-	}
-	for _, seg := range strings.FieldsFunc(k, func(r rune) bool {
-		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
-	}) {
-		if sensitiveBodySegments[seg] {
-			return true
-		}
-	}
-	return false
-}
-
-// alwaysSensitive marks an auth credential value for redaction.
-func alwaysSensitive(string) bool { return true }
 
 // isReplayRedirect reports whether status is a redirect a replay follows.
 func isReplayRedirect(status int) bool {

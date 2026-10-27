@@ -91,3 +91,56 @@ func TestBuildNetworkBodyCap(t *testing.T) {
 		}
 	})
 }
+
+// TestSensitiveHeaderRuleIsShared pins that the network ring's header
+// redactor and the exported rule the HAR export reads are one list, so a
+// header cannot be sensitive on one surface and leak on another.
+func TestSensitiveHeaderRuleIsShared(t *testing.T) {
+	headers := proto.NetworkHeaders{"Content-Type": gson.New("text/plain")}
+	for _, name := range SensitiveHeaderNames() {
+		headers[name] = gson.New("secret-value")
+		if !IsSensitiveHeader(strings.ToUpper(name)) {
+			t.Fatalf("IsSensitiveHeader(%q) = false, want true", name)
+		}
+	}
+	got, _ := redactHeaders(headers, false)
+	for _, name := range SensitiveHeaderNames() {
+		if got[name] != RedactedValue {
+			t.Fatalf("%s = %q, want %q", name, got[name], RedactedValue)
+		}
+	}
+	if got["Content-Type"] != "text/plain" {
+		t.Fatalf("Content-Type = %q, want it untouched", got["Content-Type"])
+	}
+}
+
+// TestRedactTextBodyReportsUnreachedDepth pins that an escape layer beyond the
+// scan bound is stated rather than silently reported as a clean body.
+func TestRedactTextBodyReportsUnreachedDepth(t *testing.T) {
+	body := `{"token":"tok-cli-999"}`
+	for range bodyRedactionMaxDepth + 1 {
+		body = `{"data":` + encodeJSONString(body) + `}`
+	}
+	got := redactTextBody(body, false)
+	for _, name := range got.Unreached {
+		if name == "escaped-json-depth" {
+			return
+		}
+	}
+	t.Fatalf("Unreached = %v, want escaped-json-depth", got.Unreached)
+}
+
+// TestRedactTextBodyReportsNonStringSecret pins that a sensitive key holding a
+// number is stated as unreached rather than counted as a clean body.
+func TestRedactTextBodyReportsNonStringSecret(t *testing.T) {
+	got := redactTextBody(`{"token":123456}`, false)
+	if got.Body != `{"token":123456}` {
+		t.Fatalf("Body = %q, want the value left intact", got.Body)
+	}
+	for _, name := range got.Unreached {
+		if name == "non-string-json-value" {
+			return
+		}
+	}
+	t.Fatalf("Unreached = %v, want non-string-json-value", got.Unreached)
+}

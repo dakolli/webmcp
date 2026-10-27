@@ -318,6 +318,36 @@ func TestRedactBody(t *testing.T) {
 			want:      `{"consideration":"none","url":"https://example.com/a?x=1"}`,
 			wantCount: 0,
 		},
+		{
+			name:      "repeated top-level key is redacted at every occurrence",
+			body:      `{"token":"first-token","token":"second-token"}`,
+			want:      `{"token":"<redacted>","token":"<redacted>"}`,
+			wantCount: 2,
+		},
+		{
+			name:      "escaped nested copy is redacted too",
+			body:      `{"a":1,"token":"tok-cli-999","data":"{\"a\":1,\"token\":\"tok-cli-999\"}"}`,
+			want:      `{"a":1,"token":"<redacted>","data":"{\"a\":1,\"token\":\"<redacted>\"}"}`,
+			wantCount: 2,
+		},
+		{
+			name:      "double-escaped nested copy is redacted",
+			body:      `{"outer":"{\"inner\":\"{\\\"token\\\":\\\"tok-cli-999\\\"}\"}"}`,
+			want:      `{"outer":"{\"inner\":\"{\\\"token\\\":\\\"<redacted>\\\"}\"}"}`,
+			wantCount: 1,
+		},
+		{
+			name:      "escaped non-secret JSON is untouched",
+			body:      `{"data":"{\"a\":1,\"ok\":true}"}`,
+			want:      `{"data":"{\"a\":1,\"ok\":true}"}`,
+			wantCount: 0,
+		},
+		{
+			name:      "an already-marked value is not counted twice",
+			body:      `{"token":"<redacted>"}`,
+			want:      `{"token":"<redacted>"}`,
+			wantCount: 0,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -329,6 +359,97 @@ func TestRedactBody(t *testing.T) {
 				t.Fatalf("redactBody() count = %d, want %d", count, tt.wantCount)
 			}
 		})
+	}
+}
+
+// TestRedactBodyPreservesJSONValidity pins that reaching an escaped nested
+// secret rewrites only the secret: the result still parses and no proof token
+// survives at any depth.
+func TestRedactBodyPreservesJSONValidity(t *testing.T) {
+	bodies := []string{
+		`{"a":1,"token":"tok-cli-999","data":"{\"a\":1,\"token\":\"tok-cli-999\"}"}`,
+		`{"token":"first-token","token":"second-token"}`,
+		`{"outer":"{\"inner\":\"{\\\"token\\\":\\\"tok-cli-999\\\"}\"}"}`,
+		`{"data":"{\"a\":1}"}`,
+	}
+	for _, body := range bodies {
+		got, _ := redactBody(body, false)
+		if !json.Valid([]byte(got)) {
+			t.Errorf("redactBody(%q) produced invalid JSON: %q", body, got)
+		}
+		var doc map[string]any
+		if err := json.Unmarshal([]byte(got), &doc); err != nil {
+			t.Errorf("redactBody(%q) result does not decode: %v", body, err)
+		}
+		if strings.Contains(got, "tok-cli-999") || strings.Contains(got, "first-token") || strings.Contains(got, "second-token") {
+			t.Errorf("redactBody(%q) leaked a token: %q", body, got)
+		}
+	}
+}
+
+// TestReplayResultRedactsEscapedNestedBody pins the live proof case at the
+// envelope: the top-level and escaped copies are both replaced and the counter
+// reports both, so a clean count never hides a skipped occurrence.
+func TestReplayResultRedactsEscapedNestedBody(t *testing.T) {
+	const body = `{"a":1,"token":"tok-cli-999","data":"{\"a\":1,\"token\":\"tok-cli-999\"}"}`
+	resp := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+	got, err := replayResult(
+		resp,
+		[]ReplayHop{{Status: 200, URL: "https://example.test/"}},
+		ReplaySent{Method: "POST", URL: "https://example.test/"},
+		false,
+		time.Now(),
+		replayBodyCap,
+	)
+	if err != nil {
+		t.Fatalf("replayResult() error = %v", err)
+	}
+	if strings.Contains(got.Body, "tok-cli-999") {
+		t.Fatalf("replayResult() body leaks the escaped copy: %q", got.Body)
+	}
+	if got.BodyRedactions != 2 {
+		t.Fatalf("replayResult() body_redactions = %d, want 2", got.BodyRedactions)
+	}
+	if len(got.BodyRedactionUnreached) != 0 {
+		t.Fatalf("replayResult() unreached = %v, want none", got.BodyRedactionUnreached)
+	}
+	if !json.Valid([]byte(got.Body)) {
+		t.Fatalf("replayResult() body is not valid JSON: %q", got.Body)
+	}
+}
+
+// TestReplayResultCapsRedactionGrowth pins that replacing short secrets with
+// the marker never returns more bytes than the requested cap.
+func TestReplayResultCapsRedactionGrowth(t *testing.T) {
+	const limit = 48
+	const body = `{"token":"a","token":"b","token":"c","token":"d","token":"e"}`
+	resp := &http.Response{
+		StatusCode: 200,
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+	got, err := replayResult(
+		resp,
+		nil,
+		ReplaySent{Method: "GET", URL: "https://example.test/"},
+		false,
+		time.Now(),
+		limit,
+	)
+	if err != nil {
+		t.Fatalf("replayResult() error = %v", err)
+	}
+	if int64(len(got.Body)) > limit {
+		t.Fatalf("replayResult() body is %d bytes, want <= %d", len(got.Body), limit)
+	}
+	if !got.Truncated {
+		t.Fatal("replayResult() truncated = false, want true after the cap")
+	}
+	if got.BodyRedactions == 0 {
+		t.Fatal("replayResult() body_redactions = 0, want the repeated secrets replaced")
 	}
 }
 

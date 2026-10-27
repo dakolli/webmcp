@@ -20,22 +20,9 @@ const (
 	// DefaultMaxBytes caps one HAR export at 512 KB. The oldest entries are
 	// dropped first until the encoded document fits.
 	DefaultMaxBytes = 512 << 10
-	// redactedValue replaces a sensitive header value in the export.
-	redactedValue = "<redacted>"
 	// pageID is the single page ref this export describes.
 	pageID = "page_1"
 )
-
-// sensitiveHeaders lists, lowercased, the header names whose values are
-// replaced. Cookie and Set-Cookie are absent from CDP events, so they never
-// reach this exporter; they stay listed only as a defensive backstop.
-// Authorization and X-CSRF-Token are the values this exporter actually replaces.
-var sensitiveHeaders = map[string]bool{
-	"cookie":        true,
-	"set-cookie":    true,
-	"authorization": true,
-	"x-csrf-token":  true,
-}
 
 // PageInfo identifies the page an export describes.
 type PageInfo struct {
@@ -358,8 +345,8 @@ func headerList(headers map[string]string) []Header {
 	out := make([]Header, 0, len(keys))
 	for _, k := range keys {
 		v := headers[k]
-		if sensitiveHeaders[strings.ToLower(k)] {
-			v = redactedValue
+		if browsers.IsSensitiveHeader(k) {
+			v = browsers.RedactedValue
 		}
 		out = append(out, Header{Name: k, Value: v})
 	}
