@@ -41,6 +41,7 @@ var actionVocab = map[string]bool{
 	"clear_logs": true, "sinks_install": true, "sinks_clear": true,
 	"replay": true, "inject_canary": true, "postmessage_install": true,
 	"postmessage_clear": true, "post_message": true, "wait_open": true,
+	"auth_save": true, "auth_restore": true, "auth_list": true,
 }
 
 // actPayloadSpecs maps each page act action to its positional payload slots,
@@ -79,6 +80,9 @@ var actPayloadSpecs = map[string][]string{
 	"postmessage_clear":   {},
 	"post_message":        {"value"},
 	"wait_open":           {},
+	"auth_save":           {"site", "name"},
+	"auth_restore":        {"site", "name"},
+	"auth_list":           {"site"},
 }
 
 // resolvePageID resolves a user-supplied page id (possibly empty) to a live
@@ -489,6 +493,8 @@ type actArgFlags struct {
 	target         string
 	method         string
 	headers        []string
+	site           string
+	name           string
 	x              float64
 	y              float64
 	targetX        float64
@@ -500,6 +506,7 @@ type actArgFlags struct {
 	targets        []string
 	maxBytes       int64
 	valueSet       bool
+	force          bool
 }
 
 // actArgs is the merged result of `page act` parsing: the effective
@@ -520,6 +527,8 @@ type actArgs struct {
 	target         string
 	method         string
 	headers        []string
+	site           string
+	name           string
 	x              float64
 	y              float64
 	targetX        float64
@@ -531,6 +540,7 @@ type actArgs struct {
 	targets        []string
 	maxBytes       int64
 	valueSet       bool
+	force          bool
 }
 
 // parseActArgs parses `page act` positional args against the flag values and
@@ -686,6 +696,17 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 		if len(payload) >= 1 {
 			a.value = payload[0]
 		}
+	case "auth_save", "auth_restore":
+		if len(payload) >= 1 {
+			a.site = payload[0]
+		}
+		if len(payload) >= 2 {
+			a.name = payload[1]
+		}
+	case "auth_list":
+		if len(payload) >= 1 {
+			a.site = payload[0]
+		}
 	}
 
 	// Merge the flags in: positionals win; flags are the fallback.
@@ -746,6 +767,13 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 	if a.device == "" {
 		a.device = f.device
 	}
+	if a.site == "" {
+		a.site = f.site
+	}
+	if a.name == "" {
+		a.name = f.name
+	}
+	a.force = a.force || f.force
 	if !xSet {
 		a.x = f.x
 	}

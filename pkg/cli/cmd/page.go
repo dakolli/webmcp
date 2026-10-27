@@ -63,7 +63,8 @@ resolve only against that browser and an unknown id fails with the live ids.
 Subcommands:
   list   List the browser's open pages (id, url)
   fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, console, body, article, tables, forms, marks, security, storage, sinks, postmessage, har); a URL opens a new page first
-  act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, inject_canary, wait_open)
+  act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, inject_canary, wait_open, auth_save, auth_restore, auth_list)
+  auth   Save, restore or list named auth snapshots (counts only, never values)
   close  Close an open page
 
 Run a subcommand with --help for its flags and examples.`,
@@ -77,6 +78,7 @@ Run a subcommand with --help for its flags and examples.`,
 		newPageListCmd(mgr),
 		newPageFetchCmd(mgr),
 		newPageActCmd(mgr),
+		newPageAuthCmd(mgr),
 		newPageCloseCmd(mgr),
 	)
 	return cmd
@@ -419,6 +421,9 @@ func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 		target         string
 		method         string
 		headers        []string
+		site           string
+		name           string
+		force          bool
 		maxBytes       int64
 	)
 	cmd := &cobra.Command{
@@ -502,7 +507,17 @@ a unique substring of its request URL (read the ring with
 the captured method, headers and body, and an omitted --value keeps the captured
 body. The result is the same compact JSON the MCP page_act replay action returns
 ({status, headers, body|base64, bytes, truncated, body_redactions, ms, request,
-chain}) with sensitive headers redacted and the body capped at 256 KB.`,
+chain}) with sensitive headers redacted and the body capped at 256 KB.
+auth_save captures the live page's cookies for --site plus local storage, session
+storage and IndexedDB database/store names, and persists them under --name; it
+returns counts only and never prints a cookie or storage value. Snapshots are
+stored unencrypted in the local 0600 state database, so treat that file as a
+credential. auth_restore writes the named snapshot into the page's browser
+context; a stored user agent that differs from the live page is refused with
+both agents named unless --force is set. Restoring into a fresh identity writes
+only that identity's browser context. auth_list lists saved snapshots as
+{site,name,cookie_count,origin_count,user_agent,updated_at} with no values, and
+needs no page.`,
 		Example: `  web-cli page act click "#submit"                          # click on the single open page
   web-cli page act 12 input "#search" "pizza"               # type into a search box
   web-cli page act 12 press_key "Enter"                     # press Enter key
@@ -530,6 +545,7 @@ chain}) with sensitive headers redacted and the body capped at 256 KB.`,
 				paths: paths, targets: targets, waitMode: waitMode, device: device, x: x, y: y,
 				targetX: targetX, targetY: targetY, width: width, height: height,
 				target: target, method: method, headers: headers, maxBytes: maxBytes,
+				site: site, name: name, force: force,
 				valueSet: cmd.Flags().Changed("value"),
 			})
 			if err != nil {
@@ -542,6 +558,7 @@ chain}) with sensitive headers redacted and the body capped at 256 KB.`,
 			x, y, targetX, targetY = parsed.x, parsed.y, parsed.targetX, parsed.targetY
 			width, height = parsed.width, parsed.height
 			target, method, headers, maxBytes = parsed.target, parsed.method, parsed.headers, parsed.maxBytes
+			site, name, force = parsed.site, parsed.name, parsed.force
 			valueSet := parsed.valueSet
 
 			// Enforce an explicit per-call timeout so a wedged page (or a
@@ -589,9 +606,30 @@ chain}) with sensitive headers redacted and the body capped at 256 KB.`,
 					return fmt.Errorf("page act: replay max_bytes must be >= 0")
 				}
 			}
+			if action == "auth_save" || action == "auth_restore" {
+				if site == "" {
+					return fmt.Errorf("page act: %s requires site (the host, e.g. example.org)", action)
+				}
+				if name == "" {
+					return fmt.Errorf("page act: %s requires name (the snapshot name, e.g. main)", action)
+				}
+			}
 			headerMap, err := parseHeaderFlags(headers)
 			if err != nil {
 				return fmt.Errorf("page act: %w", err)
+			}
+
+			if action == "auth_list" {
+				if cl := dialServe(cmd); cl != nil {
+					defer cl.Close()
+					return pageActViaIPC(ctx, cl, &ipc.PageActParams{Action: action, Site: site})
+				}
+				out, err := pageops.PageAuthList(ctx, site)
+				if err != nil {
+					return fmt.Errorf("page act: %w", err)
+				}
+				fmt.Println(out)
+				return nil
 			}
 
 			var vp *browsers.Viewport
@@ -637,6 +675,9 @@ chain}) with sensitive headers redacted and the body capped at 256 KB.`,
 					Target:         target,
 					Method:         method,
 					Headers:        headerMap,
+					Site:           site,
+					Name:           name,
+					Force:          force,
 					MaxBytes:       maxBytes,
 					Paths:          paths,
 					Targets:        targets,
@@ -747,6 +788,10 @@ chain}) with sensitive headers redacted and the body capped at 256 KB.`,
 					data, err = json.Marshal(popup)
 					out = string(data)
 				}
+			case "auth_save":
+				out, err = pageops.PageAuthSave(ctx, p, site, name)
+			case "auth_restore":
+				out, err = pageops.PageAuthRestore(ctx, p, site, name, force)
 			}
 			if err != nil {
 				return fmt.Errorf("page act: %w", err)
@@ -760,7 +805,7 @@ chain}) with sensitive headers redacted and the body capped at 256 KB.`,
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to act on (optional with one page open; 'last'; or a bare number)")
-	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, inject_canary, postmessage_install, postmessage_clear, post_message, wait_open")
+	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, inject_canary, postmessage_install, postmessage_clear, post_message, wait_open, auth_save, auth_restore, auth_list")
 	cmd.Flags().StringVar(&selector, "selector", "", "CSS selector targeting the element (element actions)")
 	cmd.Flags().StringVar(&handle, "handle", "", "element handle from page fetch (g<document>-b<backendNodeId>, scoped to its document); wins over --selector (element actions)")
 	cmd.Flags().StringVar(&value, "value", "", "value for eval (JS function), input (text), type (text), navigate (URL), select (option value), or inject_canary (custom canary)")
@@ -786,7 +831,184 @@ chain}) with sensitive headers redacted and the body capped at 256 KB.`,
 	cmd.Flags().IntVar(&width, "width", 0, "target viewport width in CSS pixels (set_viewport action)")
 	cmd.Flags().IntVar(&height, "height", 0, "target viewport height in CSS pixels (set_viewport action)")
 	cmd.Flags().StringVar(&device, "device", "", "go-rod device preset to apply (emulate action), e.g. IPhoneX, IPadPro")
+	cmd.Flags().StringVar(&site, "site", "", "auth snapshot site/host, e.g. example.org (auth_save, auth_restore; optional filter for auth_list)")
+	cmd.Flags().StringVar(&name, "name", "", "auth snapshot name, unique per site (auth_save, auth_restore)")
+	cmd.Flags().BoolVar(&force, "force", false, "auth_restore: restore even when the live page user agent differs from the stored one")
 	return cmd
+}
+
+// newPageAuthCmd builds the `page auth` tree — save, restore and list — over
+// named auth snapshots. Every subcommand reuses the page act auth_save /
+// auth_restore / auth_list implementation, so the CLI, MCP and IPC surfaces
+// print byte-identical results.
+func newPageAuthCmd(mgr *browsers.Manager) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "auth",
+		Short: "Save and restore named auth snapshots",
+		Long: `Saves and restores a session's auth state under a name, in the local state
+database. A snapshot holds cookies for one host set plus local storage, session
+storage and IndexedDB database/store names, and survives a daemon restart.
+
+Snapshots are stored unencrypted in a 0600 database, so treat that file as a
+credential; no result, error or log line prints a cookie or storage value.
+auth_restore writes cookies first and then storage for the live origin; a
+stored user agent that differs from the live page is refused with both agents
+named unless --force is set. Restoring into a fresh identity never touches the
+other identities.
+
+  save <site> <name>     capture the single open page's auth state
+  restore <site> <name>  write the snapshot into the single open page
+  list [site]            list saved snapshots (counts only, never values)`,
+		Example: `  browser page auth save example.org main
+  browser page auth list
+  browser page auth restore example.org main
+  browser page auth restore example.org main --force`,
+	}
+	cmd.AddCommand(
+		newPageAuthSaveCmd(mgr),
+		newPageAuthRestoreCmd(mgr),
+		newPageAuthListCmd(),
+	)
+	return cmd
+}
+
+// newPageAuthSaveCmd builds `page auth save <site> <name>`.
+func newPageAuthSaveCmd(mgr *browsers.Manager) *cobra.Command {
+	var (
+		id        string
+		browserID string
+		owner     string
+	)
+	cmd := &cobra.Command{
+		Use:   "save <site> <name>",
+		Short: "Capture the open page's auth state under a name",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runPageAuth(cmd, mgr, "auth_save", args[0], args[1], false, id, browserID, owner)
+		},
+	}
+	cmd.Flags().StringVar(&id, "id", "", "page/session id (optional with one page open; 'last'; or a bare number)")
+	cmd.Flags().StringVar(&browserID, "browser", "", "browser_id to resolve the page inside that browser only")
+	cmd.Flags().StringVar(&owner, "owner", "", "owner label restricting the lookup to browsers with that owner")
+	return cmd
+}
+
+// newPageAuthRestoreCmd builds `page auth restore <site> <name>`.
+func newPageAuthRestoreCmd(mgr *browsers.Manager) *cobra.Command {
+	var (
+		id        string
+		browserID string
+		owner     string
+		force     bool
+	)
+	cmd := &cobra.Command{
+		Use:   "restore <site> <name>",
+		Short: "Write a saved auth snapshot into the open page",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runPageAuth(cmd, mgr, "auth_restore", args[0], args[1], force, id, browserID, owner)
+		},
+	}
+	cmd.Flags().StringVar(&id, "id", "", "page/session id (optional with one page open; 'last'; or a bare number)")
+	cmd.Flags().StringVar(&browserID, "browser", "", "browser_id to resolve the page inside that browser only")
+	cmd.Flags().StringVar(&owner, "owner", "", "owner label restricting the lookup to browsers with that owner")
+	cmd.Flags().BoolVar(&force, "force", false, "restore even when the live page user agent differs from the stored one")
+	return cmd
+}
+
+// newPageAuthListCmd builds `page auth list [site]`.
+func newPageAuthListCmd() *cobra.Command {
+	var site string
+	cmd := &cobra.Command{
+		Use:   "list [site]",
+		Short: "List saved auth snapshots (counts only)",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 1 {
+				site = args[0]
+			}
+			ctx, cancel := context.WithTimeout(cmdCtx(cmd), defaultCmdTimeout)
+			defer cancel()
+			if cl := dialServe(cmd); cl != nil {
+				defer cl.Close()
+				return pageActViaIPC(ctx, cl, &ipc.PageActParams{Action: "auth_list", Site: site})
+			}
+			out, err := pageops.PageAuthList(ctx, site)
+			if err != nil {
+				return fmt.Errorf("page auth: %w", err)
+			}
+			fmt.Println(out)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&site, "site", "", "optional site/host filter")
+	return cmd
+}
+
+// runPageAuth resolves one live page and runs an auth save or restore through
+// the daemon when one is reachable, else in-process.
+func runPageAuth(
+	cmd *cobra.Command,
+	mgr *browsers.Manager,
+	action, site, name string,
+	force bool,
+	id, browserID, owner string,
+) error {
+	ctx, cancel := context.WithTimeout(cmdCtx(cmd), defaultCmdTimeout)
+	defer cancel()
+	if browserID == "" {
+		browserID = explicitBrowserID(cmd)
+	}
+	normalized, err := ipc.NormalizeOwner(owner)
+	if err != nil {
+		return fmt.Errorf("page auth: %w", err)
+	}
+	owner = normalized
+	if owner != "" {
+		ctx = browsers.WithExplicitOwner(ctx, owner)
+	}
+	if cl := dialServe(cmd); cl != nil {
+		defer cl.Close()
+		rid, err := resolvePageID(ctx, mgr, cl, browserID, owner, id, "page auth")
+		if err != nil {
+			return err
+		}
+		return pageActViaIPC(ctx, cl, &ipc.PageActParams{
+			SessionID: rid,
+			BrowserID: browserID,
+			Owner:     owner,
+			Action:    action,
+			Site:      site,
+			Name:      name,
+			Force:     force,
+		})
+	}
+	printServeHint(cmd)
+	rid, err := resolvePageID(ctx, mgr, nil, browserID, owner, id, "page auth")
+	if err != nil {
+		return err
+	}
+	p, err := mgr.Page(
+		ctx,
+		browsers.PageID(rid),
+		browsers.BrowserID(browserID),
+		owner,
+	)
+	if err != nil {
+		return fmt.Errorf("page auth: %w", err)
+	}
+	var out string
+	switch action {
+	case "auth_save":
+		out, err = pageops.PageAuthSave(ctx, p, site, name)
+	case "auth_restore":
+		out, err = pageops.PageAuthRestore(ctx, p, site, name, force)
+	}
+	if err != nil {
+		return fmt.Errorf("page auth: %w", err)
+	}
+	fmt.Println(out)
+	return nil
 }
 
 // newPageCloseCmd builds `page close`: it resolves the page with the same

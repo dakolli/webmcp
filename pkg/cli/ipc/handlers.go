@@ -499,9 +499,6 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 	if rpcErr != nil {
 		return nil, rpcErr
 	}
-	if p.SessionID == "" {
-		return nil, &Error{Code: CodeInvalidParams, Message: `page.act: missing required param "session_id"`}
-	}
 	if p.Action == "" {
 		return nil, &Error{Code: CodeInvalidParams, Message: `page.act: missing required param "action"`}
 	}
@@ -510,6 +507,30 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 			Code:    CodeInvalidParams,
 			Message: fmt.Sprintf("page.act: unknown action=%q (must be one of %s)", p.Action, PageActActionList()),
 		}
+	}
+	if p.Action == "auth_save" || p.Action == "auth_restore" {
+		if p.Site == "" {
+			return nil, &Error{
+				Code:    CodeInvalidParams,
+				Message: fmt.Sprintf("page.act: %s requires site (the host, e.g. example.org)", p.Action),
+			}
+		}
+		if p.Name == "" {
+			return nil, &Error{
+				Code:    CodeInvalidParams,
+				Message: fmt.Sprintf("page.act: %s requires name (the snapshot name, e.g. main)", p.Action),
+			}
+		}
+	}
+	if p.Action == "auth_list" {
+		out, err := pageops.PageAuthList(ctx, p.Site)
+		if err != nil {
+			return nil, serverError(err)
+		}
+		return PageActResult{Data: out}, nil
+	}
+	if p.SessionID == "" {
+		return nil, &Error{Code: CodeInvalidParams, Message: `page.act: missing required param "session_id"`}
 	}
 	if p.Action == "eval" && p.Value == "" {
 		return nil, &Error{
@@ -664,6 +685,10 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 			data, err = json.Marshal(popup)
 			out = string(data)
 		}
+	case "auth_save":
+		out, err = pageops.PageAuthSave(ctx, page, p.Site, p.Name)
+	case "auth_restore":
+		out, err = pageops.PageAuthRestore(ctx, page, p.Site, p.Name, p.Force)
 	}
 	if err != nil {
 		return nil, serverError(err)

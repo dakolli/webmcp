@@ -75,7 +75,7 @@ var pageActActions = []string{
 	"wait", "set_viewport", "emulate", "clear_logs",
 	"sinks_install", "sinks_clear", "replay", "inject_canary",
 	"postmessage_install", "postmessage_clear", "post_message",
-	"wait_open",
+	"wait_open", "auth_save", "auth_restore", "auth_list",
 }
 
 // ValidPageActAction reports whether action is a supported page.act action.
@@ -358,7 +358,7 @@ type PageFetchResult struct {
 // press_key|click_at|hover_at|drag_and_drop|upload_file|eval|navigate|back|
 // forward|reload|hover|scroll|select|wait|set_viewport|emulate|clear_logs|
 // sinks_install|sinks_clear|replay|inject_canary|postmessage_install|postmessage_clear|
-// post_message; selector/handle/value/key/button/click_count/x/y/
+// post_message|auth_save|auth_restore|auth_list; selector/handle/value/key/button/click_count/x/y/
 // target_x/target_y/target_selector/origin/paths/targets are the per-action
 // payloads (handle wins over selector for element actions); viewport carries the
 // target size for set_viewport and device the preset for emulate; timeout_ms
@@ -452,6 +452,12 @@ type PageActParams struct {
 	// Device is the go-rod device preset for the emulate action (required when
 	// action is "emulate").
 	Device string `json:"device,omitempty"`
+	// Site scopes auth_save/auth_restore and optionally filters auth_list.
+	Site string `json:"site,omitempty"`
+	// Name is the snapshot name for auth_save/auth_restore.
+	Name string `json:"name,omitempty"`
+	// Force lets auth_restore proceed across a user-agent mismatch.
+	Force bool `json:"force,omitempty"`
 }
 
 // PageActResult is the result of page.act.

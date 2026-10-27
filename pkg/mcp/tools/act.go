@@ -31,6 +31,7 @@ var actActionNames = []string{
 	"sinks_install", "sinks_clear", "replay", "inject_canary",
 	"postmessage_install", "postmessage_clear", "post_message",
 	"wait_open", "intercept_add", "intercept_list", "intercept_clear",
+	"auth_save", "auth_restore", "auth_list",
 }
 
 // actActionList renders actActionNames for an error message.
@@ -107,6 +108,18 @@ func (t *Act) Description() string {
 		"intercept_list (returns the page's rules with sensitive header values redacted), or " +
 		"intercept_clear (remove every rule, continue any paused request and disable " +
 		"interception; rules never outlive the page). " +
+		"auth_save (capture the live page's cookies for site, plus local storage, session " +
+		"storage and IndexedDB database/store names, and persist them under name; needs " +
+		"session_id, site and name; returns counts only — no cookie or storage value is ever " +
+		"printed; snapshots are stored unencrypted at rest in the local 0600 state database, " +
+		"so treat that file as a credential), " +
+		"auth_restore (write the named snapshot into the page's browser context — cookies " +
+		"first, then storage for the live origin; needs site and name; a stored user agent " +
+		"that differs from the live page is refused with both agents named unless force=true; " +
+		"restoring into a fresh identity writes only that identity's browser context), or " +
+		"auth_list (list saved snapshots as {site,name,cookie_count,origin_count,user_agent," +
+		"updated_at} with no values; site is an optional filter and the call does not use " +
+		"session_id, so a stale id is harmless). " +
 		"Pass session_id plus action=... and any required parameters. When more than " +
 		"one browser is live, pass browser_id or owner to declare which browser holds " +
 		"the session; with one live browser both may be omitted, and a session held " +
@@ -255,6 +268,23 @@ func (t *Act) InputSchema() models.InputSchema {
 				"type":        "string",
 				"description": "Go-rod device preset name for emulate action (e.g. IPhoneX, IPadPro, LaptopWithHiDPIScreen; 'clear' resets).",
 			},
+			"site": map[string]any{
+				"type": "string",
+				"description": "Host the auth snapshot is scoped to, e.g. example.org (required by auth_save " +
+					"and auth_restore, optional filter for auth_list). Accepts a bare host or a URL; only " +
+					"cookies whose domain matches the host are captured, and a cookie is never broadened to " +
+					"a parent domain on restore.",
+			},
+			"name": map[string]any{
+				"type":        "string",
+				"description": "Snapshot name, unique per site (required by auth_save and auth_restore; a second save with the same site and name updates it instead of duplicating).",
+			},
+			"force": map[string]any{
+				"type":    "boolean",
+				"default": false,
+				"description": "auth_restore only: restore even when the live page user agent differs from " +
+					"the stored one. Without it the restore is refused and both agents are named.",
+			},
 			"rules": map[string]any{
 				"type":     "array",
 				"maxItems": 50,
@@ -339,6 +369,9 @@ type actArgs struct {
 	WaitMode       string                   `json:"wait_mode"`
 	Viewport       *browsers.Viewport       `json:"viewport"`
 	Device         string                   `json:"device"`
+	Site           string                   `json:"site"`
+	Name           string                   `json:"name"`
+	Force          bool                     `json:"force"`
 	Rules          []browsers.InterceptRule `json:"rules"`
 }
 
@@ -381,6 +414,13 @@ func (a *actArgs) validate(provided map[string]json.RawMessage) error {
 		if len(a.Rules) == 0 {
 			return fmt.Errorf("intercept_add requires rules (e.g. [{\"url_pattern\":\"*api*\",\"action\":\"block\"}])")
 		}
+	case "auth_save", "auth_restore":
+		if a.Site == "" {
+			return fmt.Errorf("%s requires site (the host, e.g. example.org)", a.Action)
+		}
+		if a.Name == "" {
+			return fmt.Errorf("%s requires name (the snapshot name, e.g. main)", a.Action)
+		}
 	}
 	return nil
 }
@@ -392,9 +432,6 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 	if err := decodeArgs("page_act", args, &a); err != nil {
 		return failResult(err)
 	}
-	if a.SessionID == "" {
-		return failResult(fmt.Errorf("page_act: missing required argument %q", "session_id"))
-	}
 	if a.Action == "" {
 		return failResult(fmt.Errorf("page_act: missing required argument %q", "action"))
 	}
@@ -405,6 +442,16 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 	}
 	if err := a.validate(provided); err != nil {
 		return failResult(fmt.Errorf("page_act: %w", err))
+	}
+	if a.Action == "auth_list" {
+		out, err := pageops.PageAuthList(ctx, a.Site)
+		if err != nil {
+			return failResult(fmt.Errorf("page_act: %w", err))
+		}
+		return okResult(out)
+	}
+	if a.SessionID == "" {
+		return failResult(fmt.Errorf("page_act: missing required argument %q", "session_id"))
 	}
 
 	if a.Action == "set_viewport" {
@@ -536,6 +583,10 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 		out, err = pageops.PageInterceptList(ctx, p)
 	case "intercept_clear":
 		out, err = pageops.PageInterceptClear(ctx, p)
+	case "auth_save":
+		out, err = pageops.PageAuthSave(ctx, p, a.Site, a.Name)
+	case "auth_restore":
+		out, err = pageops.PageAuthRestore(ctx, p, a.Site, a.Name, a.Force)
 	default:
 		return failResult(fmt.Errorf("page_act: unknown action=%q (must be one of %s)", a.Action, actActionList()))
 	}

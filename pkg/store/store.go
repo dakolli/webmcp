@@ -14,14 +14,62 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+// ErrAuthSnapshotNotFound reports a named auth snapshot missing from the store.
+var ErrAuthSnapshotNotFound = errors.New("store: auth snapshot not found")
+
+// authPayloadShape is the minimal projection ListAuthSnapshots reads from a
+// snapshot payload: the counts and user agent a redacted listing exposes. It
+// deliberately never decodes cookie or storage values.
+type authPayloadShape struct {
+	Cookies   []json.RawMessage `json:"cookies"`
+	Origins   []json.RawMessage `json:"origins"`
+	UserAgent string            `json:"user_agent"`
+}
+
+// AuthSnapshot is one persisted named auth snapshot. Payload is the caller's
+// opaque JSON document; the store validates that it is JSON and never inspects
+// or re-encodes its values.
+type AuthSnapshot struct {
+	// Site is the normalized host the snapshot belongs to.
+	Site string
+	// Name is the caller-chosen snapshot name, unique per site.
+	Name string
+	// Payload is the JSON auth document (cookies, origins, user agent).
+	Payload []byte
+	// CreatedAt is when the first save for this site/name landed.
+	CreatedAt time.Time
+	// UpdatedAt is when the most recent save replaced the payload.
+	UpdatedAt time.Time
+}
+
+// AuthSummary is one redacted listing row. It carries counts and the user
+// agent only, never a cookie or storage value.
+type AuthSummary struct {
+	// Site is the normalized host.
+	Site string `json:"site"`
+	// Name is the snapshot name.
+	Name string `json:"name"`
+	// CookieCount is the number of stored cookies.
+	CookieCount int `json:"cookie_count"`
+	// OriginCount is the number of stored origins.
+	OriginCount int `json:"origin_count"`
+	// UserAgent is the browser user agent the snapshot was captured with.
+	UserAgent string `json:"user_agent"`
+	// UpdatedAt is the stored RFC3339Nano save time.
+	UpdatedAt string `json:"updated_at"`
+}
 
 const (
 	driverName = "sqlite"
@@ -49,6 +97,21 @@ var migrations = []migration{
 			`CREATE TABLE schema_version (
 				version    INTEGER NOT NULL CHECK (version > 0),
 				applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+			)`,
+		},
+	},
+	{
+		version: 2,
+		name:    "auth_snapshots",
+		stmts: []string{
+			`CREATE TABLE auth_snapshots (
+				id         INTEGER PRIMARY KEY,
+				site       TEXT NOT NULL,
+				name       TEXT NOT NULL,
+				` + jsonColumn("payload") + `,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				UNIQUE(site, name)
 			)`,
 		},
 	},
@@ -240,6 +303,132 @@ func (s *Store) Tables(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("store: iterate tables: %w", err)
 	}
 	return names, nil
+}
+
+// SaveAuthSnapshot writes one named snapshot, replacing the payload (and
+// keeping created_at) when site/name already exists. It returns the new
+// updated_at timestamp.
+func (s *Store) SaveAuthSnapshot(
+	ctx context.Context,
+	site, name string,
+	payload []byte,
+) (time.Time, error) {
+	site, name = strings.TrimSpace(site), strings.TrimSpace(name)
+	if site == "" || name == "" {
+		return time.Time{}, errors.New("store: auth snapshot needs a site and a name")
+	}
+	if !json.Valid(payload) {
+		return time.Time{}, fmt.Errorf("store: auth snapshot for %s/%s is not valid JSON", site, name)
+	}
+	now := time.Now().UTC()
+	stamp := now.Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(
+		ctx,
+		`INSERT INTO auth_snapshots (site, name, payload, created_at, updated_at)
+		 VALUES (?, ?, jsonb(?), ?, ?)
+		 ON CONFLICT(site, name) DO UPDATE SET
+			payload = excluded.payload,
+			updated_at = excluded.updated_at`,
+		site,
+		name,
+		string(payload),
+		stamp,
+		stamp,
+	)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("store: save auth snapshot %s/%s: %w", site, name, err)
+	}
+	return now, nil
+}
+
+// LoadAuthSnapshot reads one snapshot payload by site and name. A missing row
+// returns ErrAuthSnapshotNotFound.
+func (s *Store) LoadAuthSnapshot(
+	ctx context.Context,
+	site, name string,
+) (*AuthSnapshot, error) {
+	site, name = strings.TrimSpace(site), strings.TrimSpace(name)
+	var (
+		rec       AuthSnapshot
+		payload   []byte
+		createdAt string
+		updatedAt string
+	)
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT site, name, json(payload), created_at, updated_at
+		 FROM auth_snapshots WHERE site = ? AND name = ?`,
+		site,
+		name,
+	).Scan(&rec.Site, &rec.Name, &payload, &createdAt, &updatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: %s/%s", ErrAuthSnapshotNotFound, site, name)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: load auth snapshot %s/%s: %w", site, name, err)
+	}
+	rec.Payload = append([]byte(nil), payload...)
+	if rec.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAt); err != nil {
+		return nil, fmt.Errorf("store: parse created_at for %s/%s: %w", site, name, err)
+	}
+	if rec.UpdatedAt, err = time.Parse(time.RFC3339Nano, updatedAt); err != nil {
+		return nil, fmt.Errorf("store: parse updated_at for %s/%s: %w", site, name, err)
+	}
+	return &rec, nil
+}
+
+// ListAuthSnapshots returns the redacted summary of every snapshot, or only the
+// ones for site when it is non-empty. Payloads are projected to counts and the
+// user agent; no cookie or storage value is ever decoded into the result.
+func (s *Store) ListAuthSnapshots(
+	ctx context.Context,
+	site string,
+) ([]AuthSummary, error) {
+	site = strings.TrimSpace(site)
+	query := `SELECT site, name, json(payload), updated_at FROM auth_snapshots`
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if site == "" {
+		rows, err = s.db.QueryContext(ctx, query+` ORDER BY site, name`)
+	} else {
+		rows, err = s.db.QueryContext(ctx, query+` WHERE site = ? ORDER BY name`, site)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: list auth snapshots: %w", err)
+	}
+	defer rows.Close()
+
+	var out []AuthSummary
+	for rows.Next() {
+		var (
+			summary   AuthSummary
+			payload   []byte
+			updatedAt string
+		)
+		if err := rows.Scan(&summary.Site, &summary.Name, &payload, &updatedAt); err != nil {
+			return nil, fmt.Errorf("store: scan auth snapshot: %w", err)
+		}
+		var shape authPayloadShape
+		if err := json.Unmarshal(payload, &shape); err != nil {
+			return nil, fmt.Errorf(
+				"store: decode auth snapshot %s/%s: %w",
+				summary.Site,
+				summary.Name,
+				err,
+			)
+		}
+		summary.CookieCount = len(shape.Cookies)
+		summary.OriginCount = len(shape.Origins)
+		summary.UserAgent = shape.UserAgent
+		summary.UpdatedAt = updatedAt
+		out = append(out, summary)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate auth snapshots: %w", err)
+	}
+	return out, nil
 }
 
 // jsonColumn returns the column definition for a JSON payload stored as BLOB.
