@@ -74,6 +74,8 @@ var invalidArgsMarkers = []string{
 	"unknown wait_mode",
 	"must be positive",
 	"must be >= 0",
+	"must be absolute",
+	"is not empty — pass a new directory",
 	"but the request sent",
 	"1 to 64 characters",
 	"mutually exclusive",

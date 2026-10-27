@@ -264,6 +264,16 @@ func TestClassifyError(t *testing.T) {
 			want: errInvalidArgs,
 		},
 		{
+			name: "poc_bundle relative path is invalid args",
+			err:  errors.New(`page_act: poc_bundle: "poc-xss" must be absolute`),
+			want: errInvalidArgs,
+		},
+		{
+			name: "poc_bundle non-empty directory is invalid args",
+			err:  errors.New("page_act: poc_bundle: /tmp/poc-xss is not empty — pass a new directory or remove its contents"),
+			want: errInvalidArgs,
+		},
+		{
 			name: "auth user-agent mismatch is invalid args",
 			err:  errors.New(`page_act: auth_restore: stored user agent "Chrome/1" does not match the live page user agent "Chrome/2" — re-capture on this browser, or pass force=true to restore anyway`),
 			want: errInvalidArgs,
