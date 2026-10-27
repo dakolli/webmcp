@@ -105,6 +105,10 @@ type Browser struct {
 	headless bool
 	// stealth applies go-rod/stealth to every new page (default: on).
 	stealth bool
+	// chromeMajor is the major version of the launched Chromium build, probed
+	// once at launch and reused for the default User-Agent and client hints. It
+	// falls back to fallbackChromeMajor when the probe fails. Guarded by mu.
+	chromeMajor int
 	// binPath specifies a custom browser executable path.
 	binPath string
 	// profileDir specifies a custom browser user data profile directory path.
@@ -175,6 +179,7 @@ func NewBrowser(id BrowserID, baseCtx context.Context, headless, stealth bool, b
 		headerCleanups: make(map[*rod.Page]func()),
 		headless:       headless,
 		stealth:        stealth,
+		chromeMajor:    fallbackChromeMajor,
 		binPath:        binPath,
 		profileDir:     profileDir,
 		position:       pos,
@@ -371,6 +376,7 @@ func (b *Browser) newIdentity(name string, clone *rod.Browser) *Browser {
 		ttl:            b.ttl,
 		headless:       b.headless,
 		stealth:        b.stealth,
+		chromeMajor:    b.chromeMajor,
 		binPath:        b.binPath,
 		profileDir:     b.profileDir,
 		position:       b.position,
@@ -513,6 +519,12 @@ func (b *Browser) IsAlive(ctx context.Context) bool {
 // constructed with headless=true; NoSandbox is always set, as required in
 // containers. Launch is idempotent: it is a no-op once the browser is up.
 //
+// Launch installs the coherent realism defaults: the AutomationControlled
+// feature is disabled, the browser locale and Accept-Language are en-US, and
+// the launched Chromium's major version is probed ONCE and cached for the
+// per-page default User-Agent and client hints. A failed version probe degrades
+// to fallbackChromeMajor and never fails the launch.
+//
 // The rod browser's DEFAULT ctx is bound to the manager-owned baseCtx the
 // Browser was constructed with — never to the caller's ctx — so a transient
 // tool-call ctx cannot poison the browser (WEB-58: a poisoned default ctx
@@ -539,7 +551,9 @@ func (b *Browser) Launch(ctx context.Context) error {
 	// window-size / device-scale / emulation launcher flags here. Screen-size
 	// emulation is page-scoped and opt-in — a caller passes an explicit
 	// viewport to NewPage, or applies a go-rod devices.X preset via
-	// Page.Emulate after creation. A bare launch gets rod's own defaults.
+	// Page.Emulate after creation. The launcher only carries the coherent
+	// realism defaults below (locale and Accept-Language); the UA and its
+	// client hints are applied per page before navigation.
 	// The launcher is ctx-bound (l.Context) so a hung first-run Chromium
 	// download honors the caller's deadline instead of running on a background
 	// ctx.
@@ -549,6 +563,8 @@ func (b *Browser) Launch(ctx context.Context) error {
 	l.Delete("disable-site-isolation-trials")               // remove "unsupported command-line flag: --disable-site-isolation-trials" infobar
 	l.Set("disable-infobars")                               // suppress warning infobars
 	l.Set("no-default-browser-check")                       // suppress "Chromium isn't your default browser" prompt
+	l.Set("lang", defaultLanguage)
+	l.Set("accept-lang", defaultAcceptLanguage)
 	if b.proxy != "" {
 		server, host, err := parseProxy(b.proxy)
 		if err != nil {
@@ -641,8 +657,11 @@ func (b *Browser) Launch(ctx context.Context) error {
 	}
 	connected = true // Chromium is wired up; the launch is a success
 
+	major := probeChromeMajor(ctx, rb)
+
 	b.mu.Lock()
 	b.rod = rb
+	b.chromeMajor = major
 	b.profileDir = profileDir
 	b.mu.Unlock()
 	b.startTargetTracking()
@@ -670,17 +689,21 @@ func (b *Browser) Launch(ctx context.Context) error {
 //     metrics + touch). An unknown name fails with the pinned
 //     "unknown device %q" error; a non-empty preset also makes the manual
 //     viewport (1) moot for metrics, but both steps run in order.
-//  3. userAgent (when userAgent is non-empty): an explicit User-Agent
-//     override via rod's SetUserAgent, applied after any device preset so an
-//     explicit UA wins over the preset's UA.
+//  3. default User-Agent (when userAgent is empty and no device preset is
+//     selected): the browser's coherent UA, Accept-Language and Sec-CH-UA
+//     client hints via Network.setUserAgentOverride, built from the launched
+//     Chromium major and the host platform.
+//  4. userAgent (when userAgent is non-empty): an explicit User-Agent override
+//     via rod's SetUserAgent, applied after any device preset or default so an
+//     explicit UA always wins.
 //
-// Empty strings skip their step, so a plain call (nil viewport, empty device,
-// empty userAgent) makes ZERO emulation calls on the default path. Any failure
-// closes the unregistered tab (no leak) and wraps the error with %w: a
-// create/attach failure is already cleaned up by rod's own leak-prevention
-// defer inside Browser.Page (it closes the fresh target when the attach fails),
-// so only post-create failures (stealth/viewport/device/UA/navigate) call
-// closeUnregisteredPage.
+// Empty strings skip their optional step; a plain call (nil viewport, empty
+// device, empty userAgent) still applies the stealth script and the coherent
+// default User-Agent. Any failure closes the unregistered tab (no leak) and
+// wraps the error with %w: a create/attach failure is already cleaned up by
+// rod's own leak-prevention defer inside Browser.Page (it closes the fresh
+// target when the attach fails), so only post-create failures
+// (stealth/viewport/device/UA/navigate) call closeUnregisteredPage.
 func (b *Browser) NewPage(
 	ctx context.Context,
 	url string,
@@ -690,6 +713,7 @@ func (b *Browser) NewPage(
 ) (*Page, error) {
 	b.mu.Lock()
 	rb := b.rod
+	major := b.chromeMajor
 	b.mu.Unlock()
 	if rb == nil {
 		return nil, fmt.Errorf("browsers: browser not launched")
@@ -791,13 +815,20 @@ func (b *Browser) NewPage(
 
 	// Apply an explicit UA override pre-navigation via rod's own SetUserAgent
 	// (the same helper Page.Emulate uses internally for the preset UA; an
-	// explicit userAgent thus wins over a device preset's UA). ctx-bound so a
-	// hung CDP call cannot outlive the tool call. In the pre-registration
-	// window no lock is needed — no other goroutine can see the page yet.
+	// explicit userAgent thus wins over a device preset's UA). Without one, a
+	// page with no device preset gets the browser's coherent default UA,
+	// Accept-Language and Sec-CH-UA client hints. ctx-bound so a hung CDP call
+	// cannot outlive the tool call. In the pre-registration window no lock is
+	// needed — no other goroutine can see the page yet.
 	if userAgent != "" {
 		if err := p.Context(ctx).SetUserAgent(&proto.NetworkSetUserAgentOverride{UserAgent: userAgent}); err != nil {
 			b.closeUnregisteredPage(page) // do not leak the orphaned tab
 			return nil, fmt.Errorf("browsers: set user agent: %w", err)
+		}
+	} else if !hasDevicePreset(device) {
+		if err := applyDefaultUserAgent(ctx, p, major); err != nil {
+			b.closeUnregisteredPage(page) // do not leak the orphaned tab
+			return nil, err
 		}
 	}
 
