@@ -38,11 +38,18 @@ type NetworkEntry struct {
 	Type   string `json:"type,omitempty"`
 	Status int    `json:"status,omitempty"`
 	MIME   string `json:"mime,omitempty"`
-	Bytes  int64  `json:"bytes,omitempty"`
-	MS     int64  `json:"ms,omitempty"`
-	Failed bool   `json:"failed,omitempty"`
-	Error  string `json:"error,omitempty"`
-	Seq    int64  `json:"seq"`
+	// Protocol is the HTTP protocol Chrome used for the response, as CDP
+	// reported it ("http/1.1", "h2", "h3"). Empty when Chrome did not report
+	// one.
+	Protocol string `json:"protocol,omitempty"`
+	// RemoteIP is the peer IP of the response, as Chrome reported it. Empty when
+	// Chrome did not report one.
+	RemoteIP string `json:"remote_ip,omitempty"`
+	Bytes    int64  `json:"bytes,omitempty"`
+	MS       int64  `json:"ms,omitempty"`
+	Failed   bool   `json:"failed,omitempty"`
+	Error    string `json:"error,omitempty"`
+	Seq      int64  `json:"seq"`
 	// ReqHeaders holds the request headers, bounded per entry and redacted
 	// unless the page was set to capture secrets.
 	ReqHeaders map[string]string `json:"req_headers,omitempty"`
@@ -191,6 +198,12 @@ func (o *pageObserver) applyResponse(entry *NetworkEntry, r *proto.NetworkRespon
 	}
 	entry.Status = r.Status
 	entry.MIME = r.MIMEType
+	if r.Protocol != "" {
+		entry.Protocol = r.Protocol
+	}
+	if r.RemoteIPAddress != "" {
+		entry.RemoteIP = r.RemoteIPAddress
+	}
 	entry.RespHeaders, entry.RespHeadersTruncated = redactHeaders(r.Headers, o.secrets)
 	if r.EncodedDataLength > 0 {
 		entry.Bytes = int64(r.EncodedDataLength)
@@ -570,6 +583,25 @@ func (p *Page) CaptureSecrets(on bool) {
 	o.mu.Unlock()
 }
 
+// SecretsCaptured reports whether the page keeps sensitive values instead of
+// replacing them with the redaction marker.
+func (p *Page) SecretsCaptured() bool {
+	return p.captureSecrets()
+}
+
+// observedAt returns the buffered entry with the given Seq and whether it is
+// still in the ring.
+func (o *pageObserver) observedAt(seq int64) (NetworkEntry, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for i := range o.net.items {
+		if o.net.items[i].Seq == seq {
+			return o.net.items[i], true
+		}
+	}
+	return NetworkEntry{}, false
+}
+
 // NetworkBody fetches the response body the browser still holds for the entry
 // with the given Seq. The read is on demand, so memory stays bounded; a body
 // the browser has already evicted, streamed or served from cache returns an
@@ -579,17 +611,7 @@ func (p *Page) NetworkBody(ctx context.Context, seq int64) (NetworkBody, error) 
 	if o == nil {
 		return NetworkBody{}, fmt.Errorf("network body: page has no network observer")
 	}
-	o.mu.Lock()
-	var entry NetworkEntry
-	found := false
-	for i := range o.net.items {
-		if o.net.items[i].Seq == seq {
-			entry = o.net.items[i]
-			found = true
-			break
-		}
-	}
-	o.mu.Unlock()
+	entry, found := o.observedAt(seq)
 	if !found {
 		return NetworkBody{}, fmt.Errorf(
 			"network body: no network entry with seq %d (the ring keeps the newest %d; re-read what=network for current seq values)",
@@ -638,6 +660,69 @@ func (p *Page) NetworkBody(ctx context.Context, seq int64) (NetworkBody, error) 
 	return body, nil
 }
 
+// NetworkRequestBody fetches the request post body the browser still holds for
+// the entry with the given Seq, reading the same CDP record the replay seam
+// uses. Text content lands in Body and binary content in Base64, with Bytes as
+// the decoded size. A request the browser no longer retains returns an
+// actionable error instead of an empty body.
+func (p *Page) NetworkRequestBody(ctx context.Context, seq int64) (NetworkBody, error) {
+	o := p.observer
+	if o == nil {
+		return NetworkBody{}, fmt.Errorf("network request body: page has no network observer")
+	}
+	entry, found := o.observedAt(seq)
+	if !found {
+		return NetworkBody{}, fmt.Errorf(
+			"network request body: no network entry with seq %d (the ring keeps the newest %d; re-read what=network for current seq values)",
+			seq,
+			networkRingCap,
+		)
+	}
+	if !replayCarriedBody(entry) {
+		return NetworkBody{}, fmt.Errorf(
+			"network request body: seq %d (%s %s) carried no body (no Content-Type and no non-zero Content-Length)",
+			seq,
+			entry.Method,
+			entry.URL,
+		)
+	}
+	post, retained, err := p.requestPostData(ctx, entry)
+	if err != nil {
+		return NetworkBody{}, fmt.Errorf("network request body: seq %d (%s %s): %w", seq, entry.Method, entry.URL, err)
+	}
+	if !retained {
+		return NetworkBody{}, fmt.Errorf(
+			"network request body: seq %d (%s %s) is no longer retained — the browser keeps a request body only while the request's network record is live",
+			seq,
+			entry.Method,
+			entry.URL,
+		)
+	}
+	if post == "" {
+		return NetworkBody{}, fmt.Errorf(
+			"network request body: seq %d (%s %s) carried no body",
+			seq,
+			entry.Method,
+			entry.URL,
+		)
+	}
+	out := NetworkBody{
+		Seq:         entry.Seq,
+		Method:      entry.Method,
+		URL:         entry.URL,
+		Status:      entry.Status,
+		ContentType: capturedHeader(entry.ReqHeaders, "Content-Type"),
+		Bytes:       int64(len(post)),
+	}
+	if utf8.ValidString(post) {
+		out.Body = post
+		return out, nil
+	}
+	out.Base64 = base64.StdEncoding.EncodeToString([]byte(post))
+	return out, nil
+}
+
+// the payload at 256 KB and switching binary content to base64.
 // buildNetworkBody assembles a body result from a CDP body response, capping
 // the payload at 256 KB and switching binary content to base64.
 func buildNetworkBody(entry NetworkEntry, res *proto.NetworkGetResponseBodyResult) (NetworkBody, error) {

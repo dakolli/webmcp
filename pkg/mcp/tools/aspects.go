@@ -130,6 +130,6 @@ func init() {
 		return pageops.PageStorage(ctx, p, a.IncludeValues)
 	}, truncationNone)
 	registerAspect("har", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
-		return pageops.PageHAR(ctx, p)
+		return pageops.PageHAR(ctx, p, 0)
 	}, truncationNone)
 }

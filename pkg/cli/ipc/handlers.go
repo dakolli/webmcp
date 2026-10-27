@@ -531,7 +531,7 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 	}
 
 	maxBytes := p.MaxBytes
-	if maxBytes <= 0 {
+	if maxBytes <= 0 && p.What != "har" {
 		maxBytes = pageops.DefaultPageMaxBytes
 	}
 	out, err := pageops.PageAspect(ctx, page, pageops.AspectQuery{

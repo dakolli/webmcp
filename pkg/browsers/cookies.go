@@ -42,6 +42,26 @@ type AuthCookie struct {
 	Expires int64 `json:"expires"`
 }
 
+// Cookie is one cookie in the browser's cookie jar with its scope fields
+// intact. Values are raw, so a caller that exports them applies its own
+// redaction rule.
+type Cookie struct {
+	// Name is the cookie name.
+	Name string
+	// Value is the cookie value.
+	Value string
+	// Domain is the cookie domain as the browser reported it.
+	Domain string
+	// Path is the cookie path.
+	Path string
+	// Secure reports the Secure flag.
+	Secure bool
+	// HTTPOnly reports the HttpOnly flag.
+	HTTPOnly bool
+	// Expires is the expiry in epoch seconds, -1 for a session cookie.
+	Expires int64
+}
+
 // AuthDatabase is one IndexedDB database in a snapshot: its name and object
 // store names only. Values are deliberately not serialized.
 type AuthDatabase struct {
@@ -326,6 +346,40 @@ func authCookies(pc *rod.Page, site string) ([]AuthCookie, error) {
 		}
 		return out[i].Name < out[j].Name
 	})
+	return out, nil
+}
+
+// Cookies snapshots the browser context's cookie jar without filtering it to a
+// site; matching a cookie to a request belongs to the consumer. It takes the
+// page lock itself; callers must not pre-lock.
+func (p *Page) Cookies(ctx context.Context) ([]Cookie, error) {
+	p.Lock()
+	defer p.Unlock()
+	if p.Rod == nil {
+		return nil, fmt.Errorf("cookies: page session is closed")
+	}
+	b := p.Rod.Browser()
+	if b == nil {
+		return nil, fmt.Errorf("cookies: no browser for the page")
+	}
+	res, err := (proto.StorageGetCookies{
+		BrowserContextID: b.BrowserContextID,
+	}).Call(b.Context(ctx))
+	if err != nil {
+		return nil, fmt.Errorf("cookies: read browser cookie jar: %w", err)
+	}
+	out := make([]Cookie, 0, len(res.Cookies))
+	for _, c := range res.Cookies {
+		out = append(out, Cookie{
+			Name:     c.Name,
+			Value:    c.Value,
+			Domain:   c.Domain,
+			Path:     c.Path,
+			Secure:   c.Secure,
+			HTTPOnly: c.HTTPOnly,
+			Expires:  int64(c.Expires),
+		})
+	}
 	return out, nil
 }
 

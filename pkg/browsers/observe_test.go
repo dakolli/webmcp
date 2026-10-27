@@ -119,6 +119,78 @@ func TestObserverDocumentIdentity(t *testing.T) {
 	})
 }
 
+func TestObserverRemoteIP(t *testing.T) {
+	page := &Page{observer: newPageObserver()}
+	id := proto.NetworkRequestID("req-ip")
+
+	page.observer.recordRequest(&proto.NetworkRequestWillBeSent{
+		RequestID: id,
+		Request:   &proto.NetworkRequest{Method: "GET", URL: "https://example.com/"},
+		Timestamp: 1,
+	})
+	page.observer.recordResponse(&proto.NetworkResponseReceived{
+		RequestID: id,
+		Type:      proto.NetworkResourceTypeDocument,
+		Response: &proto.NetworkResponse{
+			Status:          200,
+			MIMEType:        "text/html",
+			RemoteIPAddress: "203.0.113.7",
+		},
+	})
+
+	entries, _ := page.NetworkEntries()
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	if entries[0].RemoteIP != "203.0.113.7" {
+		t.Fatalf("RemoteIP = %q, want the CDP remoteIPAddress", entries[0].RemoteIP)
+	}
+
+	page.observer.recordResponse(&proto.NetworkResponseReceived{
+		RequestID: id,
+		Type:      proto.NetworkResourceTypeDocument,
+		Response:  &proto.NetworkResponse{Status: 200, MIMEType: "text/html"},
+	})
+	entries, _ = page.NetworkEntries()
+	if entries[0].RemoteIP != "203.0.113.7" {
+		t.Fatalf("RemoteIP = %q, want the last reported IP kept when CDP omits it", entries[0].RemoteIP)
+	}
+}
+
+func TestObserverProtocol(t *testing.T) {
+	page := &Page{observer: newPageObserver()}
+	id := proto.NetworkRequestID("req-proto")
+
+	page.observer.recordRequest(&proto.NetworkRequestWillBeSent{
+		RequestID: id,
+		Request:   &proto.NetworkRequest{Method: "GET", URL: "https://example.com/"},
+		Timestamp: 1,
+	})
+	page.observer.recordResponse(&proto.NetworkResponseReceived{
+		RequestID: id,
+		Type:      proto.NetworkResourceTypeDocument,
+		Response:  &proto.NetworkResponse{Status: 200, MIMEType: "text/html", Protocol: "h2"},
+	})
+
+	entries, _ := page.NetworkEntries()
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	if entries[0].Protocol != "h2" {
+		t.Fatalf("Protocol = %q, want the CDP protocol", entries[0].Protocol)
+	}
+
+	page.observer.recordResponse(&proto.NetworkResponseReceived{
+		RequestID: id,
+		Type:      proto.NetworkResourceTypeDocument,
+		Response:  &proto.NetworkResponse{Status: 200, MIMEType: "text/html"},
+	})
+	entries, _ = page.NetworkEntries()
+	if entries[0].Protocol != "h2" {
+		t.Fatalf("Protocol = %q, want the last reported protocol kept when CDP omits it", entries[0].Protocol)
+	}
+}
+
 func TestObserverRingAndRequestJoin(t *testing.T) {
 	t.Run("redirect hops keep one entry and join the final response", func(t *testing.T) {
 		page := &Page{observer: newPageObserver()}
