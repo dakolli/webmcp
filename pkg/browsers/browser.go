@@ -162,6 +162,13 @@ type Browser struct {
 	// .Context(callCtx); derived timeouts (closes, orphan cleanup) hang off
 	// this base so teardown outlives the request that triggered it.
 	baseCtx context.Context
+	// human is the browser's randomized timing source, seeded once at
+	// construction and shared by every page and identity clone so two pages
+	// never draw the same delay or pointer path in lockstep. Immutable.
+	human *humanizer
+	// rawActions disables humanized pointer and keyboard timing for this
+	// browser (the manager's raw option). Set before launch; immutable.
+	rawActions bool
 }
 
 // NewBrowser constructs a Browser ready to be launched. id is the unique BrowserID;
@@ -191,6 +198,7 @@ func NewBrowser(id BrowserID, baseCtx context.Context, headless, stealth bool, b
 		limits:         newHostLimiter(RateLimit{RPS: DefaultRateRPS, Burst: DefaultRateBurst}),
 		logger:         slog.New(slog.DiscardHandler),
 		baseCtx:        baseCtx,
+		human:          newHumanizer(),
 	}
 }
 
@@ -396,6 +404,8 @@ func (b *Browser) newIdentity(name string, clone *rod.Browser) *Browser {
 		authPages:      make(map[*rod.Page]*proxyAuthPage),
 		logger:         b.logger,
 		baseCtx:        b.baseCtx,
+		human:          b.human,
+		rawActions:     b.rawActions,
 	}
 }
 

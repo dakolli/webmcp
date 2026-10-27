@@ -353,6 +353,16 @@ func WithLogger(logger *slog.Logger) Option {
 	}
 }
 
+// WithRawActions controls humanized pointer and keyboard timing for browsers
+// created by the manager. The default (false) steps the pointer and pauses
+// before and after click, click_at, input, hover, hover_at and press_key; true
+// restores instant actions. It is the manager-level spelling of the
+// WEB_MCP_RAW_ACTIONS environment hatch and can be overridden per call with
+// browsers.WithRawCall.
+func WithRawActions(raw bool) Option {
+	return func(m *Manager) { m.rawActions = raw }
+}
+
 // NewLogger builds the logger every production entry point installs on a
 // Manager with WithLogger: structured text records go to sink, and when console
 // is non-nil each record is mirrored there too so a foreground run shows it
@@ -470,6 +480,9 @@ type Manager struct {
 	// canceled"). Relaunches after Close reuse it, so a fresh Browser is never
 	// re-poisoned.
 	baseCtx context.Context
+	// rawActions is the default humanized-timing switch for created browsers:
+	// false humanizes pointer and keyboard actions.
+	rawActions bool
 	// cancelBase releases baseCtx; called exactly once by Shutdown.
 	cancelBase context.CancelFunc
 }
@@ -728,6 +741,7 @@ func (m *Manager) createOptions(opts []Option) (*Manager, string, bool, error) {
 		rateLimit:    m.rateLimit,
 		owner:        m.owner,
 		browserTTL:   m.browserTTL,
+		rawActions:   m.rawActions,
 	}
 	defaultProfileDir := m.profileDir
 	defaultPersist := m.persist
@@ -830,6 +844,7 @@ func (m *Manager) launchCreatedBrowser(
 	b.limits = newHostLimiter(effective.rateLimit)
 	b.logger = m.logger
 	b.ephemeral = ephemeral
+	b.rawActions = effective.rawActions
 	b.profileCleanup = func() { m.releaseProfile(profileDir) }
 	if err := m.launch(ctx, b); err != nil {
 		m.releaseProfile(profileDir)
@@ -990,6 +1005,7 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 	scopeStrict := m.scopeStrict
 	rateLimit := m.rateLimit
 	browserTTL := m.browserTTL
+	rawActions := m.rawActions
 	m.mu.Unlock()
 
 	// Mirrors a bare CreateBrowser request so both paths share one launch key.
@@ -1048,6 +1064,7 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 	b.limits = newHostLimiter(rateLimit)
 	b.logger = m.logger
 	b.ephemeral = ephemeral
+	b.rawActions = rawActions
 	b.profileCleanup = func() { m.releaseProfile(profileDir) }
 	if err := m.launch(ctx, b); err != nil {
 		m.releaseProfile(profileDir)
