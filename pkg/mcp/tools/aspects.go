@@ -93,8 +93,8 @@ func init() {
 	registerAspect("a11y", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
 		return pageops.PageA11y(ctx, p)
 	}, truncationNone)
-	registerAspect("network", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
-		return pageops.PageNetwork(ctx, p)
+	registerAspect("network", func(ctx context.Context, p *browsers.Page, a pageFetchArgs) (string, error) {
+		return pageops.PageNetworkFiltered(ctx, p, a.Filter)
 	}, truncationNone)
 	registerAspect("body", func(ctx context.Context, p *browsers.Page, a pageFetchArgs) (string, error) {
 		return pageops.PageBody(ctx, p, a.Target)
@@ -120,8 +120,8 @@ func init() {
 	registerAspect("security", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
 		return pageops.PageSecurity(ctx, p)
 	}, truncationNone)
-	registerAspect("sinks", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
-		return pageops.PageSinks(ctx, p)
+	registerAspect("sinks", func(ctx context.Context, p *browsers.Page, a pageFetchArgs) (string, error) {
+		return pageops.PageSinksFiltered(ctx, p, a.Filter)
 	}, truncationNone)
 	registerAspect("postmessage", func(ctx context.Context, p *browsers.Page, a pageFetchArgs) (string, error) {
 		return pageops.PagePostMessage(ctx, p, a.Target)

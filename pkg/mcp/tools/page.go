@@ -97,7 +97,13 @@ func (t *Page) Description() string {
 		"so the current document's traffic is distinguishable from an earlier " +
 		"navigation's. WebSocket frames carry direction, opcode, " +
 		"payload and payload_bytes. Capture is cumulative from page creation. " +
-		"Filter client-side or call page_act action clear_logs right before the " +
+		"Pass filter to narrow the read by request type: a comma list matched " +
+		"case-insensitively against each entry's type, where a bare name keeps " +
+		"that type and a '-' prefix drops it (filter=\"document,script,xhr\" " +
+		"keeps those three, filter=\"-image,-font\" drops images and fonts); an " +
+		"unknown name fails as invalid_args and lists the accepted names, and a " +
+		"filtered read adds filtered_out. Otherwise filter client-side or call " +
+		"page_act action clear_logs right before the " +
 		"step you want to observe. clear_logs clears network, console and " +
 		"websocket), article (the readable " +
 		"article body as markdown with title, byline, excerpt, word count and " +
@@ -114,7 +120,10 @@ func (t *Page) Description() string {
 		"page_act action=sinks_install, survives client-side route changes and full navigations, " +
 		"and its ring is per document, so a full navigation resets it. The newest 100 hits of a " +
 		"200-hit ring are emitted, values are clipped at 200 runes and stacks keep 5 frames; " +
-		"reset with page_act action=sinks_clear), " +
+		"reset with page_act action=sinks_clear. Pass filter=canary to keep only hits " +
+		"whose value holds the injected wm-canary-… marker (inject_canary can return " +
+		"an empty hits list, which is not an error) or filter=known to drop hits whose " +
+		"source is \"unknown\"; both add filtered_out), " +
 		"postmessage (the postMessage recorder ring: {\"installed\",\"messages\":[{\"origin\"," +
 		"\"source_kind\",\"data\",\"data_type\",\"ts\",\"stack\"}],\"dropped\",\"truncated\"," +
 		"\"frames\":[{\"url\",\"probed\"}]}. It is read-only and never arms capture: arm it with " +
@@ -163,7 +172,11 @@ func (t *Page) Description() string {
 		"element_not_found naming the selector. Example: " +
 		"{ \"session_id\": \"page-1\", \"what\": \"dom\", \"max_bytes\": 8000 } or " +
 		"{ \"session_id\": \"page-1\", \"what\": \"screenshot\", \"full_page\": true, " +
-		"\"timeout_ms\": 60000 }." +
+		"\"timeout_ms\": 60000 }, " +
+		"{ \"session_id\": \"page-1\", \"what\": \"network\", \"filter\": \"document,script\" } " +
+		"for signal-only traffic, or { \"session_id\": \"page-1\", \"what\": \"sinks\", " +
+		"\"filter\": \"canary\" } for hits carrying the injected canary. " +
+		"Numbers may be sent as JSON numbers or as numeric strings; a non-numeric string is rejected. " +
 		resultEnvelopeDoc
 }
 
@@ -219,6 +232,10 @@ func (t *Page) InputSchema() models.InputSchema {
 				"default":     false,
 				"description": "With what=storage, return real cookie and local_storage/session_storage values instead of the literal <redacted>. Default false. true exposes live session tokens, so set it only when the values themselves are the question. Example: { \"session_id\": \"page-1\", \"what\": \"storage\", \"include_values\": true }. If the report still shows <redacted>, include_values was not set on this call.",
 			},
+			"filter": map[string]any{
+				"type":        "string",
+				"description": "Narrows what=network or what=sinks; every other aspect ignores it. what=network: a comma list of request types matched case-insensitively against each entry's type — a bare name keeps that type, a '-' prefix drops it. filter=\"document,script,xhr\" keeps only those, filter=\"-image,-font\" drops images and fonts. Accepted names: document, stylesheet, image, media, font, script, texttrack, xhr, fetch, prefetch, eventsource, websocket, manifest, signedexchange, ping, cspviolationreport, preflight, other; an unknown name fails as invalid_args and lists them. what=sinks: canary (only hits whose value holds the injected wm-canary-… marker) or known (drop hits whose source is \"unknown\"). A filtered read adds filtered_out, the number of entries the filter dropped, so count=0 with filtered_out>0 means nothing matched rather than nothing captured; an unfiltered read never carries filtered_out. Examples: { \"session_id\": \"page-1\", \"what\": \"network\", \"filter\": \"document,script\" } and { \"session_id\": \"page-1\", \"what\": \"sinks\", \"filter\": \"canary\" }.",
+			},
 		},
 		Required: []string{"session_id", "what"},
 	}
@@ -250,6 +267,9 @@ type pageFetchArgs struct {
 	// IncludeValues exposes cookie and storage values instead of redacting
 	// them (what=storage only).
 	IncludeValues bool `json:"include_values"`
+	// Filter narrows what=network by request type and what=sinks by canary or
+	// known source; other aspects ignore it.
+	Filter string `json:"filter"`
 }
 
 // Execute parses the page_fetch arguments, resolves the session, dispatches to

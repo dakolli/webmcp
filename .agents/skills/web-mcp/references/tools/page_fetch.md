@@ -21,6 +21,7 @@ The live schema is `code://pkg/mcp/tools/page.go#L90`. The aspect registry is `c
 | `target` | string | no | — | Resource URL for `css`/`js`. For `body`: a `seq` number or a substring of the request URL, newest match wins. |
 | `full_page` | boolean | no | `false` | Capture the whole scrollable page. Only `screenshot` uses it. |
 | `include_values` | boolean | no | `false` | With `what=storage`, return real cookie and storage values instead of `<redacted>`. `true` exposes live session tokens. |
+| `filter` | string | no | — | Narrows `network` or `sinks`. `network`: comma list of request types, case-insensitive, a bare name keeps and a `-` prefix drops (`document,script,xhr`, `-image,-font`). `sinks`: `canary` or `known`. A filtered read adds `filtered_out`. |
 | `timeout_ms` | integer | no | `30000` | Bound for the whole call. Clamped to 1..120000. A full-page screenshot keeps its 90 s floor unless you pass a larger value. |
 
 The live `what` enum has 23 values, in registration order: `html`, `dom`, `text`, `css`, `js`, `links`, `screenshot`, `meta`, `interactives`, `a11y`, `network`, `body`, `console`, `websocket`, `article`, `tables`, `forms`, `marks`, `security`, `sinks`, `postmessage`, `storage`, `har`. `timeout_ms` defaults to 30000 and clamps to 1..120000.
@@ -41,7 +42,7 @@ The live `what` enum has 23 values, in registration order: `html`, `dom`, `text`
 | `meta` | JSON object `{title,url,meta:[...]}`. | no | yes, JSON envelope |
 | `interactives` | JSON `{interactives:[...],truncated,frames:[{url,count,truncated}],frames_truncated}`, each item with `x`, `y`, `width`, `height`, `box {x,y,w,h}`, and `frame_url`. `box` is the layout bounds as top-left plus size, `frame_url` names the same-process child frame that owns a framed entry, and every coordinate is page-absolute, so `box.x + width/2 == x` exactly. Whole values serialize without a decimal. `marks` reports viewport top-left instead. | yes | **no** |
 | `a11y` | JSON `{nodes:[...],count,truncated}`. | no | **no** |
-| `network` | JSON `{entries,count,dropped,truncated}`. | no | **no** |
+| `network` | JSON `{entries,count,dropped,truncated,filtered_out?}`. | no | **no** |
 | `body` | JSON `{seq,method,url,status,content_type,bytes,truncated}` plus `body` or `base64`. | no | **no** |
 | `console` | JSON `{entries,count,dropped,truncated}`. | no | **no** |
 | `websocket` | JSON `{entries,count,dropped,truncated}`; each entry `{seq,socket_id,url,direction,opcode,payload,payload_bytes,payload_cut,status,ms}`. | no | **no** |
@@ -50,7 +51,7 @@ The live `what` enum has 23 values, in registration order: `html`, `dom`, `text`
 | `forms` | JSON `{forms:[{index,action,method,enctype,fields,submits,csrf_candidates}],count,truncated}`. A field holds `name`, `type`, `label`, `required`, `has_value`, `options[]`, `selector`. A control value never appears. A submit holds `name`, `type`, `label`, `selector`. A CSRF candidate holds `name`, `selector`, `match`. | no | **no** |
 | `marks` | One text block `{marks,viewport_width,viewport_height,truncated}`, then one PNG image block. | no | **no** |
 | `security` | JSON `{url,checks:[{id,status,evidence,detail}],count,truncated}`. | no | **no** |
-| `sinks` | JSON `{installed,hits:[{source,sink,context,value,value_cut?,stack?,selector?,ts}],dropped,truncated}`. | no | **no** |
+| `sinks` | JSON `{installed,hits:[{source,sink,context,value,value_cut?,stack?,selector?,ts}],dropped,truncated,filtered_out?}`. | no | **no** |
 | `postmessage` | JSON `{installed, messages:[{origin, source_kind, data, data_type, ts, stack}], dropped, truncated, frames:[{url, probed}]}`. | no | **no** |
 | `storage` | JSON `{cookies,local_storage,session_storage,indexed_db,caches}`, each with a `*_truncated` counter. | no | **no** |
 | `har` | JSON `{log:{version,creator,pages,entries,comment?,truncated?}}`. The CLI also accepts `--out <path>` on the `har` row: it writes the document to that file (mode 0600) instead of stdout and prints `wrote <path> (<n> entries)`, appending ` (truncated)` when entries were dropped. The parent directory must exist; `--out` refuses any other aspect. Without `--max-bytes` the CLI asks for the uncapped export. Tested: 2026-10-26. | no | **no** |
@@ -91,6 +92,8 @@ Every handle has the form `g<document>-b<backendNodeId>`, for example `gy1g0vstq
 ### Network, console, and websocket capture
 
 Capture starts before the first document loads. All three rings are cumulative from page creation. `clear_logs` (a `page_act` action) empties all three rings and resets `dropped`, for example `{"network":39,"console":0,"websocket":0}`. The `seq` counter does not reset. The recipe is `clear_logs`, then one action, then read.
+
+`filter` narrows the network read after the ring is read. It is a comma list of request types matched case-insensitively against each entry's `type`: a bare name keeps that type and a `-` prefix drops it, so `filter: "document,script,xhr"` keeps those three and `filter: "-image,-font"` drops images and fonts. Unknown names fail as `invalid_args` and list the accepted values: `document`, `stylesheet`, `image`, `media`, `font`, `script`, `texttrack`, `xhr`, `fetch`, `prefetch`, `eventsource`, `websocket`, `manifest`, `signedexchange`, `ping`, `cspviolationreport`, `preflight`, `other`. A filtered read keeps `count` as the returned count and adds `filtered_out`, the number dropped, so `count:0` with `filtered_out:11` means nothing matched rather than nothing captured. An unfiltered read never carries `filtered_out`.
 
 #### Header redaction
 
@@ -143,6 +146,8 @@ The payload is `{installed, hits:[{source, sink, context, value, value_cut?, sta
 
 An unarmed page returns `{"installed":false,"hits":[],"dropped":0,"truncated":0}` with no error. A read is not a state change. The ring is per document. A full navigation starts a fresh ring, because the arm step re-injects the script before the new document's own scripts, so `installed` stays true. The new document's own scripts can write hits at once, so a post-navigation read can be non-empty. A client-side route change keeps the same ring and appends to it. Clear with `page_act action=sinks_clear`, which returns `{"cleared":N}`.
 
+`filter=canary` keeps only hits whose `value` holds the injected `wm-canary-…` marker, and `filter=known` drops hits whose `source` is `unknown`. Both add `filtered_out` to the envelope, so `filter: "known"` on a page whose only hits have an unknown source returns an empty `hits` list with `filtered_out` equal to the number dropped, not an error. `filter=canary` matches only the auto-minted `wm-canary-…` value; a custom `inject_canary` value outside that prefix is not matched, so read unfiltered for it. `inject_canary` can return an empty `hits` list with no error, because no instrumented sink received the canary in the current document; that is a normal result, not a failure, and the ring read is the fallback.
+
 ### postMessage recorder with what=postmessage
 
 `postmessage` reads the `message` event ring. Arm it with `page_act action=postmessage_install`. The payload is `{installed, messages:[{origin, source_kind, data, data_type, ts, stack}], dropped, truncated, frames:[{url, probed}]}`. `messages` is `[]` and never null. `source_kind` is `window`, `frame`, `worker`, or `unknown`. `data_type` is `string`, `json`, `object`, or `other`. `stack` keeps 5 receive-side frames and is omitted when empty.
@@ -180,7 +185,9 @@ Every error rides the envelope: `{"ok":false,"error":{"type":…,"message":…,"
 
 **Unknown session.** Type `page_closed`. Message `page_fetch: session "page-999" not found`. Recovery: re-read `session_list` or `page_list`, because the idle sweep removes pages.
 
-**Unknown `what`.** Type `invalid_args`. `message` is `page_fetch: unknown what="<value>" (must be one of <the live enum>)`. Recovery: send one listed value. `canary` is not on the tool surface.
+**Unknown `what`.** Type `invalid_args`. `message` is `page_fetch: unknown what="<value>" (must be one of <the live enum>)`. Recovery: send one listed value. `canary` is not a `what` value; it is the `filter` value on `what=sinks`.
+
+**Unknown `filter` value.** Type `invalid_args`. A `network` name outside the accepted list returns `invalid arguments: what=network filter "<value>" names unknown request type "<name>" — accepted: document, stylesheet, …`, and a `sinks` value other than `canary` or `known` returns `invalid arguments: what=sinks filter "<value>" is not accepted — use canary … or known …`. Recovery: send one accepted value.
 
 **No selector match on `text`.** Type `element_not_found`. Live envelope, tested on 2026-10-26:
 
@@ -212,6 +219,7 @@ Recovery: re-read `what=network` for the current `seq` values, then read the bod
 - 2026-10-26 — `tables` and `forms` on a live page. `forms` reported `has_value:false`, then `has_value:true` after an input, and never returned the value. `timeout_ms` bounded a slow read and the failure named `what` and the value.
 - 2026-10-27 — live on `https://www.debian.org/`: every `network` entry carried `frame_id` and `loader_id`, and the document request carried `top_document:true`, `dropped:0`, `truncated:0`. `security` returned `count:21` with no `header_conflict`, which is correct for a page whose audited headers each carry one value.
 - 2026-10-27 — source-verified against commit `83a6797` and its tests: the eight `csp_bypass_*` checks, their `fail`/`warn`/`info` statuses, and the trusted-host list. The running daemon predated the commit and returned the 13-check report above, so there is no live call for the new ids yet.
+- 2026-10-28 — source-verified, not live-tested: the `filter` input on `network` and `sinks`, its accepted values, and `filtered_out` (WEB-231).
 
 ## When not to use it
 

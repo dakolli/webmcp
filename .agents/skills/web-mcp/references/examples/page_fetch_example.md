@@ -76,6 +76,14 @@ Open `https://react.dev/learn` as `page-3`, call `page_act` `clear_logs` (expect
 
 Expect one entry with `"seq":40` and `"url":"https://react.dev/_next/static/chunks/616.bd871377a76d946f.js"`. Each entry also carries `frame_id` and `loader_id`, and only the page's document request sets `"top_document":true`, which marks the current top-level document. `seq` keeps counting after `clear_logs`, so it proves the action caused the request.
 
+Narrow the same read to signal traffic:
+
+```json
+{"tool":"page_fetch","arguments":{"session_id":"page-3","what":"network","filter":"document,script"}}
+```
+
+Expect only `Document` and `Script` entries, with `filtered_out` equal to the number the filter dropped. The drop form is `filter: "-image,-font"`, and an unknown name fails as `invalid_args` with the accepted list.
+
 ## 8. Read headers, one body, and redaction
 
 Open `https://httpbin.org/forms/post` as `page-4`. Clear the rings, then submit:
@@ -124,6 +132,14 @@ Open a new page with a hash, arm, load the hash into `innerHTML`, read, clear:
 ```
 
 Expect `{"installed":true}`, then `data` as `{"installed":true,"hits":[{"source":"location.hash","sink":"innerHTML","context":"html","value":"#wm-canary-160","stack":[…],"selector":"…","ts":…}],"dropped":0,"truncated":0}`, then `{"cleared":1}`. A read after the clear returns `hits:[]`.
+
+Filter the ring to the canary:
+
+```json
+{"tool":"page_fetch","arguments":{"session_id":"page-5","what":"sinks","filter":"canary"}}
+```
+
+Expect the one hit whose `value` holds `wm-canary-`, plus `filtered_out` for the hits dropped. `filter: "known"` instead drops every hit whose `source` is `"unknown"`. `inject_canary` can return `hits: []` with no error when no instrumented sink received the marker; that is a normal result, not a failure.
 
 ## 12. Export HAR
 
