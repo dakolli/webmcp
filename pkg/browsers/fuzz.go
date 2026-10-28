@@ -119,14 +119,29 @@ type FuzzRun struct {
 	BodyRedactions int `json:"body_redactions"`
 }
 
-// FuzzBaseline is the unmodified request every variant is compared with.
+// FuzzBaseline is the unmodified request every variant is compared with. It is
+// probed twice so the compared timing is warm: ColdMS is the first sample that
+// paid for connection setup, MS the second.
 type FuzzBaseline struct {
-	// Status is the baseline HTTP status.
+	// Status is the baseline HTTP status from the warm probe.
 	Status int `json:"status"`
 	// Bytes is the true baseline body size measured before the cap.
 	Bytes int64 `json:"bytes"`
-	// MS is the baseline duration.
+	// ColdMS is the first, warming probe's duration.
+	ColdMS int64 `json:"cold_ms"`
+	// MS is the second, warm probe's duration that every variant is compared
+	// against.
 	MS int64 `json:"ms"`
+}
+
+// timingSpread reports the gap between the cold and warm probes. A variant whose
+// duration differs from MS by less than this is baseline noise, not an anomaly.
+func (b FuzzBaseline) timingSpread() int64 {
+	spread := b.ColdMS - b.MS
+	if spread < 0 {
+		return -spread
+	}
+	return spread
 }
 
 // FuzzAnomaly is one rule hit on one row.
@@ -188,7 +203,8 @@ func (e *FuzzBoundsError) Hint() string {
 
 // ReplayFuzz runs a bounded matrix of variants over one captured request. It
 // validates the fixed caps and the computed size before any request leaves,
-// checks scope before the baseline, sends the baseline unmodified, then fans the
+// checks scope before the baseline, probes the baseline twice so the compared
+// timing is warm rather than the slowest sample of the run, then fans the
 // variants out five at a time with a ten-second budget each. Every variant goes
 // through the replay seam, so scope, the per-host rate limit and body redaction
 // apply to each one. Rows keep plan order with Seq starting at 1 even though the
@@ -231,12 +247,15 @@ func (p *Page) ReplayFuzz(ctx context.Context, spec FuzzSpec) (FuzzResult, error
 		req.body = body
 	}
 
-	baseCtx, cancel := context.WithTimeout(ctx, fuzzRequestTimeout)
-	base, err := p.replayEntry(baseCtx, entry, ReplaySpec{
-		CheckScope: spec.CheckScope,
-		MaxBytes:   spec.MaxBytes,
-	})
-	cancel()
+	probe := func() (ReplayResult, error) {
+		probeCtx, cancel := context.WithTimeout(ctx, fuzzRequestTimeout)
+		defer cancel()
+		return p.replayEntry(probeCtx, entry, ReplaySpec{
+			CheckScope: spec.CheckScope,
+			MaxBytes:   spec.MaxBytes,
+		})
+	}
+	base, err := fuzzWarmBaseline(probe)
 	if err != nil {
 		return FuzzResult{}, fmt.Errorf("replay_fuzz: baseline: %w", err)
 	}
@@ -244,7 +263,7 @@ func (p *Page) ReplayFuzz(ctx context.Context, spec FuzzSpec) (FuzzResult, error
 	result := FuzzResult{
 		Runs: []FuzzRun{},
 		Summary: FuzzSummary{
-			Baseline:  fuzzBaselineOf(base),
+			Baseline:  base,
 			Anomalies: []FuzzAnomaly{},
 		},
 	}
@@ -347,13 +366,30 @@ func (r fuzzRequest) spec(variant fuzzVariant) (ReplaySpec, error) {
 	return spec, nil
 }
 
-// fuzzBaselineOf maps a replay result to the summary baseline using the body
-// size measured before the cap.
-func fuzzBaselineOf(res ReplayResult) FuzzBaseline {
+// fuzzWarmBaseline probes the unmodified request twice. The first sample warms
+// the connection and its timing is reported as cold_ms; the second supplies the
+// timing every variant is compared against. A single cold sample would be the
+// slowest of the run and flag healthy variants.
+func fuzzWarmBaseline(probe func() (ReplayResult, error)) (FuzzBaseline, error) {
+	cold, err := probe()
+	if err != nil {
+		return FuzzBaseline{}, err
+	}
+	warm, err := probe()
+	if err != nil {
+		return FuzzBaseline{}, fmt.Errorf("warm probe: %w", err)
+	}
+	return fuzzBaselineOf(warm, cold), nil
+}
+
+// fuzzBaselineOf maps the warm probe to the summary baseline, keeping the cold
+// probe's timing and the body size measured before the cap.
+func fuzzBaselineOf(warm, cold ReplayResult) FuzzBaseline {
 	return FuzzBaseline{
-		Status: res.Status,
-		Bytes:  res.BodyBytes,
-		MS:     res.MS,
+		Status: warm.Status,
+		Bytes:  warm.BodyBytes,
+		ColdMS: cold.MS,
+		MS:     warm.MS,
 	}
 }
 
@@ -591,7 +627,9 @@ loop:
 
 // fuzzAnomalies compares every row with the baseline. It is the single home of
 // the rule list: status_changed, size_delta above 10 percent and time_delta
-// above 3x in either direction.
+// above 3x in either direction. A time_delta also has to clear the baseline's
+// own cold-to-warm spread, so two probes that disagree by more than the run's
+// deviation suppress the rule rather than flag noise.
 func fuzzAnomalies(rows []FuzzRun, base FuzzBaseline) []FuzzAnomaly {
 	out := make([]FuzzAnomaly, 0)
 	for _, row := range rows {
@@ -617,11 +655,20 @@ func fuzzAnomalies(rows []FuzzRun, base FuzzBaseline) []FuzzAnomaly {
 		}
 		if base.MS > 0 && row.MS > 0 {
 			ratio := float64(row.MS) / float64(base.MS)
-			if ratio > 3 || ratio < 1.0/3.0 {
+			delta := row.MS - base.MS
+			if delta < 0 {
+				delta = -delta
+			}
+			if (ratio > 3 || ratio < 1.0/3.0) && delta >= base.timingSpread() {
 				out = append(out, FuzzAnomaly{
 					Seq:  row.Seq,
 					Rule: fuzzRuleTime,
-					Why:  fmt.Sprintf("ms %d, baseline %d", row.MS, base.MS),
+					Why: fmt.Sprintf(
+						"ms %d, baseline %d (spread %d)",
+						row.MS,
+						base.MS,
+						base.timingSpread(),
+					),
 				})
 			}
 		}

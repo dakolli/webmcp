@@ -259,7 +259,7 @@ func TestFuzzPlanOrder(t *testing.T) {
 }
 
 func TestFuzzAnomalies(t *testing.T) {
-	base := FuzzBaseline{Status: 200, Bytes: 1000, MS: 100}
+	base := FuzzBaseline{Status: 200, Bytes: 1000, ColdMS: 150, MS: 100}
 	tests := []struct {
 		name string
 		row  FuzzRun
@@ -321,6 +321,44 @@ func TestFuzzAnomalies(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestFuzzWarmBaseline probes the baseline twice, compares against the warm
+// sample, and suppresses a time_delta that fits inside the cold-to-warm spread.
+func TestFuzzWarmBaseline(t *testing.T) {
+	probes := []ReplayResult{
+		{Status: 200, BodyBytes: 1000, MS: 2000},
+		{Status: 200, BodyBytes: 1000, MS: 300},
+	}
+	calls := 0
+	probe := func() (ReplayResult, error) {
+		res := probes[calls]
+		calls++
+		return res, nil
+	}
+
+	base, err := fuzzWarmBaseline(probe)
+	if err != nil {
+		t.Fatalf("fuzzWarmBaseline() error = %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("fuzzWarmBaseline() probes = %d, want 2", calls)
+	}
+	if base.ColdMS != 2000 || base.MS != 300 {
+		t.Fatalf("baseline cold_ms/ms = %d/%d, want 2000/300", base.ColdMS, base.MS)
+	}
+	if base.Status != 200 || base.Bytes != 1000 {
+		t.Fatalf("baseline status/bytes = %d/%d, want the warm probe's 200/1000", base.Status, base.Bytes)
+	}
+
+	inside := fuzzAnomalies([]FuzzRun{{Seq: 1, Status: 200, Bytes: 1000, MS: 1100}}, base)
+	if len(inside) != 0 {
+		t.Fatalf("fuzzAnomalies() inside the spread = %v, want no time_delta", inside)
+	}
+	outside := fuzzAnomalies([]FuzzRun{{Seq: 2, Status: 200, Bytes: 1000, MS: 4000}}, base)
+	if len(outside) != 1 || outside[0].Rule != fuzzRuleTime {
+		t.Fatalf("fuzzAnomalies() beyond the spread = %v, want one time_delta", outside)
 	}
 }
 
@@ -470,7 +508,7 @@ func TestFuzzCappedMatrixKeepsSizeAnomalies(t *testing.T) {
 		return res
 	}
 
-	base := fuzzBaselineOf(bodyOf("v3"))
+	base := fuzzBaselineOf(bodyOf("v3"), bodyOf("v3"))
 	if base.Bytes != baselineSize {
 		t.Fatalf("baseline bytes = %d, want the true size %d", base.Bytes, baselineSize)
 	}
