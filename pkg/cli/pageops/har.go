@@ -30,6 +30,9 @@ type harPage interface {
 // is filled from the browser cookie jar at export time. Sensitive header and
 // cookie values are redacted unless secret capture is on.
 func PageHAR(ctx context.Context, p *browsers.Page, maxBytes int) (string, error) {
+	if err := guardRead(p); err != nil {
+		return "", err
+	}
 	title := ""
 	if state, err := PageStateOf(ctx, p); err == nil {
 		title = state.Title

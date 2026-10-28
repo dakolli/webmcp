@@ -131,8 +131,11 @@ type securityReport struct {
 // entry the engine marked as the current top-level document and ignores
 // everything captured before it; it never clears the ring.
 func PageSecurity(ctx context.Context, p *browsers.Page) (string, error) {
-	p.Lock()
-	defer p.Unlock()
+	ctx, done, err := beginPage(ctx, p, "security")
+	if err != nil {
+		return "", err
+	}
+	defer done()
 	if p.Rod == nil {
 		return "", fmt.Errorf("page session is closed")
 	}

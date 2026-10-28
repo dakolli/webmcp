@@ -135,7 +135,9 @@ func (p *Page) ClearSinks(ctx context.Context) (int, error) {
 // uninstalled page returns Installed false and an empty hit list rather than an
 // error. The method takes the page lock itself.
 func (p *Page) SinkHits(ctx context.Context) (SinksResult, error) {
-	p.Lock()
+	if err := p.lockRead(ctx, "sinks"); err != nil {
+		return SinksResult{}, err
+	}
 	defer p.Unlock()
 	if p.Rod == nil {
 		return SinksResult{}, fmt.Errorf("page session is closed")

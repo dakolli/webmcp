@@ -27,6 +27,9 @@ type sinksCleared struct {
 // Deliberately does NOT lock: Page.SinkHits takes the page lock itself and owns
 // the nil-Rod guard, the same engine-seam exception as PageInteractives.
 func PageSinks(ctx context.Context, p *browsers.Page) (string, error) {
+	if err := guardRead(p); err != nil {
+		return "", err
+	}
 	res, err := p.SinkHits(ctx)
 	if err != nil {
 		return "", err

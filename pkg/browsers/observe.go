@@ -628,7 +628,9 @@ func (p *Page) NetworkBody(ctx context.Context, seq int64) (NetworkBody, error) 
 			entry.Error,
 		)
 	}
-	p.Lock()
+	if err := p.lockRead(ctx, "body"); err != nil {
+		return NetworkBody{}, err
+	}
 	defer p.Unlock()
 	if p.Rod == nil {
 		return NetworkBody{}, fmt.Errorf("network body: page session is closed")

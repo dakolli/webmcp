@@ -95,7 +95,9 @@ type A11yResult struct {
 // navigation. The tree is ONE Accessibility.getFullAXTree round trip covering
 // the root frame only: iframe contents are separate documents.
 func (p *Page) A11yNodes(ctx context.Context) (A11yResult, error) {
-	p.Lock()
+	if err := p.lockRead(ctx, "a11y"); err != nil {
+		return A11yResult{}, err
+	}
 	defer p.Unlock()
 	if p.Rod == nil {
 		return A11yResult{}, fmt.Errorf("page session is closed")

@@ -33,6 +33,9 @@ func PagePostMessage(
 	p *browsers.Page,
 	target string,
 ) (string, error) {
+	if err := guardRead(p); err != nil {
+		return "", err
+	}
 	if strings.EqualFold(strings.TrimSpace(target), "clear") {
 		cleared, err := p.ClearPostMessages(ctx)
 		if err != nil {

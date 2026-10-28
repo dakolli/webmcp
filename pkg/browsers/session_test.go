@@ -409,6 +409,55 @@ func TestGuardPageWatchdogTripsThenRecovers(t *testing.T) {
 	}
 }
 
+// TestBeginOperationReleasesLockOnCancelledContext pins WEB-229: a CDP call
+// that ignores its cancelled context must not keep the page locked. The
+// watchdog force-releases the lock, the next operation fails immediately with a
+// page-unusable error that names session_close, and the release func stays safe
+// to call once the stuck call finally unwinds.
+func TestBeginOperationReleasesLockOnCancelledContext(t *testing.T) {
+	p := &Page{ID: "page-1", info: healthyInfo}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	release, err := p.BeginOperation(ctx, "navigate")
+	if err != nil {
+		t.Fatalf("BeginOperation() error = %v", err)
+	}
+
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer waitCancel()
+	if err := p.lockContext(waitCtx, "probe", false); err != nil {
+		t.Fatalf("page lock was not released after the context was cancelled: %v", err)
+	}
+	p.Unlock()
+
+	started := time.Now()
+	guardErr := p.LockContext(context.Background(), "meta")
+	elapsed := time.Since(started)
+	var trip *PageWatchdogError
+	if !errors.As(guardErr, &trip) {
+		t.Fatalf("LockContext after the wedge = %v, want *PageWatchdogError", guardErr)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("LockContext after the wedge burned %s, want under 1s", elapsed)
+	}
+	lower := strings.ToLower(guardErr.Error())
+	for _, want := range []string{"unusable", "session_close"} {
+		if !strings.Contains(lower, want) {
+			t.Fatalf("wedge error = %q, want it to contain %q", guardErr, want)
+		}
+	}
+	if hint := trip.Hint(); !strings.Contains(hint, "session_close") {
+		t.Fatalf("wedge hint = %q, want it to name session_close", hint)
+	}
+
+	release()
+	release()
+	settle(t, "the page to recover", func() bool {
+		return p.wedgeErr.Load() == nil && p.closedErr.Load() == nil
+	})
+}
+
 // TestGuardPageReleasesLockOnEveryReturnPath pins that a value return, an
 // error return, a panic and a budget cancellation each release the operation
 // lock.

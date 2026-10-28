@@ -353,7 +353,9 @@ func authCookies(pc *rod.Page, site string) ([]AuthCookie, error) {
 // site; matching a cookie to a request belongs to the consumer. It takes the
 // page lock itself; callers must not pre-lock.
 func (p *Page) Cookies(ctx context.Context) ([]Cookie, error) {
-	p.Lock()
+	if err := p.lockRead(ctx, "cookies"); err != nil {
+		return nil, err
+	}
 	defer p.Unlock()
 	if p.Rod == nil {
 		return nil, fmt.Errorf("cookies: page session is closed")

@@ -164,7 +164,9 @@ func (p *Page) ClearPostMessages(ctx context.Context) (int, error) {
 // false and an empty message list rather than an error. The method takes the
 // page lock itself.
 func (p *Page) PostMessages(ctx context.Context) (PostMessageResult, error) {
-	p.Lock()
+	if err := p.lockRead(ctx, "postmessage"); err != nil {
+		return PostMessageResult{}, err
+	}
 	defer p.Unlock()
 	if p.Rod == nil {
 		return PostMessageResult{}, fmt.Errorf("page session is closed")

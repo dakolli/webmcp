@@ -48,7 +48,9 @@ type articlePayload struct {
 // must NOT pre-lock, and the nil-Rod guard runs under the lock. Extraction is a
 // single in-page script, so no DOM crosses the wire.
 func (p *Page) Article(ctx context.Context) (Article, error) {
-	p.Lock()
+	if err := p.lockRead(ctx, "article"); err != nil {
+		return Article{}, err
+	}
 	defer p.Unlock()
 	if p.Rod == nil {
 		return Article{}, fmt.Errorf("page session is closed")

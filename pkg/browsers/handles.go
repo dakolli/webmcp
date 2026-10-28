@@ -43,7 +43,9 @@ func MintHandle(docToken string, id proto.DOMBackendNodeID) string {
 // callers must NOT pre-lock, and the snapshot and its token always come from
 // the same lock scope.
 func (p *Page) CaptureSnapshot(ctx context.Context) (*proto.DOMSnapshotCaptureSnapshotResult, string, error) {
-	p.Lock()
+	if err := p.lockRead(ctx, "dom"); err != nil {
+		return nil, "", err
+	}
 	defer p.Unlock()
 	if p.Rod == nil {
 		return nil, "", fmt.Errorf("page session is closed")

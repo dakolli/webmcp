@@ -11,8 +11,12 @@ import (
 // PageWebsocket returns the newest buffered WebSocket frames, capped at
 // MaxLogEmit and ordered oldest first, as {"entries","count","dropped","truncated"}.
 // Deliberately does NOT lock: the engine read touches only the observer's own
-// mutex, so a closed page still answers from its in-memory buffer.
+// mutex, so a page the watchdog has not marked unusable still answers from its
+// in-memory buffer. A wedged page is rejected before the ring is read.
 func PageWebsocket(_ context.Context, p *browsers.Page) (string, error) {
+	if err := guardRead(p); err != nil {
+		return "", err
+	}
 	entries, dropped := p.WebSocketEntries()
 	return encodeLogs(entries, dropped, "websocket")
 }

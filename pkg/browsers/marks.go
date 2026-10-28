@@ -74,7 +74,9 @@ type marksSnapshot struct {
 // Coordinates are getBoundingClientRect values in viewport CSS px, which an
 // agent can pass straight to click_at.
 func (p *Page) Marks(ctx context.Context) (out MarksResult, err error) {
-	p.Lock()
+	if lockErr := p.lockRead(ctx, "marks"); lockErr != nil {
+		return MarksResult{}, lockErr
+	}
 	defer p.Unlock()
 	if p.Rod == nil {
 		return MarksResult{}, fmt.Errorf("page session is closed")

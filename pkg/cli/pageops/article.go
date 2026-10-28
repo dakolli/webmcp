@@ -13,6 +13,9 @@ import (
 // cap and reports it through the truncated field; this surface emits the result
 // verbatim.
 func PageArticle(ctx context.Context, p *browsers.Page) (string, error) {
+	if err := guardRead(p); err != nil {
+		return "", err
+	}
 	article, err := p.Article(ctx)
 	if err != nil {
 		return "", err

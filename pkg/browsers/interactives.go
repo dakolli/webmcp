@@ -171,7 +171,9 @@ type interactiveScope struct {
 // threaded through to the rod calls so a hung page cannot outlive the caller's
 // deadline.
 func (p *Page) Interactives(ctx context.Context, selector string) (InteractivesResult, error) {
-	p.Lock()
+	if err := p.lockRead(ctx, "interactives"); err != nil {
+		return InteractivesResult{}, err
+	}
 	defer p.Unlock()
 	if p.Rod == nil {
 		return InteractivesResult{}, fmt.Errorf("page session is closed")

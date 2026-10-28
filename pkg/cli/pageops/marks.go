@@ -14,6 +14,9 @@ import (
 // click_at. The output is never truncated: the screenshot data-URI must stay
 // intact.
 func PageMarks(ctx context.Context, p *browsers.Page) (string, error) {
+	if err := guardRead(p); err != nil {
+		return "", err
+	}
 	res, err := p.Marks(ctx)
 	if err != nil {
 		return "", err

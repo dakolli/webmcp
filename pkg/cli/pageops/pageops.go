@@ -94,11 +94,16 @@ func resolveError(selector string, err error) error {
 	return err
 }
 
-// beginPage gives ctx a deadline when it has none, then acquires the page
-// operation lock. The returned release func cancels the derived context and
-// releases the lock; callers defer it immediately. A page already held by
-// another operation returns the actionable lock-wait error naming op and the
-// time spent waiting.
+// beginPage gives ctx a deadline when it has none, then takes the page
+// operation lock through the engine's guarded read hold. The returned release
+// func cancels the derived context and releases the lock; callers defer it
+// immediately. The read hold waits at most the engine's bounded read budget for
+// the lock, so a page a wedged operation still holds returns the unusable error
+// at once instead of burning the call budget; a healthy page acquires it
+// immediately. A page already marked unusable by the watchdog returns its typed
+// error without touching the lock, and a CDP call that outlives a cancelled
+// context is force-released by the page watchdog instead of keeping the page
+// locked.
 func beginPage(
 	ctx context.Context,
 	p *browsers.Page,
@@ -111,14 +116,57 @@ func beginPage(
 		opCtx, stop = context.WithTimeout(ctx, defaultPageOpTimeout)
 		cancel = stop
 	}
-	if err := p.LockContext(opCtx, op); err != nil {
+	release, err := p.BeginRead(opCtx, op)
+	if err != nil {
 		cancel()
-		return opCtx, nil, err
+		return opCtx, nil, asPageUnusable(err)
 	}
 	return opCtx, func() {
-		p.Unlock()
+		release()
 		cancel()
 	}, nil
+}
+
+// pageUnusableError is the read-path failure for a page its watchdog marked
+// unusable. It keeps the engine error's prose and Hint but deliberately does not
+// unwrap to context.DeadlineExceeded: a wedged page is not a slow page, so a
+// read must not advise a higher timeout_ms. Surfaces still resolve the recovery
+// through Hint.
+type pageUnusableError struct {
+	cause error
+}
+
+// Error reports the engine's page-unusable sentence.
+func (e *pageUnusableError) Error() string { return e.cause.Error() }
+
+// Hint names the only recovery for a wedged page.
+func (e *pageUnusableError) Hint() string {
+	var hinted interface{ Hint() string }
+	if errors.As(e.cause, &hinted) {
+		return hinted.Hint()
+	}
+	return ""
+}
+
+// asPageUnusable labels a watchdog, locked or closed page error as a read
+// failure. Any other error, including a nil error, passes through unchanged.
+func asPageUnusable(err error) error {
+	var wedge *browsers.PageWatchdogError
+	var locked *browsers.PageLockedError
+	var broken *browsers.PageBrokenError
+	var unresponsive *browsers.PageUnresponsiveError
+	if errors.As(err, &wedge) || errors.As(err, &locked) ||
+		errors.As(err, &broken) || errors.As(err, &unresponsive) {
+		return &pageUnusableError{cause: err}
+	}
+	return err
+}
+
+// guardRead fails a read before any CDP call when the page watchdog marked the
+// page unusable. It never waits on the operation lock, so every page_fetch
+// aspect rejects a wedged page in microseconds instead of burning its budget.
+func guardRead(p *browsers.Page) error {
+	return asPageUnusable(p.Unusable())
 }
 
 // opDeadlineError turns a cancelled or expired operation into one actionable
@@ -563,6 +611,9 @@ func PageMeta(ctx context.Context, p *browsers.Page) (string, error) {
 // PageEmulate's engine-seam pattern) — an exception to the pageops
 // self-locking convention, so callers must not pre-lock either.
 func PageInteractives(ctx context.Context, p *browsers.Page, selector string) (string, error) {
+	if err := guardRead(p); err != nil {
+		return "", err
+	}
 	res, err := p.Interactives(ctx, selector)
 	if err != nil {
 		return "", err
@@ -584,6 +635,9 @@ func PageInteractives(ctx context.Context, p *browsers.Page, selector string) (s
 // lock itself and owns the nil-Rod guard — the same engine-seam exception as
 // PageInteractives, so callers must not pre-lock either.
 func PageA11y(ctx context.Context, p *browsers.Page) (string, error) {
+	if err := guardRead(p); err != nil {
+		return "", err
+	}
 	res, err := p.A11yNodes(ctx)
 	if err != nil {
 		return "", err
@@ -612,22 +666,88 @@ type logsEnvelope[T any] struct {
 	Dropped int `json:"dropped"`
 	// Truncated counts buffered entries omitted by the emit cap.
 	Truncated int `json:"truncated"`
+	// FilteredOut counts the entries a filter removed, and is absent when no
+	// filter ran so unfiltered output keeps its exact shape.
+	FilteredOut *int `json:"filtered_out,omitempty"`
 }
 
 // PageNetwork returns the newest buffered network entries, capped at MaxLogEmit
 // and ordered oldest first, as {"entries","count","dropped","truncated"}.
 // Deliberately does NOT lock: the engine read touches only the observer's own
-// mutex, so a closed page still answers from its in-memory buffer.
+// mutex, so a page the watchdog has not marked unusable still answers from its
+// in-memory buffer. A wedged page is rejected before the ring is read.
 func PageNetwork(_ context.Context, p *browsers.Page) (string, error) {
+	if err := guardRead(p); err != nil {
+		return "", err
+	}
 	entries, dropped := p.NetworkEntries()
 	return encodeLogs(entries, dropped, "network")
+}
+
+// PageNetworkFiltered returns PageNetwork's envelope narrowed to the request
+// types named by filter: a comma list where a bare name keeps that type and a
+// "-" prefix drops it. An empty filter is PageNetwork unchanged; a filtered read
+// reports how many entries the filter dropped in filtered_out.
+func PageNetworkFiltered(ctx context.Context, p *browsers.Page, filter string) (string, error) {
+	if err := guardRead(p); err != nil {
+		return "", err
+	}
+	f, err := parseNetworkFilter(filter)
+	if err != nil {
+		return "", err
+	}
+	if f == nil {
+		return PageNetwork(ctx, p)
+	}
+	entries, dropped := p.NetworkEntries()
+	kept, filteredOut := f.apply(entries)
+	return encodeFilteredLogs(kept, dropped, filteredOut, "network")
+}
+
+// sinksEnvelope is the what=sinks wire shape: the engine result plus
+// filtered_out, which is present only when a filter ran.
+type sinksEnvelope struct {
+	browsers.SinksResult
+	// FilteredOut counts the hits a filter removed.
+	FilteredOut *int `json:"filtered_out,omitempty"`
+}
+
+// PageSinksFiltered returns PageSinks' envelope narrowed by filter: canary keeps
+// only hits whose value holds the injected wm-canary-… marker and known drops
+// hits whose source is "unknown". An empty filter is PageSinks unchanged.
+func PageSinksFiltered(ctx context.Context, p *browsers.Page, filter string) (string, error) {
+	if err := guardRead(p); err != nil {
+		return "", err
+	}
+	f, err := parseSinksFilter(filter)
+	if err != nil {
+		return "", err
+	}
+	if f == "" {
+		return PageSinks(ctx, p)
+	}
+	res, err := p.SinkHits(ctx)
+	if err != nil {
+		return "", err
+	}
+	kept, filteredOut := f.apply(res.Hits)
+	res.Hits = kept
+	b, err := json.Marshal(sinksEnvelope{SinksResult: res, FilteredOut: &filteredOut})
+	if err != nil {
+		return "", fmt.Errorf("encode sink hits: %w", err)
+	}
+	return string(b), nil
 }
 
 // PageConsole returns the newest buffered console entries, capped at MaxLogEmit
 // and ordered oldest first, as {"entries","count","dropped","truncated"}.
 // Deliberately does NOT lock: the engine read touches only the observer's own
-// mutex, so a closed page still answers from its in-memory buffer.
+// mutex, so a page the watchdog has not marked unusable still answers from its
+// in-memory buffer. A wedged page is rejected before the ring is read.
 func PageConsole(_ context.Context, p *browsers.Page) (string, error) {
+	if err := guardRead(p); err != nil {
+		return "", err
+	}
 	entries, dropped := p.ConsoleEntries()
 	return encodeLogs(entries, dropped, "console")
 }
@@ -638,6 +758,9 @@ func PageConsole(_ context.Context, p *browsers.Page) (string, error) {
 // against the newest entry. The body itself is fetched from the browser on
 // demand, so no bodies are buffered.
 func PageBody(ctx context.Context, p *browsers.Page, target string) (string, error) {
+	if err := guardRead(p); err != nil {
+		return "", err
+	}
 	target = strings.TrimSpace(target)
 	if target == "" {
 		return "", fmt.Errorf("body requires target=<seq> or target=<url substring>")
@@ -691,6 +814,9 @@ type AspectQuery struct {
 	FullPage bool
 	// IncludeValues exposes cookie and storage values (storage only).
 	IncludeValues bool
+	// Filter narrows network reads by request type and sinks reads by canary or
+	// known source; other aspects ignore it.
+	Filter string
 	// MaxBytes caps the output unless the aspect self-caps.
 	MaxBytes int
 }
@@ -737,8 +863,8 @@ var aspectEntries = []aspectEntry{
 	{name: "a11y", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
 		return PageA11y(ctx, p)
 	}},
-	{name: "network", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
-		return PageNetwork(ctx, p)
+	{name: "network", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, q AspectQuery) (string, error) {
+		return PageNetworkFiltered(ctx, p, q.Filter)
 	}},
 	{name: "console", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
 		return PageConsole(ctx, p)
@@ -764,8 +890,8 @@ var aspectEntries = []aspectEntry{
 	{name: "storage", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, q AspectQuery) (string, error) {
 		return PageStorage(ctx, p, q.IncludeValues)
 	}},
-	{name: "sinks", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
-		return PageSinks(ctx, p)
+	{name: "sinks", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, q AspectQuery) (string, error) {
+		return PageSinksFiltered(ctx, p, q.Filter)
 	}},
 	{name: "postmessage", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, q AspectQuery) (string, error) {
 		return PagePostMessage(ctx, p, q.Target)
@@ -827,16 +953,29 @@ func PageAspect(
 // encodeLogs keeps the newest MaxLogEmit entries in chronological order and
 // marshals the shared log envelope; what names the log kind in an encode error.
 func encodeLogs[T any](entries []T, dropped int, what string) (string, error) {
+	return encodeLogEnvelope(entries, dropped, nil, what)
+}
+
+// encodeFilteredLogs is encodeLogs for a filtered read: filteredOut always
+// appears, even when it is zero, so a caller can tell a filter ran.
+func encodeFilteredLogs[T any](entries []T, dropped, filteredOut int, what string) (string, error) {
+	return encodeLogEnvelope(entries, dropped, &filteredOut, what)
+}
+
+// encodeLogEnvelope trims to the emit window and marshals one log envelope.
+// filteredOut is nil for a read that ran no filter.
+func encodeLogEnvelope[T any](entries []T, dropped int, filteredOut *int, what string) (string, error) {
 	truncated := 0
 	if len(entries) > MaxLogEmit {
 		truncated = len(entries) - MaxLogEmit
 		entries = entries[len(entries)-MaxLogEmit:]
 	}
 	b, err := json.Marshal(logsEnvelope[T]{
-		Entries:   entries,
-		Count:     len(entries),
-		Dropped:   dropped,
-		Truncated: truncated,
+		Entries:     entries,
+		Count:       len(entries),
+		Dropped:     dropped,
+		Truncated:   truncated,
+		FilteredOut: filteredOut,
 	})
 	if err != nil {
 		return "", fmt.Errorf("encode %s log: %w", what, err)
@@ -1194,6 +1333,9 @@ type resourceEntry struct {
 // Backed by Page.CaptureSnapshot; mirrors the MCP extractDOMSnapshot shape
 // exactly.
 func PageDOM(ctx context.Context, p *browsers.Page) (string, error) {
+	if err := guardRead(p); err != nil {
+		return "", err
+	}
 	snap, token, err := p.CaptureSnapshot(ctx)
 	if err != nil {
 		return "", err
@@ -2249,109 +2391,96 @@ func PageSelect(
 // PageNavigate navigates the page to url and waits for the new page to load
 // (rod's Navigate returns after the response header, so WaitLoad is
 // mandatory). Returns the final URL and title — the same confirmation shape as
-// the MCP page_act navigate.
+// the MCP page_act navigate. The wait runs under the page watchdog, so a target
+// that never finishes loading cannot hold the page lock past the call budget.
 func PageNavigate(ctx context.Context, p *browsers.Page, url string) (string, error) {
-	ctx, done, err := beginPage(ctx, p, "navigate")
-	if err != nil {
-		return "", err
-	}
-	defer done()
-	if p.Rod == nil {
-		return "", fmt.Errorf("page session is closed")
-	}
-
-	page := p.Rod.Context(ctx)
-	if err := page.Navigate(url); err != nil {
-		return "", fmt.Errorf("navigate: %w", err)
-	}
-	if err := page.WaitLoad(); err != nil {
-		return "", fmt.Errorf("wait for load: %w", err)
-	}
-	// State reports the final URL (post-redirect) and title; fall back to the
-	// requested URL if the read fails — the navigation already landed.
-	msg := fmt.Sprintf("navigated to %q", url)
-	if finalURL, title, err := p.State(ctx); err == nil {
-		msg = fmt.Sprintf("navigated to %q (title %q)", finalURL, title)
-	}
-	return msg, nil
+	return browsers.GuardPage(ctx, p, "navigate", func(ctx context.Context) (string, error) {
+		if p.Rod == nil {
+			return "", fmt.Errorf("page session is closed")
+		}
+		page := p.Rod.Context(ctx)
+		if err := page.Navigate(url); err != nil {
+			return "", fmt.Errorf("navigate: %w", err)
+		}
+		if err := page.WaitLoad(); err != nil {
+			return "", fmt.Errorf("wait for load: %w", err)
+		}
+		// State reports the final URL (post-redirect) and title; fall back to
+		// the requested URL if the read fails — the navigation already landed.
+		msg := fmt.Sprintf("navigated to %q", url)
+		if finalURL, title, err := p.State(ctx); err == nil {
+			msg = fmt.Sprintf("navigated to %q (title %q)", finalURL, title)
+		}
+		return msg, nil
+	})
 }
 
 // PageBack navigates one step back in the page's history and waits for the
 // previous page to load (history.back() triggers a fresh navigation). Returns
-// the resulting URL — the same confirmation shape as the MCP page_act back.
+// the resulting URL — the same confirmation shape as the MCP page_act back. The
+// wait runs under the page watchdog.
 func PageBack(ctx context.Context, p *browsers.Page) (string, error) {
-	ctx, done, err := beginPage(ctx, p, "back")
-	if err != nil {
-		return "", err
-	}
-	defer done()
-	if p.Rod == nil {
-		return "", fmt.Errorf("page session is closed")
-	}
-
-	page := p.Rod.Context(ctx)
-	if err := page.NavigateBack(); err != nil {
-		return "", fmt.Errorf("navigate back: %w", err)
-	}
-	// WaitLoad returns immediately if no navigation happened (no history); when
-	// it does, the URL below reflects the previous page.
-	if err := page.WaitLoad(); err != nil {
-		return "", fmt.Errorf("wait for load: %w", err)
-	}
-	backURL, _, err := p.State(ctx)
-	if err != nil {
-		return "", fmt.Errorf("read page info: %w", err)
-	}
-	return fmt.Sprintf("navigated back to %q", backURL), nil
+	return browsers.GuardPage(ctx, p, "back", func(ctx context.Context) (string, error) {
+		if p.Rod == nil {
+			return "", fmt.Errorf("page session is closed")
+		}
+		page := p.Rod.Context(ctx)
+		if err := page.NavigateBack(); err != nil {
+			return "", fmt.Errorf("navigate back: %w", err)
+		}
+		// WaitLoad returns immediately if no navigation happened (no history);
+		// when it does, the URL below reflects the previous page.
+		if err := page.WaitLoad(); err != nil {
+			return "", fmt.Errorf("wait for load: %w", err)
+		}
+		backURL, _, err := p.State(ctx)
+		if err != nil {
+			return "", fmt.Errorf("read page info: %w", err)
+		}
+		return fmt.Sprintf("navigated back to %q", backURL), nil
+	})
 }
 
 // PageForward navigates one step forward in the page's history and waits for
 // the page to load. Returns the resulting URL — the same confirmation shape as
-// the MCP page_act forward.
+// the MCP page_act forward. The wait runs under the page watchdog.
 func PageForward(ctx context.Context, p *browsers.Page) (string, error) {
-	ctx, done, err := beginPage(ctx, p, "forward")
-	if err != nil {
-		return "", err
-	}
-	defer done()
-	if p.Rod == nil {
-		return "", fmt.Errorf("page session is closed")
-	}
-
-	page := p.Rod.Context(ctx)
-	if err := page.NavigateForward(); err != nil {
-		return "", fmt.Errorf("navigate forward: %w", err)
-	}
-	if err := page.WaitLoad(); err != nil {
-		return "", fmt.Errorf("wait for load: %w", err)
-	}
-	forwardURL, _, err := p.State(ctx)
-	if err != nil {
-		return "", fmt.Errorf("read page info: %w", err)
-	}
-	return fmt.Sprintf("navigated forward to %q", forwardURL), nil
+	return browsers.GuardPage(ctx, p, "forward", func(ctx context.Context) (string, error) {
+		if p.Rod == nil {
+			return "", fmt.Errorf("page session is closed")
+		}
+		page := p.Rod.Context(ctx)
+		if err := page.NavigateForward(); err != nil {
+			return "", fmt.Errorf("navigate forward: %w", err)
+		}
+		if err := page.WaitLoad(); err != nil {
+			return "", fmt.Errorf("wait for load: %w", err)
+		}
+		forwardURL, _, err := p.State(ctx)
+		if err != nil {
+			return "", fmt.Errorf("read page info: %w", err)
+		}
+		return fmt.Sprintf("navigated forward to %q", forwardURL), nil
+	})
 }
 
 // PageReload reloads the page and waits for it to load again. Returns the same
-// confirmation string as the MCP page_act reload.
+// confirmation string as the MCP page_act reload. The wait runs under the page
+// watchdog.
 func PageReload(ctx context.Context, p *browsers.Page) (string, error) {
-	ctx, done, err := beginPage(ctx, p, "reload")
-	if err != nil {
-		return "", err
-	}
-	defer done()
-	if p.Rod == nil {
-		return "", fmt.Errorf("page session is closed")
-	}
-
-	page := p.Rod.Context(ctx)
-	if err := page.Reload(); err != nil {
-		return "", fmt.Errorf("reload: %w", err)
-	}
-	if err := page.WaitLoad(); err != nil {
-		return "", fmt.Errorf("wait for load: %w", err)
-	}
-	return "reloaded page", nil
+	return browsers.GuardPage(ctx, p, "reload", func(ctx context.Context) (string, error) {
+		if p.Rod == nil {
+			return "", fmt.Errorf("page session is closed")
+		}
+		page := p.Rod.Context(ctx)
+		if err := page.Reload(); err != nil {
+			return "", fmt.Errorf("reload: %w", err)
+		}
+		if err := page.WaitLoad(); err != nil {
+			return "", fmt.Errorf("wait for load: %w", err)
+		}
+		return "reloaded page", nil
+	})
 }
 
 // PageSetViewport changes the live page's viewport size to w × h CSS pixels
