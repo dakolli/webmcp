@@ -14,6 +14,52 @@ import (
 	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
+// TestDecodeArgsCoercesNumericStrings pins that a quoted integer is accepted for
+// max_bytes while a non-numeric string keeps the existing invalid_args sentence.
+func TestDecodeArgsCoercesNumericStrings(t *testing.T) {
+	t.Run("quoted number is coerced", func(t *testing.T) {
+		var a pageFetchArgs
+		err := decodeArgs("page_fetch", json.RawMessage(
+			`{"session_id":"page-1","what":"dom","max_bytes":"8000"}`,
+		), &a)
+		if err != nil {
+			t.Fatalf("decodeArgs() error = %v", err)
+		}
+		if a.MaxBytes != 8000 {
+			t.Fatalf("max_bytes = %d, want 8000", a.MaxBytes)
+		}
+	})
+	t.Run("non-numeric string is refused", func(t *testing.T) {
+		var a pageFetchArgs
+		err := decodeArgs("page_fetch", json.RawMessage(
+			`{"session_id":"page-1","what":"dom","max_bytes":"eight"}`,
+		), &a)
+		if err == nil {
+			t.Fatal("decodeArgs() = nil, want an argument type error")
+		}
+		want := `page_fetch: "max_bytes" must be a number, but the request sent the string "eight".`
+		if err.Error() != want {
+			t.Fatalf("decodeArgs() = %q, want %q", err, want)
+		}
+	})
+}
+
+// TestDecodeArgsKeepsNonNumericWrongType pins that only numeric strings are
+// coerced: a string sent for a string field and an object sent for a number are
+// still rejected.
+func TestDecodeArgsKeepsNonNumericWrongType(t *testing.T) {
+	var a pageFetchArgs
+	err := decodeArgs("page_fetch", json.RawMessage(
+		`{"session_id":"page-1","what":"dom","max_bytes":{"value":8000}}`,
+	), &a)
+	if err == nil {
+		t.Fatal("decodeArgs() = nil, want an argument type error")
+	}
+	if !strings.Contains(err.Error(), `"max_bytes" must be a number`) {
+		t.Fatalf("decodeArgs() = %q, want the max_bytes type error", err)
+	}
+}
+
 func TestOkResultEmbedsJSONPayload(t *testing.T) {
 	tests := []struct {
 		name    string

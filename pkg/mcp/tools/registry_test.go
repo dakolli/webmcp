@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
 func TestDecodeArgsCoercesBooleanStrings(t *testing.T) {
@@ -146,6 +148,59 @@ func TestRegistryExecuteRejectsUnknownTool(t *testing.T) {
 	r := NewEmptyRegistry()
 	if _, err := r.Execute(context.Background(), "nope", json.RawMessage(`{}`)); err == nil {
 		t.Fatal("Execute(unknown) = nil, want an unsupported tool error")
+	}
+}
+
+func TestRegistryExecuteRejectsUnknownArgument(t *testing.T) {
+	mgr := browsers.NewManager(browsers.WithTTL(0), browsers.WithBrowserTTL(0))
+	r := NewEmptyRegistry()
+	r.Register(NewPage(mgr))
+
+	out, err := r.Execute(context.Background(), "page_fetch", json.RawMessage(
+		`{"session_id":"page-1","what":"meta","filterx":"document,script"}`,
+	))
+	if err != nil {
+		t.Fatalf("Execute() error = %v, want an invalid_args envelope", err)
+	}
+	var env envelopeProbe
+	if err := json.Unmarshal([]byte(out), &env); err != nil {
+		t.Fatalf("decode envelope %q: %v", out, err)
+	}
+	if env.OK || env.Error == nil {
+		t.Fatalf("envelope = %s, want a failure branch", out)
+	}
+	if env.Error.Type != errInvalidArgs {
+		t.Fatalf("error type = %q, want %q", env.Error.Type, errInvalidArgs)
+	}
+	want := `page_fetch: unknown argument "filterx" — valid arguments are browser_id, ` +
+		`filter, full_page, include_values, max_bytes, owner, selector, session_id, target, ` +
+		`timeout_ms, what`
+	if env.Error.Message != want {
+		t.Fatalf("error message = %q, want %q", env.Error.Message, want)
+	}
+	if got := len(mgr.Browsers()); got != 0 {
+		t.Fatalf("browsers after a rejected call = %d, want 0", got)
+	}
+}
+
+func TestRegistryExecuteAcceptsDeclaredArguments(t *testing.T) {
+	mgr := browsers.NewManager(browsers.WithTTL(0), browsers.WithBrowserTTL(0))
+	r := NewEmptyRegistry()
+	r.Register(NewSessionList(mgr))
+
+	out, err := r.Execute(context.Background(), "session_list", json.RawMessage(`{"identity":""}`))
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	var env envelopeProbe
+	if err := json.Unmarshal([]byte(out), &env); err != nil {
+		t.Fatalf("decode envelope %q: %v", out, err)
+	}
+	if !env.OK || env.Error != nil {
+		t.Fatalf("envelope = %s, want ok", out)
+	}
+	if string(env.Data) != "[]" {
+		t.Fatalf("data = %s, want []", env.Data)
 	}
 }
 

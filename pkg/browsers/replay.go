@@ -25,6 +25,14 @@ const (
 	replayMaxRedirects = 5
 	// replayBodyCap is the ceiling on a returned response body: 256 KB.
 	replayBodyCap = 256 << 10
+	// replayCandidateLimit bounds how many candidates an ambiguous-target error
+	// names, and replayCandidateWidth clips each one so the whole message stays
+	// under 400 bytes even when a common substring matches dozens of entries.
+	replayCandidateLimit = 5
+	replayCandidateWidth = 44
+	// replayTargetWidth clips the echoed target so a long needle cannot push the
+	// ambiguous-target error past its budget.
+	replayTargetWidth = 40
 )
 
 // ErrReplayTargetAmbiguous reports a target that matched more than one captured
@@ -320,7 +328,8 @@ func (p *Page) replayEntry(
 
 // matchReplayEntry picks the one captured entry named by target, which is either
 // a sequence number or a substring of the request URL. An ambiguous substring is
-// refused with every candidate's sequence, method and URL.
+// refused with the first five candidates by sequence and the true total, so a
+// common word does not bury the instruction under every match.
 func matchReplayEntry(entries []NetworkEntry, target string) (NetworkEntry, error) {
 	target = strings.TrimSpace(target)
 	if target == "" {
@@ -357,15 +366,26 @@ func matchReplayEntry(entries []NetworkEntry, target string) (NetworkEntry, erro
 	case 1:
 		return matches[0], nil
 	default:
-		lines := make([]string, len(matches))
-		for i, e := range matches {
-			lines[i] = fmt.Sprintf("seq=%d %s %s", e.Seq, e.Method, e.URL)
+		sort.Slice(matches, func(i, j int) bool { return matches[i].Seq < matches[j].Seq })
+		shown := matches
+		if len(shown) > replayCandidateLimit {
+			shown = shown[:replayCandidateLimit]
 		}
+		lines := make([]string, len(shown))
+		for i, e := range shown {
+			line, _ := clipRunes(
+				fmt.Sprintf("seq=%d %s %s", e.Seq, e.Method, e.URL),
+				replayCandidateWidth,
+			)
+			lines[i] = line
+		}
+		target, _ = clipRunes(target, replayTargetWidth)
 		return NetworkEntry{}, fmt.Errorf(
-			"%w: target %q matches %d network entries — pass a seq or a longer URL substring: %s",
+			"%w: target %q matches %d network entries — pass a seq or a longer substring; first %d: %s",
 			ErrReplayTargetAmbiguous,
 			target,
 			len(matches),
+			len(shown),
 			strings.Join(lines, "; "),
 		)
 	}

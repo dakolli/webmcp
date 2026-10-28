@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 
@@ -151,21 +152,76 @@ func (r *Registry) GetPrompt(name string, args map[string]string) (*models.GetPr
 	}, nil
 }
 
-// Execute runs a call to the registered tool with the given name. Tool
-// failures travel inside the tool's result envelope; an error is returned only
-// when the tool itself is unknown.
+// Execute runs a call to the registered tool with the given name. A supplied
+// argument the tool's InputSchema does not declare is refused as invalid_args
+// before dispatch, so a plausible-but-unknown key fails instead of silently
+// doing nothing. Tool failures travel inside the tool's result envelope; an
+// error is returned only when the tool itself is unknown.
 func (r *Registry) Execute(ctx context.Context, name string, args json.RawMessage) (string, error) {
 	t, ok := r.tools[name]
 	if !ok {
 		return "", fmt.Errorf("unsupported tool: %s", name)
 	}
+	if msg := unknownArgument(t, args); msg != "" {
+		return marshalEnvelope(resultEnvelope{
+			Error: &envelopeError{
+				Type:    errInvalidArgs,
+				Message: msg,
+			},
+		})
+	}
 	return t.Execute(ctx, args)
 }
 
-// decodeArgs decodes raw tool arguments into dst. Boolean strings and
-// JSON-encoded arrays or objects are coerced, one failing field per pass, until
-// the arguments decode or no further coercion applies; a remaining type
-// mismatch is rewritten into a sentence naming the field and the wanted type.
+// unknownArgument returns the invalid_args sentence for the first supplied
+// argument the tool's InputSchema does not declare, and names the sorted valid
+// arguments. It returns "" when every key is known or the arguments are absent,
+// empty, or not a JSON object; decodeArgs reports those shapes itself.
+func unknownArgument(t Tool, args json.RawMessage) string {
+	var supplied map[string]json.RawMessage
+	if err := json.Unmarshal(args, &supplied); err != nil || len(supplied) == 0 {
+		return ""
+	}
+
+	valid := make([]string, 0, len(t.InputSchema().Properties))
+	for key := range t.InputSchema().Properties {
+		valid = append(valid, key)
+	}
+	sort.Strings(valid)
+
+	keys := make([]string, 0, len(supplied))
+	for key := range supplied {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		if slices.Contains(valid, key) {
+			continue
+		}
+		if len(valid) == 0 {
+			return fmt.Sprintf(
+				"%s: unknown argument %q — %s takes no arguments",
+				t.Name(),
+				key,
+				t.Name(),
+			)
+		}
+		return fmt.Sprintf(
+			"%s: unknown argument %q — valid arguments are %s",
+			t.Name(),
+			key,
+			strings.Join(valid, ", "),
+		)
+	}
+	return ""
+}
+
+// decodeArgs decodes raw tool arguments into dst. Boolean strings, numeric
+// strings and JSON-encoded arrays or objects are coerced, one failing field per
+// pass, until the arguments decode or no further coercion applies; a remaining
+// type mismatch is rewritten into a sentence naming the field and the wanted
+// type.
 func decodeArgs(tool string, args json.RawMessage, dst any) error {
 	if len(bytes.TrimSpace(args)) == 0 {
 		return nil
@@ -177,6 +233,9 @@ func decodeArgs(tool string, args json.RawMessage, dst any) error {
 			return nil
 		}
 		coerced, ok := coerceJSONStringArgs(normalized, err)
+		if !ok {
+			coerced, ok = coerceNumberString(normalized, err)
+		}
 		if !ok || bytes.Equal(coerced, normalized) {
 			if explained := explainArgTypeError(tool, normalized, err); explained != err {
 				return explained

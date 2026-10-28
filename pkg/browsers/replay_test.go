@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -52,6 +53,42 @@ func TestMatchReplayEntry(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestMatchReplayEntryBoundsAmbiguousCandidates pins the byte ceiling on the
+// ambiguous-target error when a common substring matches sixty entries.
+func TestMatchReplayEntryBoundsAmbiguousCandidates(t *testing.T) {
+	entries := make([]NetworkEntry, 60)
+	for i := range entries {
+		entries[i] = NetworkEntry{
+			Seq:    int64(i + 1),
+			Method: "GET",
+			URL:    fmt.Sprintf("https://bun.sh/docs/runtime/script-%02d.js", i+1),
+		}
+	}
+	_, err := matchReplayEntry(entries, "bun.sh")
+	if err == nil {
+		t.Fatal("matchReplayEntry() error = nil, want the ambiguous target")
+	}
+	if !errors.Is(err, ErrReplayTargetAmbiguous) {
+		t.Fatalf("matchReplayEntry() error = %v, want it to wrap ErrReplayTargetAmbiguous", err)
+	}
+	full := "page_act: replay_fuzz: " + err.Error()
+	if len(full) >= 400 {
+		t.Fatalf("ambiguous error is %d bytes, want under 400: %s", len(full), full)
+	}
+	if got := strings.Count(err.Error(), "seq="); got != replayCandidateLimit {
+		t.Fatalf("candidate lines = %d, want %d", got, replayCandidateLimit)
+	}
+	for _, want := range []string{
+		"matches 60 network entries",
+		"pass a seq or a longer substring",
+		"first 5",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want substring %q", err, want)
+		}
 	}
 }
 

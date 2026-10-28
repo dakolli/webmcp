@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -415,4 +416,93 @@ func containsAny(s string, markers []string) bool {
 		}
 	}
 	return false
+}
+
+// coerceNumberString rewrites an argument that failed to decode because a JSON
+// string was sent for a numeric field, when that string is a bare number that
+// fits the field's type. Clients that stringify scalars can still set numeric
+// fields; a non-numeric string keeps the original type error.
+func coerceNumberString(args json.RawMessage, err error) (json.RawMessage, bool) {
+	var typeErr *json.UnmarshalTypeError
+	if !errors.As(err, &typeErr) || typeErr.Field == "" {
+		return nil, false
+	}
+	want := typeErr.Type
+	for want != nil && want.Kind() == reflect.Pointer {
+		want = want.Elem()
+	}
+	if want == nil || !isNumberKind(want.Kind()) {
+		return nil, false
+	}
+	raw, ok := fieldValue(args, typeErr.Field)
+	if !ok {
+		return nil, false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return nil, false
+	}
+	literal := strings.TrimSpace(s)
+	if !isBareNumber(literal) {
+		return nil, false
+	}
+	if err := json.Unmarshal([]byte(literal), reflect.New(want).Interface()); err != nil {
+		return nil, false
+	}
+	return setArgument(args, typeErr.Field, json.RawMessage(literal))
+}
+
+// isNumberKind reports whether a Go kind holds a schema number or integer.
+func isNumberKind(k reflect.Kind) bool {
+	switch k {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		return true
+	}
+	return false
+}
+
+// isBareNumber reports whether s is a JSON number literal with no surrounding
+// text, so "8000" and "-1.5" qualify but "8,000", "eight" and "null" do not.
+func isBareNumber(s string) bool {
+	if s == "" {
+		return false
+	}
+	if s[0] != '-' && (s[0] < '0' || s[0] > '9') {
+		return false
+	}
+	return json.Valid([]byte(s))
+}
+
+// setArgument replaces a dotted field path in args with val, re-encoding each
+// enclosing object so a nested numeric field is rewritten in place.
+func setArgument(
+	args json.RawMessage,
+	field string,
+	val json.RawMessage,
+) (json.RawMessage, bool) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(args, &obj); err != nil {
+		return nil, false
+	}
+	head, rest, nested := strings.Cut(field, ".")
+	if !nested {
+		obj[head] = val
+	} else {
+		child, ok := obj[head]
+		if !ok {
+			return nil, false
+		}
+		rewritten, ok := setArgument(child, rest, val)
+		if !ok {
+			return nil, false
+		}
+		obj[head] = rewritten
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
 }
