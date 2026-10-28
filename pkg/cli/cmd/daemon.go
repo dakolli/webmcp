@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"syscall"
 	"time"
 
 	"github.com/dakolli/webmcp/pkg/cli/ipc"
@@ -74,10 +73,10 @@ func spawnServeDaemon(args []string) (string, error) {
 	proc.Stdin = nil // /dev/null
 	proc.Stdout = logFile
 	proc.Stderr = logFile
-	// Setsid detaches the child into its own session: it is re-parented to
-	// PID 1 when this command exits (and reaped there), so no zombie is left
-	// behind and Ctrl-C on the parent cannot reach it.
-	proc.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	// detachProcess puts the child in its own session on unix and in a
+	// detached process on Windows, so it is re-parented instead of dying with
+	// this command and Ctrl-C on the parent cannot reach it.
+	detachProcess(proc)
 	if err := proc.Start(); err != nil {
 		return "", fmt.Errorf("start serve: %w", err)
 	}
