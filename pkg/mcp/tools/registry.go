@@ -60,6 +60,9 @@ func NewRegistry() *Registry {
 	r.Register(NewBrowserList(mgr))
 	r.Register(NewBrowserClose(mgr))
 	r.Register(NewPageList(mgr))
+	if config.ActiveCaido().Enabled {
+		r.Register(NewCaidoSearch())
+	}
 
 	r.RegisterPrompt(NewFetchAndSummarizePrompt())
 	r.RegisterPrompt(NewInspectPageDecompositionPrompt())

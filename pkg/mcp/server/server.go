@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/dakolli/webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/config"
 	"github.com/dakolli/webmcp/pkg/mcp/models"
 	"github.com/dakolli/webmcp/pkg/mcp/tools"
 )
@@ -197,6 +198,20 @@ func NoAuthWarning(addr string) string {
 	)
 }
 
+// caidoSettings returns the Caido settings for this process. `serve mcp` resolves
+// them first, including the --caido and --caido-pat overrides, so an already
+// active value wins. Any other entry point (cmd/mcp) falls back to webmcp.toml.
+func caidoSettings() config.CaidoFile {
+	if cf := config.ActiveCaido(); cf.Enabled || cf.URL != "" {
+		return cf
+	}
+	cf, err := config.LoadCaido()
+	if err != nil {
+		return config.CaidoFile{}
+	}
+	return cf
+}
+
 // registerAll wires every MCP tool to the given manager, so a page opened by
 // fetch_page can be read by page_fetch and driven by page_act, and a single
 // Browser (one Chromium instance) backs all sessions.
@@ -211,6 +226,10 @@ func registerAll(mgr *browsers.Manager) *tools.Registry {
 	r.Register(tools.NewBrowserList(mgr))   // browser_list
 	r.Register(tools.NewBrowserClose(mgr))  // browser_close
 	r.Register(tools.NewPageList(mgr))      // page_list
+	if caido := caidoSettings(); caido.Enabled {
+		config.SetActiveCaido(caido)
+		r.Register(tools.NewCaidoSearch()) // caido_search
+	}
 
 	r.RegisterPrompt(tools.NewFetchAndSummarizePrompt())        // fetch_and_summarize
 	r.RegisterPrompt(tools.NewInspectPageDecompositionPrompt()) // inspect_page_decomposition
