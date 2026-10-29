@@ -22,7 +22,7 @@ func testClient(t *testing.T, fn roundTripFunc) *Client {
 	t.Helper()
 	c := NewClient("http://127.0.0.1:8080/graphql")
 	c.HTTP = &http.Client{Transport: roundTripFunc(fn)}
-	c.store("test-token", time.Now().Add(time.Hour))
+	c.store("test-token", time.Now().Add(time.Hour), AuthGuest)
 	return c
 }
 
@@ -574,5 +574,144 @@ func TestRedactHeadersScrubsURLValues(t *testing.T) {
 	}
 	if !strings.Contains(got, "page=2") {
 		t.Errorf("referer lost the benign parameter: %s", got)
+	}
+}
+
+func loginClient(t *testing.T, fn roundTripFunc) *Client {
+	t.Helper()
+	c := NewClient("http://127.0.0.1:8080/graphql")
+	c.HTTP = &http.Client{Transport: roundTripFunc(fn)}
+	return c
+}
+
+func rejectedResponse() *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body: io.NopCloser(strings.NewReader(
+			`{"errors":[{"message":"Operation error","extensions":{"CAIDO":{"reason":"INVALID_TOKEN"}}}]}`,
+		)),
+	}
+}
+
+func guestSuccess() *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body: io.NopCloser(strings.NewReader(
+			`{"data":{"loginAsGuest":{"token":{"accessToken":"guest-token","expiresAt":"2030-01-01T00:00:00Z"}}}}`,
+		)),
+	}
+}
+
+func TestLoginAccessTokenWins(t *testing.T) {
+	calls := 0
+	c := loginClient(t, func(r *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), "loginAsGuest") {
+			t.Error("guest login called with an access token set")
+			return guestSuccess(), nil
+		}
+		calls++
+		if got := r.Header.Get("Authorization"); got != "Bearer access-token" {
+			t.Errorf("authorization = %q, want the access token", got)
+		}
+		return gqlData(t, `{}`), nil
+	})
+
+	path, err := c.Login(t.Context(), "access-token", "pat-token", true)
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if path != AuthAccessToken {
+		t.Errorf("path = %q, want %q", path, AuthAccessToken)
+	}
+	if got := c.currentToken(); got != "access-token" {
+		t.Errorf("token = %q, want the access token", got)
+	}
+	if calls != 1 {
+		t.Errorf("requests = %d, want one probe", calls)
+	}
+}
+
+func TestLoginPATRejectedFallsBackToGuest(t *testing.T) {
+	probes, guest := 0, 0
+	c := loginClient(t, func(r *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), "loginAsGuest") {
+			guest++
+			return guestSuccess(), nil
+		}
+		probes++
+		return rejectedResponse(), nil
+	})
+
+	path, err := c.Login(t.Context(), "", "bad-pat", true)
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if path != AuthPATGuest {
+		t.Errorf("path = %q, want %q", path, AuthPATGuest)
+	}
+	if got := c.currentToken(); got != "guest-token" {
+		t.Errorf("token = %q, want the guest token", got)
+	}
+	if probes != 1 {
+		t.Errorf("probes = %d, want 1", probes)
+	}
+	if guest != 1 {
+		t.Errorf("guest logins = %d, want 1", guest)
+	}
+}
+
+func TestLoginPATRejectedGuestOff(t *testing.T) {
+	probes, guest := 0, 0
+	c := loginClient(t, func(r *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), "loginAsGuest") {
+			guest++
+			return guestSuccess(), nil
+		}
+		probes++
+		return rejectedResponse(), nil
+	})
+
+	path, err := c.Login(t.Context(), "", "bad-pat", false)
+	if !errors.Is(err, ErrNoSession) {
+		t.Fatalf("error = %v, want ErrNoSession", err)
+	}
+	want := "caido: no session — the instance rejected the credential and guest access is off"
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+	if path != AuthNone {
+		t.Errorf("path = %q, want %q", path, AuthNone)
+	}
+	if probes != 1 {
+		t.Errorf("probes = %d, want 1", probes)
+	}
+	if guest != 0 {
+		t.Errorf("guest logins = %d, want none", guest)
+	}
+}
+
+func TestLoginGuestWhenNoCredential(t *testing.T) {
+	c := loginClient(t, func(r *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), "loginAsGuest") {
+			t.Error("unexpected non-guest request")
+		}
+		return guestSuccess(), nil
+	})
+
+	path, err := c.Login(t.Context(), "", "", true)
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if path != AuthGuest {
+		t.Errorf("path = %q, want %q", path, AuthGuest)
+	}
+	if got := c.currentToken(); got != "guest-token" {
+		t.Errorf("token = %q, want the guest token", got)
 	}
 }

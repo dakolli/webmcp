@@ -266,6 +266,7 @@ func NewServeMcpCmd() *cobra.Command {
 	var bind string
 	var caidoOn bool
 	var caidoPAT string
+	var caidoToken string
 	mcpCmd := &cobra.Command{
 		Use:   "mcp",
 		Short: "Serve the browser over IPC and MCP (HTTP/SSE) from one daemon",
@@ -287,13 +288,18 @@ Pass --bind 0.0.0.0 to expose it to the network.
 			if err != nil {
 				return fmt.Errorf("serve mcp: %w", err)
 			}
-			caido, err := config.ResolveCaido(caidoOn, caidoPAT)
+			caido, err := config.ResolveCaido(caidoOn, caidoPAT, caidoToken)
 			if err != nil {
 				return fmt.Errorf("serve mcp: %w", err)
 			}
 			config.SetActiveCaido(caido)
 			if caidoPAT != "" {
 				if err := os.Setenv("CAIDO_PAT", caidoPAT); err != nil {
+					return fmt.Errorf("serve mcp: pass token to daemon: %w", err)
+				}
+			}
+			if caidoToken != "" {
+				if err := os.Setenv("CAIDO_ACCESS_TOKEN", caidoToken); err != nil {
 					return fmt.Errorf("serve mcp: pass token to daemon: %w", err)
 				}
 			}
@@ -349,6 +355,8 @@ Pass --bind 0.0.0.0 to expose it to the network.
 		"force-enable the Caido tool even when webmcp.toml sets enabled = false")
 	mcpCmd.Flags().StringVar(&caidoPAT, "caido-pat", "",
 		"Caido personal access token; overrides CAIDO_PAT and webmcp.toml")
+	mcpCmd.Flags().StringVar(&caidoToken, "caido-token", "",
+		"Caido instance access token; overrides access_token in webmcp.toml")
 	return mcpCmd
 }
 

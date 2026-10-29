@@ -17,18 +17,27 @@ const CaidoTemplate = `# web-mcp configuration. Mode 0600. Never commit this fil
 # Set enabled = true to register the caido_search MCP tool.
 enabled = false
 # Caido personal access token. Create one at https://dashboard.caido.io/developer
-# Leave empty to use guest access when the instance allows it.
+# Tried as the bearer. A rejected PAT is an error, never a guest fallback.
 pat = ""
+# Direct instance access token, copied from the Caido UI console:
+#   JSON.parse(localStorage.CAIDO_AUTHENTICATION).accessToken
+# Sent as the bearer with no exchange. It expires after about 7 days.
+access_token = ""
+# Allow a guest session when neither pat nor access_token is set.
+# With a credential present the tool never falls back to guest.
+allow_guest = true
 # Caido GraphQL endpoint.
 url = "http://127.0.0.1:8080/graphql"
 `
 
 // CaidoFile holds the resolved Caido settings and the file they came from.
 type CaidoFile struct {
-	Enabled bool
-	PAT     string
-	URL     string
-	Path    string
+	Enabled     bool
+	PAT         string
+	AccessToken string
+	AllowGuest  bool
+	URL         string
+	Path        string
 }
 
 var (
@@ -63,14 +72,15 @@ func CaidoConfigPath() string {
 	return filepath.Join(dir, "webmcp.toml")
 }
 
-// LoadCaido reads webmcp.toml. A missing file yields the zero value with no
-// error; a missing [caido] section leaves Enabled false.
+// LoadCaido reads webmcp.toml. A missing file yields defaults with no error;
+// allow_guest defaults to true and a missing [caido] section leaves Enabled
+// false.
 func LoadCaido() (CaidoFile, error) {
 	path := CaidoConfigPath()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return CaidoFile{}, nil
+			return CaidoFile{AllowGuest: true}, nil
 		}
 		return CaidoFile{}, fmt.Errorf("config: read %s: %w", path, err)
 	}
@@ -80,7 +90,7 @@ func LoadCaido() (CaidoFile, error) {
 		return CaidoFile{}, err
 	}
 
-	cf := CaidoFile{Path: path}
+	cf := CaidoFile{Path: path, AllowGuest: true}
 	if doc["caido"] == nil {
 		return cf, nil
 	}
@@ -94,6 +104,16 @@ func LoadCaido() (CaidoFile, error) {
 	if pat, ok := doc.String("caido", "pat"); ok {
 		cf.PAT = pat
 	}
+	if token, ok := doc.String("caido", "access_token"); ok {
+		cf.AccessToken = token
+	}
+	allowGuest, ok, err := doc.Bool("caido", "allow_guest")
+	if err != nil {
+		return CaidoFile{}, fmt.Errorf("config: webmcp.toml caido.allow_guest: %w", err)
+	}
+	if ok {
+		cf.AllowGuest = allowGuest
+	}
 	if url, ok := doc.String("caido", "url"); ok {
 		cf.URL = url
 	}
@@ -104,12 +124,21 @@ func LoadCaido() (CaidoFile, error) {
 }
 
 // ResolveCaido loads webmcp.toml and applies token precedence: the explicit
-// flag, then CAIDO_PAT, then the file. The flag also force-enables the tool.
-// Returned errors never contain the token.
-func ResolveCaido(flagOn bool, flagPAT string) (CaidoFile, error) {
+// flags, then CAIDO_PAT and CAIDO_ACCESS_TOKEN, then the file. The flag also
+// force-enables the tool. Returned errors never contain a token.
+func ResolveCaido(
+	flagOn bool,
+	flagPAT string,
+	flagToken string,
+) (CaidoFile, error) {
 	cf, err := LoadCaido()
 	if err != nil {
 		return CaidoFile{}, err
+	}
+	if flagToken != "" {
+		cf.AccessToken = flagToken
+	} else if envToken := os.Getenv("CAIDO_ACCESS_TOKEN"); envToken != "" {
+		cf.AccessToken = envToken
 	}
 	if flagPAT != "" {
 		cf.PAT = flagPAT

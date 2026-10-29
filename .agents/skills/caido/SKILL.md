@@ -26,6 +26,18 @@ Caido must run on this host. A human starts it with `make caido`. The tool never
 - History is shared. Every client of the instance writes to the same list.
 - In guest mode the history dies with the instance.
 
+## Authentication
+
+The tool tries each credential in order and falls back to a guest session. Guest is the normal path on a local instance.
+
+| Credential | Where | Behavior |
+| :--- | :--- | :--- |
+| `access_token` | `[caido] access_token`, or `--caido-token` on `browser serve mcp` | Sent as the bearer with no exchange. A direct instance token copied from the Caido UI console: `JSON.parse(localStorage.CAIDO_AUTHENTICATION).accessToken`. It expires after about 7 days. |
+| `pat` | `[caido] pat`, `CAIDO_PAT`, or `--caido-pat` (flag > env > file) | Tried as the bearer after `access_token`. A PAT the instance rejects falls back to guest when `allow_guest` is true. |
+| guest | no credential worked, `allow_guest = true` (the default) | `loginAsGuest`. The history lasts only while the instance runs. |
+
+`allow_guest = false` with no working credential is an error. `browser config show` prints the resolved path as `auth: access_token`, `pat`, `pat (rejected), guest`, `guest` or `none`. Never print or log a token.
+
 ## The one tool
 
 `caido_search` takes 8 arguments and returns the newest matching transactions.
@@ -65,11 +77,12 @@ Failure:
 4. Redaction is on unless `raw` is `true`. It masks credential-shaped header values, body keys and query parameters. A URL-bearing header such as `referer` loses its credential parameters too. A masked URL sets `url_redacted`. `raw:true` prints live cookies and tokens.
 5. `body_bytes:0` returns headers with empty bodies and sets no cut flags. `request_cut` and `response_cut` appear only when a returned body was shortened, or dropped with its headers because the message exceeds 8 MiB.
 
-## Three failure modes
+## Four failure modes
 
 1. **Caido is not running.** Exact text: `caido: no instance at http://127.0.0.1:8080/graphql — start it with make caido`. Type: `unknown`. Fix: ask the human to run `make caido`. The tool never starts it.
-2. **The credential is rejected.** Exact text: `caido: token rejected — set a PAT or enable guest access`. Type: `unknown`. Fix: set a PAT in the web-mcp config file, or enable guest access in Caido.
-3. **An argument is outside its schema.** Exact text: `caido_search: invalid arguments: part must be request, response, or both`. Type: `invalid_args`. Fix: read the table above and resend. The same rule covers a bad `method`, `status`, `since`, `limit` or `body_bytes`.
+2. **No session.** Exact text: `caido: no session — the instance rejected the credential and guest access is off`. Type: `unknown`. Fix: set a valid `access_token` from the Caido UI console, or set `allow_guest = true`. A rejected credential falls back to guest while `allow_guest` is true.
+3. **Guest is refused.** Exact text: `caido: guest access rejected — the instance does not allow guests; set access_token or pat`. Type: `unknown`. Fix: set `access_token` or `pat`.
+4. **An argument is outside its schema.** Exact text: `caido_search: invalid arguments: part must be request, response, or both`. Type: `invalid_args`. Fix: read the table above and resend. The same rule covers a bad `method`, `status`, `since`, `limit` or `body_bytes`.
 
 ## Worked example
 

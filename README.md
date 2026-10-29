@@ -255,9 +255,11 @@ the default target, and `--max-bytes 0` for unbounded output.
   proxy credentials belong in `~/.config/browser-mcp/proxy.json` with mode `0600`, never in a flag.
 - Caido settings live in `~/.config/browser-mcp/webmcp.toml` (mode `0600`). `browser config init`
   creates the file once and never overwrites it; `browser config path` prints its location and
-  `browser config show` reports the Caido settings and the resolved Chromium switches. On
-  `browser serve mcp`, `--caido-pat` overrides `CAIDO_PAT`, which overrides the file token, and
-  `--caido` forces the tool on.
+  `browser config show` reports the Caido settings, the resolved credential (`auth: access_token`,
+  `pat`, `pat (rejected), guest`, `guest` or `none`) and the resolved Chromium switches. On
+  `browser serve mcp`, `--caido-token` overrides the file `access_token`, `--caido-pat` overrides
+  `CAIDO_PAT`, which overrides the file `pat`, and `--caido` forces the tool on. An `access_token`
+  wins over a `pat`; a rejected credential falls back to a guest session unless `allow_guest = false`.
 - Browser settings live in the same file under `[browser]`. `chromium_flags = ["--flag", …]` adds
   Chromium switches to every browser this process starts, and `quiet = false` drops the built-in
   quiet set that disables background telemetry, update and sync traffic (the default is on). Add a
@@ -267,11 +269,16 @@ the default target, and `--max-bytes 0` for unbounded output.
 
 `caido_search` reads recorded history from a Caido instance on the same host. The proxy listens on
 `127.0.0.1:8081`; the UI and GraphQL API listen on `127.0.0.1:8080`. Enable it in `webmcp.toml`
-(`enabled = true`). Guest access works when the instance allows it, and guest history lasts only
-while the instance runs. The tool never changes traffic. Credential-shaped header names and
-credential-shaped keys in JSON, form, and plain bodies come back as `<redacted>` unless `raw` is
-true. `count` is the rows returned and `total` is the whole matching history; `url` and `since` scan
-back at most 5 pages of 100 rows. `body_bytes: 0` returns headers with empty bodies.
+(`enabled = true`). Authentication tries `access_token` first (a direct instance token copied from
+the Caido UI console with `JSON.parse(localStorage.CAIDO_AUTHENTICATION).accessToken`) as the bearer,
+then a `pat`, then a guest session when `allow_guest = true` (the default). A rejected credential
+falls through to the next step, so a bad PAT still yields a working guest session; with
+`allow_guest = false` the tool returns `caido: no session — the instance rejected the credential and
+guest access is off`. Guest history lasts only while the instance runs. The tool never changes
+traffic. Credential-shaped
+header names and credential-shaped keys in JSON, form, and plain bodies come back as `<redacted>`
+unless `raw` is true. `count` is the rows returned and `total` is the whole matching history; `url`
+and `since` scan back at most 5 pages of 100 rows. `body_bytes: 0` returns headers with empty bodies.
 
 ## Licence
 

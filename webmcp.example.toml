@@ -4,21 +4,53 @@
 # minimal version when none exists.
 
 [caido]
-# Set enabled = true to register the caido_search MCP tool.
-# The tool reads recorded proxy history. It never starts Caido.
+# Set enabled = true to register the caido tools.
+# The tools read recorded proxy history. They never start Caido.
 enabled = false
+
+# Engagement project. REQUIRED. The first key that stops a launch.
+# Name a project that exists, or leave it empty to get an error that lists the
+# projects the instance holds. The binary never creates a project.
+#   project = "daft"
+#   project = ""          # -> error that prints the available project names
+project = ""
+
+# Capture mode for the project: "all" | "in-scope" | "none".
+# Leave it empty to keep the mode that the project already has.
+capture = ""
+
+# Scope inside the project. Each key is optional and independent.
+# Leave a key empty to keep the value that already exists in Caido.
+#   scope_name  = "target"                  # created when missing
+#   scope_allow = ["daft.ie", "*.daft.ie"]  # hosts to capture
+#   scope_deny  = ["ads.daft.ie"]           # hosts to skip
+scope_name = ""
+scope_allow = []
+scope_deny = []
+
 # Caido personal access token. Create one at https://dashboard.caido.io/developer
-# Leave empty to use guest access when the instance allows it.
+# A PAT does not authenticate /graphql on its own. The binary uses it to approve
+# the device flow and stores the access token. See WEB-265.
 # A token on the command line overrides this file:
 #   browser serve mcp --caido --caido-pat caido_...
 pat = ""
+
+# Direct instance access token, copied from the Caido UI console:
+#   JSON.parse(localStorage.CAIDO_AUTHENTICATION).accessToken
+# Use it when the PAT device flow is not available. It expires after ~7 days.
+access_token = ""
+
+# Allow a guest session when neither pat nor access_token is set.
+# With a credential present, the binary never falls back to a guest session.
+allow_guest = true
+
 # Caido GraphQL endpoint. The UI listens on 8080, the proxy on 8081.
 url = "http://127.0.0.1:8080/graphql"
 
 [browser]
 # Extra Chromium command-line switches, passed to every browser this process
 # starts, including `browser serve` daemon browsers and `browser_create`.
-# These switches apply in addition to the built-in quiet set below.
+# These switches apply in addition to the built-in quiet set.
 chromium_flags = [
   "--disable-background-networking",
   "--disable-component-update",

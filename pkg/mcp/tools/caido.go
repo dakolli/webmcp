@@ -144,7 +144,13 @@ func (t *CaidoSearch) Execute(ctx context.Context, args json.RawMessage) (string
 		return failResult(fmt.Errorf("caido_search: invalid arguments: part must be request, response, or both"))
 	}
 
-	if err := t.client.Login(ctx, config.ActiveCaido().PAT); err != nil {
+	active := config.ActiveCaido()
+	if _, err := t.client.Login(
+		ctx,
+		active.AccessToken,
+		active.PAT,
+		active.AllowGuest,
+	); err != nil {
 		return failResult(err)
 	}
 	result, err := t.client.Search(ctx, caido.Query{

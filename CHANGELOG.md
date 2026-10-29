@@ -15,6 +15,9 @@
   the token as `set` or `empty`, never the value.
 - `browser serve mcp --caido` and `--caido-pat` enable the tool and override the token, without
   editing the file.
+- `[caido] access_token` takes a direct instance token, and `[caido] allow_guest` (default true)
+  allows the local guest session. `config show` now reports which one worked, for example
+  `auth: pat (rejected), guest`.
 - `.agents/skills/caido/` documents the tool for an agent.
 
 ## 0.2.5 - 2026-10-28

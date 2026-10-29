@@ -46,7 +46,29 @@ const metadataQuery = `query Search($limit: Int, $offset: Int, $filter: HTTPQLIn
 // guestMutation exchanges guest access for an access token.
 const guestMutation = `mutation Guest { loginAsGuest { token { accessToken refreshToken expiresAt } error { __typename } } }`
 
-var errTokenRejected = errors.New("caido: token rejected — set a PAT or enable guest access")
+var errTokenRejected = errors.New("caido: token rejected")
+
+// ErrNoSession reports that every configured credential was rejected and guest
+// access is disabled.
+var ErrNoSession = errors.New("caido: no session — the instance rejected the credential and guest access is off")
+
+// ErrNoCredential reports that no usable token is cached, so a search cannot
+// run.
+var ErrNoCredential = errors.New("caido: no credential — set pat, or set access_token, or set allow_guest = true")
+
+// ErrGuestRejected reports that the instance refused a guest session.
+var ErrGuestRejected = errors.New("caido: guest access rejected — the instance does not allow guests; set access_token or pat")
+
+// AuthPath names the credential path Login used, for `browser config show`.
+type AuthPath string
+
+const (
+	AuthAccessToken AuthPath = "access_token"
+	AuthPAT         AuthPath = "pat"
+	AuthPATGuest    AuthPath = "pat (rejected), guest"
+	AuthGuest       AuthPath = "guest"
+	AuthNone        AuthPath = "none"
+)
 
 // RawDecodeError wraps the base64 failure behind ParseRaw.
 type RawDecodeError struct {
@@ -61,11 +83,12 @@ func (e *RawDecodeError) Unwrap() error { return e.Err }
 
 // Client is a Caido GraphQL client holding one cached access token.
 type Client struct {
-	HTTP    *http.Client
-	URL     string
-	mu      sync.Mutex
-	token   string
-	expires time.Time
+	HTTP     *http.Client
+	URL      string
+	mu       sync.Mutex
+	token    string
+	expires  time.Time
+	authPath AuthPath
 }
 
 // NewClient returns a client for the GraphQL endpoint, defaulting to the local
@@ -128,33 +151,60 @@ type Entry struct {
 	URLRedacted   bool                `json:"url_redacted,omitempty"`
 }
 
-// Login caches a usable token. When a PAT is present it is tried as a bearer
-// first and guest login is used if the instance rejects it.
-func (c *Client) Login(ctx context.Context, pat string) error {
+// Login caches a usable token and reports which path authenticated. It tries an
+// access token as the bearer, then a PAT, then a guest session when allowGuest
+// is true. A rejected credential falls through to the next step.
+func (c *Client) Login(
+	ctx context.Context,
+	accessToken string,
+	pat string,
+	allowGuest bool,
+) (AuthPath, error) {
 	c.mu.Lock()
-	cached, expiry := c.token, c.expires
+	cached, expiry, path := c.token, c.expires, c.authPath
 	c.mu.Unlock()
 	if cached != "" && (expiry.IsZero() || time.Now().Before(expiry)) {
-		return nil
+		return path, nil
 	}
 
+	if accessToken != "" {
+		err := c.call(ctx, accessToken, probeQuery, nil, nil)
+		if err == nil {
+			c.store(accessToken, time.Time{}, AuthAccessToken)
+			return AuthAccessToken, nil
+		}
+		if !errors.Is(err, errTokenRejected) {
+			return AuthNone, err
+		}
+	}
+
+	patRejected := false
 	if pat != "" {
 		err := c.call(ctx, pat, probeQuery, nil, nil)
 		if err == nil {
-			c.store(pat, time.Time{})
-			return nil
+			c.store(pat, time.Time{}, AuthPAT)
+			return AuthPAT, nil
 		}
 		if !errors.Is(err, errTokenRejected) {
-			return err
+			return AuthNone, err
 		}
+		patRejected = true
+	}
+
+	if !allowGuest {
+		return AuthNone, ErrNoSession
 	}
 
 	token, expires, err := c.loginAsGuest(ctx)
 	if err != nil {
-		return err
+		return AuthNone, err
 	}
-	c.store(token, expires)
-	return nil
+	path = AuthGuest
+	if patRejected {
+		path = AuthPATGuest
+	}
+	c.store(token, expires, path)
+	return path, nil
 }
 
 // Search reads newest-first history metadata, filters it client-side, then
@@ -188,7 +238,7 @@ func (c *Client) Search(ctx context.Context, q Query) (Result, error) {
 
 	token := c.currentToken()
 	if token == "" {
-		return Result{}, errTokenRejected
+		return Result{}, ErrNoCredential
 	}
 
 	cutoff := int64(0)
@@ -555,10 +605,10 @@ func (c *Client) currentToken() string {
 	return c.token
 }
 
-// store records a token and its expiry.
-func (c *Client) store(token string, expires time.Time) {
+// store records a token, its expiry and the path that authenticated.
+func (c *Client) store(token string, expires time.Time, path AuthPath) {
 	c.mu.Lock()
-	c.token, c.expires = token, expires
+	c.token, c.expires, c.authPath = token, expires, path
 	c.mu.Unlock()
 }
 
@@ -653,13 +703,13 @@ func (c *Client) loginAsGuest(ctx context.Context) (string, time.Time, error) {
 	if err := c.call(ctx, "", guestMutation, nil, &data); err != nil {
 		var gql *graphqlError
 		if errors.Is(err, errTokenRejected) || errors.As(err, &gql) {
-			return "", time.Time{}, errTokenRejected
+			return "", time.Time{}, ErrGuestRejected
 		}
 		return "", time.Time{}, err
 	}
 	token := data.LoginAsGuest.Token
 	if token == nil || token.AccessToken == "" {
-		return "", time.Time{}, errTokenRejected
+		return "", time.Time{}, ErrGuestRejected
 	}
 	expires := time.Now().Add(7 * 24 * time.Hour)
 	if token.ExpiresAt != "" {
@@ -670,10 +720,12 @@ func (c *Client) loginAsGuest(ctx context.Context) (string, time.Time, error) {
 	return token.AccessToken, expires, nil
 }
 
-// unauthorized reports whether any error carries the AUTHORIZATION code.
+// unauthorized reports whether any error carries the AUTHORIZATION code or the
+// INVALID_TOKEN reason, the two shapes Caido uses for a rejected bearer.
 func unauthorized(errs []gqlError) bool {
 	for _, e := range errs {
-		if strings.EqualFold(e.Extensions.Caido.Code, "AUTHORIZATION") {
+		if strings.EqualFold(e.Extensions.Caido.Code, "AUTHORIZATION") ||
+			strings.EqualFold(e.Extensions.Caido.Reason, "INVALID_TOKEN") {
 			return true
 		}
 	}

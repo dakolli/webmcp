@@ -1,13 +1,20 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/dakolli/webmcp/pkg/caido"
 	"github.com/dakolli/webmcp/pkg/config"
 )
+
+// caidoAuthProbeTimeout bounds the PAT probe behind `config show`, so a stalled
+// or absent instance does not turn a settings dump into a long wait.
+const caidoAuthProbeTimeout = 2 * time.Second
 
 // NewConfigCmd builds the `config` command group for webmcp.toml.
 func NewConfigCmd() *cobra.Command {
@@ -71,16 +78,15 @@ func newConfigShowCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("config show: %w", err)
 			}
-			pat := "empty"
-			if cf.PAT != "" {
-				pat = "set"
-			}
-			caido := "disabled"
+			caidoState := "disabled"
 			if cf.Enabled {
-				caido = "enabled"
+				caidoState = "enabled"
 			}
 			out := cmd.OutOrStdout()
-			fmt.Fprintf(out, "caido: %s, %s, pat %s\n", caido, cf.URL, pat)
+			authCtx, cancel := context.WithTimeout(cmdCtx(cmd), caidoAuthProbeTimeout)
+			defer cancel()
+			fmt.Fprintf(out, "caido: %s, %s\n", caidoState, cf.URL)
+			fmt.Fprintf(out, "auth: %s\n", caidoAuthState(authCtx, cf))
 			quiet := "quiet"
 			if !bf.Quiet {
 				quiet = "quiet off"
@@ -91,5 +97,25 @@ func newConfigShowCmd() *cobra.Command {
 			}
 			return nil
 		},
+	}
+}
+
+// caidoAuthState reports which credential caido_search will use. A PAT is
+// probed so a rejected one shows the guest fallback instead of a usable PAT.
+func caidoAuthState(ctx context.Context, cf config.CaidoFile) string {
+	switch {
+	case cf.AccessToken != "":
+		return string(caido.AuthAccessToken)
+	case cf.PAT != "":
+		c := caido.NewClient(cf.URL)
+		path, err := c.Login(ctx, "", cf.PAT, cf.AllowGuest)
+		if err != nil {
+			return string(caido.AuthNone)
+		}
+		return string(path)
+	case cf.AllowGuest:
+		return string(caido.AuthGuest)
+	default:
+		return string(caido.AuthNone)
 	}
 }

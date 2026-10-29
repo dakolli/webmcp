@@ -27,9 +27,58 @@ func TestCaidoTemplateParses(t *testing.T) {
 		t.Errorf("caido.pat = %q, want empty", pat)
 	}
 
+	token, ok := doc.String("caido", "access_token")
+	if !ok || token != "" {
+		t.Errorf("caido.access_token = %q, want empty", token)
+	}
+
+	allowGuest, ok, err := doc.Bool("caido", "allow_guest")
+	if err != nil || !ok {
+		t.Fatalf("caido.allow_guest: ok=%v err=%v", ok, err)
+	}
+	if !allowGuest {
+		t.Error("caido.allow_guest = false, want true")
+	}
+
 	url, ok := doc.String("caido", "url")
 	if !ok || url != defaultCaidoURL {
 		t.Errorf("caido.url = %q, want %q", url, defaultCaidoURL)
+	}
+}
+
+func TestLoadCaidoAllowGuestDefault(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	cf, err := LoadCaido()
+	if err != nil {
+		t.Fatalf("LoadCaido(missing file): %v", err)
+	}
+	if !cf.AllowGuest {
+		t.Error("missing file: AllowGuest = false, want true")
+	}
+
+	path := CaidoConfigPath()
+	if err := os.WriteFile(path, []byte("[caido]\nenabled = true\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cf, err = LoadCaido()
+	if err != nil {
+		t.Fatalf("LoadCaido: %v", err)
+	}
+	if !cf.AllowGuest {
+		t.Error("AllowGuest = false, want the absent key to default true")
+	}
+
+	if err := os.WriteFile(path, []byte("[caido]\nallow_guest = false\n"), 0o600); err != nil {
+		t.Fatalf("rewrite config: %v", err)
+	}
+	cf, err = LoadCaido()
+	if err != nil {
+		t.Fatalf("LoadCaido: %v", err)
+	}
+	if cf.AllowGuest {
+		t.Error("AllowGuest = true, want the explicit false value")
 	}
 }
 
@@ -71,18 +120,23 @@ func TestParseTOMLErrorsCarryLine(t *testing.T) {
 func TestResolveCaidoPrecedence(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	path := CaidoConfigPath()
-	body := "[caido]\nenabled = false\npat = \"file-token\"\nurl = \"http://caido.local/graphql\"\n"
+	body := "[caido]\nenabled = false\npat = \"file-token\"\n" +
+		"access_token = \"file-access\"\nurl = \"http://caido.local/graphql\"\n"
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 
 	t.Setenv("CAIDO_PAT", "env-token")
-	cf, err := ResolveCaido(false, "")
+	t.Setenv("CAIDO_ACCESS_TOKEN", "env-access")
+	cf, err := ResolveCaido(false, "", "")
 	if err != nil {
 		t.Fatalf("ResolveCaido(no flag): %v", err)
 	}
 	if cf.PAT != "env-token" {
 		t.Errorf("PAT = %q, want the env token", cf.PAT)
+	}
+	if cf.AccessToken != "env-access" {
+		t.Errorf("AccessToken = %q, want the env token", cf.AccessToken)
 	}
 	if cf.Enabled {
 		t.Error("Enabled = true, want file value false")
@@ -91,12 +145,15 @@ func TestResolveCaidoPrecedence(t *testing.T) {
 		t.Errorf("URL = %q, want the file URL", cf.URL)
 	}
 
-	cf, err = ResolveCaido(true, "flag-token")
+	cf, err = ResolveCaido(true, "flag-token", "flag-access")
 	if err != nil {
 		t.Fatalf("ResolveCaido(flag): %v", err)
 	}
 	if cf.PAT != "flag-token" {
 		t.Errorf("PAT = %q, want the flag token", cf.PAT)
+	}
+	if cf.AccessToken != "flag-access" {
+		t.Errorf("AccessToken = %q, want the flag token", cf.AccessToken)
 	}
 	if !cf.Enabled {
 		t.Error("Enabled = false, want flag to force it on")
@@ -149,7 +206,7 @@ func TestCaidoErrorsOmitToken(t *testing.T) {
 	}
 	t.Setenv("CAIDO_PAT", "caido_env_secret")
 
-	_, err := ResolveCaido(true, "caido_flag_secret")
+	_, err := ResolveCaido(true, "caido_flag_secret", "caido_token_secret")
 	if err == nil {
 		t.Fatal("expected a parse error")
 	}
