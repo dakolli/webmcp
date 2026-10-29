@@ -542,3 +542,45 @@ func TestReplayAuthorizeRateLimit(t *testing.T) {
 		t.Fatalf("authorize error = %v, want it to wrap context.DeadlineExceeded", err)
 	}
 }
+
+// TestReplayBodyReadOnWedgedPageFailsFast pins WEB-235 and WEB-236: a replay
+// takes the bounded read lock once for the whole call, so a page a wedged
+// operation still holds costs exactly one read budget and returns the
+// session_close guidance — not three budgets, and not the caller's whole budget.
+func TestReplayBodyReadOnWedgedPageFailsFast(t *testing.T) {
+	p := &Page{ID: "page-1"}
+	p.Lock()
+	defer p.Unlock()
+
+	entry := NetworkEntry{
+		Seq:        1,
+		Method:     "POST",
+		URL:        "https://example.test/api",
+		ReqHeaders: map[string]string{"Content-Type": "application/json"},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	started := time.Now()
+	_, err := p.replayEntry(ctx, entry, ReplaySpec{Target: "1"})
+	elapsed := time.Since(started)
+	if err == nil {
+		t.Fatalf("replay on a wedged page returned no error after %s", elapsed.Round(time.Millisecond))
+	}
+	if elapsed < readLockBudget {
+		t.Fatalf("replay returned after %s, want at least one %s read budget (error = %v)", elapsed.Round(time.Millisecond), readLockBudget, err)
+	}
+	if elapsed >= 2*readLockBudget {
+		t.Fatalf("replay burned %s, want one %s read budget and not two (error = %v)", elapsed.Round(time.Millisecond), readLockBudget, err)
+	}
+	var locked *PageLockedError
+	if !errors.As(err, &locked) {
+		t.Fatalf("replay error = %v, want *PageLockedError", err)
+	}
+	lower := strings.ToLower(err.Error())
+	for _, want := range []string{"unusable", "session_close"} {
+		if !strings.Contains(lower, want) {
+			t.Fatalf("replay error = %q, want it to contain %q", err, want)
+		}
+	}
+}

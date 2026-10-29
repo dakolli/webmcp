@@ -233,22 +233,16 @@ func (p *Page) replayEntry(
 	if err := replayAuthorize(ctx, p, spec, target.String()); err != nil {
 		return ReplayResult{}, err
 	}
-	body, hasBody, bodyUncaptured, err := p.replayBody(ctx, entry, method, spec)
+	headers := replayHeaders(entry.ReqHeaders, spec.Headers)
+	in, err := p.replayCapture(ctx, entry, target, method, spec, headers.Get("Cookie") == "")
 	if err != nil {
 		return ReplayResult{}, err
 	}
-	headers := replayHeaders(entry.ReqHeaders, spec.Headers)
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		return ReplayResult{}, fmt.Errorf("replay: create cookie jar: %w", err)
 	}
-	if headers.Get("Cookie") == "" {
-		cookies, err := p.replayCookies(ctx, target)
-		if err != nil {
-			return ReplayResult{}, err
-		}
-		jar.SetCookies(target, cookies)
-	}
+	jar.SetCookies(target, in.cookies)
 	jar.SetCookies(target, replayOverrideCookies(spec.Cookies))
 
 	budget := replayBudget(ctx)
@@ -264,7 +258,7 @@ func (p *Page) replayEntry(
 	limit := replayBodyLimit(spec.MaxBytes)
 	start := time.Now()
 	chain := make([]ReplayHop, 0, replayMaxRedirects+1)
-	curURL, curMethod, curBody, curHasBody := target.String(), method, body, hasBody
+	curURL, curMethod, curBody, curHasBody := target.String(), method, in.body, in.hasBody
 	for hop := 0; ; hop++ {
 		if hop > 0 {
 			if err := replayHopAuthorize(ctx, p, spec, curURL, hop); err != nil {
@@ -301,7 +295,7 @@ func (p *Page) replayEntry(
 			if err != nil {
 				return ReplayResult{}, err
 			}
-			result.BodyUncaptured = bodyUncaptured
+			result.BodyUncaptured = in.bodyUncaptured
 			return result, nil
 		}
 		next, err := resp.Request.URL.Parse(location)
@@ -324,6 +318,78 @@ func (p *Page) replayEntry(
 		}
 		curURL = next.String()
 	}
+}
+
+// replayInputs holds the browser-side values a replay needs before it goes to
+// the network: the captured request body and the page's cookies for the target.
+type replayInputs struct {
+	body           string
+	hasBody        bool
+	bodyUncaptured bool
+	cookies        []*http.Cookie
+}
+
+// replayCapture reads every browser-side replay input under one bounded read
+// acquisition, so a wedged page costs one read budget instead of one per read.
+// A replay that needs no browser-side input — an explicit Cookie header and no
+// captured request body — takes no acquisition at all, so it still works on a
+// page a wedged operation holds. The lock is released before any network call.
+// wantCookies skips the cookie read when the outgoing headers already carry a
+// Cookie.
+func (p *Page) replayCapture(
+	ctx context.Context,
+	entry NetworkEntry,
+	target *url.URL,
+	method string,
+	spec ReplaySpec,
+	wantCookies bool,
+) (replayInputs, error) {
+	needBody := replayNeedsBodyRead(entry, method, spec)
+	if !needBody && !wantCookies {
+		return replayInputs{bodyUncaptured: replayBodyUncaptured(entry, method, spec)}, nil
+	}
+	if err := p.lockRead(ctx, "replay"); err != nil {
+		return replayInputs{}, err
+	}
+	defer p.Unlock()
+	body, hasBody, bodyUncaptured, err := p.replayBody(ctx, entry, method, spec)
+	if err != nil {
+		return replayInputs{}, err
+	}
+	in := replayInputs{
+		body:           body,
+		hasBody:        hasBody,
+		bodyUncaptured: bodyUncaptured,
+	}
+	if !wantCookies {
+		return in, nil
+	}
+	cookies, err := p.replayCookies(ctx, target)
+	if err != nil {
+		return replayInputs{}, err
+	}
+	in.cookies = cookies
+	return in, nil
+}
+
+// replayNeedsBodyRead reports whether the replay must ask the browser for the
+// captured request body: no explicit body was supplied, the method carries one,
+// and the capture retained a body record.
+func replayNeedsBodyRead(entry NetworkEntry, method string, spec ReplaySpec) bool {
+	if spec.BodySet || method == http.MethodGet || method == http.MethodHead {
+		return false
+	}
+	return replayCarriedBody(entry)
+}
+
+// replayBodyUncaptured reports that a body-carrying request retained no body
+// and none was supplied, so the replay sends no payload. It never touches the
+// browser.
+func replayBodyUncaptured(entry NetworkEntry, method string, spec ReplaySpec) bool {
+	if spec.BodySet || method == http.MethodGet || method == http.MethodHead {
+		return false
+	}
+	return !replayCarriedBody(entry)
 }
 
 // matchReplayEntry picks the one captured entry named by target, which is either
@@ -419,6 +485,8 @@ func replayMethod(captured, override string) (string, error) {
 // replayBody returns the body to send: the override when set, otherwise the
 // captured post data fetched on demand from the browser. The third result
 // reports that no body was retained and none was supplied, so nothing was sent.
+// The caller must hold the page read lock, because the captured body is read
+// over CDP.
 func (p *Page) replayBody(
 	ctx context.Context,
 	entry NetworkEntry,
@@ -434,7 +502,7 @@ func (p *Page) replayBody(
 	if !replayCarriedBody(entry) {
 		return "", false, true, nil
 	}
-	body, retained, err := p.requestPostData(ctx, entry)
+	body, retained, err := p.readPostData(ctx, entry)
 	if err != nil {
 		return "", false, false, err
 	}
@@ -455,13 +523,24 @@ func replayCarriedBody(entry NetworkEntry) bool {
 	return length != "" && length != "0"
 }
 
-// requestPostData fetches the captured request body on demand under the page
-// lock, reporting false when the browser no longer retains it. Post data lives
-// only as long as the request's network record, and multipart file parts are
-// never included.
+// requestPostData fetches the captured request body on demand under the bounded
+// read lock, reporting false when the browser no longer retains it. A page a
+// wedged operation still holds, or whose renderer stopped answering, fails here
+// with the unusable-page guidance instead of waiting its whole call budget. Post
+// data lives only as long as the request's network record, and multipart file
+// parts are never included.
 func (p *Page) requestPostData(ctx context.Context, entry NetworkEntry) (string, bool, error) {
-	p.Lock()
+	if err := p.lockRead(ctx, "replay body"); err != nil {
+		return "", false, err
+	}
 	defer p.Unlock()
+	return p.readPostData(ctx, entry)
+}
+
+// readPostData fetches the captured request body from the browser, reporting
+// false when the browser no longer retains it. The caller must hold the page
+// read lock.
+func (p *Page) readPostData(ctx context.Context, entry NetworkEntry) (string, bool, error) {
 	if p.Rod == nil {
 		return "", false, fmt.Errorf("replay: page session is closed — reopen the page and retry")
 	}
@@ -564,12 +643,10 @@ func replayOverrideCookies(overrides map[string]string) []*http.Cookie {
 	return out
 }
 
-// replayCookies reads the page's cookies applicable to the target URL under the
-// page lock and converts them for a private jar. Nothing is written back to the
-// page.
+// replayCookies reads the page's cookies applicable to the target URL and
+// converts them for a private jar. The caller must hold the page read lock.
+// Nothing is written back to the page.
 func (p *Page) replayCookies(ctx context.Context, target *url.URL) ([]*http.Cookie, error) {
-	p.Lock()
-	defer p.Unlock()
 	if p.Rod == nil {
 		return nil, fmt.Errorf("replay: page session is closed")
 	}
