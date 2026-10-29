@@ -283,6 +283,79 @@ func TestPagesBoundsLiveRead(t *testing.T) {
 	}
 }
 
+// TestPageSnapshotOnWedgedPageReturnsStale pins WEB-246: a renderer-wedged
+// page must cost a listing one renderer probe, not a live Eval that burns the
+// whole listing budget. The row is reported stale and the page is marked
+// unresponsive with the session_close guidance.
+func TestPageSnapshotOnWedgedPageReturnsStale(t *testing.T) {
+	p := newCanaryTestPage(t)
+
+	navCtx, navCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer navCancel()
+	_, navErr := GuardPage(navCtx, p, "navigate", func(ctx context.Context) (string, error) {
+		page := p.Rod.Context(ctx)
+		if err := page.Navigate("http://10.255.255.1/"); err != nil {
+			return "", err
+		}
+		return "", page.WaitLoad()
+	})
+	t.Logf("navigate left the renderer wedged after its budget: %v", navErr)
+
+	started := time.Now()
+	listCtx, listCancel := context.WithTimeout(context.Background(), listingInfoBudget)
+	defer listCancel()
+	info := p.snapshot(listCtx, DefaultIdentity)
+	elapsed := time.Since(started)
+	t.Logf("listing a wedged page took %s (one probe budget is %s, the listing budget is %s)",
+		elapsed.Round(time.Millisecond), rendererProbeBudget, listingInfoBudget)
+
+	if !info.Stale {
+		t.Fatalf("snapshot = %+v, want Stale on a wedged page", info)
+	}
+	if elapsed >= rendererProbeBudget+100*time.Millisecond {
+		t.Fatalf("snapshot took %s, want one renderer probe (~%s), not the whole listing budget (%s)",
+			elapsed.Round(time.Millisecond), rendererProbeBudget, listingInfoBudget)
+	}
+	unusable := p.Unusable()
+	var unresponsive *PageUnresponsiveError
+	if !errors.As(unusable, &unresponsive) {
+		t.Fatalf("Unusable() = %v, want *PageUnresponsiveError", unusable)
+	}
+	for _, want := range []string{"unusable", "session_close"} {
+		if !strings.Contains(unusable.Error(), want) {
+			t.Fatalf("Unusable() = %q, want it to contain %q", unusable, want)
+		}
+	}
+}
+
+// TestTryStateBoundsAWedgedRead pins WEB-247: the act path's pre-action state
+// baseline must cost one read budget, not the caller's whole action budget, even
+// when the tab's read never answers.
+func TestTryStateBoundsAWedgedRead(t *testing.T) {
+	p := &Page{ID: "page-1", info: func(ctx context.Context) (string, string, error) {
+		<-ctx.Done()
+		return "", "", ctx.Err()
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	started := time.Now()
+	_, _, err := p.TryState(ctx, "state")
+	elapsed := time.Since(started)
+
+	if err == nil {
+		t.Fatal("TryState on an unanswering read returned no error")
+	}
+	if elapsed >= readLockBudget+250*time.Millisecond {
+		t.Fatalf("TryState waited %s, want one read budget (%s)", elapsed.Round(time.Millisecond), readLockBudget)
+	}
+	unlock, ok := p.TryLock()
+	if !ok {
+		t.Fatal("TryState left the operation lock held")
+	}
+	unlock()
+}
+
 // TestPageInfoPayloadShape pins the listing payload keys the tool descriptions
 // promise: id, url and context always; title and the stale marker when known.
 func TestPageInfoPayloadShape(t *testing.T) {
@@ -535,5 +608,33 @@ func TestPageBrokenErrorClosesTheSession(t *testing.T) {
 	}
 	if _, ok := p.TryLock(); ok {
 		t.Fatal("TryLock acquired a session marked closed")
+	}
+}
+
+// TestBrokenPageNamesTheCallingOperation pins WEB-244: a page closed while an
+// earlier operation ran must report the operation that is attempted now, not
+// the label stored when the watchdog tripped.
+func TestBrokenPageNamesTheCallingOperation(t *testing.T) {
+	p := &Page{ID: "page-1", info: healthyInfo}
+	p.closedErr.Store(&PageBrokenError{
+		Op:   "meta",
+		Page: p.ID,
+		Err:  errors.New("no answer"),
+	})
+
+	err := p.LockContext(context.Background(), "eval")
+	var broken *PageBrokenError
+	if !errors.As(err, &broken) {
+		t.Fatalf("LockContext() = %v, want *PageBrokenError", err)
+	}
+	if broken.Op != "eval" {
+		t.Fatalf("error op = %q, want %q", broken.Op, "eval")
+	}
+	want := "eval: page page-1 did not answer the recovery probe"
+	if !strings.HasPrefix(err.Error(), want) {
+		t.Fatalf("error = %q, want the prefix %q", err, want)
+	}
+	if stored := p.closedErr.Load(); stored.Op != "meta" {
+		t.Fatalf("stored op = %q, want the original %q", stored.Op, "meta")
 	}
 }

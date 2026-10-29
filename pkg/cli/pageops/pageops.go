@@ -1009,26 +1009,16 @@ func PageStateOf(ctx context.Context, p *browsers.Page) (PageState, error) {
 	return PageState{URL: url, Title: title}, nil
 }
 
-// PageStateIfFree reads the page state only when the page operation lock is
-// free. A pre-action baseline must never wait for (and consume) the action's
-// own budget, so a busy page returns an error instead.
+// PageStateIfFree reads the page state through the engine's bounded, guarded
+// read, so a page another operation holds, or one whose renderer stopped
+// answering, costs at most one read budget instead of the caller's whole action
+// budget. The act path uses it as the pre- and post-action baseline, so a wedged
+// page fails the action at the guard instead of relabelling the spent budget as
+// a 500ms probe failure.
 func PageStateIfFree(ctx context.Context, p *browsers.Page) (PageState, error) {
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, defaultPageOpTimeout)
-		defer cancel()
-	}
-	unlock, ok := p.TryLock()
-	if !ok {
-		return PageState{}, fmt.Errorf("state: page %s is busy", p.ID)
-	}
-	defer unlock()
-	if p.Rod == nil {
-		return PageState{}, fmt.Errorf("page session is closed")
-	}
-	url, title, err := p.State(ctx)
+	url, title, err := p.TryState(ctx, "state")
 	if err != nil {
-		return PageState{}, fmt.Errorf("read page state: %w", err)
+		return PageState{}, asPageUnusable(err)
 	}
 	return PageState{URL: url, Title: title}, nil
 }
@@ -2537,11 +2527,12 @@ func PageWait(
 		ctx, cancel = context.WithTimeout(ctx, defaultPageOpTimeout)
 		defer cancel()
 	}
-	if err := p.LockContext(ctx, "wait"); err != nil {
+	release, err := p.BeginRead(ctx, "wait")
+	if err != nil {
 		return "", err
 	}
 	closed := p.Rod == nil
-	p.Unlock()
+	release()
 	if closed {
 		return "", fmt.Errorf("page session is closed")
 	}
@@ -2572,10 +2563,11 @@ func PageWait(
 		if handle == "" && selector == "" {
 			return "", fmt.Errorf("wait: interactable mode requires a selector or handle")
 		}
-		if err := p.LockContext(ctx, "wait"); err != nil {
+		release, err := p.BeginRead(ctx, "wait")
+		if err != nil {
 			return "", err
 		}
-		defer p.Unlock()
+		defer release()
 		// Re-check under the lock: a concurrent eviction may have nilled p.Rod
 		// since the entry check above released the lock.
 		if p.Rod == nil {
