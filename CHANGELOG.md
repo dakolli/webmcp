@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+## 0.2.5 - 2026-10-28
+
+### Highlights
+- A page that opens a dialog no longer blocks every later read. The engine answers it at once and
+  records it.
+- `page_fetch what=mutations` shows exactly what one action changed, without diffing the page.
+- A page behind HTTP basic auth is one action away. The error names the action.
+
+### Added
+- `page_fetch what=websocket` returns the WebSocket frames the page sent and received, oldest first,
+  with socket id, direction, opcode, payload, and handshake status. Text payloads clip at 2000 runes.
+  A binary frame reports size only. The newest 100 of a 200-frame ring emit, and `count`, `truncated`,
+  and `dropped` add up to the frames observed.
+- `page_fetch what=mutations` returns DOM change batches. Read `last_seq`, run an action, then read
+  again with `since` to see exactly what that action changed, without diffing the whole page.
+- `page_fetch what=dialogs` returns the recorded `alert`, `confirm`, `prompt`, `beforeunload`, and
+  auth challenges, with the policy that answered each one.
+- `page_act dialog_accept` and `dialog_dismiss` set the answer for later dialogs and return the ring.
+- `page_act http_auth` takes `user:password` for a page behind HTTP basic auth, and an empty value
+  clears it.
+
+### Fixed
+- A page that opens `alert`, `confirm`, `prompt`, or `beforeunload` no longer blocks every later
+  read. The engine answers the dialog at once, records it, and the page stays usable.
+- A 401 page with no credential used to fail as a raw navigation error. It now keeps the session
+  open and the error names `http_auth` and the exact command to run before you navigate again.
+
+### Changed
+- The install script lives at `scripts/install.sh`. The README install command matches it.
+- The release notes and the bump script stay off the git record.
+- The `security` tool description now states that the audit is passive and read-only, and that it
+  reports policy weakness, not exploitability.
+
+## 0.2.0 - 2026-10-28
+
 ### Highlights
 - One command configures an MCP client. `browser mcp add claude` writes the entry, keeps your other
   servers, and never overwrites the file.
@@ -20,26 +55,11 @@
   `--filter` on `page fetch`.
 - `page_fetch filter` narrows `network` by 18 request types with a keep form and a `-drop` form, and
   narrows `sinks` by `canary` or `known`. Both report `filtered_out`.
-- `page_fetch what=websocket` returns the WebSocket frames the page sent and received, oldest first,
-  with socket id, direction, opcode, payload, and handshake status. Text payloads clip at 2000 runes.
-  A binary frame reports size only. The newest 100 of a 200-frame ring emit, and `count`, `truncated`,
-  and `dropped` add up to the frames observed.
-- `page_fetch what=mutations` returns DOM change batches. Read `last_seq`, run an action, then read
-  again with `since` to see exactly what that action changed, without diffing the whole page.
-- `page_fetch what=dialogs` returns the recorded `alert`, `confirm`, `prompt`, `beforeunload`, and
-  auth challenges, with the policy that answered each one.
-- `page_act dialog_accept` and `dialog_dismiss` set the answer for later dialogs and return the ring.
-- `page_act http_auth` takes `user:password` for a page behind HTTP basic auth, and an empty value
-  clears it.
 - An argument outside a tool schema fails as `invalid_args` and names the key plus the valid keys. A
   quoted number is accepted for a numeric field.
 - `replay_fuzz` reports `cold_ms` beside `ms`, so the first sample is visible.
 
 ### Fixed
-- A page that opens `alert`, `confirm`, `prompt`, or `beforeunload` no longer blocks every later
-  read. The engine answers the dialog at once, records it, and the page stays usable.
-- A 401 page with no credential used to fail as a raw navigation error. It now keeps the session
-  open and the error names `http_auth` and the exact command to run before you navigate again.
 - A navigate that never commits left the page unusable for the rest of the call budget. Reads,
   actions, and page listings now return in about 0.5 s with one line that names the close command for
   your surface.
@@ -56,11 +76,12 @@
   read and action.
 
 ### Known limits
+- WebSocket frames are captured and cleared by `clear_logs`, but no read aspect returns them yet.
 - `codex` and `pi` document streamable HTTP. The server serves SSE only.
 
 ## 0.1.0 - 2026-10-27
 
-## Features
+### Features
 - feat(build): add version plumbing and a GoReleaser pipeline
 - feat(pageops): bundle a finding into a PoC directory
 - feat(cli): save a HAR export to a file with --out
@@ -112,7 +133,7 @@
 - feat(browsers): wire real fetch_page, browser lifecycle tools, and page_fetch extractors
 - feat(browsers): scaffold pkg/browsers core engine and wire MCP tools
 
-## Bug fixes
+### Bug fixes
 - fix(build): pin GoReleaser v2.17.0 and add a real CHANGELOG
 - fix(mcp): omit the hint on a runtime refusal
 - fix(mcp): classify poc_bundle refusals as invalid_args
@@ -130,12 +151,12 @@
 - fix(browsers): close sweep TOCTOU race and double-launch orphan; add injectable logger
 - fix(mcp): improve links extraction quality in page_fetch
 
-## Refactoring
+### Refactoring
 - refactor(mcp): share the page cap constant with pageops
 - refactor(pageops): derive every action list from one table
 - refactor(mcp): replace page_fetch switch with an aspect registry
 
-## Documentation
+### Documentation
 - docs(mcp,skill): note the network ring dependency for poc_bundle
 - docs: split the install paths and add the release manual
 - docs(mcp,skill): document the PoC bundle loop
@@ -147,7 +168,7 @@
 - docs: add web-mcp skill reference for the MCP browser tools
 - docs: rewrite README for the implemented page_fetch/page_act toolset
 
-## Other
+### Other
 - this is fine
 - chore: fix ignore rules for _trash/_examples and gofmt root.go
 - chore(examples): add fetch-example make target and examples ignore rules
