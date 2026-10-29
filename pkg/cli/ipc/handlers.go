@@ -539,6 +539,7 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 		Selector:      p.Selector,
 		Target:        p.Target,
 		Filter:        p.Filter,
+		Since:         p.Since,
 		FullPage:      p.FullPage,
 		IncludeValues: p.IncludeValues,
 		MaxBytes:      maxBytes,
@@ -765,6 +766,12 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		out, err = pageops.PageEmulate(ctx, page, p.Device)
 	case "clear_logs":
 		out, err = pageops.PageClearCapture(page)
+	case "dialog_accept":
+		out, err = pageops.PageDialogAccept(ctx, page, p.Value)
+	case "dialog_dismiss":
+		out, err = pageops.PageDialogDismiss(ctx, page, p.Value)
+	case "http_auth":
+		out, err = pageops.PageHTTPAuth(ctx, page, p.Value)
 	case "sinks_install":
 		out, err = pageops.PageSinksInstall(ctx, page)
 	case "sinks_clear":

@@ -341,6 +341,9 @@ type PageFetchParams struct {
 	// Target is a css/js resource URL, or with what=body a seq number or URL
 	// substring selecting one observed response body.
 	Target string `json:"target,omitempty"`
+	// Since keeps only what=mutations entries newer than this sequence; every
+	// other aspect ignores it.
+	Since int64 `json:"since,omitempty"`
 	// FullPage captures the entire scrollable page instead of the visible
 	// viewport (screenshot only).
 	FullPage bool `json:"full_page,omitempty"`

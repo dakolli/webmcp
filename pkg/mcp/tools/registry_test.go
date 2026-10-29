@@ -191,7 +191,7 @@ func TestRegistryExecuteRejectsUnknownArgument(t *testing.T) {
 		t.Fatalf("error type = %q, want %q", env.Error.Type, errInvalidArgs)
 	}
 	want := `page_fetch: unknown argument "filterx" — valid arguments are browser_id, ` +
-		`filter, full_page, include_values, max_bytes, owner, selector, session_id, target, ` +
+		`filter, full_page, include_values, max_bytes, owner, selector, session_id, since, target, ` +
 		`timeout_ms, what`
 	if env.Error.Message != want {
 		t.Fatalf("error message = %q, want %q", env.Error.Message, want)

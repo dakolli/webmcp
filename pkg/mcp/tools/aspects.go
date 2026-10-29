@@ -105,6 +105,9 @@ func init() {
 	registerAspect("websocket", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
 		return pageops.PageWebSocket(ctx, p)
 	}, truncationNone)
+	registerAspect("dialogs", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
+		return pageops.PageDialogs(ctx, p)
+	}, truncationNone)
 	registerAspect("article", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
 		return pageops.PageArticle(ctx, p)
 	}, truncationNone)
@@ -131,5 +134,8 @@ func init() {
 	}, truncationNone)
 	registerAspect("har", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
 		return pageops.PageHAR(ctx, p, 0)
+	}, truncationNone)
+	registerAspect("mutations", func(ctx context.Context, p *browsers.Page, a pageFetchArgs) (string, error) {
+		return pageops.PageMutations(ctx, p, a.Since, a.Selector)
 	}, truncationNone)
 }

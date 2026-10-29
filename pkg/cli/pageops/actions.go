@@ -52,6 +52,9 @@ var actions = []Action{
 	{Name: "auth_list", Summary: "List saved auth snapshots."},
 	{Name: "replay_fuzz", Summary: "Run a bounded request-variation matrix."},
 	{Name: "poc_bundle", NeedsValue: true, NeedsPaths: true, Summary: "Package a finding as an evidence directory."},
+	{Name: "dialog_accept", Summary: "Accept a JavaScript dialog, using value as the prompt text."},
+	{Name: "dialog_dismiss", Summary: "Dismiss a JavaScript dialog."},
+	{Name: "http_auth", NeedsValue: true, Summary: "Set or clear a per-page HTTP basic-auth credential given as user:password."},
 }
 
 // Actions returns a copy of the page-act action table in schema order.

@@ -70,6 +70,17 @@ var dispatchActions = []string{
 	"postmessage_install", "postmessage_clear", "post_message",
 	"wait_open", "intercept_add", "intercept_list", "intercept_clear",
 	"auth_save", "auth_restore", "auth_list", "replay_fuzz", "poc_bundle",
+	"dialog_accept", "dialog_dismiss", "http_auth",
+}
+
+// PageHTTPAuth arms per-page HTTP basic-auth credentials from a user:password
+// value split at the first colon, or clears them when value is empty.
+func PageHTTPAuth(ctx context.Context, p *browsers.Page, value string) (string, error) {
+	if value == "" {
+		return PageHTTPAuthClear(ctx, p)
+	}
+	user, pass, _ := strings.Cut(value, ":")
+	return PageHTTPAuthSet(ctx, p, user, pass)
 }
 
 // resolveSelector resolves one CSS selector without rod's unbounded retry: a
@@ -654,9 +665,10 @@ func PageA11y(ctx context.Context, p *browsers.Page) (string, error) {
 // reports the older buffered entries left out.
 const MaxLogEmit = 100
 
-// logsEnvelope is the JSON shape shared by PageNetwork and PageConsole: the
-// emitted entries, their count, the engine ring's true overflow loss, and the
-// buffered older entries omitted by the MaxLogEmit cap.
+// logsEnvelope is the JSON shape shared by the network, console, WebSocket,
+// dialog and mutation readers: the emitted entries, their count, the engine
+// ring's true overflow loss, and the buffered older entries omitted by the
+// MaxLogEmit cap.
 type logsEnvelope[T any] struct {
 	// Entries are the emitted entries, oldest first.
 	Entries []T `json:"entries"`
@@ -669,6 +681,12 @@ type logsEnvelope[T any] struct {
 	// FilteredOut counts the entries a filter removed, and is absent when no
 	// filter ran so unfiltered output keeps its exact shape.
 	FilteredOut *int `json:"filtered_out,omitempty"`
+	// LastSeq is the newest sequence on the page, and is present only for the
+	// mutations envelope so a caller can bracket an action with two reads.
+	LastSeq *int64 `json:"last_seq,omitempty"`
+	// Policy is the answer policy now in effect, and is present only on the
+	// dialogs envelope.
+	Policy *string `json:"policy,omitempty"`
 }
 
 // PageNetwork returns the newest buffered network entries, capped at MaxLogEmit
@@ -817,6 +835,8 @@ type AspectQuery struct {
 	// Filter narrows network reads by request type and sinks reads by canary or
 	// known source; other aspects ignore it.
 	Filter string
+	// Since keeps only mutations entries newer than that sequence.
+	Since int64
 	// MaxBytes caps the output unless the aspect self-caps.
 	MaxBytes int
 }
@@ -902,6 +922,12 @@ var aspectEntries = []aspectEntry{
 	{name: "websocket", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
 		return PageWebSocket(ctx, p)
 	}},
+	{name: "dialogs", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
+		return PageDialogs(ctx, p)
+	}},
+	{name: "mutations", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, q AspectQuery) (string, error) {
+		return PageMutations(ctx, p, q.Since, q.Selector)
+	}},
 }
 
 // unknownAspectError is the one unknown-what error every surface emits; it names
@@ -956,34 +982,47 @@ func PageAspect(
 // encodeLogs keeps the newest MaxLogEmit entries in chronological order and
 // marshals the shared log envelope; what names the log kind in an encode error.
 func encodeLogs[T any](entries []T, dropped int, what string) (string, error) {
-	return encodeLogEnvelope(entries, dropped, nil, what)
+	return encodeLogEnvelope(entries, dropped, nil, nil, what)
 }
 
 // encodeFilteredLogs is encodeLogs for a filtered read: filteredOut always
 // appears, even when it is zero, so a caller can tell a filter ran.
 func encodeFilteredLogs[T any](entries []T, dropped, filteredOut int, what string) (string, error) {
-	return encodeLogEnvelope(entries, dropped, &filteredOut, what)
+	return encodeLogEnvelope(entries, dropped, &filteredOut, nil, what)
 }
 
 // encodeLogEnvelope trims to the emit window and marshals one log envelope.
-// filteredOut is nil for a read that ran no filter.
-func encodeLogEnvelope[T any](entries []T, dropped int, filteredOut *int, what string) (string, error) {
-	truncated := 0
-	if len(entries) > MaxLogEmit {
-		truncated = len(entries) - MaxLogEmit
-		entries = entries[len(entries)-MaxLogEmit:]
-	}
+// filteredOut is nil for a read that ran no filter; lastSeq is nil for every
+// log but mutations.
+func encodeLogEnvelope[T any](
+	entries []T,
+	dropped int,
+	filteredOut *int,
+	lastSeq *int64,
+	what string,
+) (string, error) {
+	entries, truncated := trimLogs(entries)
 	b, err := json.Marshal(logsEnvelope[T]{
 		Entries:     entries,
 		Count:       len(entries),
 		Dropped:     dropped,
 		Truncated:   truncated,
 		FilteredOut: filteredOut,
+		LastSeq:     lastSeq,
 	})
 	if err != nil {
 		return "", fmt.Errorf("encode %s log: %w", what, err)
 	}
 	return string(b), nil
+}
+
+// trimLogs keeps the newest MaxLogEmit entries and reports how many older
+// buffered entries the emit cap left out.
+func trimLogs[T any](entries []T) ([]T, int) {
+	if len(entries) <= MaxLogEmit {
+		return entries, 0
+	}
+	return entries[len(entries)-MaxLogEmit:], len(entries) - MaxLogEmit
 }
 
 // PageState is the page address bar as reported by CDP: the current URL and
@@ -2393,6 +2432,9 @@ func PageNavigate(ctx context.Context, p *browsers.Page, url string) (string, er
 		}
 		page := p.Rod.Context(ctx)
 		if err := page.Navigate(url); err != nil {
+			if browsers.IsInvalidAuthCredential(err) {
+				return "", browsers.InvalidAuthCredentialError(url, p.ID)
+			}
 			return "", fmt.Errorf("navigate: %w", err)
 		}
 		if err := page.WaitLoad(); err != nil {

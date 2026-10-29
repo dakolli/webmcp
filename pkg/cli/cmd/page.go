@@ -102,8 +102,8 @@ resolve only against that browser and an unknown id fails with the live ids.
 
 Subcommands:
   list   List the browser's open pages (id, url)
-  fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, console, body, article, tables, forms, marks, security, storage, sinks, postmessage, websocket, har); a URL opens a new page first
-  act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, replay_fuzz, inject_canary, wait_open, auth_save, auth_restore, auth_list, poc_bundle)
+  fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, console, body, article, tables, forms, marks, security, storage, sinks, postmessage, websocket, dialogs, har, mutations); a URL opens a new page first
+  act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, replay_fuzz, inject_canary, wait_open, auth_save, auth_restore, auth_list, poc_bundle, dialog_accept, dialog_dismiss, http_auth)
   auth   Save, restore or list named auth snapshots (counts only, never values)
   close  Close an open page
 
@@ -217,6 +217,7 @@ func newPageFetchCmd(mgr *browsers.Manager) *cobra.Command {
 		selector      string
 		target        string
 		filter        string
+		since         int64
 		fullPage      bool
 		maxBytes      int
 		includeValues bool
@@ -229,7 +230,7 @@ func newPageFetchCmd(mgr *browsers.Manager) *cobra.Command {
 		Short: "Extract an aspect of a live page",
 		Long: `Extracts an aspect of a live page (html, text, links, meta, dom, css,
 js, screenshot, interactives, a11y, network, console, body, article, tables,
-forms, marks, security, storage, sinks, postmessage, websocket, har) and prints it. The page id is optional when
+forms, marks, security, storage, sinks, postmessage, websocket, dialogs, har, mutations) and prints it. The page id is optional when
 only one page is open; 'last' means the most recently opened page; a bare number
 resolves to page-N. A URL in the [id] slot opens a NEW page for it first —
 creating the browser if needed, exactly like 'web-cli fetch <url>' — and then
@@ -242,7 +243,8 @@ dance).
           extract the aspect — mirrors 'web-cli fetch <url>' (wait: idle)
   [what]  the aspect to extract: html, text, links, meta, dom, css, js,
           screenshot, interactives, a11y, network, console, body, article, tables,
-          forms, marks, security, storage, sinks, postmessage, websocket, har (default: text)
+          forms, marks, security, storage, sinks, postmessage, websocket, dialogs,
+          har, mutations (default: text)
 
   --id <session>     the page/session id (the positional [id] wins when both
                      are given; never treated as a URL)
@@ -262,7 +264,11 @@ dance).
                      instead of <redacted> (exposes live session tokens)
   --max-bytes <n>    cap output size (default 50000; screenshots,
                      interactives, a11y, network, console, body, article, tables,
-                     forms, marks, security, sinks, postmessage and websocket are never truncated)
+                      forms, marks, security, sinks, postmessage, websocket, dialogs
+                      and mutations are never truncated)
+  --since <seq>      with --what mutations, return only entries newer than this
+                     seq: read mutations, keep last_seq, act, then read with
+                     --since <last_seq> to see exactly what the action changed
   --out <path>       write the HAR body to this file instead of stdout (har only;
                      the parent directory must already exist, and the file is
                      mode 0600). Without --max-bytes, or with --max-bytes 0, the
@@ -282,7 +288,12 @@ dance).
                      another owner is refused, never returned.
 
 links, meta, dom, interactives, a11y, network, console, body, article, tables,
-forms, marks, security, sinks, postmessage and websocket print JSON, mirroring the MCP page_fetch shapes. article is the readable prose body as
+forms, marks, security, sinks, postmessage, websocket, dialogs and mutations print JSON, mirroring the MCP page_fetch shapes. mutations is the DOM mutation timeline
+({entries:[{seq, ts, kind, target, attribute, added, removed, text}], count,
+dropped, truncated, last_seq}); capture starts with the page and survives
+navigation, and the two-read recipe brackets an action: read mutations, keep
+last_seq, act, then read mutations again with --since <last_seq> to list exactly
+what the action changed. article is the readable prose body as
 markdown ({title, byline?, excerpt?, text, words, truncated, url}); prefer it
 over text when you want the article rather than the whole page. marks is the
 numbered overlay ({marks:[{index, role, text?, x, y, width, height}], screenshot,
@@ -300,8 +311,11 @@ the postMessage recorder ring ({installed, messages:[{origin, source_kind, data,
 data_type, ts, stack}], dropped, truncated, frames:[{url, probed}]}); arm it with
 'page act postmessage_install', reset it with 'page act postmessage_clear' or
 --target clear, and send a message with 'page act post_message'. Messages are
-aggregated across up to 20 frames and data is clipped at 500 runes.
-Screenshots print a data:image/png;base64,... data-URI. network/console emit
+aggregated across up to 20 frames and data is clipped at 500 runes. dialogs is
+the JavaScript-dialog and HTTP-auth ring ({entries, count, dropped, truncated,
+policy}); the engine answers every dialog as it opens, the default policy is
+dismiss, each entry's policy shows what answered it, and this read never changes
+policy. Screenshots print a data:image/png;base64,... data-URI. network/console emit
 {entries,count,dropped,truncated} over the newest 100 buffered entries; capture is
 cumulative from page creation, so clear with 'page act clear_logs' right before the
 step you want to observe, then filter client-side. body fetches the browser's
@@ -322,6 +336,8 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
   web-cli page fetch last storage                       # cookie flags + storage keys, values redacted
   web-cli page fetch last storage --include-values      # real values: exposes live session tokens
   web-cli page fetch last sinks                         # source-to-sink hits after 'page act sinks_install'
+  web-cli page fetch last dialogs                       # dialog/auth ring + current answer policy
+  web-cli page fetch last mutations                     # DOM changes + last_seq; re-read with --since to bracket an action
   web-cli page fetch last har --out traffic.har         # write HAR 1.2 to a file (import into Caido/Burp)
   web-cli page fetch https://hackernews.com links       # open + extract in one step`,
 		Args: cobra.MaximumNArgs(2),
@@ -382,6 +398,7 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 				Selector:      selector,
 				Target:        target,
 				Filter:        filter,
+				Since:         since,
 				FullPage:      fullPage,
 				MaxBytes:      maxBytes,
 				TimeoutMS:     int(timeout / time.Millisecond),
@@ -474,6 +491,7 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 				Selector:      selector,
 				Target:        target,
 				Filter:        filter,
+				Since:         since,
 				FullPage:      fullPage,
 				IncludeValues: includeValues,
 				MaxBytes:      maxBytes,
@@ -485,9 +503,10 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to fetch (optional with one page open; 'last'; or a bare number)")
-	cmd.Flags().StringVar(&what, "what", "", "aspect to extract: html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, tables, forms, marks, security, storage, sinks, postmessage, websocket, har (default text)")
+	cmd.Flags().StringVar(&what, "what", "", "aspect to extract: html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, tables, forms, marks, security, storage, sinks, postmessage, websocket, dialogs, har, mutations (default text)")
 	cmd.Flags().StringVar(&selector, "selector", "", "optional CSS selector scoping html/text/interactives extraction")
 	cmd.Flags().StringVar(&filter, "filter", "", "narrow --what network by request type (comma list; a bare name keeps it, a '-' prefix drops it) or --what sinks by canary/known")
+	cmd.Flags().Int64Var(&since, "since", 0, "with --what mutations, keep only entries newer than this seq (read last_seq first, act, then re-read with --since last_seq)")
 	cmd.Flags().StringVar(&target, "target", "", "resource URL for one css/js resource, or seq/URL substring selecting one network body (with --what body)")
 	cmd.Flags().BoolVar(&fullPage, "full-page", false, "capture the entire scrollable page instead of the visible viewport (screenshot only)")
 	cmd.Flags().BoolVar(&includeValues, "include-values", false, "with --what storage, print real cookie and localStorage/sessionStorage values instead of <redacted> (exposes live tokens)")
@@ -553,7 +572,7 @@ hover_at, drag_and_drop, upload_file, hover, scroll, select, eval, navigate, bac
 forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install,
 sinks_clear, replay, replay_fuzz, inject_canary, postmessage_install, postmessage_clear,
 post_message, wait_open, intercept_add, intercept_list, intercept_clear,
-auth_save, auth_restore, auth_list, poc_bundle) and prints the confirmation. The page id
+auth_save, auth_restore, auth_list, poc_bundle, dialog_accept, dialog_dismiss, http_auth) and prints the confirmation. The page id
 is optional when only one page is open; 'last' means the most recently opened page;
 a bare number resolves to page-N.
 Positional payloads fill each action's fields — flags remain as fallbacks.
@@ -608,13 +627,24 @@ prevents a false transport timeout; it never extends the action.
   intercept_add [rules]   (JSON array of {id,url_pattern,method,action,headers,status,body,delay_ms})
   intercept_list (none)
   intercept_clear (none)
+  dialog_accept [prompt]  (optional prompt text; sets the accept policy)
+  dialog_dismiss [prompt] (sets the dismiss policy)
+  http_auth    [user:password] (sets per-page HTTP basic-auth; empty clears)
   back/forward/reload    (none)
   type         [selector] [text]
 
-clear_logs empties the network, console and websocket buffers and prints
-{"network":N,"console":M,"websocket":K}.
+clear_logs empties the network, console, websocket and dialog buffers and prints
+{"network":N,"console":M,"websocket":K,"dialogs":D}.
 Logs are cumulative from page creation: clear right before the step whose traffic/logs
-you want to observe, then run 'page fetch last network|console|websocket' and filter client-side.
+you want to observe, then run 'page fetch last network|console|websocket|dialogs' and filter client-side.
+dialog_accept and dialog_dismiss set the page's JavaScript-dialog policy. The engine
+answers every alert, confirm, prompt and beforeunload as it opens, so a dialog never
+blocks a read; the default policy is dismiss. dialog_accept types its optional prompt
+text before accepting; when no dialog is open the action only changes the policy for
+the next one. The result is {"policy":...,"prompt_text":...,"count":N,"dropped":M,"last":{...}}
+with the newest dialog or auth record in last; a dialog that arrived before you set the policy was
+already dismissed, so set the policy before the step that opens it. HTTP basic-auth credentials are
+armed at the engine seam (Page.SetHTTPAuth) and are never logged or echoed.
 sinks_install arms the source-to-sink tracer and prints {"installed":true}; it changes
 page behavior, so capture stays opt-in. sinks_clear empties the tracer ring and prints
 {"cleared":N}; read the hits with 'page fetch <id> sinks'. inject_canary injects a
@@ -688,7 +718,9 @@ needs no page.`,
   web-cli page act last replay --target /api/user --header X-Env=staging  # header override, same target
   web-cli page act last replay-fuzz /api/search --points q:query --payloads a --payloads b  # 2 sniper runs
   web-cli page act last replay-fuzz /api/user --points id:body --payloads 1 --payloads 2 --strategy clusterbomb
-  web-cli page act last clear_logs  # reset all three buffers, print {network,console,websocket} counts
+  web-cli page act last clear_logs  # reset the network/console/websocket/dialog buffers, print cleared counts
+  web-cli page act last dialog_accept  # accept the next alert/confirm; print {policy,entries}
+  web-cli page act last dialog_accept "typed"  # accept the next prompt with typed text
   web-cli page act last sinks_install  # arm the source-to-sink tracer
   web-cli page act last sinks_clear    # empty the tracer ring, print {cleared}
   web-cli page act last inject_canary  # inject into all four sources, print sink hits
@@ -949,6 +981,12 @@ needs no page.`,
 				out, err = pageops.PageEmulate(ctx, p, device)
 			case "clear_logs":
 				out, err = pageops.PageClearCapture(p)
+			case "dialog_accept":
+				out, err = pageops.PageDialogAccept(ctx, p, value)
+			case "dialog_dismiss":
+				out, err = pageops.PageDialogDismiss(ctx, p, value)
+			case "http_auth":
+				out, err = pageops.PageHTTPAuth(ctx, p, value)
 			case "sinks_install":
 				out, err = pageops.PageSinksInstall(ctx, p)
 			case "sinks_clear":
@@ -1017,7 +1055,7 @@ needs no page.`,
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to act on (optional with one page open; 'last'; or a bare number)")
-	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, replay_fuzz, inject_canary, postmessage_install, postmessage_clear, post_message, wait_open, intercept_add, intercept_list, intercept_clear, auth_save, auth_restore, auth_list, poc_bundle")
+	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, replay_fuzz, inject_canary, postmessage_install, postmessage_clear, post_message, wait_open, intercept_add, intercept_list, intercept_clear, auth_save, auth_restore, auth_list, poc_bundle, dialog_accept, dialog_dismiss, http_auth")
 	cmd.Flags().StringVar(&selector, "selector", "", "CSS selector targeting the element (element actions)")
 	cmd.Flags().StringVar(&handle, "handle", "", "element handle from page fetch (g<document>-b<backendNodeId>, scoped to its document); wins over --selector (element actions)")
 	cmd.Flags().StringVar(&value, "value", "", "value for eval (JS function), input (text), type (text), navigate (URL), select (option value), or inject_canary (custom canary)")

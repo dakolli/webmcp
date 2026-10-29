@@ -29,6 +29,7 @@ var whatVocab = map[string]bool{
 	"console": true, "body": true, "article": true, "tables": true,
 	"forms": true, "marks": true, "security": true, "storage": true,
 	"sinks": true, "postmessage": true, "har": true, "websocket": true,
+	"dialogs": true, "mutations": true,
 }
 
 // isAction reports whether name is a page-act action, accepting the CLI dashed
@@ -84,6 +85,9 @@ var actPayloadSpecs = map[string][]string{
 	"auth_list":           {"site"},
 	"replay_fuzz":         {"target"},
 	"poc_bundle":          {"title"},
+	"dialog_accept":       {"value"},
+	"dialog_dismiss":      {"value"},
+	"http_auth":           {"value"},
 }
 
 // resolvePageID resolves a user-supplied page id (possibly empty) to a live
@@ -694,6 +698,10 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 			a.device = payload[0]
 		}
 	case "inject_canary":
+		if len(payload) >= 1 {
+			a.value = payload[0]
+		}
+	case "dialog_accept", "dialog_dismiss", "http_auth":
 		if len(payload) >= 1 {
 			a.value = payload[0]
 		}

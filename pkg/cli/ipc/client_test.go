@@ -71,7 +71,7 @@ func TestClientCallBadParams(t *testing.T) {
 			name:    "page.fetch unknown what",
 			method:  MethodPageFetch,
 			params:  PageFetchParams{SessionID: "page-1", What: "bogus"},
-			wantMsg: `page.fetch: unknown what="bogus" (must be one of html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, tables, forms, marks, security, storage, sinks, postmessage, har, websocket)`,
+			wantMsg: `page.fetch: unknown what="bogus" (must be one of html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, tables, forms, marks, security, storage, sinks, postmessage, har, websocket, dialogs, mutations)`,
 		},
 		{
 			name:    "page.act post_message missing value",

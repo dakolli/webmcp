@@ -20,7 +20,7 @@ func PageWebSocket(_ context.Context, p *browsers.Page) (string, error) {
 }
 
 // captureCleared is the JSON shape returned by PageClearCapture: the number of
-// network, console and WebSocket entries emptied from the capture rings.
+// network, console, WebSocket and dialog/auth entries emptied from the rings.
 type captureCleared struct {
 	// Network is the number of network entries cleared.
 	Network int `json:"network"`
@@ -28,18 +28,22 @@ type captureCleared struct {
 	Console int `json:"console"`
 	// WebSocket is the number of WebSocket frames cleared.
 	WebSocket int `json:"websocket"`
+	// Dialogs is the number of dialog/auth entries cleared.
+	Dialogs int `json:"dialogs"`
 }
 
-// PageClearCapture empties the network, console and WebSocket rings, resets
-// their dropped counters and returns the cleared counts as
-// {"network":N,"console":M,"websocket":K}. It needs no context: the call
-// touches only the observer's in-memory state.
+// PageClearCapture empties the network, console, WebSocket and dialog/auth
+// rings, resets their dropped counters and returns the cleared counts as
+// {"network":N,"console":M,"websocket":K,"dialogs":D}. It needs no context: the
+// call touches only in-memory state.
 func PageClearCapture(p *browsers.Page) (string, error) {
 	c := p.ClearCapture()
+	dialogs := p.ClearDialogs()
 	b, err := json.Marshal(captureCleared{
 		Network:   c.Network,
 		Console:   c.Console,
 		WebSocket: c.WebSocket,
+		Dialogs:   dialogs,
 	})
 	if err != nil {
 		return "", fmt.Errorf("encode cleared logs: %w", err)
