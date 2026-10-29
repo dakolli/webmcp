@@ -24,11 +24,22 @@
   with socket id, direction, opcode, payload, and handshake status. Text payloads clip at 2000 runes.
   A binary frame reports size only. The newest 100 of a 200-frame ring emit, and `count`, `truncated`,
   and `dropped` add up to the frames observed.
+- `page_fetch what=mutations` returns DOM change batches. Read `last_seq`, run an action, then read
+  again with `since` to see exactly what that action changed, without diffing the whole page.
+- `page_fetch what=dialogs` returns the recorded `alert`, `confirm`, `prompt`, `beforeunload`, and
+  auth challenges, with the policy that answered each one.
+- `page_act dialog_accept` and `dialog_dismiss` set the answer for later dialogs and return the ring.
+- `page_act http_auth` takes `user:password` for a page behind HTTP basic auth, and an empty value
+  clears it.
 - An argument outside a tool schema fails as `invalid_args` and names the key plus the valid keys. A
   quoted number is accepted for a numeric field.
 - `replay_fuzz` reports `cold_ms` beside `ms`, so the first sample is visible.
 
 ### Fixed
+- A page that opens `alert`, `confirm`, `prompt`, or `beforeunload` no longer blocks every later
+  read. The engine answers the dialog at once, records it, and the page stays usable.
+- A 401 page with no credential used to fail as a raw navigation error. It now keeps the session
+  open and the error names `http_auth` and the exact command to run before you navigate again.
 - A navigate that never commits left the page unusable for the rest of the call budget. Reads,
   actions, and page listings now return in about 0.5 s with one line that names the close command for
   your surface.

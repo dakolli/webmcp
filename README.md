@@ -172,6 +172,8 @@ Five prompts are registered: `fetch_and_summarize`, `inspect_page_decomposition`
 | `sinks` | Source-to-sink tracer hits with stack and selector. Read-only. Arm it with `sinks_install`. |
 | `postmessage` | Recorded `postMessage` traffic per window and frame. Arm it with `postmessage_install`. |
 | `websocket` | WebSocket frames the page sent and received, oldest first, with socket id, direction, opcode, payload, and handshake status. Text payloads clip at 2000 runes. A binary frame reports size only. The newest 100 of a 200-frame ring. |
+| `dialogs` | Recorded `alert`, `confirm`, `prompt`, `beforeunload`, and basic-auth challenges with the policy that answered each one. The default is dismiss, so a dialog never blocks the page. Ring of 50. |
+| `mutations` | DOM change batches with `seq`, `kind`, `target`, `attribute`, and added and removed node counts. Read `last_seq`, act, then read again with `since` to see exactly what the action changed. Ring of 500. |
 | `storage` | Cookies with flags, local and session storage, IndexedDB, and caches. Values are redacted unless `include_values`. |
 | `har` | HAR 1.2 export of the observed traffic for Burp, Caido, or ZAP. |
 | `html`, `text` | Raw `outerHTML`, or visible `innerText`. `selector` narrows both. |
@@ -194,8 +196,8 @@ reports `truncated` and `omitted` instead of cutting an object in half.
 | View and time | `scroll`, `wait`, `set_viewport`, `emulate` |
 | Code and logs | `eval`, `clear_logs` |
 | Network | `replay`, `replay_fuzz`, `intercept_add`, `intercept_list`, `intercept_clear` |
-| Session | `auth_save`, `auth_restore`, `auth_list` |
-| Windows | `wait_open`, `post_message` |
+| Session and auth | `auth_save`, `auth_restore`, `auth_list`, `http_auth` |
+| Windows | `wait_open`, `post_message`, `dialog_accept`, `dialog_dismiss` |
 | Security | `sinks_install`, `sinks_clear`, `postmessage_install`, `postmessage_clear`, `inject_canary`, `poc_bundle` |
 
 Element actions take a `handle` from `page_fetch`, or a CSS selector. A handle wins when both are
