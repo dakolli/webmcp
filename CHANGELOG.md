@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.2.0 - 2026-10-29
+
+### Highlights
+- One command configures an MCP client. `browser mcp add claude` writes the entry, keeps your other
+  servers, and never overwrites the file.
+- A page that stops answering now fails in about half a second with a recovery line. Before, it
+  waited out the whole call timeout.
+- `network` and `sinks` reads take a filter. A normal page no longer buries the signal under images
+  and framework boot.
+- `replay` edits URL query parameters.
+
+### Added
+- `browser mcp add claude|opencode|codex|pi`. Flags: `--url`, `--dir`, `--dry-run`, `--force`,
+  `--remove`. It merges and copies the file to `.bak` first. With no config file, it prints the path
+  and the snippet to paste.
+- `page_act replay` takes `query`. A value replaces a parameter. An empty string or `null` removes it.
+- The CLI and IPC carry the same two arguments: `--query NAME=VALUE` (repeatable) on `page act`, and
+  `--filter` on `page fetch`.
+- `page_fetch filter` narrows `network` by 18 request types with a keep form and a `-drop` form, and
+  narrows `sinks` by `canary` or `known`. Both report `filtered_out`.
+- An argument outside a tool schema fails as `invalid_args` and names the key plus the valid keys. A
+  quoted number is accepted for a numeric field.
+- `replay_fuzz` reports `cold_ms` beside `ms`, so the first sample is visible.
+
+### Fixed
+- A navigate that never commits left the page unusable for the rest of the call budget. Reads,
+  actions, and page listings now return in about 0.5 s with one line that names the close command for
+  your surface.
+- An action on such a page could burn the full 30 s. It now fails in about 0.5 s.
+- An error names the operation you ran, not an earlier one. A nested argument error names the key,
+  for example `query["probe"]`.
+- The ambiguous-target error for `replay` dropped from about 1.6 KB to 365 bytes.
+- Wedge recovery on the CLI fell from 1.5 s to about 0.5 s.
+
+### Changed
+- The README is now four parts: install, connect an MCP client, install the agent skill, and a tool
+  and feature reference. Release instructions moved to `RELEASING.md`.
+- The agent skill documents `filter`, replay `query`, strict arguments, and recovery bounds split by
+  read and action.
+
+### Known limits
+- WebSocket frames are captured and cleared by `clear_logs`, but no read aspect returns them yet.
+- `codex` and `pi` document streamable HTTP. The server serves SSE only.
+
 ## 0.1.0 - 2026-10-27
 
 ## Features
