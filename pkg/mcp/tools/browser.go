@@ -98,6 +98,13 @@ func (t *BrowserCreate) InputSchema() models.InputSchema {
 				"type":        "string",
 				"description": "Comma-separated hosts that skip the proxy, for example 'localhost,*.internal'.",
 			},
+			"deny_hosts": map[string]any{
+				"type":  "array",
+				"items": map[string]any{"type": "string"},
+				"description": "Opt-in proxy deny list of host globs, for example [\"*.bsg.brave.com\", \"usage-ping.brave.com\"]. " +
+					"Each host is routed outside the proxy and resolved to NOTFOUND, so browser telemetry never reaches the proxy history. " +
+					"Default empty: behaviour is unchanged. Chromium and Chrome understand the same mechanism.",
+			},
 			"ignore_certs": map[string]any{
 				"type": "boolean",
 				"description": "Accept invalid TLS certificates, for example an intercept proxy's MITM CA. " +
@@ -149,6 +156,7 @@ type browserCreateArgs struct {
 	Position     string            `json:"position,omitempty"`
 	Proxy        string            `json:"proxy,omitempty"`
 	ProxyBypass  string            `json:"proxy_bypass,omitempty"`
+	DenyHosts    []string          `json:"deny_hosts,omitempty"`
 	Owner        string            `json:"owner,omitempty"`
 	Headless     *bool             `json:"headless,omitempty"`
 	Stealth      *bool             `json:"stealth,omitempty"`
@@ -195,6 +203,9 @@ func (t *BrowserCreate) Execute(ctx context.Context, args json.RawMessage) (stri
 	}
 	if a.ProxyBypass != "" {
 		opts = append(opts, browsers.WithProxyBypass(a.ProxyBypass))
+	}
+	if len(a.DenyHosts) > 0 {
+		opts = append(opts, browsers.WithDenyHosts(a.DenyHosts))
 	}
 	if a.IgnoreCerts != nil {
 		opts = append(opts, browsers.WithIgnoreCerts(*a.IgnoreCerts))

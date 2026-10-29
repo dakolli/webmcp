@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/go-rod/rod/lib/launcher"
@@ -121,5 +122,40 @@ func TestApplyChromiumFlagsRejectsBareName(t *testing.T) {
 	want := `browsers: chromium flag "disable-gpu" must start with --`
 	if err == nil || err.Error() != want {
 		t.Fatalf("err = %v, want %q", err, want)
+	}
+}
+
+// TestApplyDenyHosts pins the two launch switches a deny list needs: the hosts
+// join the proxy bypass list and map to NOTFOUND, and both merge with values
+// already present instead of replacing them.
+func TestApplyDenyHosts(t *testing.T) {
+	l := launcher.New()
+	l.Set("proxy-bypass-list", "localhost,*.internal")
+	l.Set("host-resolver-rules", "MAP existing.test 127.0.0.1")
+
+	applyDenyHosts(l, []string{"*.bsg.brave.com", "dict.brave.com"})
+
+	if got, want := l.Get("proxy-bypass-list"),
+		"localhost,*.internal,*.bsg.brave.com,dict.brave.com"; got != want {
+		t.Errorf("proxy-bypass-list = %q, want %q", got, want)
+	}
+	if got, want := l.Get("host-resolver-rules"),
+		"MAP existing.test 127.0.0.1, MAP *.bsg.brave.com ~NOTFOUND, MAP dict.brave.com ~NOTFOUND"; got != want {
+		t.Errorf("host-resolver-rules = %q, want %q", got, want)
+	}
+}
+
+func TestNormalizeDenyHosts(t *testing.T) {
+	got, err := normalizeDenyHosts([]string{" *.bsg.brave.com ", "", "dict.brave.com", "*.bsg.brave.com"})
+	if err != nil {
+		t.Fatalf("normalizeDenyHosts: %v", err)
+	}
+	if want := "*.bsg.brave.com,dict.brave.com"; strings.Join(got, ",") != want {
+		t.Fatalf("hosts = %v, want %q", got, want)
+	}
+	for _, bad := range []string{"a,b", "two words"} {
+		if _, err := normalizeDenyHosts([]string{bad}); err == nil {
+			t.Errorf("normalizeDenyHosts(%q) = nil error, want a rejection", bad)
+		}
 	}
 }

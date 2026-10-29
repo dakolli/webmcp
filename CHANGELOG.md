@@ -15,6 +15,10 @@
   the token as `set` or `empty`, never the value.
 - `browser serve mcp --caido` and `--caido-pat` enable the tool and override the token, without
   editing the file.
+- `caido_status` reports the selected project, every scope, the capture mode and the history count.
+  Call it first when a search returns nothing. `browser caido status` prints the same facts.
+- `browser_create.deny_hosts` keeps chosen hosts out of the proxy. A proxied visit now stays clean of
+  browser telemetry, so Caido history shows the target and not the browser.
 - `[caido] access_token` takes a direct instance token, and `[caido] allow_guest` (default true)
   allows the local guest session. `config show` now reports which one worked, for example
   `auth: pat (rejected), guest`.

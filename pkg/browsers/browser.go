@@ -135,6 +135,10 @@ type Browser struct {
 	// chromiumFlags are the extra Chromium command-line switches applied at
 	// launch. Immutable after creation; copied for identity clones.
 	chromiumFlags []string
+	// denyHosts is the opt-in proxy deny list: host globs routed outside the
+	// proxy and resolved to NOTFOUND, so their requests never reach the proxy.
+	// Immutable after creation; copied for identity clones.
+	denyHosts []string
 	// extraHeaders are sent with every request from every page of this browser,
 	// first navigation included. Immutable after creation.
 	extraHeaders map[string]string
@@ -400,6 +404,7 @@ func (b *Browser) newIdentity(name string, clone *rod.Browser) *Browser {
 		proxyBypass:    b.proxyBypass,
 		ignoreCerts:    b.ignoreCerts,
 		chromiumFlags:  append([]string(nil), b.chromiumFlags...),
+		denyHosts:      append([]string(nil), b.denyHosts...),
 		extraHeaders:   cloneHeaders(b.extraHeaders),
 		scope:          append([]string(nil), b.scope...),
 		scopeStrict:    b.scopeStrict,
@@ -612,6 +617,9 @@ func (b *Browser) Launch(ctx context.Context) error {
 	}
 	if b.proxyBypass != "" {
 		l.Set("proxy-bypass-list", b.proxyBypass)
+	}
+	if len(b.denyHosts) > 0 {
+		applyDenyHosts(l, b.denyHosts)
 	}
 	if b.ignoreCerts {
 		l.Set("ignore-certificate-errors")
@@ -1423,6 +1431,50 @@ func applyChromiumFlags(l *launcher.Launcher, switches []string) error {
 		l.Set(flags.Flag(name))
 	}
 	return nil
+}
+
+// applyDenyHosts routes each denied host outside the proxy and resolves it to
+// NOTFOUND. The bypass is required because a proxied request is sent to the
+// proxy unresolved, so a host-resolver rule alone never applies to it.
+func applyDenyHosts(l *launcher.Launcher, hosts []string) {
+	bypass := l.Get("proxy-bypass-list")
+	entries := make([]string, 0, len(hosts)+1)
+	if bypass != "" {
+		entries = append(entries, bypass)
+	}
+	entries = append(entries, hosts...)
+	l.Set("proxy-bypass-list", strings.Join(entries, ","))
+
+	rules := make([]string, 0, len(hosts)+1)
+	if existing := l.Get("host-resolver-rules"); existing != "" {
+		rules = append(rules, existing)
+	}
+	for _, host := range hosts {
+		rules = append(rules, "MAP "+host+" ~NOTFOUND")
+	}
+	l.Set("host-resolver-rules", strings.Join(rules, ", "))
+}
+
+// normalizeDenyHosts trims entries and drops blanks, rejecting a value that
+// would break the comma-separated proxy flags.
+func normalizeDenyHosts(hosts []string) ([]string, error) {
+	out := make([]string, 0, len(hosts))
+	seen := make(map[string]struct{}, len(hosts))
+	for _, host := range hosts {
+		host = strings.TrimSpace(host)
+		if host == "" {
+			continue
+		}
+		if strings.ContainsAny(host, ", \t\r\n") {
+			return nil, fmt.Errorf("browsers: deny host %q must not contain spaces or commas", host)
+		}
+		if _, ok := seen[host]; ok {
+			continue
+		}
+		seen[host] = struct{}{}
+		out = append(out, host)
+	}
+	return out, nil
 }
 
 // parseChromiumFlag splits a "--name" or "--name=value" switch into the

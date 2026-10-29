@@ -230,6 +230,13 @@ func WithProxyBypass(bypass string) Option {
 	return func(m *Manager) { m.proxyBypass = bypass }
 }
 
+// WithDenyHosts sets the opt-in proxy deny list: host globs whose requests are
+// routed outside the proxy and resolved to NOTFOUND, so they never reach the
+// proxy. An empty list leaves behaviour unchanged.
+func WithDenyHosts(hosts []string) Option {
+	return func(m *Manager) { m.denyHosts = append([]string(nil), hosts...) }
+}
+
 // WithIgnoreCerts makes Chromium accept invalid TLS certificates, such as an
 // intercept proxy's MITM CA. It is independent of WithProxy.
 func WithIgnoreCerts(ignore bool) Option {
@@ -444,6 +451,9 @@ type Manager struct {
 	proxy string
 	// proxyBypass is the default comma-separated proxy bypass list.
 	proxyBypass string
+	// denyHosts is the default opt-in proxy deny list: host globs routed
+	// outside the proxy and resolved to NOTFOUND.
+	denyHosts []string
 	// ignoreCerts makes Chromium accept invalid TLS certificates by default.
 	ignoreCerts bool
 	// chromiumFlags are extra Chromium command-line switches passed to every
@@ -577,6 +587,7 @@ type launchKey struct {
 	Position    string
 	Proxy       string
 	ProxyBypass string
+	DenyHosts   string
 	IgnoreCerts bool
 	Flags       string
 	Headers     string
@@ -604,6 +615,7 @@ func launchKeyOf(owner string, m *Manager) launchKey {
 		Position:    m.position,
 		Proxy:       m.proxy,
 		ProxyBypass: m.proxyBypass,
+		DenyHosts:   canonicalFlags(m.denyHosts),
 		IgnoreCerts: m.ignoreCerts,
 		Flags:       canonicalFlags(m.chromiumFlags),
 		Headers:     canonicalHeaders(m.extraHeaders),
@@ -751,6 +763,7 @@ func (m *Manager) createOptions(opts []Option) (*Manager, string, bool, error) {
 		position:      m.position,
 		proxy:         m.proxy,
 		proxyBypass:   m.proxyBypass,
+		denyHosts:     append([]string(nil), m.denyHosts...),
 		ignoreCerts:   m.ignoreCerts,
 		chromiumFlags: append([]string(nil), m.chromiumFlags...),
 		extraHeaders:  cloneHeaders(m.extraHeaders),
@@ -768,6 +781,11 @@ func (m *Manager) createOptions(opts []Option) (*Manager, string, bool, error) {
 	for _, o := range opts {
 		o(effective)
 	}
+	denyHosts, err := normalizeDenyHosts(effective.denyHosts)
+	if err != nil {
+		return nil, "", false, err
+	}
+	effective.denyHosts = denyHosts
 	return effective, defaultProfileDir, defaultPersist, nil
 }
 
@@ -855,6 +873,7 @@ func (m *Manager) launchCreatedBrowser(
 	b.ttl = effective.browserTTL
 	b.proxy = effective.proxy
 	b.proxyBypass = effective.proxyBypass
+	b.denyHosts = append([]string(nil), effective.denyHosts...)
 	b.ignoreCerts = effective.ignoreCerts
 	b.chromiumFlags = append([]string(nil), effective.chromiumFlags...)
 	b.extraHeaders = cloneHeaders(effective.extraHeaders)
@@ -1018,6 +1037,7 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 	position := m.position
 	proxy := m.proxy
 	proxyBypass := m.proxyBypass
+	denyHostsRaw := append([]string(nil), m.denyHosts...)
 	ignoreCerts := m.ignoreCerts
 	chromiumFlags := append([]string(nil), m.chromiumFlags...)
 	extraHeaders := cloneHeaders(m.extraHeaders)
@@ -1028,6 +1048,11 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 	rawActions := m.rawActions
 	m.mu.Unlock()
 
+	denyHosts, err := normalizeDenyHosts(denyHostsRaw)
+	if err != nil {
+		return nil, err
+	}
+
 	// Mirrors a bare CreateBrowser request so both paths share one launch key.
 	key := launchKeyOf(owner, &Manager{
 		binPath:       binPath,
@@ -1037,6 +1062,7 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 		position:      position,
 		proxy:         proxy,
 		proxyBypass:   proxyBypass,
+		denyHosts:     denyHosts,
 		ignoreCerts:   ignoreCerts,
 		chromiumFlags: chromiumFlags,
 		extraHeaders:  extraHeaders,
@@ -1078,6 +1104,7 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 	b.ttl = browserTTL
 	b.proxy = proxy
 	b.proxyBypass = proxyBypass
+	b.denyHosts = denyHosts
 	b.ignoreCerts = ignoreCerts
 	b.chromiumFlags = chromiumFlags
 	b.extraHeaders = extraHeaders
