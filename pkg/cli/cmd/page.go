@@ -719,7 +719,7 @@ needs no page.`,
   web-cli page act last replay-fuzz /api/search --points q:query --payloads a --payloads b  # 2 sniper runs
   web-cli page act last replay-fuzz /api/user --points id:body --payloads 1 --payloads 2 --strategy clusterbomb
   web-cli page act last clear_logs  # reset the network/console/websocket/dialog buffers, print cleared counts
-  web-cli page act last dialog_accept  # accept the next alert/confirm; print {policy,entries}
+  web-cli page act last dialog_accept  # accept the next alert/confirm; print {policy,prompt_text,count,dropped,last}
   web-cli page act last dialog_accept "typed"  # accept the next prompt with typed text
   web-cli page act last sinks_install  # arm the source-to-sink tracer
   web-cli page act last sinks_clear    # empty the tracer ring, print {cleared}

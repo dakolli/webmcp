@@ -138,9 +138,12 @@ func (t *Page) Description() string {
 		"annotated viewport PNG as an image block, with the data URI returned " +
 		"in screenshot for a text-only client. Its x/y coordinates feed " +
 		"page_act click_at), " +
-		"security (a passive audit of response headers, CSP, cookie flags, mixed " +
-		"content, subresource integrity and form targets, returned as " +
-		"{\"checks\":[{\"id\",\"status\",\"evidence\",\"detail\"}],\"count\":N}), " +
+		"security (a passive, read-only audit of response headers, CSP, cookie " +
+		"flags, mixed content, subresource integrity and form targets, returned as " +
+		"{\"checks\":[{\"id\",\"status\",\"evidence\",\"detail\"}],\"count\":N}, which " +
+		"never changes the page and never runs a bypass and reports policy weakness, " +
+		"not exploitability, with each finding quoting the real header or meta tag, " +
+		"for example check csp_bypass_trusted_host), " +
 		"sinks (source-to-sink tracer ring: {\"installed\",\"hits\":[{\"source\",\"sink\"," +
 		"\"context\",\"value\",\"value_cut\",\"stack\",\"selector\",\"ts\"}],\"dropped\"," +
 		"\"truncated\"}. It is read-only and never arms capture: capture starts only with " +
@@ -179,9 +182,8 @@ func (t *Page) Description() string {
 		"<redacted> and no argument enables secret capture; response bodies are " +
 		"verbatim and can echo a request cookie. The MCP export defaults to a " +
 		"512 KiB cap, while the CLI har --out writes the uncapped export and says " +
-		"Cap: none in log.comment; log.truncated counts only the entries dropped " +
-		"to fit the cap — entries lost to the network ring's own bound are not " +
-		"counted yet and will be reported separately after WEB-168. Read-only, " +
+		"Cap: none in log.comment; log.truncated counts the entries dropped to fit " +
+		"the cap plus the entries the network ring evicted. Read-only, " +
 		"never arms capture), " +
 		"or meta. Pass the session_id " +
 		"returned by fetch_page plus what=<aspect>. When more than one browser is " +

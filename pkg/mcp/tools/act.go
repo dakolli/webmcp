@@ -70,8 +70,9 @@ func (t *Act) Description() string {
 		"click_at / hover_at (coordinate-based mouse actions), drag_and_drop (mouse drag), " +
 		"upload_file (set files on <input type='file'>), eval (run JS — the primary escape hatch), " +
 		"navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, " +
-		"clear_logs (empties the network, console and websocket buffers, returning the cleared counts, e.g. " +
-		"page_act { action: \"clear_logs\" } → {\"network\":12,\"console\":5,\"websocket\":0}), " +
+		"clear_logs (empties the network, console, websocket and dialog buffers, the dialog ring covering " +
+		"alert, confirm, prompt, beforeunload and auth challenges, returning the cleared counts, e.g. " +
+		"page_act { action: \"clear_logs\" } → {\"network\":12,\"console\":5,\"websocket\":0,\"dialogs\":0}), " +
 		"sinks_install (arms the source-to-sink tracer and returns {\"installed\":true}; capture is " +
 		"opt-in and never starts by itself because instrumentation changes page behavior. The " +
 		"wrappers survive client-side route changes and full navigations, but the hit ring is per " +
