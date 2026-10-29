@@ -342,15 +342,15 @@ func TestClassifyError(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, hint := classifyError(tt.err, tt.page)
-			if got != tt.want {
-				t.Fatalf("classifyError() = %q, want %q", got, tt.want)
+			c := classifyError(tt.err, tt.page)
+			if c.Type != tt.want {
+				t.Fatalf("classifyError() = %q, want %q", c.Type, tt.want)
 			}
-			if got == errUnknown && hint != "" {
-				t.Fatalf("unknown hint = %q, want none", hint)
+			if c.Type == errUnknown && c.Hint != "" {
+				t.Fatalf("unknown hint = %q, want none", c.Hint)
 			}
-			if got != errUnknown && got != errInvalidArgs && hint == "" {
-				t.Fatalf("%s hint = empty, want a remediation", got)
+			if c.Type != errUnknown && c.Type != errInvalidArgs && c.Hint == "" {
+				t.Fatalf("%s hint = empty, want a remediation", c.Type)
 			}
 		})
 	}
@@ -444,8 +444,8 @@ func TestClassifyErrorPrecedence(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got, _ := classifyError(tt.err, challengeState{}); got != tt.want {
-				t.Fatalf("classifyError() = %q, want %q", got, tt.want)
+			if got := classifyError(tt.err, challengeState{}); got.Type != tt.want {
+				t.Fatalf("classifyError() = %q, want %q", got.Type, tt.want)
 			}
 			out, err := failResult(tt.err)
 			if err != nil {
@@ -534,8 +534,8 @@ func TestAntiBotMarkersArePinned(t *testing.T) {
 	}
 	for _, marker := range markers {
 		t.Run(marker, func(t *testing.T) {
-			if got, _ := classifyError(errors.New(marker), challengeState{}); got != errAntiBot {
-				t.Fatalf("classifyError(%q) = %q, want %q", marker, got, errAntiBot)
+			if got := classifyError(errors.New(marker), challengeState{}); got.Type != errAntiBot {
+				t.Fatalf("classifyError(%q) = %q, want %q", marker, got.Type, errAntiBot)
 			}
 		})
 	}
@@ -571,8 +571,8 @@ func TestChallengeURLIsNotAntiBot(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got, _ := classifyError(tt.err, challengeState{}); got != tt.want {
-				t.Fatalf("classifyError() = %q, want %q", got, tt.want)
+			if got := classifyError(tt.err, challengeState{}); got.Type != tt.want {
+				t.Fatalf("classifyError() = %q, want %q", got.Type, tt.want)
 			}
 		})
 	}
@@ -620,8 +620,8 @@ func TestClassifyReplayErrors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got, _ := classifyError(tt.err, challengeState{}); got != tt.want {
-				t.Fatalf("classifyError() = %q, want %q", got, tt.want)
+			if got := classifyError(tt.err, challengeState{}); got.Type != tt.want {
+				t.Fatalf("classifyError() = %q, want %q", got.Type, tt.want)
 			}
 			out, err := failResult(tt.err)
 			if err != nil {
@@ -732,15 +732,15 @@ func TestSpecificHintBeatsGenericHint(t *testing.T) {
 		Page: "page-1",
 		Err:  context.DeadlineExceeded,
 	})
-	gotType, gotHint := classifyError(timeoutErr, challengeState{})
-	if gotType != errTimeout {
-		t.Fatalf("type = %q, want %q", gotType, errTimeout)
+	got := classifyError(timeoutErr, challengeState{})
+	if got.Type != errTimeout {
+		t.Fatalf("type = %q, want %q", got.Type, errTimeout)
 	}
-	if gotHint == hintFor(errTimeout) {
-		t.Fatalf("hint = %q, want the typed hint, not the generic one", gotHint)
+	if got.Hint == hintFor(errTimeout) {
+		t.Fatalf("hint = %q, want the typed hint, not the generic one", got.Hint)
 	}
-	if !strings.Contains(gotHint, "raw:true") {
-		t.Fatalf("hint = %q, want raw:true", gotHint)
+	if !strings.Contains(got.Hint, "raw:true") {
+		t.Fatalf("hint = %q, want raw:true", got.Hint)
 	}
 
 	fuzzErr := fmt.Errorf("page_act: %w", &browsers.FuzzBoundsError{
@@ -748,15 +748,15 @@ func TestSpecificHintBeatsGenericHint(t *testing.T) {
 		Computed: "60",
 		Bound:    "50",
 	})
-	gotType, gotHint = classifyError(fuzzErr, challengeState{})
-	if gotType != errInvalidArgs {
-		t.Fatalf("type = %q, want %q", gotType, errInvalidArgs)
+	got = classifyError(fuzzErr, challengeState{})
+	if got.Type != errInvalidArgs {
+		t.Fatalf("type = %q, want %q", got.Type, errInvalidArgs)
 	}
-	if gotHint == hintFor(errInvalidArgs) {
-		t.Fatalf("hint = %q, want the typed hint, not the generic one", gotHint)
+	if got.Hint == hintFor(errInvalidArgs) {
+		t.Fatalf("hint = %q, want the typed hint, not the generic one", got.Hint)
 	}
-	if !strings.Contains(gotHint, "50") {
-		t.Fatalf("hint = %q, want the payload bound", gotHint)
+	if !strings.Contains(got.Hint, "50") {
+		t.Fatalf("hint = %q, want the payload bound", got.Hint)
 	}
 }
 

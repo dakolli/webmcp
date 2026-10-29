@@ -191,6 +191,10 @@ var pageClosedMarkers = []string{
 	"wait_open: browser",
 }
 
+// timeoutMarkers identify a deadline that an inner library flattened with %v,
+// so errors.Is can no longer see context.DeadlineExceeded.
+var timeoutMarkers = []string{"context deadline exceeded"}
+
 // navFailedMarkers identify a failed navigation.
 var navFailedMarkers = []string{
 	"navigation failed",
@@ -230,12 +234,12 @@ func failResultForPage(
 
 // marshalFailure is the single failure-envelope builder.
 func marshalFailure(err error, ch challengeState) (string, error) {
-	errType, hint := classifyError(err, ch)
+	c := classifyError(err, ch)
 	return marshalEnvelope(resultEnvelope{
 		Error: &envelopeError{
-			Type:    errType,
+			Type:    c.Type,
 			Message: err.Error(),
-			Hint:    hint,
+			Hint:    c.Hint,
 		},
 	})
 }
@@ -249,96 +253,148 @@ func marshalEnvelope(env resultEnvelope) (string, error) {
 	return string(out), nil
 }
 
+// Remediations that name the exact next call. They stay in the tool layer so
+// the engine never carries LLM-facing prose.
+const (
+	hintLookupAmbiguous = "this session id needs a browser — pass browser_id or owner to choose the browser that holds it"
+	hintLookupMissing   = "the session is not in that browser or owner — call session_list for the live ids, or pass the matching browser_id or owner"
+	hintPageCap         = "the browser is at its page cap — call session_close on a session you no longer need, then retry"
+	hintCanaryTracer    = "arm the tracer first with page_act action=sinks_install, then retry inject_canary"
+	hintUnknownBrowser  = "that browser_id is not live — call browser_list for the running ids and pass one of them"
+	hintReplaySlow      = "the replay exceeded its fixed 30s budget — the target is slow or wedged; retry or replay a lighter entry"
+	hintReplayTransport = "the replay transport failed — verify the URL is reachable and the host's DNS and TLS trust are correct, then retry"
+	hintAuthSnapshot    = "no snapshot is stored for that site and name — call page_act action=auth_list to see the saved names, or auth_save first"
+	hintStaleHandle     = "the handle was not minted by this document — re-read page_fetch what=interactives and pass a fresh handle, or use a selector"
+	hintUserAgentForce  = "pass force=true to restore anyway, or re-save the snapshot on this browser with auth_save"
+)
+
+// classification is one resolved failure: the stable type an agent branches on
+// and the one-line remediation it can act on.
+type classification struct {
+	Type string
+	Hint string
+}
+
+// plain pairs a type with its generic remediation.
+func plain(errType string) classification {
+	return classification{Type: errType, Hint: hintFor(errType)}
+}
+
+// isAs reports whether err carries a T anywhere in its chain.
+func isAs[T error](err error) bool {
+	_, ok := errors.AsType[T](err)
+	return ok
+}
+
+// hintOf returns the remediation that the first T in the chain carries.
+func hintOf[T interface {
+	error
+	hintedError
+}](err error) string {
+	hinted, ok := errors.AsType[T](err)
+	if !ok {
+		return ""
+	}
+	return hinted.Hint()
+}
+
 // classifyError maps a wrapped tool error to a stable type and an actionable
 // hint. An error that carries Hint() supplies its own remediation, which always
 // beats the generic per-type hint.
-func classifyError(err error, ch challengeState) (string, string) {
-	errType, hint := classifyErrorType(err, ch)
+func classifyError(err error, ch challengeState) classification {
+	c := classifyErrorType(err, ch)
 	var hinted hintedError
 	if errors.As(err, &hinted) {
 		if specific := hinted.Hint(); specific != "" {
-			return errType, specific
+			c.Hint = specific
 		}
 	}
-	return errType, hint
+	return c
 }
 
-// classifyErrorType resolves the type and the generic hint. The order is
-// deliberate: invalid_args first, page_closed before timeout (reopening is the
-// fix), anti_bot before nav_failed (the navigation failed because of the
-// challenge), and timeout before nav_failed.
-func classifyErrorType(err error, ch challengeState) (string, string) {
+// classifyErrorType resolves the type and the generic hint. Typed errors win
+// over prose markers, and the typed order matters: invalid_args first, scope
+// before rate limit, page_closed before timeout (reopening is the fix),
+// anti_bot before nav_failed (the navigation failed because of the challenge),
+// and timeout before nav_failed.
+func classifyErrorType(err error, ch challengeState) classification {
 	if err == nil {
-		return errUnknown, ""
+		return classification{Type: errUnknown}
 	}
 	msg := strings.ToLower(err.Error())
 
-	var (
-		missingElement *rod.ElementNotFoundError
-		notClickable   *rod.NotInteractableError
-		closeCanceled  *rod.PageCloseCanceledError
-		navigation     *rod.NavigationError
-		lookup         *browsers.PageLookupError
-		replay         *browsers.ReplayTransportError
-		pageLimit      *browsers.PageLimitError
-		fuzzBounds     *browsers.FuzzBoundsError
-		rateLimit      *browsers.RateLimitError
-		scopeRefused   *browsers.ScopeError
-	)
-
 	switch {
-	case errors.As(err, &lookup) && lookup.Kind == browsers.PageLookupAmbiguous:
-		return errInvalidArgs, "this session id needs a browser — pass browser_id or owner to choose the browser that holds it"
-	case errors.As(err, &lookup):
-		return errNotFound, "the session is not in that browser or owner — call session_list for the live ids, or pass the matching browser_id or owner"
-	case errors.As(err, &pageLimit):
-		return errInvalidArgs, "the browser is at its page cap — call session_close on a session you no longer need, then retry"
-	case errors.As(err, &fuzzBounds):
-		return errInvalidArgs, hintFor(errInvalidArgs)
+	case isAs[*browsers.PageLookupError](err):
+		return lookupFailure(err)
+	case isAs[*browsers.PageLimitError](err):
+		return classification{Type: errInvalidArgs, Hint: hintPageCap}
+	case isAs[*browsers.FuzzBoundsError](err):
+		return plain(errInvalidArgs)
 	case errors.Is(err, browsers.ErrCanaryNeedsTracer):
-		return errInvalidArgs, "arm the tracer first with page_act action=sinks_install, then retry inject_canary"
+		return classification{Type: errInvalidArgs, Hint: hintCanaryTracer}
 	case errors.Is(err, browsers.ErrUnknownBrowser):
-		return errInvalidArgs, "that browser_id is not live — call browser_list for the running ids and pass one of them"
+		return classification{Type: errInvalidArgs, Hint: hintUnknownBrowser}
 	case errors.Is(err, browsers.ErrReplayTargetAmbiguous),
 		errors.Is(err, browsers.ErrReplayTargetNotFound):
-		return errInvalidArgs, hintFor(errInvalidArgs)
+		return plain(errInvalidArgs)
 	case containsAny(msg, notFoundMarkers):
-		return errNotFound, "no snapshot is stored for that site and name — call page_act action=auth_list to see the saved names, or auth_save first"
+		// Stands in for a typed not-found error from the auth store.
+		return classification{Type: errNotFound, Hint: hintAuthSnapshot}
 	case containsAny(msg, handleArgsMarkers):
-		return errInvalidArgs, "the handle was not minted by this document — re-read page_fetch what=interactives and pass a fresh handle, or use a selector"
+		// Stands in for a typed stale-handle error.
+		return classification{Type: errInvalidArgs, Hint: hintStaleHandle}
 	case containsAny(msg, userAgentMismatchMarkers):
-		return errInvalidArgs, "pass force=true to restore anyway, or re-save the snapshot on this browser with auth_save"
-	case errors.As(err, &scopeRefused):
-		return errInvalidArgs, scopeRefused.Hint()
-	case errors.As(err, &rateLimit):
-		return errTimeout, rateLimit.Hint()
-	case errors.As(err, &replay):
-		if replay.TimedOut() {
-			return errTimeout, "the replay exceeded its fixed 30s budget — the target is slow or wedged; retry or replay a lighter entry"
-		}
-		return errNavFailed, "the replay transport failed — verify the URL is reachable and the host's DNS and TLS trust are correct, then retry"
+		// Stands in for a typed user-agent mismatch error.
+		return classification{Type: errInvalidArgs, Hint: hintUserAgentForce}
+	case isAs[*browsers.ScopeError](err):
+		return classification{Type: errInvalidArgs, Hint: hintOf[*browsers.ScopeError](err)}
+	case isAs[*browsers.RateLimitError](err):
+		// A rate limit is a retryable delay, so it shares the timeout type.
+		return classification{Type: errTimeout, Hint: hintOf[*browsers.RateLimitError](err)}
+	case isAs[*browsers.ReplayTransportError](err):
+		return replayFailure(err)
 	case containsAny(msg, invalidArgsMarkers):
+		// Stands in for typed validation errors raised across the tools.
 		if containsAny(msg, decodeArgsMarkers) {
-			return errInvalidArgs, hintFor(errInvalidArgs)
+			return plain(errInvalidArgs)
 		}
-		return errInvalidArgs, ""
-	case errors.As(err, &missingElement) || containsAny(msg, elementNotFoundMarkers):
-		return errElementNotFound, hintFor(errElementNotFound)
-	case errors.As(err, &notClickable) || containsAny(msg, notInteractableMarkers):
-		return errNotInteractable, hintFor(errNotInteractable)
-	case ch.challenged() || containsAny(msg, antiBotMarkers):
-		return errAntiBot, hintFor(errAntiBot)
-	case errors.As(err, &closeCanceled) || containsAny(msg, pageClosedMarkers):
-		return errPageClosed, hintFor(errPageClosed)
+		return classification{Type: errInvalidArgs}
+	case isAs[*rod.ElementNotFoundError](err), containsAny(msg, elementNotFoundMarkers):
+		return plain(errElementNotFound)
+	case isAs[*rod.NotInteractableError](err), containsAny(msg, notInteractableMarkers):
+		return plain(errNotInteractable)
+	case ch.challenged(), containsAny(msg, antiBotMarkers):
+		return plain(errAntiBot)
+	case isAs[*rod.PageCloseCanceledError](err), containsAny(msg, pageClosedMarkers):
+		return plain(errPageClosed)
 	case errors.Is(err, context.DeadlineExceeded),
 		errors.Is(err, context.Canceled),
-		strings.Contains(msg, "context deadline exceeded"):
-		return errTimeout, hintFor(errTimeout)
-	case errors.As(err, &navigation) || containsAny(msg, navFailedMarkers):
-		return errNavFailed, hintFor(errNavFailed)
+		containsAny(msg, timeoutMarkers):
+		return plain(errTimeout)
+	case isAs[*rod.NavigationError](err), containsAny(msg, navFailedMarkers):
+		return plain(errNavFailed)
 	default:
-		return errUnknown, hintFor(errUnknown)
+		return plain(errUnknown)
 	}
+}
+
+// lookupFailure classifies a session lookup miss. An ambiguous id needs a
+// browser choice, a plain miss needs the live id list.
+func lookupFailure(err error) classification {
+	lookup, _ := errors.AsType[*browsers.PageLookupError](err)
+	if lookup.Kind == browsers.PageLookupAmbiguous {
+		return classification{Type: errInvalidArgs, Hint: hintLookupAmbiguous}
+	}
+	return classification{Type: errNotFound, Hint: hintLookupMissing}
+}
+
+// replayFailure classifies a replay transport failure by whether it timed out.
+func replayFailure(err error) classification {
+	replay, _ := errors.AsType[*browsers.ReplayTransportError](err)
+	if replay.TimedOut() {
+		return classification{Type: errTimeout, Hint: hintReplaySlow}
+	}
+	return classification{Type: errNavFailed, Hint: hintReplayTransport}
 }
 
 // hintFor returns the one-line remediation for an error type. The unknown type
