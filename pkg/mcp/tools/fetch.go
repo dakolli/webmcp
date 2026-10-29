@@ -38,22 +38,7 @@ func (t *Fetch) Name() string {
 
 // Description returns a customer/LLM-facing description of fetch_page.
 func (t *Fetch) Description() string {
-	return "Opens a URL in a new live browser session and returns a page " +
-		"summary (title, url, session_id, byte-size hints). Call this FIRST to " +
-		"load a page; then use page_fetch with the returned session_id to read " +
-		"its html/dom/text/css/js/links/screenshot/meta, and page_act to " +
-		"interact with it. Each fetch_page call creates a new session. Set owner " +
-		"(1 to 64 characters from A-Z, a-z, 0-9, '.', '_', '-') to use your own " +
-		"browser when several agents share one session; with an owner set it never " +
-		"falls back to the shared unowned browser. Example: " +
-		"{ \"owner\": \"scraper-a\", \"url\": \"https://example.com\" } and " +
-		"{ \"owner\": \"scraper-b\", \"url\": \"https://example.com\" } open two " +
-		"separate browsers. identity opens the page in an incognito context " +
-		"inside the target browser and defaults to 'default': a new name is " +
-		"created on first use, each name is one isolated context, and contexts " +
-		"keep separate cookies and storage while sharing one Chromium process. " +
-		"Example: { \"url\": \"https://x.test\", \"identity\": \"victim\" }." +
-		resultEnvelopeDoc
+	return models.FetchPageDescription
 }
 
 // InputSchema returns the JSON Schema for fetch_page's arguments: a required
@@ -288,7 +273,7 @@ func (p *FetchAndSummarizePrompt) Name() string { return "fetch_and_summarize" }
 
 // Description returns a description of the prompt template.
 func (p *FetchAndSummarizePrompt) Description() string {
-	return "Loads a web page and provides step-by-step instructions to read metadata and extract main content."
+	return models.FetchAndSummarizePromptDescription
 }
 
 // Arguments returns the parameter list accepted by the prompt template.

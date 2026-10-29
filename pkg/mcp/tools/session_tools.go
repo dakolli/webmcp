@@ -31,20 +31,7 @@ func (t *SessionClose) Name() string {
 
 // Description returns a customer/LLM-facing description of session_close.
 func (t *SessionClose) Description() string {
-	return "Closes a live browser session opened by fetch_page, releasing its " +
-		"browser tab. When more than one browser is live, pass browser_id or owner " +
-		"to declare which browser holds the session; with one live browser both may " +
-		"be omitted, and a session held outside the declared owner is refused as " +
-		"not_found with the holding browser named and its content untouched. The id " +
-		"is resolved from the live browser registry without probing the tab, then closed through the " +
-		"browser that owns it, without launching a browser. A page an operation " +
-		"still holds is evicted from the session registry after a short bound, " +
-		"and its tab is left to the browser teardown. Closing a page that opened " +
-		"popups also closes those popups. The session_id becomes " +
-		"invalid afterwards. Use session_list to see which sessions are still " +
-		"open; an unknown id fails and names the live ids. This never launches a " +
-		"browser and never touches a browser that does not own the session. " +
-		"Example: { \"session_id\": \"page-1\" }." + resultEnvelopeDoc
+	return models.SessionCloseDescription
 }
 
 // InputSchema returns the JSON Schema for session_close's arguments: a required
@@ -133,19 +120,7 @@ func (t *SessionList) Name() string {
 
 // Description returns a customer/LLM-facing description of session_list.
 func (t *SessionList) Description() string {
-	return "Lists every live browser session across every live browser and " +
-		"identity as a JSON array. Each entry is {id, url, opener?, context, " +
-		"title?, stale?}: url and title are read from the live tab, so they " +
-		"follow navigations and redirects; opener is the id of the page that " +
-		"opened this popup (a target=\"_blank\" link or window.open), absent for " +
-		"a top-level page; context is the incognito identity " +
-		"('default' for the browser's own cookie jar); stale marks an entry " +
-		"whose tab was busy or unreadable, in which case url is the last known " +
-		"value. Use it to see which fetch_page sessions are still open before " +
-		"closing them with session_close. Pass identity to list one identity " +
-		"only; an unknown identity reports the live names and creates nothing. " +
-		"It never launches a browser: with none running it returns an empty " +
-		"array. Example: {}." + resultEnvelopeDoc
+	return models.SessionListDescription
 }
 
 // InputSchema returns the JSON Schema for session_list's arguments: an optional
@@ -204,7 +179,7 @@ func (p *ManageSessionLifecyclePrompt) Name() string { return "manage_session_li
 
 // Description returns a description of the prompt template.
 func (p *ManageSessionLifecyclePrompt) Description() string {
-	return "Provides guidance for inspecting active sessions and releasing unused browser tabs."
+	return models.ManageSessionLifecyclePromptDescription
 }
 
 // Arguments returns the parameter list accepted by the prompt template.

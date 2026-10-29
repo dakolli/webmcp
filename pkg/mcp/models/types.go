@@ -1,5 +1,5 @@
-// Package types defines the data structures used by the Model Context
-// Protocol (MCP) server.
+// Package models holds the MCP wire types and the tool and prompt
+// descriptions the server publishes.
 package models
 
 import "encoding/json"

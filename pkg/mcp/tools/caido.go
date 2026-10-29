@@ -30,36 +30,7 @@ func (t *CaidoSearch) Name() string {
 
 // Description returns the LLM-facing description of caido_search.
 func (t *CaidoSearch) Description() string {
-	return "Reads the Caido proxy history over GraphQL and returns HTTP transactions " +
-		"as JSON. Caido must run on the same host: the proxy listens on " +
-		"127.0.0.1:8081, while the UI and GraphQL API listen on 127.0.0.1:8080. " +
-		"The tool reads recorded history and never changes, replays, or blocks " +
-		"traffic. In guest mode the history exists only while the Caido instance " +
-		"runs. " +
-		"Only method and status filter on the server; url and since filter here. " +
-		"Every call scans the newest 500 rows (5 pages of 100) at any limit, " +
-		"newest first, so older history is not reachable. count is the rows " +
-		"returned. total is the server count for the method and status filter " +
-		"only, so it ignores url and since. scanned is the rows examined. " +
-		"dropped is the rows that failed the url or since filter. " +
-		"limit clamps at 100 and body_bytes clamps at 65536, reported as " +
-		"limit_applied and body_bytes_applied only when clamped. " +
-		"body_bytes 0 returns metadata and headers with empty bodies and no " +
-		"request_cut or response_cut. request_cut and response_cut appear only " +
-		"when a returned body was shortened, or dropped with its headers because " +
-		"the captured message exceeds 8 MiB. " +
-		"Redaction is on unless raw is true. It covers credential-shaped header " +
-		"names, credential-shaped keys in JSON, form, XML and plain bodies, and " +
-		"credential-shaped query parameters in the url, which sets url_redacted. " +
-		"Transport and CORS headers stay readable. " +
-		"bytes is the request size. response_bytes is the raw captured response " +
-		"size, which includes its headers and can exceed content-length. part " +
-		"selects which side carries a body: request, response, or both. " +
-		"Results are newest first: {entries:[...],count,total,scanned,dropped}. " +
-		"Empty history returns entries:[] and is not an error. " +
-		"Example: {} lists the newest 20 transactions. Example: " +
-		`{"url":"/api","method":"POST","status":200,"since":3600,` +
-		`"limit":50,"body_bytes":4000,"part":"both"}.` + resultEnvelopeDoc
+	return models.CaidoSearchDescription
 }
 
 // InputSchema returns the JSON Schema for caido_search's arguments.
