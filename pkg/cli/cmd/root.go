@@ -124,6 +124,7 @@ browser_list and browser_close tools.`,
 		NewSkillCmd(),
 		NewMcpCmd(),
 		NewConfigCmd(),
+		NewCaidoCmd(),
 	)
 	return root
 }

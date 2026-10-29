@@ -11,11 +11,14 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"github.com/dakolli/webmcp/pkg/config"
 )
 
 const (
@@ -41,6 +44,15 @@ const metadataQuery = `query Search($limit: Int, $offset: Int, $filter: HTTPQLIn
       response { id statusCode length roundtripTime createdAt }
     }
   }
+}`
+
+// statusQuery reads the project, scopes, capture settings and history count in
+// one request. The aliases keep the four field groups distinct in the response.
+const statusQuery = `query Status {
+  project: currentProject { project { id name path status temporary } readOnly }
+  scopes: scopes { id name allowlist denylist }
+  capture: passthroughOptions { captureList passthroughList outOfScope }
+  history: requestsByOffset(limit: 1) { count { value } }
 }`
 
 // guestMutation exchanges guest access for an access token.
@@ -149,6 +161,50 @@ type Entry struct {
 	ReqCut        bool                `json:"request_cut,omitempty"`
 	RespCut       bool                `json:"response_cut,omitempty"`
 	URLRedacted   bool                `json:"url_redacted,omitempty"`
+}
+
+// Status is the resolved view of the Caido instance that caido_search reads.
+// Selected is the instance's project name and Configured is the [caido] project
+// value, so a mismatch is visible before the launch switch exists.
+type Status struct {
+	Auth    string        `json:"auth"`
+	URL     string        `json:"url"`
+	Project ProjectStatus `json:"project"`
+	Scopes  []ScopeStatus `json:"scopes"`
+	Capture Capture       `json:"capture"`
+	History int           `json:"history"`
+}
+
+// ProjectStatus is the current project with its read-only flag.
+type ProjectStatus struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Path       string `json:"path"`
+	Status     string `json:"status"`
+	Temporary  bool   `json:"temporary"`
+	ReadOnly   bool   `json:"read_only"`
+	Selected   string `json:"selected"`
+	Configured string `json:"configured"`
+}
+
+// ScopeStatus is one scope with a rendered allowlist verdict. Matches is
+// "all traffic" for an empty allowlist and "allowlist" otherwise.
+type ScopeStatus struct {
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	Allowlist []string `json:"allowlist"`
+	Denylist  []string `json:"denylist"`
+	Matches   string   `json:"matches"`
+	Focus     bool     `json:"focus"`
+}
+
+// Capture is the passthroughOptions object. Unfiltered reports the null case,
+// where Caido records every request and only that single field is emitted.
+type Capture struct {
+	CaptureList     []string `json:"capture_list,omitempty"`
+	PassthroughList []string `json:"passthrough_list,omitempty"`
+	OutOfScope      *bool    `json:"out_of_scope,omitempty"`
+	Unfiltered      bool     `json:"unfiltered,omitempty"`
 }
 
 // Login caches a usable token and reports which path authenticated. It tries an
@@ -327,6 +383,145 @@ search:
 		LimitApplied:     limitApplied,
 		BodyBytesApplied: bodyBytesApplied,
 	}, nil
+}
+
+// Status reads the project, every scope, the capture settings and the history
+// count in one GraphQL request. A configured project or scope name is only
+// compared, never written.
+func (c *Client) Status(
+	ctx context.Context,
+	configuredProject string,
+	focusScope string,
+) (Status, error) {
+	token := c.currentToken()
+	if token == "" {
+		return Status{}, ErrNoCredential
+	}
+
+	var data struct {
+		Project *struct {
+			Project struct {
+				ID        string `json:"id"`
+				Name      string `json:"name"`
+				Path      string `json:"path"`
+				Status    string `json:"status"`
+				Temporary bool   `json:"temporary"`
+			} `json:"project"`
+			ReadOnly bool `json:"readOnly"`
+		} `json:"project"`
+		Scopes []struct {
+			ID        string   `json:"id"`
+			Name      string   `json:"name"`
+			Allowlist []string `json:"allowlist"`
+			Denylist  []string `json:"denylist"`
+		} `json:"scopes"`
+		Capture *struct {
+			CaptureList     []string `json:"captureList"`
+			PassthroughList []string `json:"passthroughList"`
+			OutOfScope      bool     `json:"outOfScope"`
+		} `json:"capture"`
+		History struct {
+			Count struct {
+				Value int `json:"value"`
+			} `json:"count"`
+		} `json:"history"`
+	}
+	if err := c.call(ctx, token, statusQuery, nil, &data); err != nil {
+		var gql *graphqlError
+		if errors.As(err, &gql) {
+			return Status{}, fmt.Errorf("caido: status query failed: %s", gql.Error())
+		}
+		return Status{}, err
+	}
+
+	configuredProject = strings.TrimSpace(configuredProject)
+	focusScope = strings.TrimSpace(focusScope)
+	st := Status{
+		Auth:    authMode(c.currentAuth()),
+		URL:     c.URL,
+		Scopes:  make([]ScopeStatus, 0, len(data.Scopes)),
+		History: data.History.Count.Value,
+		Project: ProjectStatus{Configured: configuredProject},
+	}
+	if data.Project != nil {
+		st.Project.ID = data.Project.Project.ID
+		st.Project.Name = data.Project.Project.Name
+		st.Project.Path = data.Project.Project.Path
+		st.Project.Status = data.Project.Project.Status
+		st.Project.Temporary = data.Project.Project.Temporary
+		st.Project.ReadOnly = data.Project.ReadOnly
+		st.Project.Selected = data.Project.Project.Name
+	}
+
+	if data.Capture == nil {
+		st.Capture = Capture{Unfiltered: true}
+	} else {
+		outOfScope := data.Capture.OutOfScope
+		st.Capture = Capture{
+			CaptureList:     emptyIfNil(data.Capture.CaptureList),
+			PassthroughList: emptyIfNil(data.Capture.PassthroughList),
+			OutOfScope:      &outOfScope,
+		}
+	}
+
+	for _, s := range data.Scopes {
+		matches := "allowlist"
+		if len(s.Allowlist) == 0 {
+			matches = "all traffic"
+		}
+		st.Scopes = append(st.Scopes, ScopeStatus{
+			ID:        s.ID,
+			Name:      s.Name,
+			Allowlist: emptyIfNil(s.Allowlist),
+			Denylist:  emptyIfNil(s.Denylist),
+			Matches:   matches,
+			Focus:     focusScope != "" && s.Name == focusScope,
+		})
+	}
+	return st, nil
+}
+
+// Selection returns the [caido] project and scope_name from webmcp.toml. It
+// reads the file directly because config.CaidoFile does not carry those keys
+// yet; WEB-264 replaces this with typed fields.
+func Selection() (project, scope string) {
+	data, err := os.ReadFile(config.CaidoConfigPath())
+	if err != nil {
+		return "", ""
+	}
+	doc, err := config.ParseTOML(data)
+	if err != nil {
+		return "", ""
+	}
+	project, _ = doc.String("caido", "project")
+	scope, _ = doc.String("caido", "scope_name")
+	return strings.TrimSpace(project), strings.TrimSpace(scope)
+}
+
+// authMode renders the credential path as the mode that actually worked.
+func authMode(path AuthPath) string {
+	if path == AuthPATGuest {
+		return "guest"
+	}
+	if path == "" {
+		return string(AuthNone)
+	}
+	return string(path)
+}
+
+// emptyIfNil renders an absent list as [] so the JSON stays addressable.
+func emptyIfNil(values []string) []string {
+	if values == nil {
+		return []string{}
+	}
+	return values
+}
+
+// currentAuth returns the credential path under the lock.
+func (c *Client) currentAuth() AuthPath {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.authPath
 }
 
 // keptRow carries the entry plus the ids and declared lengths needed for the

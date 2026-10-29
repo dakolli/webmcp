@@ -229,6 +229,7 @@ func registerAll(mgr *browsers.Manager) *tools.Registry {
 	if caido := caidoSettings(); caido.Enabled {
 		config.SetActiveCaido(caido)
 		r.Register(tools.NewCaidoSearch()) // caido_search
+		r.Register(tools.NewCaidoStatus()) // caido_status
 	}
 
 	r.RegisterPrompt(tools.NewFetchAndSummarizePrompt())        // fetch_and_summarize

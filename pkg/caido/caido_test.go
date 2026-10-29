@@ -715,3 +715,148 @@ func TestLoginGuestWhenNoCredential(t *testing.T) {
 		t.Errorf("token = %q, want the guest token", got)
 	}
 }
+
+func TestStatus(t *testing.T) {
+	project := `"project":{"project":{"id":"p1","name":"webmcp","path":"/srv/webmcp",` +
+		`"status":"READY","temporary":false},"readOnly":false}`
+	cases := []struct {
+		name  string
+		data  string
+		check func(t *testing.T, st Status)
+	}{
+		{
+			name: "project present",
+			data: `{` + project +
+				`,"scopes":[{"id":"1","name":"target","allowlist":["example.com"],` +
+				`"denylist":["ads.example.com"]}],` +
+				`"capture":{"captureList":["example.com"],"passthroughList":[],` +
+				`"outOfScope":true},"history":{"count":{"value":1879}}}`,
+			check: func(t *testing.T, st Status) {
+				t.Helper()
+				if st.Project.ID != "p1" || st.Project.Name != "webmcp" {
+					t.Errorf("project = %+v", st.Project)
+				}
+				if st.Project.Path != "/srv/webmcp" || st.Project.Status != "READY" {
+					t.Errorf("project path/status = %+v", st.Project)
+				}
+				if st.Project.Temporary || st.Project.ReadOnly {
+					t.Errorf("project flags = temporary %t, read_only %t", st.Project.Temporary, st.Project.ReadOnly)
+				}
+				if st.Project.Selected != "webmcp" || st.Project.Configured != "webmcp" {
+					t.Errorf("selected/configured = %q/%q", st.Project.Selected, st.Project.Configured)
+				}
+				if st.History != 1879 {
+					t.Errorf("history = %d, want 1879", st.History)
+				}
+				if st.Capture.Unfiltered || st.Capture.OutOfScope == nil || !*st.Capture.OutOfScope {
+					t.Errorf("capture = %+v", st.Capture)
+				}
+				if len(st.Capture.CaptureList) != 1 || st.Capture.CaptureList[0] != "example.com" {
+					t.Errorf("capture_list = %v", st.Capture.CaptureList)
+				}
+				if len(st.Scopes) != 1 {
+					t.Fatalf("scopes = %d, want 1", len(st.Scopes))
+				}
+				if st.Scopes[0].Matches != "allowlist" || !st.Scopes[0].Focus {
+					t.Errorf("scope = %+v", st.Scopes[0])
+				}
+			},
+		},
+		{
+			name: "passthrough options null",
+			data: `{` + project + `,"scopes":[],"capture":null,` +
+				`"history":{"count":{"value":3}}}`,
+			check: func(t *testing.T, st Status) {
+				t.Helper()
+				if !st.Capture.Unfiltered {
+					t.Errorf("capture = %+v, want unfiltered", st.Capture)
+				}
+				if st.Capture.OutOfScope != nil || st.Capture.CaptureList != nil {
+					t.Errorf("capture fields set on a null object: %+v", st.Capture)
+				}
+				encoded, err := json.Marshal(st.Capture)
+				if err != nil {
+					t.Fatalf("encoding capture: %v", err)
+				}
+				if string(encoded) != `{"unfiltered":true}` {
+					t.Errorf("capture JSON = %s, want {\"unfiltered\":true}", encoded)
+				}
+			},
+		},
+		{
+			name: "empty scope list",
+			data: `{` + project + `,"scopes":[],"capture":null,` +
+				`"history":{"count":{"value":0}}}`,
+			check: func(t *testing.T, st Status) {
+				t.Helper()
+				if len(st.Scopes) != 0 {
+					t.Errorf("scopes = %d, want 0", len(st.Scopes))
+				}
+			},
+		},
+		{
+			name: "one scope with an empty allowlist",
+			data: `{` + project + `,"scopes":[{"id":"2","name":"target",` +
+				`"allowlist":[],"denylist":[]}],"capture":null,` +
+				`"history":{"count":{"value":5}}}`,
+			check: func(t *testing.T, st Status) {
+				t.Helper()
+				if len(st.Scopes) != 1 {
+					t.Fatalf("scopes = %d, want 1", len(st.Scopes))
+				}
+				scope := st.Scopes[0]
+				if scope.Matches != "all traffic" {
+					t.Errorf("matches = %q, want all traffic", scope.Matches)
+				}
+				if scope.Allowlist == nil {
+					t.Error("allowlist = nil, want an empty slice")
+				}
+				if !scope.Focus {
+					t.Error("focus = false, want true for the configured scope")
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			calls := 0
+			c := testClient(t, func(r *http.Request) (*http.Response, error) {
+				calls++
+				body, _ := io.ReadAll(r.Body)
+				var payload struct {
+					Query string `json:"query"`
+				}
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("decoding request: %v", err)
+				}
+				for _, alias := range []string{
+					"project: currentProject",
+					"scopes: scopes",
+					"capture: passthroughOptions",
+					"history: requestsByOffset",
+				} {
+					if !strings.Contains(payload.Query, alias) {
+						t.Errorf("query missing alias %q", alias)
+					}
+				}
+				return gqlData(t, tc.data), nil
+			})
+
+			st, err := c.Status(t.Context(), "webmcp", "target")
+			if err != nil {
+				t.Fatalf("Status: %v", err)
+			}
+			if calls != 1 {
+				t.Errorf("requests = %d, want one round trip", calls)
+			}
+			if st.Auth != "guest" {
+				t.Errorf("auth = %q, want guest", st.Auth)
+			}
+			if st.URL != "http://127.0.0.1:8080/graphql" {
+				t.Errorf("url = %q", st.URL)
+			}
+			tc.check(t, st)
+		})
+	}
+}

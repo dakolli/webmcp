@@ -62,6 +62,7 @@ func NewRegistry() *Registry {
 	r.Register(NewPageList(mgr))
 	if config.ActiveCaido().Enabled {
 		r.Register(NewCaidoSearch())
+		r.Register(NewCaidoStatus())
 	}
 
 	r.RegisterPrompt(NewFetchAndSummarizePrompt())
