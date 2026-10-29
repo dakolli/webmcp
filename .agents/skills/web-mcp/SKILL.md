@@ -38,10 +38,10 @@ Install or refresh this skill with `browser skill <harness|path|.>`. With no arg
 - **Context** (`identity`). One incognito cookie jar inside a browser. `default` is that
   browser's own jar. Every name dies with its browser.
 - `browser-1` is the first id minted. It is not a shared singleton.
-- The ephemeral profile lives under `~/.config/browser-mcp/profiles/.ephemeral/` and is removed on close.
+- The ephemeral profile lives under `profiles/.ephemeral/` in the config dir and is removed on close.
 - A persistent profile needs `persist:true` and a `profile` name.
 - A bare `profile` name resolves under the config dir. A relative path with a separator is rejected.
-- A browser idle for 30 minutes closes automatically. Set `browser_ttl` in `~/.config/browser-mcp/config.json` to change it. `browser_list` shows `idle_for` and `ttl`.
+- A browser idle for 30 minutes closes automatically. Set `browser_ttl` in `config.json` in the config dir to change it. `browser_list` shows `idle_for` and `ttl`.
 - Idle sessions expire after 15 minutes. A dead Chromium is relaunched under the same `browser_id`.
 - Page ids are unique inside one browser only. Two live browsers can both have `page-1`.
 - Pages get a coherent default identity: the User-Agent's Chrome major matches the launched Chromium, `Accept-Language` is `en-US,en;q=0.9`, and the `Sec-CH-UA` hints agree with both. An explicit `user_agent` wins, and a `device` preset's own UA wins while that preset is applied.
@@ -65,7 +65,7 @@ Install or refresh this skill with `browser skill <harness|path|.>`. With no arg
 
 1. Call `browser_list` before you use a `browser_id`. Confirm the id and its `profile_dir`.
 2. If your client does not show `persist` or `owner`, reconnect it before you create a browser. Reconnect it when a cached `page_fetch` `what` enum lacks `har`, `postmessage`, `sinks`, `storage`, `tables`, `forms`, or `websocket`, because the live enum has 23 values. A cached client schema can also omit the new `browser_id` and `owner` inputs, so reconnect the client after a server build.
-3. Never close a browser you did not create, and close your own by id when done. Never call `browser_close` with an empty `browser_id` in a shared session. A misspelled `browser` key is ignored and becomes an empty id. Use the exact key `browser_id`.
+3. Never close a browser you did not create, and close your own by id when done. Never call `browser_close` with an empty `browser_id` in a shared session. Use the exact key `browser_id`. A key outside a tool's schema fails as `invalid_args`. The message quotes the key once and lists the valid keys sorted. So a misspelled `browser` key now fails, and `browser_close` no longer closes every browser on that typo. `page_fetch` and `page_act` take no `identity` argument. `fetch_page` alone accepts `identity`.
 4. Use one browser per agent and task. Page ids are unique per browser, so two owners can both hold `page-1`. With one live browser a bare id resolves. With two or more live browsers a bare id returns `invalid_args`, and the message names every browser and owner.
 5. `page_fetch`, `page_act`, and `session_close` take optional `browser_id` and `owner`. A session held outside the declared owner returns `not_found`, names the holder, and returns no content. Pass `browser_id` to cross on purpose.
 6. `session_list` reads every live browser and identity. Use `page_list` with a required `browser_id` for one browser. Both report the live URL and title, refreshed after navigation and redirects.
@@ -87,6 +87,9 @@ Install or refresh this skill with `browser skill <harness|path|.>`. With no arg
 22. Scope is not navigation-only. It gates `fetch_page`, `page_act navigate`, `replay` and `replay_fuzz` hops, and intercepted subresources. The engine refuses an out-of-scope request before it is sent. A navigation HTTP redirect is not re-checked, while replay hops and paused subresources are.
 23. Pointer and keyboard actions (`click`, `click_at`, `input`, `hover`, `hover_at`, `press_key`) are humanized by default: stepped, jittered pointer movement and a randomized 100-500 ms pause. A sub-second `timeout_ms` can expire in that pause and leave the action unperformed, so pass at least 1000 ms or `raw:true`. Any one hatch disables it: per-call `raw:true`, `WEB_MCP_RAW_ACTIONS=1` in the server environment, or the server started with raw actions.
 24. `page_act` `poc_bundle` packages one finding as an evidence directory. Inputs: `value` (the finding title), `paths` (an array whose first entry is an absolute output directory), and optional `target` (a `seq` or request-URL substring; omit it for the main document request). It writes `meta.json`, `request.http`, `response.http`, `screenshot.png`, `dom.html` (2 MB cap), `storage.json`, `README.md`, and `sinks.json` only when the tracer is installed. The result is `{directory,files:[{name,bytes}],omitted:[{name,reason}]}`. A relative path or a non-empty directory is refused, and Cookie, Set-Cookie, Authorization and X-CSRF-Token values stay `<redacted>` unless secret capture is on.
+25. `page_fetch` `filter` narrows `network` and `sinks`. For `network`, pass a comma list of request types. A bare name keeps that type, and a `-` prefix drops it. An unknown name fails as `invalid_args`. For `sinks`, pass `canary` or `known`. A filtered read adds `filtered_out` with the dropped count. An unfiltered read omits it. See [page_fetch.md](references/tools/page_fetch.md).
+26. `page_act` `replay` `query` edits URL parameters. A non-empty value replaces that parameter, and `""` removes it. Every other parameter keeps its captured value. `request.url` shows the rebuilt URL and is the only proof of the edit. Parameter order can change. See [page_act.md](references/tools/page_act.md).
+27. A quoted number is coerced when it parses. `"max_bytes":"8000"` works, and a non-numeric string fails as `invalid_args`.
 
 ## Bounty loop
 
@@ -157,6 +160,18 @@ Each tool reference states only its own payload and its failure types, and links
 - A humanized pre/post pause that does not fit the remaining budget is skipped, not clipped. A budget that expires first returns `timeout` and performs no action.
 - `page_fetch` `har` always returns an empty `response.cookies`, because Chrome omits `Set-Cookie` from CDP events. `request.cookies` is populated from the browser jar and redacted.
 - `page_fetch` `har` reports `headersSize` and `bodySize` as `-1` when the size was not measured (`code://pkg/har/har.go#L764-L776`).
+- A client caches `tools/list` for its whole connection, so a live argument can look missing. `make schema` is the authority. A name in `make schema` and absent from your client means a stale client cache, not a server defect.
+
+## Unresponsive page recovery
+
+**Symptom.** A `navigate` never commits, or a `page_fetch` or `page_act` call reports that the tab is unusable. The renderer no longer answers CDP calls.
+
+- A read returns within 1.5 s. On 2026-10-28, `page_fetch` `what=meta` took 510 ms and `page_list` took 7 ms.
+- An action can use the full per-call timeout. On 2026-10-28, `page_act` `eval` took 30 015 ms and `page_act` `click` took 30 014 ms. WEB-247 adds an act fast-fail.
+- `page_act` `replay` stays fast at 9 ms, because it sends a new HTTP request outside the page.
+- A higher `timeout_ms` does not help.
+- Close the session with `session_close` on MCP, or with `browser page close` on the CLI.
+- Run `fetch_page` to open a fresh page.
 
 ## Isolated test recipe
 
@@ -194,3 +209,4 @@ Keep these shapes in the rotation, with a new host each time:
 - Auth snapshots (`auth_save`, `auth_restore`, `auth_list`) and the per-host `rps`/`burst` budget with its `limits` report are documented as of 2026-10-27.
 - Scope covers replay and `replay_fuzz` hops and intercepted subresources, a navigation HTTP redirect is not re-checked, and the interception limits (cache bypass, method filter, rewritten headers absent from `req_headers`) are documented as of 2026-10-27.
 - Humanized pointer and keyboard timing, `replay_fuzz` with its caps and anomaly rules, the `network` identity fields (`frame_id`, `loader_id`, `top_document`), and the `security` top-document boundary plus `header_conflict` are documented as of 2026-10-27.
+- `page_fetch` `filter`, `page_act` `replay` `query`, the warm `replay_fuzz` baseline, and the strict-argument gate are documented as of 2026-10-28.

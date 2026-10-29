@@ -142,6 +142,24 @@ func TestDecodeArgsExplainsTypeMismatch(t *testing.T) {
 			t.Fatalf("value = %q, want the literal text %q", a.Value, "[1,2]")
 		}
 	})
+
+	t.Run("bad member inside an object names the member", func(t *testing.T) {
+		var a struct {
+			Query map[string]string `json:"query"`
+		}
+		err := decodeArgs(
+			"page_act",
+			json.RawMessage(`{"query":{"probe":123}}`),
+			&a,
+		)
+		if err == nil {
+			t.Fatal("decodeArgs() = nil, want an argument type error")
+		}
+		want := `page_act: query["probe"] must be a string, but the request sent the number 123.`
+		if got := firstLine(err.Error()); got != want {
+			t.Fatalf("decodeArgs() first line = %q, want %q", got, want)
+		}
+	})
 }
 
 func TestRegistryExecuteRejectsUnknownTool(t *testing.T) {

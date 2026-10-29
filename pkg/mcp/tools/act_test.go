@@ -106,6 +106,36 @@ func TestReplaySurface(t *testing.T) {
 	}
 }
 
+// TestReplayQueryNullValueRemovesParameter pins that a JSON null query value
+// decodes to the empty removal edit that pageops applies to the captured URL,
+// and that the query description names null as a removal, so the prose cannot
+// drift from the live behaviour again.
+func TestReplayQueryNullValueRemovesParameter(t *testing.T) {
+	args := json.RawMessage(`{"action":"replay","target":"1","query":{"probe":null}}`)
+	var a actArgs
+	if err := decodeArgs("page_act", args, &a); err != nil {
+		t.Fatalf("decodeArgs() error = %v", err)
+	}
+	got, ok := a.Query["probe"]
+	if !ok {
+		t.Fatal("query[probe] is absent, want the key present as an empty removal edit")
+	}
+	if got != "" {
+		t.Fatalf("query[probe] = %q, want an empty removal edit", got)
+	}
+
+	query, ok := (&Act{}).InputSchema().Properties["query"].(map[string]any)
+	if !ok {
+		t.Fatal("query schema property is missing")
+	}
+	desc, _ := query["description"].(string)
+	for _, want := range []string{"null", `""`} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("query description is missing %q: %q", want, desc)
+		}
+	}
+}
+
 // TestActSinksActions pins that both tracer actions are advertised in the
 // schema enum and described on both surfaces, and that they need no argument
 // beyond session_id and action.

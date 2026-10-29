@@ -1,4 +1,4 @@
-> Tool: `page_act` · Server: web-mcp · Surface: MCP · Tested: 2026-10-27
+> Tool: `page_act` · Server: web-mcp · Surface: MCP · Tested: 2026-10-28
 
 # page_act
 
@@ -27,6 +27,7 @@ The schema is `code://pkg/mcp/tools/act.go#L125`. Only `session_id` and `action`
 | `target` | string | `replay`, `replay_fuzz`, `poc_bundle` | — | Captured network entry: a `seq` number or a substring of the request URL. |
 | `method` | string | `replay` (optional) | — | HTTP method override, for example `PUT`. Omit to keep the captured method. |
 | `headers` | object | `replay` (optional) | — | `replay` only: each named header replaces the captured value on the resent request, others keep theirs. It does not set headers on page requests; use `browser_create` `headers` for browser-wide request headers or `intercept_add` with `action:"rewrite"` for a per-request rewrite. |
+| `query` | object | `replay` (optional) | — | `replay` only: URL parameters to edit. A non-empty value replaces that parameter, and `""` removes it. Every other captured parameter keeps its value. Parameter order can change. `request.url` shows the rebuilt URL. |
 | `max_bytes` | integer | `replay` (optional) | `262144` | Cap on the returned replay body. Larger values are clamped. A cut body returns `truncated:true`. |
 | `raw` | boolean | no | `false` | Disable humanized timing for this call: one instant pointer move and no pre/post pause. Applies to `click`, `click_at`, `input`, `hover`, `hover_at`, and `press_key`. |
 | `points` | array | `replay_fuzz` | — | Injection points, each `{param,location}` with `location` one of `query`, `body`, `header`, `cookie`. At most 20. A stringified JSON array is accepted. |
@@ -97,11 +98,7 @@ A non-positive `click_count` becomes `1`. An unknown `button` is rejected before
 
 ## PoC bundle
 
-`poc_bundle` turns one live page into a self-contained directory for a report.
-
-```json
-{"tool":"page_act","arguments":{"session_id":"page-6","action":"poc_bundle","value":"Stored XSS in search","paths":["/tmp/poc-xss"]}}
-```
+`poc_bundle` turns one live page into a self-contained directory for a report. One call is `{"tool":"page_act","arguments":{"session_id":"page-6","action":"poc_bundle","value":"Stored XSS in search","paths":["/tmp/poc-xss"]}}`.
 
 - `value` is the finding title written to `meta.json` and `README.md`.
 - `paths[0]` is the absolute output directory. It is created with mode `0700` when absent. A relative path is refused with `poc_bundle: "…" must be absolute`, and a non-empty directory with `poc_bundle: … is not empty — pass a new directory or remove its contents`.
@@ -197,10 +194,11 @@ Three limits apply. A response served from the HTTP cache bypasses the hook enti
 `replay` resends one captured network entry through a real Go HTTP client, outside the browser (`code://pkg/browsers/replay.go#L112-L235`). It bypasses CORS, carries the page's cookies for the target host in a private jar without writing anything back, and never touches the live page. Recipe: read `page_fetch` `what=network`, pick one entry, then replay it.
 
 - `target` picks the entry: a `seq` number or a unique substring of the request URL, and an ambiguous substring is refused as `invalid_args` with every candidate listed as `seq=N METHOD url`. `method` overrides the captured method, `headers` replaces captured headers per name, and framing headers (`Host`, `Cookie`, `Connection`, `Accept-Encoding`, `Content-Length`, and kin) are never copied because the client owns them and the cookie jar owns `Cookie`.
+- `query` rebuilds the URL before the request. A non-empty value replaces that parameter, and `""` removes it. Every other parameter keeps its captured value, and the fragment is kept. Parameter order can change, so `request.url` is the proof of the edit.
 - `value` replaces the request body, but it is sent only when the `value` field itself is present. Without it the captured body is fetched from the browser, and a body the browser no longer retains reports `body_uncaptured: true` instead of being sent empty. `GET` and `HEAD` never send a body.
 - Each URL, redirects included, is checked against the browser's scope allowlist before any request runs (`code://pkg/mcp/tools/act.go#L504-L516`, `code://pkg/browsers/replay.go#L453`). Up to 5 redirects are followed and reported in `chain`, and a 301, 302, or 303 switches the next hop to `GET` and drops the body.
 
-The result is compact JSON inside `data` (`code://pkg/browsers/replay.go#L86-L110`). See [page_act_example.md](../examples/page_act_example.md) §7 for the live replay result. **CLI and IPC.** `browser page act [id] replay <target>` reaches the same engine and prints the same JSON. The first positional slot is the target, and `--target` is the flag fallback. `--method` overrides the method, `--header NAME=VALUE` is repeatable, `--max-bytes` caps the body (0 means the 256 KB ceiling), and the body rides `--value` (omit it to keep the captured body, pass `--value ''` for an empty one). A malformed header fails with `page act: invalid --header "X" — use NAME=VALUE, e.g. X-Bug-Bounty=your-handle`. IPC `page.act` carries `target`, `method`, `headers`, `value` with `value_set`, and `max_bytes`. Without `value_set`, a non-empty `value` still sets the body. A missing target fails with `page act: replay requires target=<seq> or target=<url substring> from page_fetch what=network`, and a negative cap with `page act: replay max_bytes must be >= 0` (the IPC copies say `page.act:`). Fields: `status`, `headers` (final response headers as string arrays), `body` for UTF-8 text or `base64` for binary, `bytes`, `truncated`, `body_redactions`, `body_uncaptured`, `ms`, `request` (first-hop method, url, and echoed headers), and `chain` (each hop's `status` and `url`, always present and `[]` for a single hop). `truncated` and `chain` are always present. The response body is capped at 256 KB on a rune boundary, and `truncated: true` marks the cut. Sensitive request and response header values (`Cookie`, `Set-Cookie`, `Authorization`, and kin) show `<redacted>` unless the page opted into secrets capture, and no surface exposes that switch. Text-body secrets are replaced with `<redacted>` and counted in `body_redactions`. Binary bodies are not scanned. The whole replay is bounded by the call's `timeout_ms` deadline (engine cap 30 seconds).
+The result is compact JSON inside `data` (`code://pkg/browsers/replay.go#L86-L110`). See [page_act_example.md](../examples/page_act_example.md) §7 for the live replay result. **CLI and IPC.** `browser page act [id] replay <target>` reaches the same engine and prints the same JSON. The first positional slot is the target, and `--target` is the flag fallback. `--method` overrides the method, `--header NAME=VALUE` is repeatable, `--max-bytes` caps the body (0 means the 256 KB ceiling), and the body rides `--value` (omit it to keep the captured body, pass `--value ''` for an empty one). A malformed header fails with `page act: invalid --header "X" — use NAME=VALUE, e.g. X-Bug-Bounty=your-handle`. IPC `page.act` carries `target`, `method`, `headers`, `value` with `value_set`, and `max_bytes`. `query` works on MCP, on the CLI with `--query NAME=VALUE`, and on IPC. An empty value or null removes a parameter. Without `value_set`, a non-empty `value` still sets the body. A missing target fails with `page act: replay requires target=<seq> or target=<url substring> from page_fetch what=network`, and a negative cap with `page act: replay max_bytes must be >= 0` (the IPC copies say `page.act:`). Fields: `status`, `headers` (final response headers as string arrays), `body` for UTF-8 text or `base64` for binary, `bytes`, `truncated`, `body_redactions`, `body_uncaptured`, `ms`, `request` (first-hop method, url, and echoed headers), and `chain` (each hop's `status` and `url`, always present and `[]` for a single hop). `truncated` and `chain` are always present. The response body is capped at 256 KB on a rune boundary, and `truncated: true` marks the cut. Sensitive request and response header values (`Cookie`, `Set-Cookie`, `Authorization`, and kin) show `<redacted>` unless the page opted into secrets capture, and no surface exposes that switch. Text-body secrets are replaced with `<redacted>` and counted in `body_redactions`. Binary bodies are not scanned. The whole replay is bounded by the call's `timeout_ms` deadline (engine cap 30 seconds).
 
 ### Replay fuzz
 
@@ -214,7 +212,7 @@ The result is compact JSON inside `data` (`code://pkg/browsers/replay.go#L86-L11
 
 The size is computed and refused before any request: at most 100 matrix requests, 20 points, 50 payloads, and 200 runes per payload. The baseline probe is extra. Runs execute 5 in flight with 10 s each. A refusal is `invalid_args`, for example live on 2026-10-27: `page_act: replay_fuzz: requests computed 243, over the 100 bound`.
 
-One unmodified baseline request is sent first. The payload is `{runs:[{seq,payload,point,status,ms,bytes,body_cut,body_redactions}],summary:{baseline:{status,bytes,ms},anomalies:[{seq,rule,why}]}}`, and every run body is redacted like `replay`. Three rules compare each run with the baseline: `status_changed` (a different status), `size_delta` (over 10% either way), and `time_delta` (over 3× either way).
+One unmodified baseline request is sent twice. The payload is `{runs:[{seq,payload,point,status,ms,bytes,body_cut,body_redactions}],summary:{baseline:{status,bytes,cold_ms,ms},anomalies:[{seq,rule,why}]}}`. Every run body is redacted like `replay`. `cold_ms` is the first sample and `ms` the second warm sample that each run compares against. Three rules compare each run with the baseline: `status_changed` (a different status), `size_delta` (over 10% either way), and `time_delta` (over 3× either way). A `time_delta` inside the cold-to-warm spread is suppressed.
 
 ## Failure modes and recovery
 
@@ -256,7 +254,12 @@ An absent selector for `click`, `input`, `hover` or `select` fails immediately w
 | Bad intercept action or status | `page_act: intercept add: intercept: rule "r1" has action "deny" (must be block, allow, rewrite or fulfill)` or `… has status 700 (must be 100-599)` (`unknown`) | Fix the rule. Status is 100-599. |
 | Intercept rule cap | `page_act: intercept add: intercept: page already holds 50 rules; adding 1 more exceeds the 50-rule limit (clear rules first)` (`unknown`) | Reuse an id to replace a rule, or run `intercept_clear`. |
 | Closed page | `page_act: page session is closed` | Open a new session. |
+| Page locked by a running action | `page_act: <action>: page page-N is still busy after 0s — a previous operation on this page did not return; retry, or close it with session_close` | Run `session_close` on that session, then `fetch_page` a fresh page. |
+| Page renderer stopped answering | `page_act: <action>: page page-N is unusable — the tab's renderer stopped answering CDP calls; close it with session_close` | Run `session_close` on that session, then `fetch_page` a fresh page. |
+| Page closed after a forced lock recovery | `page_act: <action>: page page-N did not answer the recovery probe after the page watchdog forced its lock open — page session is closed: the renderer never answered again; close it with session_close` | Run `session_close` on that session, then `fetch_page` a fresh page. |
 | `select` with an unknown value | `MCP error -32001: Request timed out` at the transport, not the envelope | Use an exact option `value`. A live test wedged the whole server until its browser was terminated. Treat as a defect. |
+
+On the CLI, run `browser page close <id>` in place of `session_close`.
 
 ## When not to use it
 
@@ -270,6 +273,7 @@ Do not use `page_act` to open a URL in a new tab, use `fetch_page`. Do not use i
 - 2026-10-27 — source-verified against the shipped code and its tests: `intercept_add`/`list`/`clear` and the `intercepted` network tag (commit `037138c`), and replay over CLI and IPC (commit `ee64f65`). The running daemon predated `037138c` and rejected `intercept_add`, so these two paths have no live call yet.
 - 2026-10-27 — `replay_fuzz` live on `https://www.debian.org/`: sniper over one `query` point with two payloads returned two runs plus the baseline and `anomalies:[]`, and a five-point `clusterbomb` with three payloads was refused before any request with `page_act: replay_fuzz: requests computed 243, over the 100 bound`. The live MCP enum lists all 36 actions, `intercept_*` included, and the CLI/IPC vocabularies carry the same `intercept_*` names. Humanized timing and `raw` were read from the live schema.
 - 2026-10-27 — `auth_save`, `auth_list`, and `auth_restore` on `www.saucedemo.com`: the snapshot restored a login into a new browser and a new identity, `auth_list` answered with no live browser and a stale `session_id`, and a host-only `session-username` cookie stayed scoped to `www.saucedemo.com`.
+- 2026-10-28 — live on `https://www.freebsd.org/?probe=one`. `replay` with target `1` and `query:{"probe":"two"}` returned status 200 and `request.url` `https://www.freebsd.org/?probe=two`. `query:{"probe":""}` returned `https://www.freebsd.org/`. `replay_fuzz` over the same entry returned `summary.baseline` `{"status":200,"bytes":22060,"cold_ms":30,"ms":44}` with `anomalies:[]`.
 
 ## Related tools
 

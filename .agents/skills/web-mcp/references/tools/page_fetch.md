@@ -1,4 +1,4 @@
-> Tool: `page_fetch` · Server: web-mcp · Surface: MCP · Tested: 2026-10-27
+> Tool: `page_fetch` · Server: web-mcp · Surface: MCP · Tested: 2026-10-28
 
 # page_fetch
 
@@ -21,7 +21,7 @@ The live schema is `code://pkg/mcp/tools/page.go#L90`. The aspect registry is `c
 | `target` | string | no | — | Resource URL for `css`/`js`. For `body`: a `seq` number or a substring of the request URL, newest match wins. |
 | `full_page` | boolean | no | `false` | Capture the whole scrollable page. Only `screenshot` uses it. |
 | `include_values` | boolean | no | `false` | With `what=storage`, return real cookie and storage values instead of `<redacted>`. `true` exposes live session tokens. |
-| `filter` | string | no | — | Narrows `network` or `sinks`. `network`: comma list of request types, case-insensitive, a bare name keeps and a `-` prefix drops (`document,script,xhr`, `-image,-font`). `sinks`: `canary` or `known`. A filtered read adds `filtered_out`. |
+| `filter` | string | no | — | Narrows `network` or `sinks`. `network`: comma list of request types, case-insensitive, a bare name keeps and a `-` prefix drops (`document,script,xhr`, `-image,-font`). An unknown name fails as `invalid_args`. `sinks`: `canary` or `known`. A filtered read adds `filtered_out`, the dropped count. An empty value is unfiltered. |
 | `timeout_ms` | integer | no | `30000` | Bound for the whole call. Clamped to 1..120000. A full-page screenshot keeps its 90 s floor unless you pass a larger value. |
 
 The live `what` enum has 23 values, in registration order: `html`, `dom`, `text`, `css`, `js`, `links`, `screenshot`, `meta`, `interactives`, `a11y`, `network`, `body`, `console`, `websocket`, `article`, `tables`, `forms`, `marks`, `security`, `sinks`, `postmessage`, `storage`, `har`. `timeout_ms` defaults to 30000 and clamps to 1..120000.
@@ -93,7 +93,7 @@ Every handle has the form `g<document>-b<backendNodeId>`, for example `gy1g0vstq
 
 Capture starts before the first document loads. All three rings are cumulative from page creation. `clear_logs` (a `page_act` action) empties all three rings and resets `dropped`, for example `{"network":39,"console":0,"websocket":0}`. The `seq` counter does not reset. The recipe is `clear_logs`, then one action, then read.
 
-`filter` narrows the network read after the ring is read. It is a comma list of request types matched case-insensitively against each entry's `type`: a bare name keeps that type and a `-` prefix drops it, so `filter: "document,script,xhr"` keeps those three and `filter: "-image,-font"` drops images and fonts. Unknown names fail as `invalid_args` and list the accepted values: `document`, `stylesheet`, `image`, `media`, `font`, `script`, `texttrack`, `xhr`, `fetch`, `prefetch`, `eventsource`, `websocket`, `manifest`, `signedexchange`, `ping`, `cspviolationreport`, `preflight`, `other`. A filtered read keeps `count` as the returned count and adds `filtered_out`, the number dropped, so `count:0` with `filtered_out:11` means nothing matched rather than nothing captured. An unfiltered read never carries `filtered_out`.
+`filter` narrows the network read after the ring is read. It is a comma list of request types matched case-insensitively against each entry's `type`. The CLI emits the CDP casing, for example `Document` and `Stylesheet`. The filter accepts either case. A bare name keeps that type and a `-` prefix drops it, so `filter: "document,script,xhr"` keeps those three and `filter: "-image,-font"` drops images and fonts. Unknown names fail as `invalid_args` and list the accepted values: `document`, `stylesheet`, `image`, `media`, `font`, `script`, `texttrack`, `xhr`, `fetch`, `prefetch`, `eventsource`, `websocket`, `manifest`, `signedexchange`, `ping`, `cspviolationreport`, `preflight`, `other`. A filtered read keeps `count` as the returned count and adds `filtered_out`, the number dropped, so `count:0` with `filtered_out:11` means nothing matched rather than nothing captured. An unfiltered read never carries `filtered_out`.
 
 #### Header redaction
 
@@ -219,7 +219,7 @@ Recovery: re-read `what=network` for the current `seq` values, then read the bod
 - 2026-10-26 — `tables` and `forms` on a live page. `forms` reported `has_value:false`, then `has_value:true` after an input, and never returned the value. `timeout_ms` bounded a slow read and the failure named `what` and the value.
 - 2026-10-27 — live on `https://www.debian.org/`: every `network` entry carried `frame_id` and `loader_id`, and the document request carried `top_document:true`, `dropped:0`, `truncated:0`. `security` returned `count:21` with no `header_conflict`, which is correct for a page whose audited headers each carry one value.
 - 2026-10-27 — source-verified against commit `83a6797` and its tests: the eight `csp_bypass_*` checks, their `fail`/`warn`/`info` statuses, and the trusted-host list. The running daemon predated the commit and returned the 13-check report above, so there is no live call for the new ids yet.
-- 2026-10-28 — source-verified, not live-tested: the `filter` input on `network` and `sinks`, its accepted values, and `filtered_out` (WEB-231).
+- 2026-10-28 — live on `https://www.freebsd.org/?probe=one`. `filter:"document,stylesheet,script"` returned `count:5` with `filtered_out:14`. `filter:"-image,-font"` returned `count:7` with `filtered_out:12`. The unfiltered read returned `count:19` with no `filtered_out`. `filter:"banana"` returned `invalid_args` with all 18 names. `filter:"canary"` kept one sink hit with `filtered_out:0`.
 
 ## When not to use it
 

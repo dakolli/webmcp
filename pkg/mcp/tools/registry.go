@@ -237,7 +237,7 @@ func decodeArgs(tool string, args json.RawMessage, dst any) error {
 			coerced, ok = coerceNumberString(normalized, err)
 		}
 		if !ok || bytes.Equal(coerced, normalized) {
-			if explained := explainArgTypeError(tool, normalized, err); explained != err {
+			if explained := explainArgTypeError(tool, normalized, dst, err); explained != err {
 				return explained
 			}
 			return fmt.Errorf("%s: invalid arguments: %w", tool, err)
@@ -359,23 +359,114 @@ func coerceBooleanStrings(args json.RawMessage) json.RawMessage {
 
 // explainArgTypeError replaces a JSON type mismatch in tool arguments with a
 // sentence naming the tool, field and wanted type, plus the value that was sent.
-// Non-type errors are returned unchanged.
+// A mismatch inside an object names the failing member as field["key"]. Non-type
+// errors are returned unchanged.
 func explainArgTypeError(
 	tool string,
 	args json.RawMessage,
+	dst any,
 	err error,
 ) error {
 	var typeErr *json.UnmarshalTypeError
 	if !errors.As(err, &typeErr) || typeErr.Field == "" {
 		return err
 	}
+	label := fmt.Sprintf("%q", typeErr.Field)
+	raw, ok := fieldValue(args, typeErr.Field)
+	if key, member, found := failingObjectMember(raw, fieldType(dst, typeErr.Field)); found {
+		label = fmt.Sprintf("%s[%q]", typeErr.Field, key)
+		raw, ok = member, true
+	}
 	return fmt.Errorf(
-		"%s: %q must be %s, but the request sent %s.",
+		"%s: %s must be %s, but the request sent %s.",
 		tool,
-		typeErr.Field,
+		label,
 		wantedType(typeErr.Type),
-		sentValue(args, typeErr.Field),
+		sentValue(raw, ok),
 	)
+}
+
+// failingObjectMember returns the first member of an object argument that does
+// not decode into the map's value type, so a type mismatch inside a map names
+// the member instead of the whole object. It reports false when the field is
+// not map-typed, the value is not an object, or every member fits.
+func failingObjectMember(
+	raw json.RawMessage,
+	field reflect.Type,
+) (string, json.RawMessage, bool) {
+	for field != nil && field.Kind() == reflect.Pointer {
+		field = field.Elem()
+	}
+	if field == nil || field.Kind() != reflect.Map {
+		return "", nil, false
+	}
+	want := field.Elem()
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return "", nil, false
+	}
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	if _, err := dec.Token(); err != nil {
+		return "", nil, false
+	}
+	for dec.More() {
+		token, err := dec.Token()
+		if err != nil {
+			return "", nil, false
+		}
+		key, ok := token.(string)
+		if !ok {
+			return "", nil, false
+		}
+		var member json.RawMessage
+		if err := dec.Decode(&member); err != nil {
+			return "", nil, false
+		}
+		if err := json.Unmarshal(member, reflect.New(want).Interface()); err != nil {
+			return key, member, true
+		}
+	}
+	return "", nil, false
+}
+
+// fieldType resolves the Go type a dotted JSON field path decodes into, or nil
+// when the path cannot be followed.
+func fieldType(dst any, field string) reflect.Type {
+	t := reflect.TypeOf(dst)
+	for _, name := range strings.Split(field, ".") {
+		for t != nil && (t.Kind() == reflect.Pointer ||
+			t.Kind() == reflect.Slice || t.Kind() == reflect.Array) {
+			t = t.Elem()
+		}
+		if t == nil {
+			return nil
+		}
+		switch t.Kind() {
+		case reflect.Struct:
+			next, ok := jsonFieldType(t, name)
+			if !ok {
+				return nil
+			}
+			t = next
+		case reflect.Map:
+			t = t.Elem()
+		default:
+			return nil
+		}
+	}
+	return t
+}
+
+// jsonFieldType returns the type of the struct field whose JSON name is name.
+func jsonFieldType(t reflect.Type, name string) (reflect.Type, bool) {
+	for i := range t.NumField() {
+		f := t.Field(i)
+		tag, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+		if tag == name {
+			return f.Type, true
+		}
+	}
+	return nil, false
 }
 
 // wantedType renders a JSON field's expected type in plain words.
@@ -404,10 +495,9 @@ func wantedType(t reflect.Type) string {
 	}
 }
 
-// sentValue describes the raw argument value that failed to decode. The field
-// may be nested, so it is resolved segment by segment through the arguments.
-func sentValue(args json.RawMessage, field string) string {
-	raw, ok := fieldValue(args, field)
+// sentValue describes the raw argument value that failed to decode. ok reports
+// whether the value could be resolved at all.
+func sentValue(raw json.RawMessage, ok bool) string {
 	if !ok {
 		return "an unexpected value"
 	}

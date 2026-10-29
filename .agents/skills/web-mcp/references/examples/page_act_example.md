@@ -1,4 +1,4 @@
-> Tool: `page_act` · Server: web-mcp · Surface: MCP · Tested: 2026-10-27
+> Tool: `page_act` · Server: web-mcp · Surface: MCP · Tested: 2026-10-28
 
 # page_act example
 
@@ -98,19 +98,16 @@ The second `target` is the seq of this run's `news.css` request. Success rides `
 {"ok":true,"data":{"status":200,"headers":{"Content-Type":["text/css; charset=utf-8"],"Server":["nginx"],"Vary":["Accept-Encoding"]},"body":"body  { font-family:Verdana, Geneva, sans-serif; … }","bytes":7418,"ms":63,"request":{"method":"GET","url":"https://news.ycombinator.com/news.css?EieZrD3Ae1qf3cIQQaRb","headers":{"Accept-Language":"en","Referer":"https://news.ycombinator.com/","User-Agent":"Mozilla/5.0 …"}}}}
 ```
 
-Then fuzz one query parameter over the same entry:
+Then edit one URL parameter and fuzz one captured entry. Open `https://www.freebsd.org/?probe=one` as `page-8`:
 
 ```json
-{"tool":"page_act","arguments":{"session_id":"page-6","action":"replay_fuzz","target":"2","points":[{"param":"q","location":"query"}],"payloads":["a","b"],"strategy":"sniper","max_bytes":2000}}
+{"tool":"fetch_page","arguments":{"url":"https://www.freebsd.org/?probe=one","browser_id":"browser-10","wait_for":"load"}}
+{"tool":"page_act","arguments":{"session_id":"page-8","action":"replay","target":"1","query":{"probe":"two"},"max_bytes":300}}
+{"tool":"page_act","arguments":{"session_id":"page-8","action":"replay","target":"1","query":{"probe":""},"max_bytes":300}}
+{"tool":"page_act","arguments":{"session_id":"page-8","action":"replay_fuzz","target":"1","points":[{"param":"probe","location":"query"}],"payloads":["a","b"],"strategy":"sniper","max_bytes":500}}
 ```
 
-Live on 2026-10-27 against `https://www.debian.org/`, sniper with one point and two payloads returned two runs plus the baseline:
-
-```json
-{"ok":true,"data":{"runs":[{"seq":1,"payload":"a","point":"q","status":200,"ms":105,"bytes":2000,"body_cut":true,"body_redactions":0},{"seq":2,"payload":"b","point":"q","status":200,"ms":93,"bytes":2000,"body_cut":true,"body_redactions":0}],"summary":{"baseline":{"status":200,"bytes":2000,"ms":271},"anomalies":[]}}}
-```
-
-`anomalies` is `[]` when no run differs from the baseline by status, by more than 10% in size, or by more than 3× in time. An over-bound matrix is refused before any request:
+`request.url` reads `https://www.freebsd.org/?probe=two` on the first replay, then `https://www.freebsd.org/` on the second. A non-empty value replaces, `""` removes, and every other parameter keeps its captured value. Parameter order can change, so `request.url` is the only proof of the edit. The fuzz result carries `"summary":{"baseline":{"status":200,"bytes":22060,"cold_ms":30,"ms":44},"anomalies":[]}`. `cold_ms` is the first sample and `ms` the second warm sample that each run compares against, so a `time_delta` inside that spread is suppressed. An over-bound matrix is refused before any request:
 
 ```json
 {"ok":false,"error":{"type":"invalid_args","message":"page_act: replay_fuzz: requests computed 243, over the 100 bound","hint":"lower the payload count or the point count, or use strategy sniper (points*payloads) to stay under the 100-request bound"}}

@@ -1,4 +1,4 @@
-> Tool: `page_fetch` · Server: web-mcp · Surface: MCP · Tested: 2026-10-27
+> Tool: `page_fetch` · Server: web-mcp · Surface: MCP · Tested: 2026-10-28
 
 # page_fetch example
 
@@ -74,15 +74,17 @@ Open `https://react.dev/learn` as `page-3`, call `page_act` `clear_logs` (expect
 {"tool":"page_fetch","arguments":{"session_id":"page-3","what":"network"}}
 ```
 
-Expect one entry with `"seq":40` and `"url":"https://react.dev/_next/static/chunks/616.bd871377a76d946f.js"`. Each entry also carries `frame_id` and `loader_id`, and only the page's document request sets `"top_document":true`, which marks the current top-level document. `seq` keeps counting after `clear_logs`, so it proves the action caused the request.
+Expect one entry with `"seq":40` and `"url":"https://react.dev/_next/static/chunks/616.bd871377a76d946f.js"`. Each entry also carries `frame_id` and `loader_id`, and only the page's document request sets `"top_document":true`. `seq` keeps its count after `clear_logs`, so it proves the action caused the request.
 
-Narrow the same read to signal traffic:
+Filter the same ring twice, first to the page's own assets, then to its API traffic:
 
 ```json
-{"tool":"page_fetch","arguments":{"session_id":"page-3","what":"network","filter":"document,script"}}
+{"tool":"page_fetch","arguments":{"session_id":"page-3","what":"network","filter":"document,stylesheet,script"}}
+{"tool":"page_act","arguments":{"session_id":"page-3","action":"click","selector":"h1"}}
+{"tool":"page_fetch","arguments":{"session_id":"page-3","what":"network","filter":"xhr,fetch"}}
 ```
 
-Expect only `Document` and `Script` entries, with `filtered_out` equal to the number the filter dropped. The drop form is `filter: "-image,-font"`, and an unknown name fails as `invalid_args` with the accepted list.
+Expect only `Document`, `Stylesheet` and `Script` entries from the first read, and only `XHR` and `Fetch` entries from the last. Each filtered read adds `filtered_out` with the number it dropped. Every entry still carries its `status`. Chrome omits `bytes` and `ms` when it reports no size, for example a cache-served stylesheet. `count:0` with `filtered_out` above 0 means nothing matched, not that nothing was captured. The drop form is one line, `filter:"-image,-font"`. An unknown name fails as `invalid_args` with the accepted list.
 
 ## 8. Read headers, one body, and redaction
 
@@ -139,7 +141,7 @@ Filter the ring to the canary:
 {"tool":"page_fetch","arguments":{"session_id":"page-5","what":"sinks","filter":"canary"}}
 ```
 
-Expect the one hit whose `value` holds `wm-canary-`, plus `filtered_out` for the hits dropped. `filter: "known"` instead drops every hit whose `source` is `"unknown"`. `inject_canary` can return `hits: []` with no error when no instrumented sink received the marker; that is a normal result, not a failure.
+Expect the one hit whose `value` holds `wm-canary-`, plus `filtered_out` for the hits dropped. `filter: "known"` instead drops every hit whose `source` is `"unknown"`. `inject_canary` can return `hits: []` with no error when no instrumented sink received the marker. That is a normal result, not a failure.
 
 ## 12. Export HAR
 
@@ -149,13 +151,7 @@ Expect the one hit whose `value` holds `wm-canary-`, plus `filtered_out` for the
 
 Expect `data` as `{"log":{"version":"1.2","creator":{"name":"web-mcp","version":"1.0"},"pages":[{"startedDateTime":"…","id":"page_1","title":"…","pageTimings":{"onContentLoad":-1,"onLoad":-1}}],"entries":[{"request":{"method":"GET","url":"https://…","httpVersion":"http/1.1","headers":[…],"cookies":[…]},"response":{"status":200,"httpVersion":"http/1.1","content":{"size":1256,"mimeType":"text/html","text":"<!doctype html>…"},"cookies":[]},"serverIPAddress":"203.0.113.7",…}],"comment":"web-mcp HAR 1.2 export. … Cap 524288 bytes. …","truncated":0,"bodies_skipped":0}}`. `response.cookies` is always `[]`, a binary body sets `content.encoding:"base64"`, and header and cookie values read `<redacted>` while bodies stay verbatim.
 
-The CLI writes the same document uncapped and prints one line, never the body:
-
-```sh
-browser page fetch page-1 har --out traffic.har
-```
-
-Expect `wrote traffic.har (42 entries)`. The file is mode 0600 and its `log.comment` says `Cap: none`.
+The CLI writes the same document uncapped and prints one line, never the body: `browser page fetch page-1 har --out traffic.har` prints `wrote traffic.har (42 entries)`. The file is mode 0600 and its `log.comment` says `Cap: none`.
 
 ## 13. Errors and cleanup
 
