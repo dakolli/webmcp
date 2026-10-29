@@ -26,7 +26,8 @@
 # PORT is the shared MCP/SSE port for launch and the install-dev relaunch.
 PORT ?= 4099
 
-# PART selects the version component bumped by the bump target.
+# PART selects the version component bumped by the bump target: patch, minor,
+# major or half. half steps the minor by a half, so 0.2.0 becomes 0.2.5.
 PART ?= patch
 
 # CONFIG_DIR is the browser-mcp config directory install-dev wipes. Every path

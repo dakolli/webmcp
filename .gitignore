@@ -21,3 +21,5 @@ smoketest.md
 dist/
 .release/
 .live-schema.json
+RELEASING.md
+scripts/bump.sh

@@ -22,7 +22,7 @@ go install github.com/dakolli/webmcp/cmd/browser@latest
 ```
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/dakolli/webmcp/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/dakolli/webmcp/main/scripts/install.sh | sh
 ```
 
 ```sh
