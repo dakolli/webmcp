@@ -121,6 +121,7 @@ browser_list and browser_close tools.`,
 		NewServeCmd(),
 		NewServeStopCmd(),
 		NewSkillCmd(),
+		NewMcpCmd(),
 	)
 	return root
 }
