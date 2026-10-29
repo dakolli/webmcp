@@ -304,8 +304,9 @@ type PageListResult struct {
 // shared pageops registry (ValidateAspect is the allow-list); dom element nodes,
 // matched links and DOM-backed a11y nodes carry a g<document>-b<backendNodeId>
 // handle for page.act; selector scopes html/text/interactives (on interactives
-// it selects a subtree, or a child frame when it matches an iframe); target
-// fetches exactly one
+// it selects a subtree, or a child frame when it matches an iframe); filter
+// narrows network reads by request type and sinks reads by canary or known
+// source; target fetches exactly one
 // css/js resource's content, or with what=body selects one observed response by
 // seq or URL substring; full_page captures the whole scrollable page in a
 // screenshot; max_bytes caps the returned data (default pageops.DefaultPageMaxBytes),
@@ -332,6 +333,11 @@ type PageFetchParams struct {
 	// match; on interactives it scopes to that element's subtree, or to a child
 	// frame when the match is an iframe.
 	Selector string `json:"selector,omitempty"`
+	// Filter narrows what=network by request type (a comma list where a bare
+	// name keeps that type and a "-" prefix drops it) and what=sinks by canary
+	// or known source; every other aspect ignores it. A filtered read adds
+	// filtered_out to the envelope.
+	Filter string `json:"filter,omitempty"`
 	// Target is a css/js resource URL, or with what=body a seq number or URL
 	// substring selecting one observed response body.
 	Target string `json:"target,omitempty"`
@@ -366,7 +372,8 @@ type PageFetchResult struct {
 // bounds the action (default 30000) and sizes the wait action's "ms" sleep;
 // wait_mode selects what the wait action waits for: load|idle|stable|interactable|ms
 // (default ms). replay resends one captured network entry: target selects it by
-// seq or URL substring, method/headers override the captured request, value
+// seq or URL substring, method/headers/query override the captured request
+// (query edits URL parameters, an empty value removes one), value
 // replaces the captured body when value_set is true (or value is non-empty), and
 // max_bytes caps the returned body. replay_fuzz runs a bounded matrix over that
 // captured entry: points/payloads/strategy define the variants, the size is
@@ -412,6 +419,10 @@ type PageActParams struct {
 	// Headers overrides captured request headers for replay; each named header
 	// replaces its captured value.
 	Headers map[string]string `json:"headers,omitempty"`
+	// Query edits the captured URL's query parameters for replay: a non-empty
+	// value replaces the parameter and an empty value removes it. Every other
+	// parameter keeps its captured value.
+	Query map[string]string `json:"query,omitempty"`
 	// Points are the replay_fuzz injection points: each param is injected at its
 	// location (query, body, header or cookie) in the captured request.
 	Points []browsers.FuzzPoint `json:"points,omitempty"`

@@ -56,6 +56,28 @@ func pageFetchTimeout(ms int) time.Duration {
 	return time.Duration(ms) * time.Millisecond
 }
 
+// parseQueryFlags converts repeatable --query NAME=VALUE flags into replay query
+// edits. A non-empty value replaces that URL parameter and an empty value
+// removes it.
+func parseQueryFlags(flags []string) (map[string]string, error) {
+	if len(flags) == 0 {
+		return nil, nil
+	}
+	edits := make(map[string]string, len(flags))
+	for _, raw := range flags {
+		name, value, ok := strings.Cut(raw, "=")
+		name = strings.TrimSpace(name)
+		if !ok || name == "" {
+			return nil, fmt.Errorf(
+				"page act: --query %q must be NAME=VALUE (an empty value removes the parameter)",
+				raw,
+			)
+		}
+		edits[name] = value
+	}
+	return edits, nil
+}
+
 // NewPageCmd constructs the "page" command tree — list, fetch, act and close —
 // mirroring the MCP page_list / page_fetch / page_act / session_close tools
 // against the same pkg/browsers engine. Bare `page` prints help.
@@ -194,6 +216,7 @@ func newPageFetchCmd(mgr *browsers.Manager) *cobra.Command {
 		url           string
 		selector      string
 		target        string
+		filter        string
 		fullPage      bool
 		maxBytes      int
 		includeValues bool
@@ -226,6 +249,11 @@ dance).
   --what <what>      the aspect to extract (the positional [what] wins when
                      both are given; default text)
   --selector <css>   optional CSS selector scoping html/text/interactives extraction
+  --filter <list>    narrow --what network by request type: a comma list where a
+                     bare name keeps that type and a '-' prefix drops it
+                     (e.g. document,script,xhr or -image,-font); with
+                     --what sinks, canary or known. An unknown name fails with
+                     the accepted list, and a filtered read adds filtered_out
   --target <url>     fetch exactly one css/js resource's full content instead
                      of the {url,type,size} list (with --what css|js); with
                      --what body, select the entry by seq or URL substring
@@ -347,6 +375,19 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 				}
 			}
 
+			fetchParams := ipc.PageFetchParams{
+				BrowserID:     browserID,
+				Owner:         owner,
+				What:          what,
+				Selector:      selector,
+				Target:        target,
+				Filter:        filter,
+				FullPage:      fullPage,
+				MaxBytes:      maxBytes,
+				TimeoutMS:     int(timeout / time.Millisecond),
+				IncludeValues: includeValues,
+			}
+
 			if cl := dialServe(cmd); cl != nil {
 				defer cl.Close()
 				if url != "" {
@@ -368,7 +409,8 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 						return fmt.Errorf("page fetch: %w", err)
 					}
 					reportFallbackBrowserID(cmd, browserID)
-					body, err := pageFetchViaIPC(ctx, cl, summary.SessionID, browserID, owner, what, selector, target, fullPage, maxBytes, int(timeout/time.Millisecond), includeValues)
+					fetchParams.SessionID = summary.SessionID
+					body, err := pageFetchViaIPC(ctx, cl, &fetchParams)
 					if err != nil {
 						return err
 					}
@@ -379,7 +421,8 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 					return err
 				}
 				reportFallbackBrowserID(cmd, browserID)
-				body, err := pageFetchViaIPC(ctx, cl, rid, browserID, owner, what, selector, target, fullPage, maxBytes, int(timeout/time.Millisecond), includeValues)
+				fetchParams.SessionID = rid
+				body, err := pageFetchViaIPC(ctx, cl, &fetchParams)
 				if err != nil {
 					return err
 				}
@@ -430,6 +473,7 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 				What:          what,
 				Selector:      selector,
 				Target:        target,
+				Filter:        filter,
 				FullPage:      fullPage,
 				IncludeValues: includeValues,
 				MaxBytes:      maxBytes,
@@ -443,6 +487,7 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to fetch (optional with one page open; 'last'; or a bare number)")
 	cmd.Flags().StringVar(&what, "what", "", "aspect to extract: html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, tables, forms, marks, security, storage, sinks, postmessage, har (default text)")
 	cmd.Flags().StringVar(&selector, "selector", "", "optional CSS selector scoping html/text/interactives extraction")
+	cmd.Flags().StringVar(&filter, "filter", "", "narrow --what network by request type (comma list; a bare name keeps it, a '-' prefix drops it) or --what sinks by canary/known")
 	cmd.Flags().StringVar(&target, "target", "", "resource URL for one css/js resource, or seq/URL substring selecting one network body (with --what body)")
 	cmd.Flags().BoolVar(&fullPage, "full-page", false, "capture the entire scrollable page instead of the visible viewport (screenshot only)")
 	cmd.Flags().BoolVar(&includeValues, "include-values", false, "with --what storage, print real cookie and localStorage/sessionStorage values instead of <redacted> (exposes live tokens)")
@@ -488,6 +533,7 @@ func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 		target         string
 		method         string
 		headers        []string
+		queryFlags     []string
 		pointFlags     []string
 		payloadFlags   []string
 		strategy       string
@@ -552,7 +598,7 @@ prevents a false transport timeout; it never extends the action.
   clear_logs   (none)
   sinks_install (none)
   sinks_clear  (none)
-  replay       [target]   (target via --target; overrides via --method, --header, --value, --max-bytes)
+  replay       [target]   (target via --target; overrides via --method, --header, --query, --value, --max-bytes)
   replay_fuzz  [target]   (matrix via --points, --payloads, --strategy; alias: replay-fuzz)
   inject_canary [canary]  (optional custom value; targets via --targets)
   postmessage_install (none)
@@ -592,9 +638,11 @@ once. replay resends one captured network entry through a Go HTTP client,
 outside the browser: it bypasses CORS and carries the page's cookies for the
 target host without writing any back. --target takes the entry's seq number or
 a unique substring of its request URL (read the ring with
-'page fetch <id> network'); --method, --header NAME=VALUE and --value override
-the captured method, headers and body, and an omitted --value keeps the captured
-body. The result is the same compact JSON the MCP page_act replay action returns
+'page fetch <id> network'); --method, --header NAME=VALUE, --query NAME=VALUE
+and --value override the captured method, headers, URL parameters and body; a
+--query with an empty value removes that parameter, and an omitted --value keeps
+the captured body. The result is the same compact JSON the MCP page_act replay
+action returns
 ({status, headers, body|base64, bytes, truncated, body_redactions, ms, request,
 chain}) with sensitive headers redacted and the body capped at 256 KB.
 replay_fuzz (alias replay-fuzz) runs a bounded matrix of variants over one
@@ -751,6 +799,10 @@ needs no page.`,
 			if err != nil {
 				return fmt.Errorf("page act: %w", err)
 			}
+			queryEdits, err := parseQueryFlags(queryFlags)
+			if err != nil {
+				return err
+			}
 
 			if action == "auth_list" {
 				if cl := dialServe(cmd); cl != nil {
@@ -810,6 +862,7 @@ needs no page.`,
 					Target:         target,
 					Method:         method,
 					Headers:        headerMap,
+					Query:          queryEdits,
 					Points:         points,
 					Payloads:       payloads,
 					Strategy:       browsers.FuzzStrategy(strategy),
@@ -905,6 +958,7 @@ needs no page.`,
 					Target:   target,
 					Method:   method,
 					Headers:  headerMap,
+					Query:    queryEdits,
 					Body:     value,
 					BodySet:  valueSet,
 					MaxBytes: maxBytes,
@@ -982,6 +1036,7 @@ needs no page.`,
 	cmd.Flags().StringVar(&target, "target", "", "replay target: a seq number or a substring of the captured request URL (read the ring with 'page fetch <id> network')")
 	cmd.Flags().StringVar(&method, "method", "", "HTTP method override for replay (e.g. PUT, PATCH); omit to keep the captured method")
 	cmd.Flags().StringArrayVar(&headers, "header", nil, "replay header override NAME=VALUE (repeatable); omitted headers keep their captured values")
+	cmd.Flags().StringArrayVar(&queryFlags, "query", nil, "replay query parameter edit NAME=VALUE (repeatable); a non-empty value replaces it and an empty value removes it")
 	cmd.Flags().StringArrayVar(&pointFlags, "points", nil, "replay_fuzz injection point, repeatable: param:location (e.g. q:query) or a JSON {\"param\":...,\"location\":...} object; location is query, body, header or cookie")
 	cmd.Flags().StringArrayVar(&payloadFlags, "payloads", nil, "replay_fuzz payload value (repeatable); the same raw strings replay sends as a body/value")
 	cmd.Flags().StringVar(&strategy, "strategy", "sniper", "replay_fuzz strategy: sniper (one point at a time), pitchfork (nth point with nth payload) or clusterbomb (every combination)")
@@ -1289,38 +1344,25 @@ func pageListRow(p browsers.PageInfo) string {
 }
 
 // pageFetchViaIPC implements `page fetch` against a live serve process: it
-// forwards the extraction (and the --target/--full-page/--timeout-ms params)
-// to page.fetch (the server truncates to max_bytes itself) and returns the data
-// byte-identically to the in-process path. The CLI's --max-bytes 0 means "no
-// truncation" (pageops.PageTruncate returns s unchanged), which the wire
+// forwards the extraction (and the --selector/--target/--filter/--full-page/
+// --timeout-ms params) to page.fetch and returns the data byte-identically to
+// the in-process path (the server truncates to max_bytes itself). The CLI's
+// --max-bytes 0 means "no truncation" (pageops.PageTruncate returns s
+// unchanged), which the wire
 // contract cannot express (0 → the server default), so it is forwarded as an
 // effectively-unbounded cap. har keeps its own negative sentinel instead, so the
 // daemon hands it to the encoder unchanged and the document reports "Cap: none".
 func pageFetchViaIPC(
 	ctx context.Context,
 	cl *ipc.Client,
-	id, browserID, owner, what, selector, target string,
-	fullPage bool,
-	maxBytes int,
-	timeoutMS int,
-	includeValues bool,
+	params *ipc.PageFetchParams,
 ) (string, error) {
-	if maxBytes <= 0 && what != "har" {
-		maxBytes = int(^uint(0) >> 1) // CLI parity: 0 means "no truncation"
+	p := *params
+	if p.MaxBytes <= 0 && p.What != "har" {
+		p.MaxBytes = int(^uint(0) >> 1) // CLI parity: 0 means "no truncation"
 	}
 	var res ipc.PageFetchResult
-	if err := cl.Call(ctx, ipc.MethodPageFetch, &ipc.PageFetchParams{
-		SessionID:     id,
-		BrowserID:     browserID,
-		Owner:         owner,
-		What:          what,
-		Selector:      selector,
-		Target:        target,
-		FullPage:      fullPage,
-		MaxBytes:      maxBytes,
-		TimeoutMS:     timeoutMS,
-		IncludeValues: includeValues,
-	}, &res); err != nil {
+	if err := cl.Call(ctx, ipc.MethodPageFetch, &p, &res); err != nil {
 		return "", fmt.Errorf("page fetch: %w", err)
 	}
 	return res.Data, nil

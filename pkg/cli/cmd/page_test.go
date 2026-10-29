@@ -358,6 +358,56 @@ func TestPageActReplayFlags(t *testing.T) {
 	}
 }
 
+// TestQueryAndFilterFlags pins the CLI side of the replay query edit and the
+// page fetch filter: --query parses NAME=VALUE pairs (an empty value removes a
+// parameter) and both flags reach their commands.
+func TestQueryAndFilterFlags(t *testing.T) {
+	if newPageActCmd(nil).Flags().Lookup("query") == nil {
+		t.Fatal("page act is missing --query")
+	}
+	if newPageFetchCmd(nil).Flags().Lookup("filter") == nil {
+		t.Fatal("page fetch is missing --filter")
+	}
+
+	tests := []struct {
+		name    string
+		flags   []string
+		want    map[string]string
+		wantErr bool
+	}{
+		{name: "absent is nil", flags: nil, want: nil},
+		{
+			name:  "replace",
+			flags: []string{"ref=5.0"},
+			want:  map[string]string{"ref": "5.0"},
+		},
+		{
+			name:  "empty value removes",
+			flags: []string{"q=other", "drop="},
+			want:  map[string]string{"q": "other", "drop": ""},
+		},
+		{name: "missing separator", flags: []string{"ref"}, wantErr: true},
+		{name: "empty name", flags: []string{"=5.0"}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseQueryFlags(tt.flags)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("parseQueryFlags(%v) error = nil, want a NAME=VALUE error", tt.flags)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseQueryFlags(%v) error = %v", tt.flags, err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("parseQueryFlags(%v) = %v, want %v", tt.flags, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestPageActViaIPCForwardsReplay pins the daemon path: every replay override
 // reaches the wire intact, including value_set for an explicitly empty body.
 func TestPageActViaIPCForwardsReplay(t *testing.T) {
@@ -613,11 +663,12 @@ func TestPageFetchViaIPCForwardsTimeout(t *testing.T) {
 	_, err = pageFetchViaIPC(
 		context.Background(),
 		cl,
-		"page-1", "", "", "dom", "", "",
-		false,
-		50000,
-		60000,
-		false,
+		&ipc.PageFetchParams{
+			SessionID: "page-1",
+			What:      "dom",
+			MaxBytes:  50000,
+			TimeoutMS: 60000,
+		},
 	)
 	if err != nil {
 		t.Fatalf("pageFetchViaIPC: %v", err)
@@ -909,16 +960,12 @@ func TestPageFetchViaIPCMaxBytesSentinel(t *testing.T) {
 			_, err = pageFetchViaIPC(
 				context.Background(),
 				cl,
-				"page-1",
-				"",
-				"",
-				tt.what,
-				"",
-				"",
-				false,
-				tt.maxBytes,
-				30000,
-				false,
+				&ipc.PageFetchParams{
+					SessionID: "page-1",
+					What:      tt.what,
+					MaxBytes:  tt.maxBytes,
+					TimeoutMS: 30000,
+				},
 			)
 			if err != nil {
 				t.Fatalf("pageFetchViaIPC: %v", err)

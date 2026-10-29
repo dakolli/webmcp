@@ -10,6 +10,60 @@ import (
 	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
+// TestReplayQueryAndFetchFilterWireRoundTrip pins that replay's query edits and
+// page.fetch's filter survive the JSON-RPC framing, including an explicit empty
+// value (the removal signal) and an absent map.
+func TestReplayQueryAndFetchFilterWireRoundTrip(t *testing.T) {
+	actLine, err := json.Marshal(Request{
+		JSONRPC: "2.0",
+		ID:      1,
+		Method:  MethodPageAct,
+		Params: json.RawMessage(
+			`{"session_id":"page-1","action":"replay","target":"/api/search","query":{"q":"other","drop":""}}`,
+		),
+	})
+	if err != nil {
+		t.Fatalf("marshal act request: %v", err)
+	}
+	actReq, rpcErr := decodeRequest(actLine)
+	if rpcErr != nil {
+		t.Fatalf("decodeRequest: %+v", rpcErr)
+	}
+	actParams, rpcErr := decodeParams[PageActParams](actReq.Params)
+	if rpcErr != nil {
+		t.Fatalf("decodeParams: %+v", rpcErr)
+	}
+	if got := actParams.Query["q"]; got != "other" {
+		t.Errorf("query[q] = %q, want other", got)
+	}
+	if got, ok := actParams.Query["drop"]; !ok || got != "" {
+		t.Errorf("query[drop] = %q (present=%v), want an empty removal edit", got, ok)
+	}
+
+	fetchLine, err := json.Marshal(Request{
+		JSONRPC: "2.0",
+		ID:      2,
+		Method:  MethodPageFetch,
+		Params: json.RawMessage(
+			`{"session_id":"page-1","what":"network","filter":"-image,-font"}`,
+		),
+	})
+	if err != nil {
+		t.Fatalf("marshal fetch request: %v", err)
+	}
+	fetchReq, rpcErr := decodeRequest(fetchLine)
+	if rpcErr != nil {
+		t.Fatalf("decodeRequest: %+v", rpcErr)
+	}
+	fetchParams, rpcErr := decodeParams[PageFetchParams](fetchReq.Params)
+	if rpcErr != nil {
+		t.Fatalf("decodeParams: %+v", rpcErr)
+	}
+	if fetchParams.Filter != "-image,-font" {
+		t.Errorf("filter = %q, want -image,-font", fetchParams.Filter)
+	}
+}
+
 // TestPageActRawWireRoundTrip pins that the raw intent survives the JSON-RPC
 // framing: true and false both decode back intact, and an absent field keeps
 // the daemon's default (no raw).
