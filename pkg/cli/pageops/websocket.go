@@ -8,12 +8,10 @@ import (
 	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
-// PageWebsocket returns the newest buffered WebSocket frames, capped at
-// MaxLogEmit and ordered oldest first, as {"entries","count","dropped","truncated"}.
-// Deliberately does NOT lock: the engine read touches only the observer's own
-// mutex, so a page the watchdog has not marked unusable still answers from its
-// in-memory buffer. A wedged page is rejected before the ring is read.
-func PageWebsocket(_ context.Context, p *browsers.Page) (string, error) {
+// PageWebSocket returns the newest buffered WebSocket frames, capped at
+// MaxLogEmit and ordered oldest first, as {entries,count,dropped,truncated}.
+// It rejects a page the watchdog marked unusable before reading the ring.
+func PageWebSocket(_ context.Context, p *browsers.Page) (string, error) {
 	if err := guardRead(p); err != nil {
 		return "", err
 	}
@@ -47,16 +45,4 @@ func PageClearCapture(p *browsers.Page) (string, error) {
 		return "", fmt.Errorf("encode cleared logs: %w", err)
 	}
 	return string(b), nil
-}
-
-// init registers the WebSocket frame aspect beside the other self-capping log
-// aspects. The ring bounds the output, so max_bytes truncation is not applied.
-func init() {
-	aspectEntries = append(aspectEntries, aspectEntry{
-		name:       "websocket",
-		selfCapped: true,
-		read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
-			return PageWebsocket(ctx, p)
-		},
-	})
 }

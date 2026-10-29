@@ -102,7 +102,7 @@ resolve only against that browser and an unknown id fails with the live ids.
 
 Subcommands:
   list   List the browser's open pages (id, url)
-  fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, console, body, article, tables, forms, marks, security, storage, sinks, postmessage, har); a URL opens a new page first
+  fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, console, body, article, tables, forms, marks, security, storage, sinks, postmessage, websocket, har); a URL opens a new page first
   act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, replay_fuzz, inject_canary, wait_open, auth_save, auth_restore, auth_list, poc_bundle)
   auth   Save, restore or list named auth snapshots (counts only, never values)
   close  Close an open page
@@ -229,7 +229,7 @@ func newPageFetchCmd(mgr *browsers.Manager) *cobra.Command {
 		Short: "Extract an aspect of a live page",
 		Long: `Extracts an aspect of a live page (html, text, links, meta, dom, css,
 js, screenshot, interactives, a11y, network, console, body, article, tables,
-forms, marks, security, storage, sinks, postmessage, har) and prints it. The page id is optional when
+forms, marks, security, storage, sinks, postmessage, websocket, har) and prints it. The page id is optional when
 only one page is open; 'last' means the most recently opened page; a bare number
 resolves to page-N. A URL in the [id] slot opens a NEW page for it first —
 creating the browser if needed, exactly like 'web-cli fetch <url>' — and then
@@ -242,7 +242,7 @@ dance).
           extract the aspect — mirrors 'web-cli fetch <url>' (wait: idle)
   [what]  the aspect to extract: html, text, links, meta, dom, css, js,
           screenshot, interactives, a11y, network, console, body, article, tables,
-          forms, marks, security, storage, sinks, postmessage, har (default: text)
+          forms, marks, security, storage, sinks, postmessage, websocket, har (default: text)
 
   --id <session>     the page/session id (the positional [id] wins when both
                      are given; never treated as a URL)
@@ -262,7 +262,7 @@ dance).
                      instead of <redacted> (exposes live session tokens)
   --max-bytes <n>    cap output size (default 50000; screenshots,
                      interactives, a11y, network, console, body, article, tables,
-                     forms, marks, security, sinks and postmessage are never truncated)
+                     forms, marks, security, sinks, postmessage and websocket are never truncated)
   --out <path>       write the HAR body to this file instead of stdout (har only;
                      the parent directory must already exist, and the file is
                      mode 0600). Without --max-bytes, or with --max-bytes 0, the
@@ -282,7 +282,7 @@ dance).
                      another owner is refused, never returned.
 
 links, meta, dom, interactives, a11y, network, console, body, article, tables,
-forms, marks, security, sinks and postmessage print JSON, mirroring the MCP page_fetch shapes. article is the readable prose body as
+forms, marks, security, sinks, postmessage and websocket print JSON, mirroring the MCP page_fetch shapes. article is the readable prose body as
 markdown ({title, byline?, excerpt?, text, words, truncated, url}); prefer it
 over text when you want the article rather than the whole page. marks is the
 numbered overlay ({marks:[{index, role, text?, x, y, width, height}], screenshot,
@@ -485,7 +485,7 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to fetch (optional with one page open; 'last'; or a bare number)")
-	cmd.Flags().StringVar(&what, "what", "", "aspect to extract: html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, tables, forms, marks, security, storage, sinks, postmessage, har (default text)")
+	cmd.Flags().StringVar(&what, "what", "", "aspect to extract: html, text, links, meta, dom, css, js, screenshot, interactives, a11y, network, console, body, article, tables, forms, marks, security, storage, sinks, postmessage, websocket, har (default text)")
 	cmd.Flags().StringVar(&selector, "selector", "", "optional CSS selector scoping html/text/interactives extraction")
 	cmd.Flags().StringVar(&filter, "filter", "", "narrow --what network by request type (comma list; a bare name keeps it, a '-' prefix drops it) or --what sinks by canary/known")
 	cmd.Flags().StringVar(&target, "target", "", "resource URL for one css/js resource, or seq/URL substring selecting one network body (with --what body)")

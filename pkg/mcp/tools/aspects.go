@@ -103,7 +103,7 @@ func init() {
 		return pageops.PageConsole(ctx, p)
 	}, truncationNone)
 	registerAspect("websocket", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
-		return pageops.PageWebsocket(ctx, p)
+		return pageops.PageWebSocket(ctx, p)
 	}, truncationNone)
 	registerAspect("article", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
 		return pageops.PageArticle(ctx, p)

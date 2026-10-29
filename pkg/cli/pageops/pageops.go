@@ -899,6 +899,9 @@ var aspectEntries = []aspectEntry{
 	{name: "har", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, q AspectQuery) (string, error) {
 		return PageHAR(ctx, p, q.MaxBytes)
 	}},
+	{name: "websocket", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, _ AspectQuery) (string, error) {
+		return PageWebSocket(ctx, p)
+	}},
 }
 
 // unknownAspectError is the one unknown-what error every surface emits; it names
