@@ -7,7 +7,7 @@ Best for:
 
 - Agent research and browsing that must keep a login, a cart, or a wizard step across calls.
 - Page dissection: the DOM, the accessibility tree, interactive elements with coordinates, loaded
-  assets, network traffic, and console output. Build a scraper without a guess.
+  assets, network traffic, and console output.
 - Authorised security testing on a target you own. Replay, fuzz, trace sinks, and package the
   evidence.
 
@@ -83,7 +83,7 @@ paste. It writes nothing.
 
 `browser mcp add` with no harness prints the table above and writes nothing.
 
-The server speaks SSE (protocol `2024-11-05`). A harness that requires streamable HTTP will not
+The server speaks SSE (protocol `2024-11-05`, planning on updating to streamable HTTP soon). A harness that requires streamable HTTP will not
 connect until that transport lands. Claude Code and OpenCode work today.
 
 Add the entry by hand when you prefer:
@@ -171,6 +171,7 @@ Five prompts are registered: `fetch_and_summarize`, `inspect_page_decomposition`
 | `security` | A passive audit of headers, CSP, cookie flags, mixed content, and form targets. |
 | `sinks` | Source-to-sink tracer hits with stack and selector. Read-only. Arm it with `sinks_install`. |
 | `postmessage` | Recorded `postMessage` traffic per window and frame. Arm it with `postmessage_install`. |
+| `websocket` | WebSocket frames the page sent and received, oldest first, with socket id, direction, opcode, payload, and handshake status. Text payloads clip at 2000 runes. A binary frame reports size only. The newest 100 of a 200-frame ring. |
 | `storage` | Cookies with flags, local and session storage, IndexedDB, and caches. Values are redacted unless `include_values`. |
 | `har` | HAR 1.2 export of the observed traffic for Burp, Caido, or ZAP. |
 | `html`, `text` | Raw `outerHTML`, or visible `innerText`. `selector` narrows both. |

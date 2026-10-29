@@ -113,6 +113,32 @@ Expect `{"seq":N,"method":"POST","url":"https://httpbin.org/post","status":200,"
 
 Expect one httpbin entry with `"Cookie":"<redacted>"` in `req_headers`. `Authorization` and `X-CSRF-Token` redact the same way. `Set-Cookie` is absent, because Chrome omits it from CDP events.
 
+## 9. Read WebSocket frames
+
+Open a real page, clear the rings, then let `eval` open a socket and send one message. The promise resolves with the echoed frame, so the read runs after both frames land.
+
+```json
+{"tool":"fetch_page","arguments":{"url":"https://www.gnu.org/","browser_id":"browser-20","wait_for":"idle"}}
+{"tool":"page_act","arguments":{"session_id":"page-5","action":"clear_logs"}}
+{"tool":"page_act","arguments":{"session_id":"page-5","action":"eval","value":"() => new Promise((resolve) => { const ws = new WebSocket('wss://ws.postman-echo.com/raw'); ws.onopen = () => ws.send('hello from web-mcp'); ws.onmessage = (event) => { resolve(event.data) }; setTimeout(() => resolve('timeout'), 5000) })"}}
+{"tool":"page_fetch","arguments":{"session_id":"page-5","what":"websocket"}}
+```
+
+Expect `{"network":N,"console":M,"websocket":0}`, then `"hello from web-mcp"`, then:
+
+```json
+{"ok":true,"data":{"entries":[{"seq":1,"socket_id":"…","url":"wss://ws.postman-echo.com/raw","direction":"sent","opcode":1,"payload":"hello from web-mcp","payload_bytes":18,"payload_cut":false,"status":101,"ms":0},{"seq":2,"socket_id":"…","url":"wss://ws.postman-echo.com/raw","direction":"received","opcode":1,"payload":"hello from web-mcp","payload_bytes":18,"payload_cut":false,"status":101,"ms":0}],"count":2,"dropped":0,"truncated":0}}
+```
+
+`status` is `101` from the observed handshake, and `ms` can be `0` even then. A binary frame carries an empty `payload` and its size in `payload_bytes`. The socket stays open, so the read holds only the sent and echoed frames. Read this aspect with no `filter` and no `target`. The CLI:
+
+```sh
+browser fetch https://www.gnu.org/ --wait idle
+browser page act last clear_logs
+browser page act last eval "() => new Promise((resolve) => { const ws = new WebSocket('wss://ws.postman-echo.com/raw'); ws.onopen = () => ws.send('hello from web-mcp'); ws.onmessage = (event) => { resolve(event.data) }; setTimeout(() => resolve('timeout'), 5000) })"
+browser page fetch last websocket
+```
+
 ## 10. Capture a screenshot as two blocks
 
 ```json
@@ -127,10 +153,10 @@ Open a new page with a hash, arm, load the hash into `innerHTML`, read, clear:
 
 ```json
 {"tool":"fetch_page","arguments":{"url":"https://www.iana.org/help/example-domains#wm-canary-160","browser_id":"browser-20","wait_for":"idle"}}
-{"tool":"page_act","arguments":{"session_id":"page-5","action":"sinks_install"}}
-{"tool":"page_act","arguments":{"session_id":"page-5","action":"eval","value":"() => { const d=document.createElement('div'); d.innerHTML=location.hash; document.body.appendChild(d); return d.textContent }"}}
-{"tool":"page_fetch","arguments":{"session_id":"page-5","what":"sinks"}}
-{"tool":"page_act","arguments":{"session_id":"page-5","action":"sinks_clear"}}
+{"tool":"page_act","arguments":{"session_id":"page-6","action":"sinks_install"}}
+{"tool":"page_act","arguments":{"session_id":"page-6","action":"eval","value":"() => { const d=document.createElement('div'); d.innerHTML=location.hash; document.body.appendChild(d); return d.textContent }"}}
+{"tool":"page_fetch","arguments":{"session_id":"page-6","what":"sinks"}}
+{"tool":"page_act","arguments":{"session_id":"page-6","action":"sinks_clear"}}
 ```
 
 Expect `{"installed":true}`, then `data` as `{"installed":true,"hits":[{"source":"location.hash","sink":"innerHTML","context":"html","value":"#wm-canary-160","stack":[…],"selector":"…","ts":…}],"dropped":0,"truncated":0}`, then `{"cleared":1}`. A read after the clear returns `hits:[]`.
@@ -138,7 +164,7 @@ Expect `{"installed":true}`, then `data` as `{"installed":true,"hits":[{"source"
 Filter the ring to the canary:
 
 ```json
-{"tool":"page_fetch","arguments":{"session_id":"page-5","what":"sinks","filter":"canary"}}
+{"tool":"page_fetch","arguments":{"session_id":"page-6","what":"sinks","filter":"canary"}}
 ```
 
 Expect the one hit whose `value` holds `wm-canary-`, plus `filtered_out` for the hits dropped. `filter: "known"` instead drops every hit whose `source` is `"unknown"`. `inject_canary` can return `hits: []` with no error when no instrumented sink received the marker. That is a normal result, not a failure.

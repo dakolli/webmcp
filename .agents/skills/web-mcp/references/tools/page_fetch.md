@@ -134,7 +134,21 @@ The eight `csp_bypass_*` probes (`code://pkg/cli/pageops/security.go#L539`) read
 
 ### WebSocket frames with what=websocket
 
-`websocket` reads the WebSocket frame ring (`code://pkg/browsers/websocket.go#L26-L51`). The payload is `{entries,count,dropped,truncated}`. Each entry holds `seq`, `socket_id`, `url`, `direction` (`sent` or `received`), `opcode`, `payload`, `payload_bytes`, `payload_cut`, `status`, and `ms`. The ring holds 200 frames and one read emits the newest 100, oldest first, so `dropped` counts ring eviction and `truncated` counts buffered frames above the emit cap. A text payload clips at 2000 runes and sets `payload_cut`; secret-like values show `<redacted>` before the clip. A non-text frame (opcode 2 or a control frame) carries an empty `payload` and its true size in `payload_bytes`. `status` and `ms` come from the socket handshake and are 0 when the open event was missed. `clear_logs` empties this ring with the network and console rings. `max_bytes` does not apply.
+`websocket` reads the WebSocket frame ring (`code://pkg/browsers/websocket.go#L26-L51`). The payload is `{entries,count,dropped,truncated}`, oldest first. Each entry holds `seq`, `socket_id` (the CDP request id, shared by every frame of one connection), `url`, `direction` (`sent` or `received`), `opcode`, `payload`, `payload_bytes`, `payload_cut`, `status`, and `ms`.
+
+`count` is the emitted count, at most 100, and `count + truncated + dropped` equals the frames observed. `dropped` counts evictions when the 200-frame ring turns over and can exceed 200, and `truncated` counts buffered frames the read held back at the 100-emit cap. A 500-frame run returned `count:100, dropped:300, truncated:100`.
+
+| `opcode` | Frame |
+| :--- | :--- |
+| 1 | text |
+| 2 | binary |
+| 8 | close |
+| 9 | ping |
+| 10 | pong |
+
+A text frame (opcode 1) carries readable `payload`, not base64, clipped at 2000 runes with `payload_cut` set; secret-like values show `<redacted>` before the clip. Every other frame carries an empty `payload` and its true size in `payload_bytes`. `status` is `101` on an observed handshake and `0` when the open event was missed. `ms` is `0` on a frame that arrived before the socket metadata, and it can be `0` even when `status` is `101`. `clear_logs` empties this ring with the network and console rings.
+
+The aspect is read-only and takes no `filter` and no `target`. `max_bytes` does not apply. A live socket can land a frame between `clear_logs` and the read, so a zero `count` needs a quiet page or a repeat.
 
 ### Sinks tracer with what=sinks
 

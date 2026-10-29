@@ -90,6 +90,7 @@ Install or refresh this skill with `browser skill <harness|path|.>`. With no arg
 25. `page_fetch` `filter` narrows `network` and `sinks`. For `network`, pass a comma list of request types. A bare name keeps that type, and a `-` prefix drops it. An unknown name fails as `invalid_args`. For `sinks`, pass `canary` or `known`. A filtered read adds `filtered_out` with the dropped count. An unfiltered read omits it. See [page_fetch.md](references/tools/page_fetch.md).
 26. `page_act` `replay` `query` edits URL parameters. A non-empty value replaces that parameter, and `""` removes it. Every other parameter keeps its captured value. `request.url` shows the rebuilt URL and is the only proof of the edit. Parameter order can change. See [page_act.md](references/tools/page_act.md).
 27. A quoted number is coerced when it parses. `"max_bytes":"8000"` works, and a non-numeric string fails as `invalid_args`.
+28. `page_fetch` `what=websocket` reads a 200-frame ring and emits the newest 100, so `dropped` is ring eviction and `truncated` is the emit-cap remainder. A text frame (`opcode` 1) carries `payload`, while a binary or control frame leaves `payload` empty and reports its size in `payload_bytes`. See [page_fetch.md](references/tools/page_fetch.md).
 
 ## Bounty loop
 

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 - 2026-10-29
+## Unreleased
 
 ### Highlights
 - One command configures an MCP client. `browser mcp add claude` writes the entry, keeps your other
@@ -20,6 +20,10 @@
   `--filter` on `page fetch`.
 - `page_fetch filter` narrows `network` by 18 request types with a keep form and a `-drop` form, and
   narrows `sinks` by `canary` or `known`. Both report `filtered_out`.
+- `page_fetch what=websocket` returns the WebSocket frames the page sent and received, oldest first,
+  with socket id, direction, opcode, payload, and handshake status. Text payloads clip at 2000 runes.
+  A binary frame reports size only. The newest 100 of a 200-frame ring emit, and `count`, `truncated`,
+  and `dropped` add up to the frames observed.
 - An argument outside a tool schema fails as `invalid_args` and names the key plus the valid keys. A
   quoted number is accepted for a numeric field.
 - `replay_fuzz` reports `cold_ms` beside `ms`, so the first sample is visible.
@@ -41,7 +45,6 @@
   read and action.
 
 ### Known limits
-- WebSocket frames are captured and cleared by `clear_logs`, but no read aspect returns them yet.
 - `codex` and `pi` document streamable HTTP. The server serves SSE only.
 
 ## 0.1.0 - 2026-10-27
