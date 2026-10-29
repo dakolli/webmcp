@@ -1950,6 +1950,7 @@ func (m *Manager) sweepIdleOwnerPages(ctx context.Context, b *Browser, ttl time.
 			continue
 		}
 
+		p.stopDialogs()
 		closeCtx, cancel := context.WithTimeout(ctx, closePageTimeout)
 		b.stopProxyAuth(handle)
 		b.stopHeaderCleanup(handle)

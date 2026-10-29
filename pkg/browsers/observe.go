@@ -146,16 +146,22 @@ func (r *ringBuffer[T]) len() int {
 	return len(r.items)
 }
 
-// pageObserver captures CDP Network/Runtime/Log truth for one Page into three
-// bounded rings. It has its own mutex; its handlers never touch Page.mu.
+// pageObserver captures CDP Network/Runtime/Log truth and the page-reported DOM
+// mutation timeline for one Page into bounded rings. It has its own mutex; its
+// handlers never touch Page.mu.
 type pageObserver struct {
 	mu     sync.Mutex
 	net    ringBuffer[NetworkEntry]
 	con    ringBuffer[ConsoleEntry]
 	ws     ringBuffer[WebSocketEntry]
+	mut    ringBuffer[MutationEntry]
 	netSeq int64
 	conSeq int64
 	wsSeq  int64
+	mutSeq int64
+	// mutRemove and mutStop unarm the in-page mutation observer and its binding.
+	mutRemove func() error
+	mutStop   func() error
 	// sockets names the live WebSocket connections their frames belong to.
 	sockets map[proto.NetworkRequestID]*webSocketSocket
 	// secrets keeps sensitive header values instead of redacting them.
@@ -174,6 +180,7 @@ func newPageObserver() *pageObserver {
 		net:     ringBuffer[NetworkEntry]{cap: networkRingCap},
 		con:     ringBuffer[ConsoleEntry]{cap: consoleRingCap},
 		ws:      ringBuffer[WebSocketEntry]{cap: websocketRingCap},
+		mut:     ringBuffer[MutationEntry]{cap: MutationRingCap},
 		sockets: make(map[proto.NetworkRequestID]*webSocketSocket),
 	}
 }
@@ -806,10 +813,10 @@ func (p *Page) ClearCapture() CaptureCounts {
 }
 
 // startObservation arms network, console and WebSocket capture on the page's
-// own context, plus the frame navigation events that identify the current
-// top-level document. It runs in the pre-registration window, so no page lock is
-// needed. Capture is strictly best-effort: a failed enable silences one stream
-// but never fails page creation.
+// own context, the per-page DOM mutation timeline, plus the frame navigation
+// events that identify the current top-level document. It runs in the
+// pre-registration window, so no page lock is needed. Capture is strictly
+// best-effort: a failed enable silences one stream but never fails page creation.
 func (p *Page) startObservation() {
 	if p.Rod == nil {
 		return
@@ -821,6 +828,7 @@ func (p *Page) startObservation() {
 	capturePage, cancel := p.Rod.WithCancel()
 	p.obsCancel = cancel
 
+	p.startMutationObservation()
 	_ = proto.NetworkEnable{}.Call(capturePage)
 	_ = proto.RuntimeEnable{}.Call(capturePage)
 	_ = proto.LogEnable{}.Call(capturePage)
@@ -851,6 +859,9 @@ func (p *Page) startObservation() {
 // the drain goroutine.
 func (p *Page) stopObservation() {
 	p.disarmInterception()
+	if p.observer != nil {
+		p.observer.stopMutations()
+	}
 	if p.obsCancel == nil {
 		return
 	}

@@ -135,6 +135,7 @@ func (b *Browser) registerPopup(rb *rod.Browser, info *proto.TargetTargetInfo) {
 
 	p := &Page{ID: root.mintPageID(), Rod: rodPage, URL: info.URL, browser: root}
 	p.startObservation()
+	p.startDialogs()
 
 	registered, err := root.registerPage(info, p)
 	if err != nil {
@@ -421,6 +422,7 @@ func closeTarget(rb *rod.Browser, id proto.TargetTargetID) {
 
 // discardPage releases a wrapped page that never reached the registry.
 func (b *Browser) discardPage(p *Page) {
+	p.stopDialogs()
 	p.stopObservation()
 	if p.Rod == nil {
 		return

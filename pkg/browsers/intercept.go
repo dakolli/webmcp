@@ -546,6 +546,13 @@ func (p *Page) interceptor(ctx context.Context) (*interceptor, error) {
 		return it, nil
 	}
 
+	if p.httpAuthArmed() {
+		return nil, fmt.Errorf(
+			"intercept: page %s has HTTP basic-auth credentials armed, which owns the CDP Fetch domain — clear the credentials first",
+			p.ID,
+		)
+	}
+
 	rodPage, err := p.rodPageForIntercept(ctx)
 	if err != nil {
 		return nil, err

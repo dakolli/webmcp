@@ -769,6 +769,7 @@ func (b *Browser) NewPage(
 	// ID, URL and lastAccess are filled at registration below.
 	page := &Page{Rod: p, browser: b}
 	page.startObservation()
+	page.startDialogs()
 	b.startProxyAuth(p)
 
 	// Install the browser's extra request headers before stealth and before any
@@ -856,18 +857,28 @@ func (b *Browser) NewPage(
 		pc := p.Context(ctx)
 		if err := pc.Navigate(url); err != nil {
 			authErr := b.takeProxyAuthError(p)
-			b.closeUnregisteredPage(page) // do not leak the orphaned tab
 			if authErr != nil {
+				b.closeUnregisteredPage(page) // do not leak the orphaned tab
 				return nil, authErr
 			}
+			if IsInvalidAuthCredential(err) {
+				b.registerNewPage(page, url)
+				return nil, fmt.Errorf("browsers: %w", InvalidAuthCredentialError(url, page.ID))
+			}
+			b.closeUnregisteredPage(page) // do not leak the orphaned tab
 			return nil, fmt.Errorf("browsers: navigate: %w", err)
 		}
 		if err := pc.WaitLoad(); err != nil {
 			authErr := b.takeProxyAuthError(p)
-			b.closeUnregisteredPage(page) // do not leak the orphaned tab
 			if authErr != nil {
+				b.closeUnregisteredPage(page) // do not leak the orphaned tab
 				return nil, authErr
 			}
+			if IsInvalidAuthCredential(err) {
+				b.registerNewPage(page, url)
+				return nil, fmt.Errorf("browsers: %w", InvalidAuthCredentialError(url, page.ID))
+			}
+			b.closeUnregisteredPage(page) // do not leak the orphaned tab
 			return nil, fmt.Errorf("browsers: wait load: %w", err)
 		}
 		if authErr := b.takeProxyAuthError(p); authErr != nil {
@@ -876,7 +887,15 @@ func (b *Browser) NewPage(
 		}
 	}
 
-	targetID := p.TargetID
+	b.registerNewPage(page, url)
+	return page, nil
+}
+
+// registerNewPage inserts a freshly created page into its browser and records
+// its target id. It is the success path and the kept-page path for a navigation
+// that only lacked credentials.
+func (b *Browser) registerNewPage(page *Page, url string) {
+	targetID := page.Rod.TargetID
 	pageID := b.mintPageID()
 	b.mu.Lock()
 	page.ID = pageID
@@ -886,7 +905,6 @@ func (b *Browser) NewPage(
 	b.mu.Unlock()
 	b.root().touch()
 	b.root().trackTarget(page, targetID)
-	return page, nil
 }
 
 // closeUnregisteredPage best-effort closes a freshly created page whose session
@@ -904,6 +922,7 @@ func (b *Browser) NewPage(
 func (b *Browser) closeUnregisteredPage(page *Page) {
 	b.stopProxyAuth(page.Rod)
 	b.stopHeaderCleanup(page.Rod)
+	page.stopDialogs()
 	page.stopObservation()
 	closeCtx, cancel := context.WithTimeout(b.baseCtx, closePageTimeout)
 	defer cancel()
@@ -948,6 +967,7 @@ func (b *Browser) Page(ctx context.Context, id PageID) (*Page, error) {
 			}
 			owner.mu.Unlock()
 			unlock()
+			p.stopDialogs()
 		}
 		if evicted {
 			owner.forgetTarget(p)
@@ -1258,6 +1278,7 @@ func (b *Browser) closeOnePage(ctx context.Context, id PageID) (released bool, e
 	handle := p.Rod
 	p.Rod = nil
 	unlock()
+	p.stopDialogs()
 
 	if handle == nil {
 		return true, nil
@@ -1338,6 +1359,7 @@ func (b *Browser) Close(ctx context.Context) error {
 			p.Rod = nil
 		}
 		unlock()
+		p.stopDialogs()
 	}
 
 	for _, cleanup := range headerCleanups {

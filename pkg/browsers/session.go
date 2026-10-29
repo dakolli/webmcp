@@ -95,6 +95,13 @@ type Page struct {
 	// pre-registration window and cleared by stopObservation. Guarded by the
 	// operation lock.
 	obsCancel context.CancelFunc
+	// dialogs holds the page's JavaScript-dialog and HTTP-auth state: the
+	// bounded entry ring, the answer policy and the CDP subscriptions that
+	// answer a dialog before it blocks the renderer. It has its own mutex and is
+	// deliberately outside the operation lock, so a dialog can be answered
+	// while an operation holds the page. Assigned once in the pre-registration
+	// window.
+	dialogs *pageDialogs
 	// intercept holds the page's request interception state, nil until the first
 	// rule is added and after it is cleared. It is guarded by interceptMu, never
 	// by the operation lock, because its handlers make CDP calls from their own
@@ -714,6 +721,7 @@ func (p *Page) lockContextBudget(
 // surfaces a ctx-bound error (e.g. context.DeadlineExceeded) instead of
 // blocking the caller past its deadline.
 func (p *Page) Close(ctx context.Context) error {
+	p.stopDialogs()
 	p.stopInterception(ctx)
 	if err := p.lockContextBudget(ctx, "close page", 0, false); err != nil {
 		return err
