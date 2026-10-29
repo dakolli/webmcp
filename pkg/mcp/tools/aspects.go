@@ -28,12 +28,12 @@ const (
 	truncationNone
 )
 
-// aspectFunc reads one page aspect through pageops.
-type aspectFunc func(ctx context.Context, p *browsers.Page, a pageFetchArgs) (string, error)
+// fetchFunc reads one page aspect through pageops.
+type fetchFunc = func(ctx context.Context, p *browsers.Page, a pageFetchArgs) (string, error)
 
 // aspectEntry pairs an aspect reader with its truncation policy.
 type aspectEntry struct {
-	read  aspectFunc
+	read  fetchFunc
 	trunc truncation
 }
 
@@ -43,7 +43,7 @@ var (
 )
 
 // registerAspect adds one what value and its truncation policy to the registry.
-func registerAspect(name string, fn aspectFunc, trunc truncation) {
+func registerAspect(name string, fn fetchFunc, trunc truncation) {
 	aspects[name] = aspectEntry{read: fn, trunc: trunc}
 	aspectNames = append(aspectNames, name)
 }
@@ -64,74 +64,54 @@ func readScreenshot(ctx context.Context, p *browsers.Page, a pageFetchArgs) (str
 	return pageops.PageScreenshot(captureCtx, p, true)
 }
 
+// noArgs adapts a pageops function that only needs the page.
+func noArgs(f func(context.Context, *browsers.Page) (string, error)) fetchFunc {
+	return func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
+		return f(ctx, p)
+	}
+}
+
+// withArg adapts a pageops function that needs one extra argument extracted
+// from pageFetchArgs.
+func withArg[T any](f func(context.Context, *browsers.Page, T) (string, error), get func(pageFetchArgs) T) fetchFunc {
+	return func(ctx context.Context, p *browsers.Page, a pageFetchArgs) (string, error) {
+		return f(ctx, p, get(a))
+	}
+}
+
+// selector returns the selector argument of a page_fetch call.
+func selector(a pageFetchArgs) string { return a.Selector }
+
+// target returns the css/js/postmessage target argument of a page_fetch call.
+func target(a pageFetchArgs) string { return a.Target }
+
+// filter returns the network/sinks filter argument of a page_fetch call.
+func filter(a pageFetchArgs) string { return a.Filter }
+
 func init() {
-	registerAspect("html", func(ctx context.Context, p *browsers.Page, a pageFetchArgs) (string, error) {
-		return pageops.PageHTML(ctx, p, a.Selector)
-	}, truncationText)
-	registerAspect("dom", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
-		return pageops.PageDOM(ctx, p)
-	}, truncationJSON)
-	registerAspect("text", func(ctx context.Context, p *browsers.Page, a pageFetchArgs) (string, error) {
-		return pageops.PageText(ctx, p, a.Selector)
-	}, truncationText)
-	registerAspect("css", func(ctx context.Context, p *browsers.Page, a pageFetchArgs) (string, error) {
-		return pageops.PageCSS(ctx, p, a.Target)
-	}, truncationText)
-	registerAspect("js", func(ctx context.Context, p *browsers.Page, a pageFetchArgs) (string, error) {
-		return pageops.PageJS(ctx, p, a.Target)
-	}, truncationText)
-	registerAspect("links", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
-		return pageops.PageLinks(ctx, p)
-	}, truncationJSON)
+	registerAspect("html", withArg(pageops.PageHTML, selector), truncationText)
+	registerAspect("dom", noArgs(pageops.PageDOM), truncationJSON)
+	registerAspect("text", withArg(pageops.PageText, selector), truncationText)
+	registerAspect("css", withArg(pageops.PageCSS, target), truncationText)
+	registerAspect("js", withArg(pageops.PageJS, target), truncationText)
+	registerAspect("links", noArgs(pageops.PageLinks), truncationJSON)
 	registerAspect("screenshot", readScreenshot, truncationNone)
-	registerAspect("meta", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
-		return pageops.PageMeta(ctx, p)
-	}, truncationJSON)
-	registerAspect("interactives", func(ctx context.Context, p *browsers.Page, a pageFetchArgs) (string, error) {
-		return pageops.PageInteractives(ctx, p, a.Selector)
-	}, truncationNone)
-	registerAspect("a11y", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
-		return pageops.PageA11y(ctx, p)
-	}, truncationNone)
-	registerAspect("network", func(ctx context.Context, p *browsers.Page, a pageFetchArgs) (string, error) {
-		return pageops.PageNetworkFiltered(ctx, p, a.Filter)
-	}, truncationNone)
-	registerAspect("body", func(ctx context.Context, p *browsers.Page, a pageFetchArgs) (string, error) {
-		return pageops.PageBody(ctx, p, a.Target)
-	}, truncationNone)
-	registerAspect("console", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
-		return pageops.PageConsole(ctx, p)
-	}, truncationNone)
-	registerAspect("websocket", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
-		return pageops.PageWebSocket(ctx, p)
-	}, truncationNone)
-	registerAspect("dialogs", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
-		return pageops.PageDialogs(ctx, p)
-	}, truncationNone)
-	registerAspect("article", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
-		return pageops.PageArticle(ctx, p)
-	}, truncationNone)
-	registerAspect("tables", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
-		return pageops.PageTables(ctx, p)
-	}, truncationNone)
-	registerAspect("forms", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
-		return pageops.PageForms(ctx, p)
-	}, truncationNone)
-	registerAspect("marks", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
-		return pageops.PageMarks(ctx, p)
-	}, truncationNone)
-	registerAspect("security", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
-		return pageops.PageSecurity(ctx, p)
-	}, truncationNone)
-	registerAspect("sinks", func(ctx context.Context, p *browsers.Page, a pageFetchArgs) (string, error) {
-		return pageops.PageSinksFiltered(ctx, p, a.Filter)
-	}, truncationNone)
-	registerAspect("postmessage", func(ctx context.Context, p *browsers.Page, a pageFetchArgs) (string, error) {
-		return pageops.PagePostMessage(ctx, p, a.Target)
-	}, truncationNone)
-	registerAspect("storage", func(ctx context.Context, p *browsers.Page, a pageFetchArgs) (string, error) {
-		return pageops.PageStorage(ctx, p, a.IncludeValues)
-	}, truncationNone)
+	registerAspect("meta", noArgs(pageops.PageMeta), truncationJSON)
+	registerAspect("interactives", withArg(pageops.PageInteractives, selector), truncationNone)
+	registerAspect("a11y", noArgs(pageops.PageA11y), truncationNone)
+	registerAspect("network", withArg(pageops.PageNetworkFiltered, filter), truncationNone)
+	registerAspect("body", withArg(pageops.PageBody, target), truncationNone)
+	registerAspect("console", noArgs(pageops.PageConsole), truncationNone)
+	registerAspect("websocket", noArgs(pageops.PageWebSocket), truncationNone)
+	registerAspect("dialogs", noArgs(pageops.PageDialogs), truncationNone)
+	registerAspect("article", noArgs(pageops.PageArticle), truncationNone)
+	registerAspect("tables", noArgs(pageops.PageTables), truncationNone)
+	registerAspect("forms", noArgs(pageops.PageForms), truncationNone)
+	registerAspect("marks", noArgs(pageops.PageMarks), truncationNone)
+	registerAspect("security", noArgs(pageops.PageSecurity), truncationNone)
+	registerAspect("sinks", withArg(pageops.PageSinksFiltered, filter), truncationNone)
+	registerAspect("postmessage", withArg(pageops.PagePostMessage, target), truncationNone)
+	registerAspect("storage", withArg(pageops.PageStorage, func(a pageFetchArgs) bool { return a.IncludeValues }), truncationNone)
 	registerAspect("har", func(ctx context.Context, p *browsers.Page, _ pageFetchArgs) (string, error) {
 		return pageops.PageHAR(ctx, p, 0)
 	}, truncationNone)
