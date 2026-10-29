@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/dakolli/webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/config"
 	"github.com/dakolli/webmcp/pkg/mcp/models"
 )
 
@@ -77,7 +78,10 @@ func (t *BrowserCreate) Description() string {
 		"Example: { \"owner\": \"scraper-a\" } and { \"owner\": \"scraper-b\" } get two browsers; " +
 		"{ \"persist\": true, \"profile\": \"audit\" } keeps a profile; " +
 		"{ \"headers\": {\"X-Bug-Bounty\":\"me\"}, \"scope\": [\"example.com\", \"*.iana.org\"], " +
-		"\"rps\": 2, \"burst\": 4 } confines navigation and spaces requests." + resultEnvelopeDoc
+		"\"rps\": 2, \"burst\": 4 } confines navigation and spaces requests. " +
+		"Chromium switches: pass chromium_args to append switches for this browser only, e.g. " +
+		"[\"--disable-gpu\"], on top of the built-in quiet set and [browser] chromium_flags." +
+		resultEnvelopeDoc
 }
 
 // InputSchema returns the JSON Schema for browser_create's arguments: optional
@@ -156,27 +160,33 @@ func (t *BrowserCreate) InputSchema() models.InputSchema {
 					"Different owners with identical options get separate browsers; the same owner with the same options reuses one. " +
 					"Defaults to the session identity, else 'unowned'.",
 			},
+			"chromium_args": map[string]any{
+				"type":        "array",
+				"items":       map[string]any{"type": "string"},
+				"description": "Extra Chromium command-line switches for this browser only, for example [\"--disable-gpu\"]. Each must start with '--'. They are appended to the built-in quiet set and [browser] chromium_flags, deduplicated first-wins, and join the create key.",
+			},
 		},
 	}
 }
 
 // browserCreateArgs is the strict decoding target for browser_create arguments.
 type browserCreateArgs struct {
-	Bin         string            `json:"bin,omitempty"`
-	Profile     string            `json:"profile,omitempty"`
-	Position    string            `json:"position,omitempty"`
-	Proxy       string            `json:"proxy,omitempty"`
-	ProxyBypass string            `json:"proxy_bypass,omitempty"`
-	Owner       string            `json:"owner,omitempty"`
-	Headless    *bool             `json:"headless,omitempty"`
-	Stealth     *bool             `json:"stealth,omitempty"`
-	Persist     *bool             `json:"persist,omitempty"`
-	IgnoreCerts *bool             `json:"ignore_certs,omitempty"`
-	ScopeStrict *bool             `json:"scope_strict,omitempty"`
-	Headers     map[string]string `json:"headers,omitempty"`
-	Scope       []string          `json:"scope,omitempty"`
-	RPS         *float64          `json:"rps,omitempty"`
-	Burst       *int              `json:"burst,omitempty"`
+	Bin          string            `json:"bin,omitempty"`
+	Profile      string            `json:"profile,omitempty"`
+	Position     string            `json:"position,omitempty"`
+	Proxy        string            `json:"proxy,omitempty"`
+	ProxyBypass  string            `json:"proxy_bypass,omitempty"`
+	Owner        string            `json:"owner,omitempty"`
+	Headless     *bool             `json:"headless,omitempty"`
+	Stealth      *bool             `json:"stealth,omitempty"`
+	Persist      *bool             `json:"persist,omitempty"`
+	IgnoreCerts  *bool             `json:"ignore_certs,omitempty"`
+	ScopeStrict  *bool             `json:"scope_strict,omitempty"`
+	Headers      map[string]string `json:"headers,omitempty"`
+	Scope        []string          `json:"scope,omitempty"`
+	ChromiumArgs []string          `json:"chromium_args,omitempty"`
+	RPS          *float64          `json:"rps,omitempty"`
+	Burst        *int              `json:"burst,omitempty"`
 }
 
 // Execute parses options and creates a new distinct Browser via Manager.CreateBrowser.
@@ -221,6 +231,13 @@ func (t *BrowserCreate) Execute(ctx context.Context, args json.RawMessage) (stri
 	}
 	if len(a.Scope) > 0 {
 		opts = append(opts, browsers.WithScope(a.Scope))
+	}
+	if len(a.ChromiumArgs) > 0 {
+		browser, err := config.ResolveBrowser(a.ChromiumArgs)
+		if err != nil {
+			return failResult(fmt.Errorf("browser_create: %w", err))
+		}
+		opts = append(opts, browsers.WithChromiumFlags(browser.ChromiumFlags))
 	}
 	if a.ScopeStrict != nil {
 		opts = append(opts, browsers.WithScopeStrict(*a.ScopeStrict))

@@ -3,7 +3,10 @@ package browsers
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
+
+	"github.com/go-rod/rod/lib/launcher"
 )
 
 // TestPageSnapshotsNeverMixTwoPages pins the atomic listing read: each row's URL
@@ -86,5 +89,37 @@ func TestPageSnapshotStaleDropsTitle(t *testing.T) {
 	}
 	if info.URL != "https://old.test/" || info.Title != "" {
 		t.Fatalf("pair = (%q, %q), want the stored URL with no title", info.URL, info.Title)
+	}
+}
+
+// TestApplyChromiumFlags proves each accepted switch reaches the launcher as
+// the exact argument form: a bare switch with no value, a value switch split at
+// the first "=".
+func TestApplyChromiumFlags(t *testing.T) {
+	l := launcher.New()
+	if err := applyChromiumFlags(l, []string{
+		"--disable-gpu",
+		"--disable-features=OptimizationHints,MediaRouter,Translate",
+		"--lang=en-GB",
+	}); err != nil {
+		t.Fatalf("applyChromiumFlags: %v", err)
+	}
+	args := l.FormatArgs()
+	for _, want := range []string{
+		"--disable-gpu",
+		"--disable-features=OptimizationHints,MediaRouter,Translate",
+		"--lang=en-GB",
+	} {
+		if !slices.Contains(args, want) {
+			t.Errorf("launcher args missing %q: %v", want, args)
+		}
+	}
+}
+
+func TestApplyChromiumFlagsRejectsBareName(t *testing.T) {
+	err := applyChromiumFlags(launcher.New(), []string{"disable-gpu"})
+	want := `browsers: chromium flag "disable-gpu" must start with --`
+	if err == nil || err.Error() != want {
+		t.Fatalf("err = %v, want %q", err, want)
 	}
 }

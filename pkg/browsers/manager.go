@@ -236,6 +236,13 @@ func WithIgnoreCerts(ignore bool) Option {
 	return func(m *Manager) { m.ignoreCerts = ignore }
 }
 
+// WithChromiumFlags sets the extra Chromium command-line switches passed to
+// every browser this manager launches, including a relaunch after a crash. The
+// slice is copied, so the caller may reuse or mutate its own.
+func WithChromiumFlags(switches []string) Option {
+	return func(m *Manager) { m.chromiumFlags = append([]string(nil), switches...) }
+}
+
 // WithExtraHeaders sets request headers sent with every request from every page
 // of a browser created with this option, the first navigation included. The map
 // is copied, so the caller may reuse or mutate its own.
@@ -439,6 +446,9 @@ type Manager struct {
 	proxyBypass string
 	// ignoreCerts makes Chromium accept invalid TLS certificates by default.
 	ignoreCerts bool
+	// chromiumFlags are extra Chromium command-line switches passed to every
+	// browser this manager launches.
+	chromiumFlags []string
 	// extraHeaders are the default request headers for created browsers.
 	extraHeaders map[string]string
 	// scope is the default navigation allowlist for created browsers.
@@ -568,11 +578,17 @@ type launchKey struct {
 	Proxy       string
 	ProxyBypass string
 	IgnoreCerts bool
+	Flags       string
 	Headers     string
 	Scope       string
 	ScopeStrict bool
 	RateRPS     float64
 	RateBurst   int
+}
+
+// canonicalFlags renders the ordered switch list for launch-key comparison.
+func canonicalFlags(switches []string) string {
+	return strings.Join(switches, "\x00")
 }
 
 // launchKeyOf builds the canonical launch key from a manager's launch fields.
@@ -589,6 +605,7 @@ func launchKeyOf(owner string, m *Manager) launchKey {
 		Proxy:       m.proxy,
 		ProxyBypass: m.proxyBypass,
 		IgnoreCerts: m.ignoreCerts,
+		Flags:       canonicalFlags(m.chromiumFlags),
 		Headers:     canonicalHeaders(m.extraHeaders),
 		Scope:       canonicalScope(m.scope),
 		ScopeStrict: m.scopeStrict,
@@ -727,21 +744,22 @@ func (m *Manager) createOptions(opts []Option) (*Manager, string, bool, error) {
 		return nil, "", false, errManagerShutdown
 	}
 	effective := &Manager{
-		headless:     m.headless,
-		stealth:      m.stealth,
-		binPath:      m.binPath,
-		profileName:  m.profileName,
-		position:     m.position,
-		proxy:        m.proxy,
-		proxyBypass:  m.proxyBypass,
-		ignoreCerts:  m.ignoreCerts,
-		extraHeaders: cloneHeaders(m.extraHeaders),
-		scope:        append([]string(nil), m.scope...),
-		scopeStrict:  m.scopeStrict,
-		rateLimit:    m.rateLimit,
-		owner:        m.owner,
-		browserTTL:   m.browserTTL,
-		rawActions:   m.rawActions,
+		headless:      m.headless,
+		stealth:       m.stealth,
+		binPath:       m.binPath,
+		profileName:   m.profileName,
+		position:      m.position,
+		proxy:         m.proxy,
+		proxyBypass:   m.proxyBypass,
+		ignoreCerts:   m.ignoreCerts,
+		chromiumFlags: append([]string(nil), m.chromiumFlags...),
+		extraHeaders:  cloneHeaders(m.extraHeaders),
+		scope:         append([]string(nil), m.scope...),
+		scopeStrict:   m.scopeStrict,
+		rateLimit:     m.rateLimit,
+		owner:         m.owner,
+		browserTTL:    m.browserTTL,
+		rawActions:    m.rawActions,
 	}
 	defaultProfileDir := m.profileDir
 	defaultPersist := m.persist
@@ -838,6 +856,7 @@ func (m *Manager) launchCreatedBrowser(
 	b.proxy = effective.proxy
 	b.proxyBypass = effective.proxyBypass
 	b.ignoreCerts = effective.ignoreCerts
+	b.chromiumFlags = append([]string(nil), effective.chromiumFlags...)
 	b.extraHeaders = cloneHeaders(effective.extraHeaders)
 	b.scope = append([]string(nil), effective.scope...)
 	b.scopeStrict = effective.scopeStrict
@@ -1000,6 +1019,7 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 	proxy := m.proxy
 	proxyBypass := m.proxyBypass
 	ignoreCerts := m.ignoreCerts
+	chromiumFlags := append([]string(nil), m.chromiumFlags...)
 	extraHeaders := cloneHeaders(m.extraHeaders)
 	scope := append([]string(nil), m.scope...)
 	scopeStrict := m.scopeStrict
@@ -1010,18 +1030,19 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 
 	// Mirrors a bare CreateBrowser request so both paths share one launch key.
 	key := launchKeyOf(owner, &Manager{
-		binPath:      binPath,
-		profileName:  "",
-		headless:     headless,
-		stealth:      stealth,
-		position:     position,
-		proxy:        proxy,
-		proxyBypass:  proxyBypass,
-		ignoreCerts:  ignoreCerts,
-		extraHeaders: extraHeaders,
-		scope:        scope,
-		scopeStrict:  scopeStrict,
-		rateLimit:    rateLimit,
+		binPath:       binPath,
+		profileName:   "",
+		headless:      headless,
+		stealth:       stealth,
+		position:      position,
+		proxy:         proxy,
+		proxyBypass:   proxyBypass,
+		ignoreCerts:   ignoreCerts,
+		chromiumFlags: chromiumFlags,
+		extraHeaders:  extraHeaders,
+		scope:         scope,
+		scopeStrict:   scopeStrict,
+		rateLimit:     rateLimit,
 	})
 
 	if proxy != "" {
@@ -1058,6 +1079,7 @@ func (m *Manager) OpenBrowser(ctx context.Context, id BrowserID) (*Browser, erro
 	b.proxy = proxy
 	b.proxyBypass = proxyBypass
 	b.ignoreCerts = ignoreCerts
+	b.chromiumFlags = chromiumFlags
 	b.extraHeaders = extraHeaders
 	b.scope = scope
 	b.scopeStrict = scopeStrict

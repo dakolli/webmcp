@@ -1,0 +1,34 @@
+# web-mcp configuration.
+# Copy this file to ~/.config/browser-mcp/webmcp.toml and set mode 0600.
+# The binary never overwrites an existing file. `browser config init` writes a
+# minimal version when none exists.
+
+[caido]
+# Set enabled = true to register the caido_search MCP tool.
+# The tool reads recorded proxy history. It never starts Caido.
+enabled = false
+# Caido personal access token. Create one at https://dashboard.caido.io/developer
+# Leave empty to use guest access when the instance allows it.
+# A token on the command line overrides this file:
+#   browser serve mcp --caido --caido-pat caido_...
+pat = ""
+# Caido GraphQL endpoint. The UI listens on 8080, the proxy on 8081.
+url = "http://127.0.0.1:8080/graphql"
+
+[browser]
+# Extra Chromium command-line switches, passed to every browser this process
+# starts, including `browser serve` daemon browsers and `browser_create`.
+# These switches apply in addition to the built-in quiet set below.
+chromium_flags = [
+  "--disable-background-networking",
+  "--disable-component-update",
+  "--disable-domain-reliability",
+  "--disable-client-side-phishing-detection",
+  "--safebrowsing-disable-auto-update",
+  "--no-pings",
+  "--disable-sync",
+  "--disable-breakpad",
+  "--no-first-run",
+  "--no-default-browser-check",
+  "--disable-features=OptimizationHints,MediaRouter,Translate",
+]

@@ -33,6 +33,7 @@ All inputs are optional. The schema declares no required field. Source: `code://
 | `rps` | number | no | `5` | Per-host sustained request rate in requests per second. Must be finite and greater than 0. Every engine-issued request waits for a token. |
 | `burst` | integer | no | `10` | Per-host token bucket depth: how many requests may leave at once before the `rps` pace applies. Must be at least 1. |
 | `owner` | string | no | session identity, else `unowned` | Owner label of 1 to 64 characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, and `-`. It joins the create key. |
+| `chromium_args` | array of strings | no | empty | Extra Chromium command-line switches for this browser only, for example `["--disable-gpu"]`. Each must start with `--`; a value switch uses `--name=value`. They are appended to the built-in quiet set and `[browser] chromium_flags`, deduplicated first-wins, and join the create key. |
 
 String-encoded arguments are accepted: the registry rewrites `"scope":"[\"wikipedia.org\"]"` into the array and `"true"` into the boolean before the call runs. Source: `code://pkg/mcp/tools/registry.go#L189-L264`.
 
@@ -59,7 +60,7 @@ One line of compact JSON with eight fields. Source: `code://pkg/mcp/tools/browse
 
 ## Behavior and limits
 
-**The create key is owner plus every launch option, including headers and scope.** The key holds `owner`, `bin`, `profile`, `persist`, `headless`, `stealth`, `position`, `proxy`, `proxy_bypass`, `ignore_certs`, `headers`, `scope`, `scope_strict`, `rps`, and `burst`. A different owner plus a different scope is therefore a different browser. Scope and header identity is canonical: allowlist order, duplicates and blank entries are ignored, and headers compare as sorted `name=value`. Source: `code://pkg/browsers/manager.go#L447-L482`.
+**The create key is owner plus every launch option, including headers, scope and Chromium switches.** The key holds `owner`, `bin`, `profile`, `persist`, `headless`, `stealth`, `position`, `proxy`, `proxy_bypass`, `ignore_certs`, `chromium_args`, `headers`, `scope`, `scope_strict`, `rps`, and `burst`. A different owner plus a different scope is therefore a different browser. Scope and header identity is canonical: allowlist order, duplicates and blank entries are ignored, and headers compare as sorted `name=value`. Source: `code://pkg/browsers/manager.go#L447-L482`.
 
 **Owner joins the key but does not authorize.** `browser_close` works by id and never checks the owner. Source: `code://pkg/browsers/manager.go#L128-L140`.
 

@@ -15,6 +15,7 @@ import (
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
+	"github.com/go-rod/rod/lib/launcher/flags"
 	"github.com/go-rod/rod/lib/proto"
 	"github.com/go-rod/stealth"
 )
@@ -131,6 +132,9 @@ type Browser struct {
 	// ignoreCerts makes Chromium accept invalid TLS certificates (e.g. the
 	// MITM CA of an intercept proxy).
 	ignoreCerts bool
+	// chromiumFlags are the extra Chromium command-line switches applied at
+	// launch. Immutable after creation; copied for identity clones.
+	chromiumFlags []string
 	// extraHeaders are sent with every request from every page of this browser,
 	// first navigation included. Immutable after creation.
 	extraHeaders map[string]string
@@ -395,6 +399,7 @@ func (b *Browser) newIdentity(name string, clone *rod.Browser) *Browser {
 		proxy:          b.proxy,
 		proxyBypass:    b.proxyBypass,
 		ignoreCerts:    b.ignoreCerts,
+		chromiumFlags:  append([]string(nil), b.chromiumFlags...),
 		extraHeaders:   cloneHeaders(b.extraHeaders),
 		scope:          append([]string(nil), b.scope...),
 		scopeStrict:    b.scopeStrict,
@@ -584,6 +589,9 @@ func (b *Browser) Launch(ctx context.Context) error {
 	l.Set("disable-infobars")                               // suppress warning infobars
 	l.Set("no-default-browser-check")                       // suppress "Chromium isn't your default browser" prompt
 	l.Set("lang", defaultLanguage)
+	if err := applyChromiumFlags(l, b.chromiumFlags); err != nil {
+		return err
+	}
 	if b.proxy != "" {
 		server, host, err := parseProxy(b.proxy)
 		if err != nil {
@@ -1398,4 +1406,42 @@ func (b *Browser) Close(ctx context.Context) error {
 		return identityErr
 	}
 	return closeErr
+}
+
+// applyChromiumFlags sets each configured switch on the launcher. A switch
+// carrying an "=" passes its value to Set; a bare switch passes none.
+func applyChromiumFlags(l *launcher.Launcher, switches []string) error {
+	for _, switchValue := range switches {
+		name, value, hasValue, err := parseChromiumFlag(switchValue)
+		if err != nil {
+			return err
+		}
+		if hasValue {
+			l.Set(flags.Flag(name), value)
+			continue
+		}
+		l.Set(flags.Flag(name))
+	}
+	return nil
+}
+
+// parseChromiumFlag splits a "--name" or "--name=value" switch into the
+// launcher name and its optional value. A switch without the "--" prefix is
+// rejected so a typo surfaces at launch instead of being silently ignored.
+func parseChromiumFlag(switchValue string) (name, value string, hasValue bool, err error) {
+	if !strings.HasPrefix(switchValue, "--") {
+		return "", "", false, fmt.Errorf("browsers: chromium flag %q must start with --", switchValue)
+	}
+	body := strings.TrimPrefix(switchValue, "--")
+	if body == "" {
+		return "", "", false, fmt.Errorf("browsers: chromium flag %q must start with --", switchValue)
+	}
+	if idx := strings.IndexByte(body, '='); idx >= 0 {
+		name = body[:idx]
+		if name == "" {
+			return "", "", false, fmt.Errorf("browsers: chromium flag %q must start with --", switchValue)
+		}
+		return name, body[idx+1:], true, nil
+	}
+	return body, "", false, nil
 }
