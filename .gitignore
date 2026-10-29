@@ -10,6 +10,11 @@ lane-planning.md
 /_examples
 /.release/
 smoketest.md
+/caido.toml
+/caido.crt
+/caido.crt.pem
+/ca.crt
+/ca.pem
 /docs
 # Browser profile runtime artifacts (profiles launched into the workspace root)
 /brave

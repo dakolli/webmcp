@@ -31,6 +31,9 @@ type serveRunOptions struct {
 	bin string
 	// profile specifies a custom profile name (brave, chrome, firefox, default) or directory path.
 	profile string
+	// chromiumFlags is the resolved Chromium switch list applied to every
+	// browser the manager launches.
+	chromiumFlags []string
 	// socket is the IPC socket path to bind ("" → ipc.DefaultSocketPath()).
 	socket string
 	// mcpPort is the HTTP port for the in-process MCP server; 0 disables the
@@ -44,11 +47,12 @@ type serveRunOptions struct {
 // serveFlags holds the serve-tree flags, defined once on the `serve` parent as
 // persistent flags so the `serve mcp` subcommand inherits them.
 type serveFlags struct {
-	headless   bool
-	stealth    bool
-	bin        string
-	profile    string
-	foreground bool
+	headless     bool
+	stealth      bool
+	bin          string
+	profile      string
+	foreground   bool
+	chromiumArgs []string
 }
 
 // serveFlagsVar is the package-level storage the serve-tree persistent flags
@@ -114,12 +118,17 @@ Subcommands:
 			if err != nil {
 				return fmt.Errorf("serve: %w", err)
 			}
+			browser, err := config.ResolveBrowser(flags.chromiumArgs)
+			if err != nil {
+				return fmt.Errorf("serve: %w", err)
+			}
 			opts := serveRunOptions{
-				headless: flags.headless,
-				stealth:  flags.stealth,
-				bin:      flags.bin,
-				profile:  flags.profile,
-				socket:   path,
+				headless:      flags.headless,
+				stealth:       flags.stealth,
+				bin:           flags.bin,
+				profile:       flags.profile,
+				chromiumFlags: browser.ChromiumFlags,
+				socket:        path,
 			}
 			if flags.foreground {
 				return runServeForeground(cmdCtx(cmd), opts)
@@ -133,6 +142,7 @@ Subcommands:
 				"--profile=" + flags.profile,
 				"--socket=" + path,
 			}
+			childArgs = appendChromiumArgs(childArgs, browser.ChromiumFlags)
 			if err := daemonizeServe(cmd, opts, childArgs); err != nil {
 				return fmt.Errorf("serve: %w", err)
 			}
@@ -150,6 +160,8 @@ Subcommands:
 		"optional browser user profile name (brave, chrome, firefox, default) or custom directory path")
 	serveCmd.PersistentFlags().BoolVar(&serveFlagsVar.foreground, "foreground", false,
 		"run in the foreground instead of daemonizing (Ctrl-C stops it)")
+	serveCmd.PersistentFlags().StringArrayVar(&serveFlagsVar.chromiumArgs, "chromium-arg", nil,
+		"extra Chromium switch passed to every browser, for example --chromium-arg=--disable-gpu (repeatable; appended to [browser] chromium_flags)")
 
 	serveCmd.AddCommand(NewServeStopCmd(), NewServeMcpCmd())
 	return serveCmd
@@ -176,7 +188,19 @@ func serveFlagsFromCmd(cmd *cobra.Command) (serveFlags, error) {
 	if f.foreground, err = cmd.Flags().GetBool("foreground"); err != nil {
 		return f, fmt.Errorf("read --foreground: %w", err)
 	}
+	if f.chromiumArgs, err = cmd.Flags().GetStringArray("chromium-arg"); err != nil {
+		return f, fmt.Errorf("read --chromium-arg: %w", err)
+	}
 	return f, nil
+}
+
+// appendChromiumArgs appends one --chromium-arg per resolved switch so the
+// daemon child launches with the same switches as its caller.
+func appendChromiumArgs(args, switches []string) []string {
+	for _, switchValue := range switches {
+		args = append(args, "--chromium-arg="+switchValue)
+	}
+	return args
 }
 
 // NewServeStopCmd builds `serve stop`: it probes the IPC socket, sends the
@@ -240,6 +264,8 @@ exits 0) when no serve daemon is running.`,
 func NewServeMcpCmd() *cobra.Command {
 	var port int
 	var bind string
+	var caidoOn bool
+	var caidoPAT string
 	mcpCmd := &cobra.Command{
 		Use:   "mcp",
 		Short: "Serve the browser over IPC and MCP (HTTP/SSE) from one daemon",
@@ -261,6 +287,20 @@ Pass --bind 0.0.0.0 to expose it to the network.
 			if err != nil {
 				return fmt.Errorf("serve mcp: %w", err)
 			}
+			caido, err := config.ResolveCaido(caidoOn, caidoPAT)
+			if err != nil {
+				return fmt.Errorf("serve mcp: %w", err)
+			}
+			config.SetActiveCaido(caido)
+			if caidoPAT != "" {
+				if err := os.Setenv("CAIDO_PAT", caidoPAT); err != nil {
+					return fmt.Errorf("serve mcp: pass token to daemon: %w", err)
+				}
+			}
+			browser, err := config.ResolveBrowser(flags.chromiumArgs)
+			if err != nil {
+				return fmt.Errorf("serve mcp: %w", err)
+			}
 			path, err := socketPath(cmd)
 			if err != nil {
 				return fmt.Errorf("serve mcp: %w", err)
@@ -270,13 +310,14 @@ Pass --bind 0.0.0.0 to expose it to the network.
 				return fmt.Errorf("serve mcp: %w", err)
 			}
 			opts := serveRunOptions{
-				headless: flags.headless,
-				stealth:  flags.stealth,
-				bin:      flags.bin,
-				profile:  flags.profile,
-				socket:   path,
-				mcpPort:  port,
-				mcpAddr:  addr,
+				headless:      flags.headless,
+				stealth:       flags.stealth,
+				bin:           flags.bin,
+				profile:       flags.profile,
+				chromiumFlags: browser.ChromiumFlags,
+				socket:        path,
+				mcpPort:       port,
+				mcpAddr:       addr,
 			}
 			if flags.foreground {
 				return runServeForeground(cmdCtx(cmd), opts)
@@ -286,12 +327,14 @@ Pass --bind 0.0.0.0 to expose it to the network.
 				"--foreground",
 				"--port=" + strconv.Itoa(port),
 				"--bind=" + bind,
+				"--caido=" + strconv.FormatBool(caidoOn),
 				"--headless=" + strconv.FormatBool(flags.headless),
 				"--stealth=" + strconv.FormatBool(flags.stealth),
 				"--bin=" + flags.bin,
 				"--profile=" + flags.profile,
 				"--socket=" + path,
 			}
+			childArgs = appendChromiumArgs(childArgs, browser.ChromiumFlags)
 			if err := daemonizeServe(cmd, opts, childArgs); err != nil {
 				return fmt.Errorf("serve mcp: %w", err)
 			}
@@ -302,6 +345,10 @@ Pass --bind 0.0.0.0 to expose it to the network.
 		fmt.Sprintf("HTTP port for the MCP/SSE server (default %d)", defaultServeMcpPort))
 	mcpCmd.Flags().StringVar(&bind, "bind", mcpServer.DefaultBind,
 		"host/interface for the MCP/SSE server (default 127.0.0.1; 0.0.0.0 exposes it to the network)")
+	mcpCmd.Flags().BoolVar(&caidoOn, "caido", false,
+		"force-enable the Caido tool even when webmcp.toml sets enabled = false")
+	mcpCmd.Flags().StringVar(&caidoPAT, "caido-pat", "",
+		"Caido personal access token; overrides CAIDO_PAT and webmcp.toml")
 	return mcpCmd
 }
 
@@ -473,6 +520,7 @@ func runServeForeground(ctx context.Context, opts serveRunOptions) error {
 		browsers.WithHeadless(opts.headless),
 		browsers.WithStealth(opts.stealth),
 		browsers.WithBin(opts.bin),
+		browsers.WithChromiumFlags(opts.chromiumFlags),
 		browsers.WithPersistentDefault(!agentPool),
 		browsers.WithLogger(logger),
 	}

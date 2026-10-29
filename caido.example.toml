@@ -1,0 +1,8 @@
+# Local Caido dev config. Copy to caido.toml, which git ignores.
+# make caido reads this file and passes the values to caido-cli.
+
+ui = "127.0.0.1:8080"
+proxy = "127.0.0.1:8081"
+data_path = "~/.config/browser-mcp/caido"
+allow_guests = true
+open_browser = true

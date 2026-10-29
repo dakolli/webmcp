@@ -17,6 +17,7 @@ import (
 
 	"github.com/dakolli/webmcp/pkg/browsers"
 	"github.com/dakolli/webmcp/pkg/cli/ipc"
+	"github.com/dakolli/webmcp/pkg/config"
 )
 
 // singleBrowserID is the id reported for the manager's one Browser, mirroring
@@ -122,6 +123,7 @@ browser_list and browser_close tools.`,
 		NewServeStopCmd(),
 		NewSkillCmd(),
 		NewMcpCmd(),
+		NewConfigCmd(),
 	)
 	return root
 }
@@ -465,7 +467,7 @@ func printBrowserEntries(w io.Writer, entries []ipc.BrowserEntry) {
 // (--rps/--burst).
 func NewBrowserCreateCmd(mgr *browsers.Manager) *cobra.Command {
 	var bin, profile, position, proxy, proxyBypass, owner string
-	var headers, scope []string
+	var headers, scope, chromiumArgs []string
 	var persist, ignoreCerts, headless, scopeStrict bool
 	var rps float64
 	var burst int
@@ -510,14 +512,19 @@ subresources: an out-of-scope request is refused before it is sent.
 --rps and --burst set the per-host request budget. --rps is the sustained
 requests per second (default 5) and --burst is the token bucket depth (default
 10). Every engine-issued request waits for a token; a request whose deadline
-cannot fit the wait fails as a timeout naming the host and the remaining wait.`,
+cannot fit the wait fails as a timeout naming the host and the remaining wait.
+
+--chromium-arg SWITCH (repeatable) adds a Chromium command-line switch to this
+browser, appended to the built-in quiet set and [browser] chromium_flags from
+webmcp.toml. Pass --chromium-arg=--disable-gpu or --chromium-arg --disable-gpu.`,
 		Example: `  browser create --owner scraper-a
   browser create --headless
   browser create --persist --profile audit
   browser create --proxy http://127.0.0.1:8080 --ignore-certs
   browser create --proxy 127.0.0.1:8080 --proxy-bypass localhost,*.internal
   browser create --header X-Bug-Bounty=me --scope example.com --scope '*.iana.org'
-  browser create --scope example.com --rps 2 --burst 4`,
+  browser create --scope example.com --rps 2 --burst 4
+  browser create --chromium-arg=--disable-gpu`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx, cancel := context.WithTimeout(cmdCtx(cmd), 30*time.Second)
 			defer cancel()
@@ -530,6 +537,10 @@ cannot fit the wait fails as a timeout naming the host and the remaining wait.`,
 				ctx = browsers.WithExplicitOwner(ctx, owner)
 			}
 			headerMap, err := parseHeaderFlags(headers)
+			if err != nil {
+				return fmt.Errorf("browser create: %w", err)
+			}
+			browser, err := config.ResolveBrowser(chromiumArgs)
 			if err != nil {
 				return fmt.Errorf("browser create: %w", err)
 			}
@@ -603,6 +614,7 @@ cannot fit the wait fails as a timeout naming the host and the remaining wait.`,
 			if len(headerMap) > 0 {
 				opts = append(opts, browsers.WithExtraHeaders(headerMap))
 			}
+			opts = append(opts, browsers.WithChromiumFlags(browser.ChromiumFlags))
 			if len(scope) > 0 {
 				opts = append(opts, browsers.WithScope(scope))
 			}
@@ -665,6 +677,7 @@ cannot fit the wait fails as a timeout naming the host and the remaining wait.`,
 	cmd.Flags().BoolVar(&scopeStrict, "scope-strict", false, "deny every request when --scope is empty")
 	cmd.Flags().Float64Var(&rps, "rps", browsers.DefaultRateRPS, "per-host sustained request rate in requests per second (default 5)")
 	cmd.Flags().IntVar(&burst, "burst", browsers.DefaultRateBurst, "per-host token bucket depth, i.e. requests allowed at once before the rps pace applies (default 10)")
+	cmd.Flags().StringArrayVar(&chromiumArgs, "chromium-arg", nil, "extra Chromium switch, e.g. --chromium-arg=--disable-gpu (repeatable; appended to the resolved [browser] set)")
 	return cmd
 }
 

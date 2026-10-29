@@ -11,6 +11,8 @@
 #               when nothing listens on PORT)
 # launch      — stop any running serve daemon, then start the MCP/SSE server
 #               daemonized on PORT (default 4089)
+# caido       — local dev aid: start the headless Caido server from ./caido.toml
+#               with separate UI and proxy listeners.
 # version     — print the latest release tag and the next patch/minor/major
 # notes       — group the commits since the last tag (or the whole history when
 #               there is none) into .release/notes.md
@@ -20,7 +22,7 @@
 # release     — build a DRAFT GitHub release; never pushes, never publishes
 # tools       — print the install commands for goreleaser and git-cliff
 
-.PHONY: test install install-dev schema launch stop guard-config \
+.PHONY: test install install-dev schema launch caido stop guard-config \
 	version notes changelog release-dry bump release tools
 
 # PORT is the shared MCP/SSE port for launch and the install-dev relaunch.
@@ -34,6 +36,10 @@ PART ?= patch
 # in that recipe is quoted and the recipe refuses to run when the directory is
 # unset or outside $HOME.
 CONFIG_DIR ?= $(HOME)/.config/browser-mcp
+
+# The Caido dev config path is the single source of truth; copy
+# caido.example.toml to this path, which git ignores.
+CAIDO_TOML ?= caido.toml
 
 # stop — stop any running browser serve daemon, tolerantly: no daemon running
 # (or browser not yet on PATH) must never abort install/launch, so the
@@ -91,6 +97,36 @@ install-dev: guard-config stop
 launch: stop
 	browser serve mcp --port "$(PORT)"
 	@echo "MCP SSE endpoint is at http://127.0.0.1:$(PORT)/sse"
+
+# caido — local dev aid for a machine that already has caido-cli. Reads the
+# single gitignored caido.toml and passes its addresses to the server. No
+# install step runs.
+caido:
+	@set -eu; \
+	cfg="$(CAIDO_TOML)"; \
+	if ! command -v caido-cli >/dev/null 2>&1; then \
+		echo "caido-cli: not on PATH" >&2; \
+		exit 1; \
+	fi; \
+	if [ ! -f "$$cfg" ]; then \
+		echo "caido: $$cfg missing — copy caido.example.toml" >&2; \
+		exit 1; \
+	fi; \
+	ui=$$(sed -n 's/^ui *= *"\(.*\)"/\1/p' "$$cfg"); \
+	proxy=$$(sed -n 's/^proxy *= *"\(.*\)"/\1/p' "$$cfg"); \
+	data_path=$$(sed -n 's/^data_path *= *"\(.*\)"/\1/p' "$$cfg"); \
+	allow_guests=$$(sed -n 's/^allow_guests *= *\(.*\)/\1/p' "$$cfg"); \
+	open_browser=$$(sed -n 's/^open_browser *= *\(.*\)/\1/p' "$$cfg"); \
+	case "$$data_path" in \
+		"~"/*) data_path="$(HOME)$${data_path#\~}" ;; \
+	esac; \
+	mkdir -p "$$data_path"; \
+	echo "ui   http://$$ui"; \
+	echo "proxy browser_create {\"proxy\":\"$$proxy\",\"ignore_certs\":true}"; \
+	set -- --ui-listen "$$ui" --proxy-listen "$$proxy" --data-path "$$data_path"; \
+	if [ "$$allow_guests" = "true" ]; then set -- "$$@" --allow-guests; fi; \
+	if [ "$$open_browser" = "false" ]; then set -- "$$@" --no-open; fi; \
+	caido-cli "$$@"
 
 # fetch-example — download a file from go-rod into ./examples/
 # Usage: make fetch-example URL=https://github.com/go-rod/rod/blob/main/hijack_test.go
