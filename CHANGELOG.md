@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Added
+- Chromium switches are now configurable. `[browser] chromium_flags` in `webmcp.toml`, `browser create --chromium-arg`, and `browser_create.chromium_args` all add to one resolved list.
+- A built-in quiet set is on by default for `browser serve` and every created browser. It stops Brave and Chromium background traffic, component updates, sync, breakpad and first-run noise. `[browser] quiet = false` turns it off.
+- `browser config show` lists the resolved switches.
+- `caido_search` reads the recorded HTTP history of a local Caido instance: method, URL, status,
+  request and response headers and bodies, timing, and sizes. This is the half `page_fetch` cannot
+  show. It is registered only when `~/.config/browser-mcp/webmcp.toml` sets `[caido] enabled = true`.
+- Credentials are masked by default in headers, bodies and query strings. `raw: true` prints the
+  live values.
+- `browser config init|path|show` creates and inspects that file with mode 0600. `config show` prints
+  the token as `set` or `empty`, never the value.
+- `browser serve mcp --caido` and `--caido-pat` enable the tool and override the token, without
+  editing the file.
+- `.agents/skills/caido/` documents the tool for an agent.
+
 ## 0.2.5 - 2026-10-28
 
 ### Highlights

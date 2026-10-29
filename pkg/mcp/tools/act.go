@@ -131,7 +131,8 @@ func (t *Act) Description() string {
 		"{id, url_pattern, method, action, headers, rewrite_method, status, body, delay_ms} where " +
 		"action is block, allow, rewrite or fulfill, url_pattern is a wildcard glob like *api*, and " +
 		"a miss continues immediately; rewrite continues the request with headers, a non-empty body " +
-		"and rewrite_method, and the network ring records the method and headers as sent; interception " +
+		"and rewrite_method (method only filters the match and never changes the request), and the " +
+		"network ring records the method and headers as sent; interception " +
 		"is opt-in, changes page behaviour and disables the page HTTP cache while any rule is armed, so " +
 		"cached subresources still match; the page holds at most 50 rules across calls, so the cap is " +
 		"page-wide rather than per call; the result reports rules and the remaining budget), " +

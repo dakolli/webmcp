@@ -253,6 +253,25 @@ the default target, and `--max-bytes 0` for unbounded output.
 - `--scope HOST` bounds navigation, replay, and intercepted subresources to a host list.
 - `--proxy http://127.0.0.1:8080 --ignore-certs` sends traffic through Burp, Caido, or ZAP. Remote
   proxy credentials belong in `~/.config/browser-mcp/proxy.json` with mode `0600`, never in a flag.
+- Caido settings live in `~/.config/browser-mcp/webmcp.toml` (mode `0600`). `browser config init`
+  creates the file once and never overwrites it; `browser config path` prints its location and
+  `browser config show` reports the Caido settings and the resolved Chromium switches. On
+  `browser serve mcp`, `--caido-pat` overrides `CAIDO_PAT`, which overrides the file token, and
+  `--caido` forces the tool on.
+- Browser settings live in the same file under `[browser]`. `chromium_flags = ["--flag", …]` adds
+  Chromium switches to every browser this process starts, and `quiet = false` drops the built-in
+  quiet set that disables background telemetry, update and sync traffic (the default is on). Add a
+  one-off switch with `browser create --chromium-arg=--disable-gpu` or the MCP `chromium_args`.
+
+## Caido history
+
+`caido_search` reads recorded history from a Caido instance on the same host. The proxy listens on
+`127.0.0.1:8081`; the UI and GraphQL API listen on `127.0.0.1:8080`. Enable it in `webmcp.toml`
+(`enabled = true`). Guest access works when the instance allows it, and guest history lasts only
+while the instance runs. The tool never changes traffic. Credential-shaped header names and
+credential-shaped keys in JSON, form, and plain bodies come back as `<redacted>` unless `raw` is
+true. `count` is the rows returned and `total` is the whole matching history; `url` and `since` scan
+back at most 5 pages of 100 rows. `body_bytes: 0` returns headers with empty bodies.
 
 ## Licence
 

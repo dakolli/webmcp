@@ -91,7 +91,7 @@ func (t *Fetch) InputSchema() models.InputSchema {
 			},
 			"user_agent": map[string]any{
 				"type":        "string",
-				"description": "Optional User-Agent override for the session's page.",
+				"description": "Optional User-Agent override for the session's page. The default identity sends Accept-Language: en-US,en;q=0.9.",
 			},
 			"timeout_ms": map[string]any{
 				"type":        "integer",
