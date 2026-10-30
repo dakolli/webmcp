@@ -38,7 +38,7 @@ func (t *Fetch) Name() string {
 
 // Description returns a customer/LLM-facing description of fetch_page.
 func (t *Fetch) Description() string {
-	return models.FetchPageDescription
+	return FetchPageDescription
 }
 
 // InputSchema returns the JSON Schema for fetch_page's arguments: a required
@@ -219,7 +219,7 @@ func (p *FetchAndSummarizePrompt) Name() string { return "fetch_and_summarize" }
 
 // Description returns a description of the prompt template.
 func (p *FetchAndSummarizePrompt) Description() string {
-	return models.FetchAndSummarizePromptDescription
+	return FetchAndSummarizePromptDescription
 }
 
 // Arguments returns the parameter list accepted by the prompt template.

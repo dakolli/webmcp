@@ -54,7 +54,7 @@ func (t *BrowserCreate) Name() string {
 
 // Description returns a customer/LLM-facing description of browser_create.
 func (t *BrowserCreate) Description() string {
-	return models.BrowserCreateDescription
+	return BrowserCreateDescription
 }
 
 // InputSchema returns the JSON Schema for browser_create's arguments: optional
@@ -228,7 +228,7 @@ func (t *BrowserList) Name() string {
 
 // Description returns a customer/LLM-facing description of browser_list.
 func (t *BrowserList) Description() string {
-	return models.BrowserListDescription
+	return BrowserListDescription
 }
 
 // InputSchema returns the JSON Schema for browser_list's arguments: none.
@@ -325,7 +325,7 @@ func (t *BrowserClose) Name() string {
 
 // Description returns a customer/LLM-facing description of browser_close.
 func (t *BrowserClose) Description() string {
-	return models.BrowserCloseDescription
+	return BrowserCloseDescription
 }
 
 // InputSchema returns the JSON Schema for browser_close's arguments: an optional
@@ -403,7 +403,7 @@ func (t *PageList) Name() string {
 
 // Description returns a customer/LLM-facing description of page_list.
 func (t *PageList) Description() string {
-	return models.PageListDescription
+	return PageListDescription
 }
 
 // InputSchema returns the JSON Schema for page_list's arguments: a required
@@ -456,7 +456,7 @@ func (p *BrowserSetupAndEmulatePrompt) Name() string { return "browser_setup_and
 
 // Description returns a description of the prompt template.
 func (p *BrowserSetupAndEmulatePrompt) Description() string {
-	return models.BrowserSetupAndEmulatePromptDescription
+	return BrowserSetupAndEmulatePromptDescription
 }
 
 // Arguments returns the parameter list accepted by the prompt template.

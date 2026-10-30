@@ -71,7 +71,7 @@ const caidoSearchDescription = "Reads the Caido proxy history over GraphQL and r
 	"Example: {\"httpql\":\"req.host.eq:\\\"www.gnu.org\\\"\"} returns only that " +
 	"host. Example: {\"host\":\"www.gnu.org\",\"limit\":50} produces the same " +
 	"rows. Example: {\"scope_id\":\"*\",\"method\":\"POST\",\"status_gte\":400} " +
-	"searches every scope for POST errors." + models.ResultEnvelopeDoc
+	"searches every scope for POST errors." + ResultEnvelopeDoc
 
 // InputSchema returns the JSON Schema for caido_search's arguments.
 func (t *CaidoSearch) InputSchema() models.InputSchema {
@@ -232,7 +232,7 @@ const caidoStatusDescription = "Reports which Caido project, scopes, capture mod
 	`"selected":"webmcp","configured":"webmcp"},` +
 	`"scopes":[{"id":"1","name":"target","allowlist":[],"denylist":[],` +
 	`"matches":"all traffic","focus":true}],` +
-	`"capture":{"unfiltered":true},"history":1879}}` + models.ResultEnvelopeDoc
+	`"capture":{"unfiltered":true},"history":1879}}` + ResultEnvelopeDoc
 
 // CaidoStatus implements the "caido_status" tool: it reports the project,
 // scopes and capture settings that shape what caido_search can see.
@@ -306,7 +306,7 @@ const caidoSitemapDescription = "Lists the endpoints the Caido sitemap recorded 
 	"a shallow read is never mistaken for the whole host. " +
 	"Example: {\"host\":\"www.gnu.org\"} returns every endpoint shape on that host. " +
 	"If it returns nothing, call caido_status to confirm the project and scope, " +
-	"because a host outside the focus scope records no sitemap entry." + models.ResultEnvelopeDoc
+	"because a host outside the focus scope records no sitemap entry." + ResultEnvelopeDoc
 
 // CaidoSitemap implements the "caido_sitemap" tool: it reads a host's Caido
 // sitemap tree and returns the collapsed endpoint list.
@@ -429,7 +429,7 @@ const caidoFindingDescription = "Reads or creates Caido findings so a proven bug
 	"Example: {\"action\":\"create\",\"title\":\"IDOR on /api/orders\",\"request_id\":\"994\"," +
 	"\"notes\":\"User A reads user B's order\"}. " +
 	"If create returns an error, take request_id from a caido_search row; if list is empty, " +
-	"call caido_status to confirm the project." + models.ResultEnvelopeDoc
+	"call caido_status to confirm the project." + ResultEnvelopeDoc
 
 // CaidoFinding implements the "caido_finding" tool: it lists, reads and creates
 // findings that link a title and notes to one captured request.

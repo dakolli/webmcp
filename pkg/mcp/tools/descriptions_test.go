@@ -3,8 +3,6 @@ package tools
 import (
 	"strings"
 	"testing"
-
-	"github.com/dakolli/webmcp/pkg/mcp/models"
 )
 
 // TestEveryToolDescriptionCarriesEnvelopeDoc guards the moved description
@@ -18,7 +16,7 @@ func TestEveryToolDescriptionCarriesEnvelopeDoc(t *testing.T) {
 			t.Errorf("%s: empty description", tool.Name)
 			continue
 		}
-		if !strings.HasSuffix(tool.Description, models.ResultEnvelopeDoc) {
+		if !strings.HasSuffix(tool.Description, ResultEnvelopeDoc) {
 			t.Errorf("%s: description does not end with ResultEnvelopeDoc", tool.Name)
 		}
 	}

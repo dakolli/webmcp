@@ -31,30 +31,13 @@ func (t *SessionClose) Name() string {
 
 // Description returns a customer/LLM-facing description of session_close.
 func (t *SessionClose) Description() string {
-	return models.SessionCloseDescription
+	return SessionCloseDescription
 }
 
 // InputSchema returns the JSON Schema for session_close's arguments: a required
 // session_id.
 func (t *SessionClose) InputSchema() models.InputSchema {
-	return models.InputSchema{
-		Type: "object",
-		Properties: map[string]any{
-			"session_id": map[string]any{
-				"type":        "string",
-				"description": "The session_id returned by fetch_page for the session to close.",
-			},
-			"browser_id": map[string]any{
-				"type":        "string",
-				"description": "Optional browser_id to resolve the session inside that browser only (e.g. 'browser-2'). Use it when more than one browser is live; with exactly one live browser it may be omitted.",
-			},
-			"owner": map[string]any{
-				"type":        "string",
-				"description": "Optional owner label (1-64 chars: A-Z, a-z, 0-9, '.', '_', '-') restricting the lookup to browsers with that owner. A session held by another owner is not_found, never closed.",
-			},
-		},
-		Required: []string{"session_id"},
-	}
+	return newSessionCloseInputSchema()
 }
 
 // sessionCloseArgs is the strict decoding target for session_close arguments.
@@ -120,21 +103,13 @@ func (t *SessionList) Name() string {
 
 // Description returns a customer/LLM-facing description of session_list.
 func (t *SessionList) Description() string {
-	return models.SessionListDescription
+	return SessionListDescription
 }
 
 // InputSchema returns the JSON Schema for session_list's arguments: an optional
 // identity filter.
 func (t *SessionList) InputSchema() models.InputSchema {
-	return models.InputSchema{
-		Type: "object",
-		Properties: map[string]any{
-			"identity": map[string]any{
-				"type":        "string",
-				"description": "Optional incognito identity to list (e.g. 'victim', or 'default'). Must already exist; an unknown name reports the live identities and is not created.",
-			},
-		},
-	}
+	return newSessionListInputSchema()
 }
 
 // sessionListArgs is the strict decoding target for session_list arguments.
@@ -179,7 +154,7 @@ func (p *ManageSessionLifecyclePrompt) Name() string { return "manage_session_li
 
 // Description returns a description of the prompt template.
 func (p *ManageSessionLifecyclePrompt) Description() string {
-	return models.ManageSessionLifecyclePromptDescription
+	return ManageSessionLifecyclePromptDescription
 }
 
 // Arguments returns the parameter list accepted by the prompt template.

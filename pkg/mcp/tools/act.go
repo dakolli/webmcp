@@ -65,7 +65,7 @@ func (t *Act) Name() string {
 
 // Description returns a customer/LLM-facing description of page_act.
 func (t *Act) Description() string {
-	return models.PageActDescription
+	return PageActDescription
 }
 
 // InputSchema returns the JSON Schema for page_act's arguments.
@@ -407,7 +407,7 @@ func (p *FormSearchAndSubmitPrompt) Name() string { return "form_search_and_subm
 
 // Description returns a description of the prompt template.
 func (p *FormSearchAndSubmitPrompt) Description() string {
-	return models.FormSearchAndSubmitPromptDescription
+	return FormSearchAndSubmitPromptDescription
 }
 
 // Arguments returns the parameter list accepted by the prompt template.

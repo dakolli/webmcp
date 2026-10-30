@@ -14,6 +14,17 @@ import (
 	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
+// ResultEnvelopeDoc is appended to every tool description so an agent knows
+// where the success payload and the failure branch live.
+const ResultEnvelopeDoc = " Every result is one JSON envelope: " +
+	`{"ok":true,"data":<payload>}` +
+	" on success (data is the JSON object/array to address directly, or a JSON " +
+	"string for prose), or " +
+	`{"ok":false,"error":{"type":<type>,"message":<human sentence>,"hint":<one-line fix>}}` +
+	" on failure. Branch on error.type (invalid_args, not_found, element_not_found, " +
+	"not_interactable, anti_bot, page_closed, timeout, nav_failed, unknown), " +
+	"apply error.hint when present, and read success payloads under data."
+
 // Error types carried in resultEnvelope.Error.Type. They are the agent's
 // machine branch signal; the human sentence stays in Error.Message.
 const (

@@ -68,7 +68,7 @@ func (t *Page) Name() string {
 
 // Description returns a customer/LLM-facing description of page_fetch.
 func (t *Page) Description() string {
-	return models.PageFetchDescription
+	return PageFetchDescription
 }
 
 // InputSchema returns the JSON Schema for page_fetch's arguments: a required
@@ -519,7 +519,7 @@ func (p *InspectPageDecompositionPrompt) Name() string { return "inspect_page_de
 
 // Description returns a description of the prompt template.
 func (p *InspectPageDecompositionPrompt) Description() string {
-	return models.InspectPageDecompositionPromptDescription
+	return InspectPageDecompositionPromptDescription
 }
 
 // Arguments returns the parameter list accepted by the prompt template.

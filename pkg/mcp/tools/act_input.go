@@ -2,6 +2,138 @@ package tools
 
 import "github.com/dakolli/webmcp/pkg/mcp/models"
 
+// PageActDescription is the LLM-facing description of the Act tool.
+const PageActDescription = "Interacts with a live page opened by fetch_page: click (supports button selection & double-click), " +
+	"input, type, press_key (send keys/combos like Enter, Escape, Control+A, Meta+C), " +
+	"click_at / hover_at (coordinate-based mouse actions), drag_and_drop (mouse drag), " +
+	"upload_file (set files on <input type='file'>), eval (run JS — the primary escape hatch), " +
+	"navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, " +
+	"clear_logs (empties the network, console, websocket and dialog buffers, the dialog ring covering " +
+	"alert, confirm, prompt, beforeunload and auth challenges, returning the cleared counts, e.g. " +
+	"page_act { action: \"clear_logs\" } → {\"network\":12,\"console\":5,\"websocket\":0,\"dialogs\":0}), " +
+	"sinks_install (arms the source-to-sink tracer and returns {\"installed\":true}; capture is " +
+	"opt-in and never starts by itself because instrumentation changes page behavior. The " +
+	"wrappers survive client-side route changes and full navigations, but the hit ring is per " +
+	"document and resets after a full navigation. Read it with page_fetch what=sinks, which is " +
+	"read-only and never arms capture; it emits the newest 100 hits of a 200-hit ring), " +
+	"sinks_clear (empties the tracer ring and returns {\"cleared\":N}), or " +
+	"replay (resends one captured network entry through a Go HTTP client — bypasses CORS, " +
+	"carries the page's cookies for the target host without writing any back, follows up to 5 " +
+	"redirects, and returns {status,headers,body,bytes,truncated,body_redactions,ms,request,chain} " +
+	"with sensitive response headers and text-body secrets (cookies, authorization, session ids, " +
+	"bearer tokens) replaced by <redacted>; body_redactions counts them, max_bytes caps the body " +
+	"at a 256 KB ceiling, and truncated/chain are always present. query edits the captured URL " +
+	"parameters — a non-empty value replaces one and an empty value or JSON null removes it — while method, " +
+	"headers and value override the captured method, headers and body; request.url shows the " +
+	"edited URL), or " +
+	"replay_fuzz (run a bounded matrix of variants over one captured network entry: target uses " +
+	"replay's seq-or-URL-substring rule, points is an array of {param, location} with location " +
+	"query, body, header or cookie, payloads is the value list, and strategy is sniper (one " +
+	"point at a time, points*payloads requests; default), pitchfork (nth point with nth payload) " +
+	"or clusterbomb (every combination, payloads^points). The size is computed and refused BEFORE " +
+	"any request: at most 100 matrix requests (the two baseline probes are extra), 20 points, 50 " +
+	"payloads and 200 runes per payload, with 5 requests in flight and 10s each. It probes the " +
+	"unmodified baseline twice so cold_ms is the warming sample and ms the compared warm one, " +
+	"and returns {runs:[{seq, payload, point, status, ms, bytes, body_cut, body_redactions}], " +
+	"summary:{baseline:{status,bytes,cold_ms,ms}, anomalies:[{seq, rule, why}]}}; the rules are " +
+	"status_changed, size_delta (>10% either way) and time_delta (>3x either way and beyond the " +
+	"baseline's cold-to-warm spread), " +
+	"bytes is the true response size measured before max_bytes, and every run body is redacted " +
+	"like replay. Example: target=/api/search, " +
+	"points=[{param:\"q\",location:\"query\"}], payloads=[\"a\",\"b\"] with sniper sends 2 " +
+	"requests; 3 points with 4 payloads sends 12. An over-bound matrix is refused before any " +
+	"request, e.g. 5 points with 3 payloads on clusterbomb returns \"replay_fuzz: requests " +
+	"computed 243, over the 100 bound\" — lower the payloads or use sniper), or " +
+	"inject_canary (proves sink reachability: injects a unique wm-canary-<8 hex> value into " +
+	"query, hash, postmessage and name — the default set, or pass targets to narrow it — and " +
+	"returns {canary, injected:[{target, where}], hits:[{sink, context, selector, value, stack}], " +
+	"installed}. query reloads the page, hash does not, postmessage posts a wm-probe message to " +
+	"every frame, name writes window.name. Work is capped at 20 frames and each frame is reported " +
+	"with its URL in injected.where. Requires sinks_install first), " +
+	"postmessage_install (arm the postMessage recorder: one capture-phase listener per window and " +
+	"iframe, without wrapping addEventListener, so a page listener keeps its identity; no " +
+	"parameters; returns {\"installed\":true}; read the ring with page_fetch what=postmessage), " +
+	"postmessage_clear (empty every recorder ring; no parameters; returns {\"cleared\":N}), or " +
+	"post_message (deliver value to window.top, window.self or window.parent when " +
+	"target_selector is \"top\", \"self\", \"parent\" or omitted, or to the contentWindow of " +
+	"the <iframe>/<frame> matched by any other target_selector; a selector that is not a frame " +
+	"returns an error instead of falling back to top; origin is the target origin, default " +
+	"\"*\"; it arms the recorder first so the delivery can be read back, and returns " +
+	"{origin,target}. A value that is a complete JSON object or array is delivered as that " +
+	"structure, anything else as a string), or " +
+	"wait_open (block until this page opens a popup or new tab — a target=\"_blank\" link " +
+	"or window.open — and return {session_id,url,opener} for the new page; a popup opened " +
+	"before the call is returned immediately, each popup is reported once, and timeout_ms " +
+	"bounds the wait. Use the returned session_id with page_fetch/page_act), " +
+	"intercept_add (arm a page-scoped in-flight request interceptor; rules is an array of " +
+	"{id, url_pattern, method, action, headers, rewrite_method, status, body, delay_ms} where " +
+	"action is block, allow, rewrite or fulfill, url_pattern is a wildcard glob like *api*, and " +
+	"a miss continues immediately; rewrite continues the request with headers, a non-empty body " +
+	"and rewrite_method (method only filters the match and never changes the request), and the " +
+	"network ring records the method and headers as sent; interception " +
+	"is opt-in, changes page behaviour and disables the page HTTP cache while any rule is armed, so " +
+	"cached subresources still match; the page holds at most 50 rules across calls, so the cap is " +
+	"page-wide rather than per call; the result reports rules and the remaining budget), " +
+	"intercept_list (returns the page's rules with sensitive header values redacted, plus the " +
+	"remaining rule budget), or " +
+	"intercept_clear (remove every rule, continue any paused request, disable interception and " +
+	"restore the page cache; rules never outlive the page), or " +
+	"dialog_accept (set the page's dialog policy to accept; value is the prompt text typed before " +
+	"accepting a prompt, and the result is {policy,prompt_text,count,dropped,last}) or " +
+	"dialog_dismiss (set the policy to dismiss), with the caveat that the engine already answers " +
+	"every alert, confirm, prompt and beforeunload the moment it opens — the default policy is " +
+	"dismiss — so a dialog that arrived before you set the policy was already dismissed; set the " +
+	"policy before the step that opens it. " +
+	"http_auth (arm a per-page HTTP basic-auth credential: value is user:password split at the first " +
+	"colon, and an empty value clears it. The credential is never echoed, and it applies to later 401 " +
+	"challenges on that page. The result is {http_auth:\"armed\"} or {http_auth:\"cleared\"}, plus " +
+	"note when Chromium already cached a credential for this origin — then open a new page to test " +
+	"a different credential. http_auth and intercept_add both need the Fetch domain, so one must be " +
+	"cleared first), " +
+	"auth_save (capture the live page's cookies for site, plus local storage, session " +
+	"storage and IndexedDB database/store names, and persist them under name; needs " +
+	"session_id, site and name; returns counts only — no cookie or storage value is ever " +
+	"printed; snapshots are stored unencrypted at rest in the local 0600 state database, " +
+	"so treat that file as a credential), " +
+	"auth_restore (write the named snapshot into the page's browser context — cookies " +
+	"first, then storage for the live origin; needs site and name; a stored user agent " +
+	"that differs from the live page is refused with both agents named unless force=true; " +
+	"restoring into a fresh identity writes only that identity's browser context), or " +
+	"auth_list (list saved snapshots as {site,name,cookie_count,origin_count,user_agent," +
+	"updated_at} with no values; site is an optional filter and the call does not use " +
+	"session_id, so a stale id is harmless), or " +
+	"poc_bundle (package one finding as a self-contained evidence directory; pass value=<finding title>, " +
+	"paths=[<absolute output directory>] and optionally target=<seq or URL substring> to select the captured " +
+	"request, otherwise the main document request is used. request.http and response.http come from the " +
+	"network ring, so a prior clear_logs omits both files with reason no network entry. It writes meta.json, request.http, response.http, " +
+	"screenshot.png, dom.html, storage.json and README.md, plus sinks.json only when the tracer was installed, " +
+	"returns {directory,files:[{name,bytes}],omitted:[{name,reason}]} where reason is one of not installed, " +
+	"no body, no network entry, cap reached or secrets hidden; it refuses a relative path or a non-empty " +
+	"directory, and keeps Cookie, Set-Cookie, Authorization and X-CSRF-Token values redacted unless the page " +
+	"opted into secret capture). " +
+	"Pass session_id plus action=... and any required parameters. When more than " +
+	"one browser is live, pass browser_id or owner to declare which browser holds " +
+	"the session; with one live browser both may be omitted, and a session held " +
+	"outside the declared owner is refused as not_found. Element actions take a selector " +
+	"or a stable handle from page_fetch (handle wins when both are given). A selector that " +
+	"matches nothing returns error.type=element_not_found and does not wait for timeout_ms. " +
+	"input and type never echo the value: the result reports the target and the value's rune " +
+	"length, plus value_redacted=true for a password or hidden field. " +
+	"Pointer and keyboard actions (click, click_at, input, hover, hover_at, press_key) are " +
+	"humanized by default: the pointer steps to the target with small jitter and a randomized " +
+	"100-500 ms pause precedes and follows the action. A sub-second timeout_ms can expire during " +
+	"that pause and leave the action unperformed, so allow at least 1000 ms or use an instant hatch. " +
+	"Pass raw=true, set WEB_MCP_RAW_ACTIONS=1 in the server environment, or start the server " +
+	"with raw actions enabled to make them instant. " +
+	"Logs are cumulative " +
+	"from page creation, so call clear_logs right before the step whose traffic/logs you want to " +
+	"observe, then read page_fetch what=network|console and filter client-side. " +
+	"Numbers may be sent as JSON numbers or as numeric strings; a non-numeric string is rejected. " +
+	ResultEnvelopeDoc
+
+// FormSearchAndSubmitPromptDescription is the LLM-facing description of the FormSearchAndSubmitPrompt tool.
+const FormSearchAndSubmitPromptDescription = "Provides step-by-step guidance for inputting text into search/form fields and submitting the form."
+
 // newActInputSchema returns the input schema of the act tool.
 func newActInputSchema() models.InputSchema {
 	return models.InputSchema{
