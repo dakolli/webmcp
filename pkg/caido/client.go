@@ -36,8 +36,8 @@ const (
 const probeQuery = `query Probe { requestsByOffset(limit: 1) { count { value } } }`
 
 // metadataQuery lists history without bodies, newest first.
-const metadataQuery = `query Search($limit: Int, $offset: Int, $filter: HTTPQLInput) {
-  requestsByOffset(limit: $limit, offset: $offset, filter: $filter, order: {by: CREATED_AT, ordering: DESC}) {
+const metadataQuery = `query Search($limit: Int, $offset: Int, $filter: HTTPQLInput, $scopeId: ID) {
+  requestsByOffset(limit: $limit, offset: $offset, filter: $filter, scopeId: $scopeId, order: {by: CREATED_AT, ordering: DESC}) {
     count { value }
     nodes {
       id host method path query port isTls length createdAt
@@ -54,6 +54,10 @@ const statusQuery = `query Status {
   capture: passthroughOptions { captureList passthroughList outOfScope }
   history: requestsByOffset(limit: 1) { count { value } }
 }`
+
+// scopesQuery lists the instance's scopes so a scope id or name can be
+// resolved before a search.
+const scopesQuery = `query Scopes { scopes { id name } }`
 
 // guestMutation exchanges guest access for an access token.
 const guestMutation = `mutation Guest { loginAsGuest { token { accessToken refreshToken expiresAt } error { __typename } } }`
@@ -115,31 +119,72 @@ func NewClient(url string) *Client {
 	}
 }
 
-// Query describes one history search.
+// Query describes one history search. HTTPQL is a raw expression sent to the
+// instance unchanged; when it is set the typed keys are ignored. ScopeID is a
+// live scope id, or "*" for every scope. ScopeName is echoed in the result.
 type Query struct {
-	URL       string
-	Method    string
-	Status    int
-	Limit     int
-	BodyBytes int
-	Since     time.Duration
-	Part      string
-	Raw       bool
+	URL          string
+	Method       string
+	Status       int
+	StatusGTE    int
+	Host         string
+	PathContains string
+	HTTPQL       string
+	ScopeID      string
+	ScopeName    string
+	Limit        int
+	BodyBytes    int
+	Since        time.Duration
+	Part         string
+	Raw          bool
 }
 
 // Result is the bounded outcome of one search. Count is the rows returned,
-// Total is the whole matching history on the server, Scanned is the rows
-// examined, and Dropped is the rows the url/since filter rejected. The applied
-// fields are set only when a request was clamped.
+// Total is the whole matching history on the server and ignores Since, Scanned is
+// the rows examined, and Dropped is the examined rows the url/since filter
+// rejected. SinceSeconds is the applied window and DroppedSince is every matching
+// row older than that window, examined or not. Note explains a count of zero
+// beside a non-zero total. HTTPQL is the expression that ran and HTTPQLSource is
+// "httpql" or "typed". The applied fields are set only when a request was
+// clamped.
 type Result struct {
 	Entries          []Entry `json:"entries"`
 	Count            int     `json:"count"`
 	Total            int     `json:"total"`
 	Scanned          int     `json:"scanned"`
 	Dropped          int     `json:"dropped"`
+	SinceSeconds     int     `json:"since_seconds"`
+	DroppedSince     int     `json:"dropped_since"`
+	Note             string  `json:"note,omitempty"`
+	HTTPQL           string  `json:"httpql"`
+	HTTPQLSource     string  `json:"httpql_source"`
+	ScopeID          string  `json:"scope_id"`
+	ScopeName        string  `json:"scope_name,omitempty"`
+	AllScopes        bool    `json:"all_scopes,omitempty"`
 	LimitApplied     int     `json:"limit_applied,omitempty"`
 	BodyBytesApplied int     `json:"body_bytes_applied,omitempty"`
 }
+
+// Scope is one Caido scope reduced to the id and name a search needs.
+type Scope struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// ScopeError reports that the instance rejected a scope id, or that a scope the
+// caller named does not exist.
+type ScopeError struct {
+	Scope   string
+	Message string
+}
+
+// Error renders the rejection as an invalid-arguments sentence.
+func (e *ScopeError) Error() string {
+	return fmt.Sprintf("caido: invalid arguments: scope %s — %s", strconv.Quote(e.Scope), e.Message)
+}
+
+// Hint tells the agent where to read the live scope ids.
+func (e *ScopeError) Hint() string { return "call caido_status to list scopes" }
 
 // Entry is one HTTP transaction reduced to its request and response.
 type Entry struct {
@@ -264,8 +309,10 @@ func (c *Client) Login(
 }
 
 // Search reads newest-first history metadata, filters it client-side, then
-// fetches raw messages only for the rows it keeps. It pages back at most
-// maxPages pages of maxPageRows rows to satisfy the url/since filter.
+// fetches raw messages only for the rows it keeps. A raw expression, a typed
+// key, or a scope id filters on the server and pages until the limit is met or
+// the instance stops returning rows. Without them the scan is bounded to
+// maxPages pages of maxPageRows rows.
 func (c *Client) Search(ctx context.Context, q Query) (Result, error) {
 	limit := q.Limit
 	if limit <= 0 {
@@ -297,23 +344,55 @@ func (c *Client) Search(ctx context.Context, q Query) (Result, error) {
 		return Result{}, ErrNoCredential
 	}
 
+	sinceSeconds := 0
 	cutoff := int64(0)
 	if q.Since > 0 {
 		cutoff = time.Now().Add(-q.Since).UnixMilli()
+		sinceSeconds = int(q.Since / time.Second)
 	}
 	needle := strings.ToLower(strings.TrimSpace(q.URL))
-	// Always scan full pages, so the documented bound (maxPages × maxPageRows)
-	// is the real scan depth whatever the caller asked to receive.
-	pageSize := maxPageRows
 
+	httpql := strings.TrimSpace(q.HTTPQL)
+	source := ""
+	if httpql != "" {
+		source = "httpql"
+	} else {
+		httpql = buildHTTPQL(q)
+		if httpql != "" {
+			source = "typed"
+		}
+	}
+
+	scopeID := strings.TrimSpace(q.ScopeID)
+	allScopes := scopeID == "*"
+	if allScopes {
+		scopeID = ""
+	}
+	scopeLabel := scopeID
+	if allScopes {
+		scopeLabel = "*"
+	}
+	serverFiltered := httpql != "" || scopeID != ""
+
+	pageSize := maxPageRows
 	kept := make([]keptRow, 0, limit)
-	scanned, dropped, total := 0, 0, 0
+	scanned, dropped, droppedURL, total := 0, 0, 0, 0
+	droppedSince := 0
 
 search:
-	for page := 0; page < maxPages; page++ {
+	for page := 0; ; page++ {
+		if !serverFiltered && page >= maxPages {
+			break
+		}
+		if serverFiltered && total > 0 && page*pageSize >= total {
+			break
+		}
 		vars := map[string]any{"limit": pageSize, "offset": page * pageSize}
-		if code := buildHTTPQL(q.Method, q.Status); code != "" {
-			vars["filter"] = map[string]string{"code": code}
+		if httpql != "" {
+			vars["filter"] = map[string]string{"code": httpql}
+		}
+		if scopeID != "" {
+			vars["scopeId"] = scopeID
 		}
 		var meta struct {
 			RequestsByOffset connection `json:"requestsByOffset"`
@@ -321,6 +400,9 @@ search:
 		if err := c.call(ctx, token, metadataQuery, vars, &meta); err != nil {
 			var gql *graphqlError
 			if errors.As(err, &gql) {
+				if scopeID != "" && scopeRejected(gql.Error()) {
+					return Result{}, &ScopeError{Scope: scopeID, Message: gql.Error()}
+				}
 				return Result{}, fmt.Errorf("caido: requestsByOffset failed: %s", gql.Error())
 			}
 			return Result{}, err
@@ -334,10 +416,15 @@ search:
 			url := composeURL(n)
 			if needle != "" && !strings.Contains(strings.ToLower(url), needle) {
 				dropped++
+				droppedURL++
 				continue
 			}
 			if cutoff > 0 && n.CreatedAt > 0 && n.CreatedAt < cutoff {
 				dropped++
+				droppedSince = 1
+				if total > scanned {
+					droppedSince += total - scanned
+				}
 				break search
 			}
 			row := keptRow{
@@ -374,12 +461,28 @@ search:
 			}
 		}
 	}
+	note := ""
+	if len(entries) == 0 && total > 0 && droppedSince > 0 && droppedURL == 0 {
+		note = fmt.Sprintf(
+			"all %d matching rows are older than since=%ds — pass since:0 to read them",
+			total,
+			sinceSeconds,
+		)
+	}
 	return Result{
 		Entries:          entries,
 		Count:            len(entries),
 		Total:            total,
 		Scanned:          scanned,
 		Dropped:          dropped,
+		SinceSeconds:     sinceSeconds,
+		DroppedSince:     droppedSince,
+		Note:             note,
+		HTTPQL:           httpql,
+		HTTPQLSource:     source,
+		ScopeID:          scopeLabel,
+		ScopeName:        strings.TrimSpace(q.ScopeName),
+		AllScopes:        allScopes,
 		LimitApplied:     limitApplied,
 		BodyBytesApplied: bodyBytesApplied,
 	}, nil
@@ -479,6 +582,43 @@ func (c *Client) Status(
 		})
 	}
 	return st, nil
+}
+
+// ResolveScope resolves a scope id, or a configured scope name when id is
+// empty, against the instance's live scopes. It returns a ScopeError when the
+// instance does not hold the scope.
+func (c *Client) ResolveScope(ctx context.Context, id, name string) (Scope, error) {
+	id = strings.TrimSpace(id)
+	name = strings.TrimSpace(name)
+	token := c.currentToken()
+	if token == "" {
+		return Scope{}, ErrNoCredential
+	}
+	var data struct {
+		Scopes []Scope `json:"scopes"`
+	}
+	if err := c.call(ctx, token, scopesQuery, nil, &data); err != nil {
+		var gql *graphqlError
+		if errors.As(err, &gql) {
+			return Scope{}, fmt.Errorf("caido: scopes query failed: %s", gql.Error())
+		}
+		return Scope{}, err
+	}
+	for _, s := range data.Scopes {
+		if id != "" && s.ID == id {
+			return s, nil
+		}
+		if id == "" && name != "" && s.Name == name {
+			return s, nil
+		}
+	}
+	if id != "" {
+		return Scope{}, &ScopeError{Scope: id, Message: "no scope with that id"}
+	}
+	if name != "" {
+		return Scope{}, &ScopeError{Scope: name, Message: "no scope with that name"}
+	}
+	return Scope{}, nil
 }
 
 // Selection returns the [caido] project and scope_name from webmcp.toml. It
@@ -781,16 +921,32 @@ func formatMillis(ms int64) string {
 	return time.UnixMilli(ms).UTC().Format(time.RFC3339)
 }
 
-// buildHTTPQL composes the only server-side filter: method and status code.
-func buildHTTPQL(method string, status int) string {
-	clauses := make([]string, 0, 2)
-	if method != "" {
-		clauses = append(clauses, fmt.Sprintf("req.method.eq:%q", strings.ToUpper(method)))
+// buildHTTPQL compiles the typed search keys into one HTTPQL expression.
+func buildHTTPQL(q Query) string {
+	clauses := make([]string, 0, 5)
+	if host := strings.TrimSpace(q.Host); host != "" {
+		clauses = append(clauses, "req.host.eq:"+strconv.Quote(host))
 	}
-	if status > 0 {
-		clauses = append(clauses, fmt.Sprintf("resp.code.eq:%d", status))
+	if method := strings.ToUpper(strings.TrimSpace(q.Method)); method != "" {
+		clauses = append(clauses, "req.method.eq:"+strconv.Quote(method))
+	}
+	if q.Status > 0 {
+		clauses = append(clauses, fmt.Sprintf("resp.code.eq:%d", q.Status))
+	}
+	if q.StatusGTE > 0 {
+		clauses = append(clauses, fmt.Sprintf("resp.code.gte:%d", q.StatusGTE))
+	}
+	if path := strings.TrimSpace(q.PathContains); path != "" {
+		clauses = append(clauses, "req.path.cont:"+strconv.Quote(path))
 	}
 	return strings.Join(clauses, " AND ")
+}
+
+// scopeRejected reports whether a GraphQL message names the scopeId argument.
+func scopeRejected(message string) bool {
+	m := strings.ToLower(message)
+	return strings.Contains(m, "scope") || strings.Contains(m, "id format") ||
+		strings.Contains(m, "invalid id")
 }
 
 // currentToken returns the cached token under the lock.

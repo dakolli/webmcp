@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -25,6 +27,7 @@ queries Caido directly without starting the serve daemon.`,
 		Args: cobra.NoArgs,
 	}
 	cmd.AddCommand(newCaidoStatusCmd())
+	cmd.AddCommand(newCaidoSearchCmd())
 	return cmd
 }
 
@@ -65,6 +68,156 @@ allowlist matches only its hosts.`,
 			printCaidoStatus(cmd, status)
 			return nil
 		},
+	}
+}
+
+// newCaidoSearchCmd constructs the "caido search" command: the human view over
+// the same server-side filter the caido_search MCP tool sends.
+func newCaidoSearchCmd() *cobra.Command {
+	var (
+		httpql       string
+		scopeID      string
+		host         string
+		pathContains string
+		method       string
+		urlSub       string
+		part         string
+		status       int
+		statusGTE    int
+		since        int
+		limit        int
+		bodyBytes    int
+		raw          bool
+		jsonOut      bool
+	)
+	cmd := &cobra.Command{
+		Use:   "search",
+		Short: "Search the Caido history with HTTPQL, typed keys, or a scope",
+		Long: `Reads recorded history newest first. A raw HTTPQL expression or the typed
+keys (host, method, status, status_gte, path_contains) filter on the server and
+join with AND; a non-empty --httpql wins and the typed keys are ignored.
+--scope-id selects the scope: empty uses the configured focus scope, "*" searches
+every scope, any other value is a scope id from "browser caido status".
+Without an expression or a scope the scan is bounded to the newest 500 rows.`,
+		Example: `  browser caido search --host www.gnu.org
+  browser caido search --httpql 'req.host.eq:"www.gnu.org"' --limit 50
+  browser caido search --scope-id '*' --method POST --status-gte 400`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cf, err := config.LoadCaido()
+			if err != nil {
+				return fmt.Errorf("caido search: %w", err)
+			}
+			ctx, cancel := context.WithTimeout(cmdCtx(cmd), defaultCmdTimeout)
+			defer cancel()
+
+			client := caido.NewClient(cf.URL)
+			if _, err := client.Login(
+				ctx,
+				cf.AccessToken,
+				cf.PAT,
+				cf.AllowGuest,
+			); err != nil {
+				return fmt.Errorf("caido search: %w", err)
+			}
+
+			scope := strings.TrimSpace(scopeID)
+			scopeName := ""
+			allScopes := scope == "*"
+			if !allScopes {
+				if scope == "" {
+					_, scopeName = caido.Selection()
+				}
+				if scope != "" || scopeName != "" {
+					resolved, err := client.ResolveScope(ctx, scope, scopeName)
+					if err != nil {
+						return fmt.Errorf("caido search: %w", err)
+					}
+					scope, scopeName = resolved.ID, resolved.Name
+				}
+			}
+
+			result, err := client.Search(ctx, caido.Query{
+				URL:          strings.TrimSpace(urlSub),
+				Method:       strings.ToUpper(strings.TrimSpace(method)),
+				Status:       status,
+				StatusGTE:    statusGTE,
+				Host:         strings.TrimSpace(host),
+				PathContains: strings.TrimSpace(pathContains),
+				HTTPQL:       strings.TrimSpace(httpql),
+				ScopeID:      scope,
+				ScopeName:    scopeName,
+				Limit:        limit,
+				BodyBytes:    bodyBytes,
+				Since:        time.Duration(since) * time.Second,
+				Part:         part,
+				Raw:          raw,
+			})
+			if err != nil {
+				return fmt.Errorf("caido search: %w", err)
+			}
+			if jsonOut {
+				data, err := json.Marshal(result)
+				if err != nil {
+					return fmt.Errorf("caido search: %w", err)
+				}
+				fmt.Fprintln(cmd.OutOrStdout(), string(data))
+				return nil
+			}
+			printCaidoSearch(cmd, result)
+			return nil
+		},
+	}
+	f := cmd.Flags()
+	f.StringVar(&httpql, "httpql", "", "raw HTTPQL expression sent to the instance unchanged")
+	f.StringVar(&scopeID, "scope-id", "", "scope id, \"*\" for every scope, empty for the configured focus scope")
+	f.StringVar(&host, "host", "", "typed host filter (req.host.eq)")
+	f.StringVar(&method, "method", "", "HTTP method filter (req.method.eq)")
+	f.IntVar(&status, "status", 0, "exact status code (resp.code.eq), 0 for all")
+	f.IntVar(&statusGTE, "status-gte", 0, "minimum status code (resp.code.gte), 0 to disable")
+	f.StringVar(&pathContains, "path-contains", "", "path substring (req.path.cont)")
+	f.StringVar(&urlSub, "url", "", "URL substring matched on the returned rows")
+	f.IntVar(&since, "since", 900, "lookback window in seconds, 0 to disable")
+	f.IntVar(&limit, "limit", 20, "rows returned, clamps at 100")
+	f.IntVar(&bodyBytes, "body-bytes", 2000, "per-body byte cap, 0 for no body")
+	f.StringVar(&part, "part", "both", "which sides carry a body: request, response, or both")
+	f.BoolVar(&raw, "raw", false, "disable credential redaction")
+	f.BoolVar(&jsonOut, "json", false, "print the result as JSON")
+	return cmd
+}
+
+// printCaidoSearch renders the filter that ran and one line per transaction.
+func printCaidoSearch(cmd *cobra.Command, result caido.Result) {
+	out := cmd.OutOrStdout()
+	httpql := result.HTTPQL
+	if httpql == "" {
+		httpql = "(none)"
+	}
+	source := result.HTTPQLSource
+	if source == "" {
+		source = "none"
+	}
+	fmt.Fprintf(out, "httpql: %s\n", httpql)
+	fmt.Fprintf(out, "source: %s\n", source)
+	if result.AllScopes {
+		fmt.Fprintf(out, "scope_id: *\n")
+	} else if result.ScopeID != "" {
+		fmt.Fprintf(out, "scope_id: %s\n", result.ScopeID)
+	} else {
+		fmt.Fprintf(out, "scope_id: (none)\n")
+	}
+	if result.ScopeName != "" {
+		fmt.Fprintf(out, "scope_name: %s\n", result.ScopeName)
+	}
+	fmt.Fprintf(out, "count: %d total: %d scanned: %d dropped: %d\n",
+		result.Count, result.Total, result.Scanned, result.Dropped)
+	fmt.Fprintf(out, "since: %ds dropped_since: %d\n",
+		result.SinceSeconds, result.DroppedSince)
+	if result.Note != "" {
+		fmt.Fprintf(out, "note: %s\n", result.Note)
+	}
+	for _, e := range result.Entries {
+		fmt.Fprintf(out, "%s %d %s %s\n", e.Method, e.Status, e.ID, e.URL)
 	}
 }
 

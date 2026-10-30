@@ -577,6 +577,181 @@ func TestRedactHeadersScrubsURLValues(t *testing.T) {
 	}
 }
 
+// searchFilter returns a client that records the variables of the metadata
+// request, so a test can assert what reached the wire.
+func searchFilter(t *testing.T, now int64) (*Client, *map[string]any) {
+	t.Helper()
+	captured := map[string]any{}
+	c := testClient(t, func(r *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), "request(id:") {
+			return gqlData(t, `{}`), nil
+		}
+		var payload struct {
+			Variables map[string]any `json:"variables"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("decoding request: %v", err)
+		}
+		for k, v := range payload.Variables {
+			captured[k] = v
+		}
+		return gqlData(t, metadataJSON(now)), nil
+	})
+	return c, &captured
+}
+
+func TestSearchHTTPQLPassesThrough(t *testing.T) {
+	now := time.Now().UnixMilli()
+	expression := `req.host.eq:"www.gnu.org"`
+	c, vars := searchFilter(t, now)
+
+	result, err := c.Search(t.Context(), Query{HTTPQL: expression, Limit: 5, Part: "request"})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	filter, _ := (*vars)["filter"].(map[string]any)
+	if got, _ := filter["code"].(string); got != expression {
+		t.Errorf("filter = %q, want %q", got, expression)
+	}
+	if result.HTTPQL != expression || result.HTTPQLSource != "httpql" {
+		t.Errorf("envelope = %q/%q, want the raw expression", result.HTTPQL, result.HTTPQLSource)
+	}
+}
+
+func TestSearchTypedKeysCompile(t *testing.T) {
+	now := time.Now().UnixMilli()
+	c, vars := searchFilter(t, now)
+
+	result, err := c.Search(t.Context(), Query{
+		Host:         "www.gnu.org",
+		Method:       "post",
+		Status:       200,
+		StatusGTE:    400,
+		PathContains: "/api",
+		Limit:        5,
+		Part:         "request",
+	})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	want := `req.host.eq:"www.gnu.org" AND req.method.eq:"POST" AND ` +
+		`resp.code.eq:200 AND resp.code.gte:400 AND req.path.cont:"/api"`
+	filter, _ := (*vars)["filter"].(map[string]any)
+	if got, _ := filter["code"].(string); got != want {
+		t.Errorf("filter = %q, want %q", got, want)
+	}
+	if result.HTTPQL != want || result.HTTPQLSource != "typed" {
+		t.Errorf("envelope = %q/%q, want the typed expression", result.HTTPQL, result.HTTPQLSource)
+	}
+}
+
+func TestSearchHTTPQLWinsOverTypedKeys(t *testing.T) {
+	now := time.Now().UnixMilli()
+	expression := `req.host.eq:"www.gnu.org"`
+	c, vars := searchFilter(t, now)
+
+	result, err := c.Search(t.Context(), Query{
+		HTTPQL: expression,
+		Host:   "ignored.example",
+		Method: "GET",
+		Status: 500,
+		Limit:  5,
+		Part:   "request",
+	})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	filter, _ := (*vars)["filter"].(map[string]any)
+	if got, _ := filter["code"].(string); got != expression {
+		t.Errorf("filter = %q, want %q", got, expression)
+	}
+	if result.HTTPQLSource != "httpql" {
+		t.Errorf("source = %q, want httpql", result.HTTPQLSource)
+	}
+}
+
+func TestSearchAllScopesOmitsArgument(t *testing.T) {
+	now := time.Now().UnixMilli()
+	c, vars := searchFilter(t, now)
+
+	result, err := c.Search(t.Context(), Query{ScopeID: "*", Limit: 5, Part: "request"})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if _, ok := (*vars)["scopeId"]; ok {
+		t.Errorf("scopeId sent for \"*\": %v", *vars)
+	}
+	if !result.AllScopes || result.ScopeID != "*" {
+		t.Errorf("envelope all_scopes=%t scope_id=%q", result.AllScopes, result.ScopeID)
+	}
+}
+
+func TestSearchRejectedScope(t *testing.T) {
+	c := testClient(t, func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body: io.NopCloser(strings.NewReader(
+				`{"errors":[{"message":"Invalid ID format, should be an i32"}]}`,
+			)),
+		}, nil
+	})
+
+	_, err := c.Search(t.Context(), Query{ScopeID: "not-an-id", Limit: 5})
+	var scopeErr *ScopeError
+	if !errors.As(err, &scopeErr) {
+		t.Fatalf("error = %v, want *ScopeError", err)
+	}
+	if got := scopeErr.Hint(); got != "call caido_status to list scopes" {
+		t.Errorf("hint = %q", got)
+	}
+	if !strings.Contains(err.Error(), "invalid arguments") {
+		t.Errorf("error = %q, want an invalid-arguments sentence", err)
+	}
+}
+
+func TestResolveScope(t *testing.T) {
+	c := testClient(t, func(r *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), "scopes") {
+			t.Errorf("unexpected query: %s", body)
+		}
+		return gqlData(t, `{"scopes":[{"id":"1","name":"target"},{"id":"2","name":"other"}]}`), nil
+	})
+
+	cases := []struct {
+		name    string
+		id      string
+		scope   string
+		wantID  string
+		wantErr bool
+	}{
+		{name: "by id", id: "2", wantID: "2"},
+		{name: "by name", scope: "target", wantID: "1"},
+		{name: "missing id", id: "9", wantErr: true},
+		{name: "missing name", scope: "nope", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := c.ResolveScope(t.Context(), tc.id, tc.scope)
+			if tc.wantErr {
+				var scopeErr *ScopeError
+				if !errors.As(err, &scopeErr) {
+					t.Fatalf("error = %v, want *ScopeError", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ResolveScope: %v", err)
+			}
+			if got.ID != tc.wantID {
+				t.Errorf("id = %q, want %q", got.ID, tc.wantID)
+			}
+		})
+	}
+}
+
 func loginClient(t *testing.T, fn roundTripFunc) *Client {
 	t.Helper()
 	c := NewClient("http://127.0.0.1:8080/graphql")
@@ -858,5 +1033,56 @@ func TestStatus(t *testing.T) {
 			}
 			tc.check(t, st)
 		})
+	}
+}
+
+func TestSearchSinceEmptiesResult(t *testing.T) {
+	old := time.Now().Add(-2 * time.Hour).UnixMilli()
+	nodes := make([]requestNode, 3)
+	for i := range nodes {
+		id := strconv.Itoa(500 + i)
+		nodes[i] = requestNode{
+			ID:        id,
+			Host:      "www.gnu.org",
+			Method:    "GET",
+			Path:      "/licenses/" + id,
+			Port:      443,
+			IsTLS:     true,
+			Length:    10,
+			CreatedAt: old,
+		}
+	}
+	c := testClient(t, func(r *http.Request) (*http.Response, error) {
+		return gqlData(t, pageData(t, 3, nodes)), nil
+	})
+
+	result, err := c.Search(t.Context(), Query{
+		HTTPQL: `req.host.eq:"www.gnu.org"`,
+		Since:  900 * time.Second,
+		Limit:  5,
+		Part:   "request",
+	})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if result.Count != 0 || result.Total != 3 {
+		t.Fatalf("count/total = %d/%d, want 0/3", result.Count, result.Total)
+	}
+	if result.SinceSeconds != 900 {
+		t.Errorf("since_seconds = %d, want 900", result.SinceSeconds)
+	}
+	if result.DroppedSince != 3 {
+		t.Errorf("dropped_since = %d, want 3", result.DroppedSince)
+	}
+	want := "all 3 matching rows are older than since=900s — pass since:0 to read them"
+	if result.Note != want {
+		t.Errorf("note = %q, want %q", result.Note, want)
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("encoding result: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"note":"all 3 matching rows`) {
+		t.Errorf("envelope missing note: %s", encoded)
 	}
 }
