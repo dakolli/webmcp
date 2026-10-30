@@ -170,12 +170,12 @@ type securityViolations struct {
 
 // PageSecurity returns a passive security audit of the live page as
 // {"url","checks":[{id,status,evidence,detail}],"count","truncated"}. Every
-// check reads truth the browser already holds — observed response headers from
-// the audited document's own requests in the page's network ring, the cookie
-// jar for the current URL and one DOM evaluation — so the audit never reloads
-// or probes the site. The ring spans navigations, so the audit starts at the
-// entry the engine marked as the current top-level document and ignores
-// everything captured before it; it never clears the ring.
+// check reads truth the browser already holds — the audited document's own
+// response headers (page-side capture, falling back to the network ring), the
+// cookie jar for the current URL and one DOM evaluation — so the audit never
+// reloads or probes the site. The ring spans navigations, so the ring-scoped
+// checks start at the entry the engine marked as the current top-level document
+// and ignore everything captured before it; it never clears the ring.
 func PageSecurity(ctx context.Context, p *browsers.Page) (string, error) {
 	ctx, done, err := beginPage(ctx, p, "security")
 	if err != nil {
@@ -217,7 +217,7 @@ func PageSecurity(ctx context.Context, p *browsers.Page) (string, error) {
 	checks = append(checks, cookies...)
 	checks = append(checks, securityMixedContentCheck(probe, entries))
 	checks = append(checks, securityContentChecks(probe)...)
-	checks = append(checks, securityCORSCheck(entries))
+	checks = append(checks, securityCORSCheck(headers))
 
 	violations, violationsDropped := p.CSPViolations()
 	report := securityReport{
@@ -498,25 +498,10 @@ func securityHeaderChecks(
 	}
 	if policy != "" {
 		parsed := parseCSP(policy)
-		for _, weak := range []struct {
-			id    string
-			token string
-		}{
-			{"csp_unsafe_inline", "'unsafe-inline'"},
-			{"csp_unsafe_eval", "'unsafe-eval'"},
-		} {
-			check := securityCheck{
-				ID:     weak.id,
-				Status: "ok",
-				Detail: "the effective script directive does not allow " + weak.token,
-			}
-			if d, ok := parsed.effective("script-src"); ok && hasSource(d.values, weak.token) {
-				check.Status = "warn"
-				check.Evidence = d.text
-				check.Detail = d.name + " allows " + weak.token + " — use nonces or hashes for scripts and avoid eval-style code"
-			}
-			checks = append(checks, check)
-		}
+		checks = append(checks,
+			weakScriptSourceCheck(parsed, "csp_unsafe_inline", "'unsafe-inline'"),
+			weakScriptSourceCheck(parsed, "csp_unsafe_eval", "'unsafe-eval'"),
+		)
 	}
 
 	checks = append(checks, securityHSTSCheck(probe.Scheme, headerValue(headers, "strict-transport-security")))
@@ -599,6 +584,36 @@ func securityHeaderChecks(
 		checks = append(checks, check)
 	}
 	return checks
+}
+
+// weakScriptSourceCheck judges whether the effective script directive of p
+// allows token. Evidence quotes the directive that was judged on both the
+// passing and the warning result, so a pass is never reported without the text
+// that produced it.
+func weakScriptSourceCheck(p cspPolicy, id, token string) securityCheck {
+	d, ok := p.effective("script-src")
+	if !ok {
+		return securityCheck{
+			ID:       id,
+			Status:   "info",
+			Evidence: p.raw,
+			Detail:   "the policy has no script-src or default-src directive, so " + token + " is not judged",
+		}
+	}
+	if hasSource(d.values, token) {
+		return securityCheck{
+			ID:       id,
+			Status:   "warn",
+			Evidence: d.text,
+			Detail:   d.name + " allows " + token + " — use nonces or hashes for scripts and avoid eval-style code",
+		}
+	}
+	return securityCheck{
+		ID:       id,
+		Status:   "ok",
+		Evidence: d.text,
+		Detail:   "the effective script directive does not allow " + token,
+	}
 }
 
 // securityPolicy returns the enforced policy text, preferring the response
@@ -1403,32 +1418,50 @@ func securityContentChecks(probe securityProbe) []securityCheck {
 	return checks
 }
 
-// securityCORSCheck flags a response the audited document observed that pairs a
-// wildcard origin with credentials, a combination browsers reject. entries must
-// already be scoped to that document.
-func securityCORSCheck(entries []browsers.NetworkEntry) securityCheck {
-	if len(entries) == 0 {
+// securityCORSCheck flags the audited document's response when it pairs a
+// wildcard origin with credentials, a combination browsers reject. headers is
+// the merged document header map, which already prefers the page-side capture,
+// so clear_logs cannot empty the evidence. Only the document response is judged;
+// a subresource response is not part of that record.
+func securityCORSCheck(headers map[string]string) securityCheck {
+	origin := headerValue(headers, "access-control-allow-origin")
+	credentials := headerValue(headers, "access-control-allow-credentials")
+	if origin == "" {
 		return securityCheck{
-			ID:     "cors",
-			Status: "info",
-			Detail: "no requests belonging to the audited document have been observed (the network ring spans navigations, so an earlier page's requests are ignored)",
+			ID:       "cors",
+			Status:   "info",
+			Evidence: "Access-Control-Allow-Origin absent from the document response",
+			Detail:   "the document response declares no Access-Control-Allow-Origin, so there is no cross-origin grant to judge; subresource CORS responses are not audited",
 		}
 	}
-	var offenders []string
-	for _, e := range entries {
-		if headerValue(e.RespHeaders, "access-control-allow-origin") != "*" {
-			continue
-		}
-		if strings.EqualFold(strings.TrimSpace(headerValue(e.RespHeaders, "access-control-allow-credentials")), "true") {
-			offenders = append(offenders, e.URL)
+	evidence := "Access-Control-Allow-Origin: " + origin
+	if credentials == "" {
+		evidence += "\nAccess-Control-Allow-Credentials absent"
+	} else {
+		evidence += "\nAccess-Control-Allow-Credentials: " + credentials
+	}
+	if origin != "*" {
+		return securityCheck{
+			ID:       "cors",
+			Status:   "ok",
+			Evidence: evidence,
+			Detail:   "the document response scopes Access-Control-Allow-Origin to a single origin, so a wildcard cannot be paired with credentials",
 		}
 	}
-	return securityFinding(
-		"cors",
-		"no observed response allows any origin together with credentials",
-		"%d response(s) send Access-Control-Allow-Origin: * with Access-Control-Allow-Credentials: true; browsers reject the pair — echo the one allowed origin instead",
-		offenders,
-	)
+	if strings.EqualFold(strings.TrimSpace(credentials), "true") {
+		return securityCheck{
+			ID:       "cors",
+			Status:   "warn",
+			Evidence: evidence,
+			Detail:   "the document response sends Access-Control-Allow-Origin: * with Access-Control-Allow-Credentials: true; browsers reject the pair — echo the single allowed origin instead",
+		}
+	}
+	return securityCheck{
+		ID:       "cors",
+		Status:   "ok",
+		Evidence: evidence,
+		Detail:   "the document response allows any origin but does not combine it with credentials",
+	}
 }
 
 // securityFinding builds one aggregated check: ok when no value was flagged,

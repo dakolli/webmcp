@@ -373,7 +373,6 @@ func TestSecurityAuditScopesNetworkToCurrentDocument(t *testing.T) {
 		name       string
 		ring       []browsers.NetworkEntry
 		wantDoc    string
-		wantCORS   string
 		wantMixed  string
 		wantAbsent []string
 	}{
@@ -387,7 +386,6 @@ func TestSecurityAuditScopesNetworkToCurrentDocument(t *testing.T) {
 				{Seq: 5, Type: "XHR", URL: "https://new.test/api", RespHeaders: securityCORSPair},
 			},
 			wantDoc:    "https://new.test/",
-			wantCORS:   "https://new.test/api",
 			wantMixed:  "",
 			wantAbsent: []string{"old.test"},
 		},
@@ -401,7 +399,6 @@ func TestSecurityAuditScopesNetworkToCurrentDocument(t *testing.T) {
 				{Seq: 5, Type: "XHR", URL: "https://same.test/b/api", RespHeaders: securityCORSPair},
 			},
 			wantDoc:    "https://same.test/b",
-			wantCORS:   "https://same.test/b/api",
 			wantMixed:  "",
 			wantAbsent: []string{"https://same.test/a"},
 		},
@@ -412,7 +409,6 @@ func TestSecurityAuditScopesNetworkToCurrentDocument(t *testing.T) {
 				{Seq: 2, Type: "XHR", URL: "https://spa.test/api/me", RespHeaders: securityCORSPair},
 			},
 			wantDoc:   "https://spa.test/",
-			wantCORS:  "https://spa.test/api/me",
 			wantMixed: "",
 		},
 		{
@@ -423,7 +419,6 @@ func TestSecurityAuditScopesNetworkToCurrentDocument(t *testing.T) {
 				{Seq: 3, Type: "Document", URL: "https://app.test/"},
 			},
 			wantDoc:   "https://app.test/",
-			wantCORS:  "https://app.test/api",
 			wantMixed: "",
 		},
 		{
@@ -434,7 +429,6 @@ func TestSecurityAuditScopesNetworkToCurrentDocument(t *testing.T) {
 				{Seq: 3, Type: "Document", URL: "https://cache.test/b"},
 			},
 			wantDoc:   "https://cache.test/a",
-			wantCORS:  "https://cache.test/a/api",
 			wantMixed: "",
 		},
 	}
@@ -447,27 +441,20 @@ func TestSecurityAuditScopesNetworkToCurrentDocument(t *testing.T) {
 			if doc.URL != tt.wantDoc {
 				t.Errorf("document = %q, want %q", doc.URL, tt.wantDoc)
 			}
-			cors := securityCORSCheck(scoped)
 			mixed := securityMixedContentCheck(securityProbe{Scheme: "https"}, scoped)
-			if cors.ID != "cors" || mixed.ID != "mixed_content" {
-				t.Fatalf("check ids = %q, %q; want cors, mixed_content", cors.ID, mixed.ID)
-			}
-			if cors.Evidence != tt.wantCORS {
-				t.Errorf("cors evidence = %q, want %q", cors.Evidence, tt.wantCORS)
+			if mixed.ID != "mixed_content" {
+				t.Fatalf("check id = %q, want mixed_content", mixed.ID)
 			}
 			if mixed.Evidence != tt.wantMixed {
 				t.Errorf("mixed_content evidence = %q, want %q", mixed.Evidence, tt.wantMixed)
 			}
 			for _, absent := range tt.wantAbsent {
-				if strings.Contains(cors.Evidence, absent) {
-					t.Errorf("cors evidence %q cites another document (%q)", cors.Evidence, absent)
-				}
 				if strings.Contains(mixed.Evidence, absent) {
 					t.Errorf("mixed_content evidence %q cites another document (%q)", mixed.Evidence, absent)
 				}
 			}
-			if cors2 := securityCORSCheck(scoped); !slices.Equal([]securityCheck{cors}, []securityCheck{cors2}) {
-				t.Error("two audits of the same ring produced different cors findings")
+			if again := securityMixedContentCheck(securityProbe{Scheme: "https"}, scoped); !slices.Equal([]securityCheck{mixed}, []securityCheck{again}) {
+				t.Error("two audits of the same ring produced different mixed_content findings")
 			}
 		})
 	}
@@ -499,16 +486,114 @@ func TestSecurityAuditEmptyRingHasEmptyEvidence(t *testing.T) {
 			if doc.URL != "" || len(scoped) != 0 {
 				t.Fatalf("securityDocumentRing returned doc %q and %d scoped entries", doc.URL, len(scoped))
 			}
-			cors := securityCORSCheck(scoped)
 			mixed := securityMixedContentCheck(securityProbe{Scheme: "https"}, scoped)
-			if cors.Status != "info" {
-				t.Errorf("cors status = %q, want info", cors.Status)
-			}
 			if mixed.Status != "ok" {
 				t.Errorf("mixed_content status = %q, want ok", mixed.Status)
 			}
-			if cors.Evidence != "" || mixed.Evidence != "" {
-				t.Errorf("evidence = %q, %q; want empty", cors.Evidence, mixed.Evidence)
+			if mixed.Evidence != "" {
+				t.Errorf("mixed_content evidence = %q, want empty", mixed.Evidence)
+			}
+		})
+	}
+}
+
+// TestSecurityCORSCheckMatrix proves the CORS check judges the audited
+// document's page-side headers only: a wildcard origin paired with credentials
+// warns, a scoped or credential-less grant passes, and a response with no origin
+// is info. Every status quotes the header values it judged, so no verdict is bare.
+func TestSecurityCORSCheckMatrix(t *testing.T) {
+	tests := []struct {
+		name       string
+		headers    map[string]string
+		wantStatus string
+		wantQuote  []string
+	}{
+		{
+			name: "wildcard with credentials warns",
+			headers: map[string]string{
+				"access-control-allow-origin":      "*",
+				"access-control-allow-credentials": "true",
+			},
+			wantStatus: "warn",
+			wantQuote:  []string{"Access-Control-Allow-Origin: *", "Access-Control-Allow-Credentials: true"},
+		},
+		{
+			name:       "wildcard without credentials passes",
+			headers:    map[string]string{"access-control-allow-origin": "*"},
+			wantStatus: "ok",
+			wantQuote:  []string{"Access-Control-Allow-Origin: *", "Access-Control-Allow-Credentials absent"},
+		},
+		{
+			name: "single origin with credentials passes",
+			headers: map[string]string{
+				"access-control-allow-origin":      "https://app.test",
+				"access-control-allow-credentials": "true",
+			},
+			wantStatus: "ok",
+			wantQuote:  []string{"Access-Control-Allow-Origin: https://app.test", "Access-Control-Allow-Credentials: true"},
+		},
+		{
+			name:       "no origin is info",
+			headers:    nil,
+			wantStatus: "info",
+			wantQuote:  []string{"Access-Control-Allow-Origin absent"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			check := securityCORSCheck(tt.headers)
+			if check.ID != "cors" {
+				t.Fatalf("id = %q, want cors", check.ID)
+			}
+			if check.Status != tt.wantStatus {
+				t.Errorf("status = %q, want %q (detail %q)", check.Status, tt.wantStatus, check.Detail)
+			}
+			if check.Evidence == "" {
+				t.Fatal("evidence is empty; every status must quote the judged headers")
+			}
+			for _, quote := range tt.wantQuote {
+				if !strings.Contains(check.Evidence, quote) {
+					t.Errorf("evidence = %q, want it to quote %q", check.Evidence, quote)
+				}
+			}
+		})
+	}
+}
+
+// TestSecurityCORSSurvivesClearedRing proves clear_logs no longer changes the
+// CORS verdict: the page-side document capture supplies the same status and
+// evidence whether the ring still holds the document headers or was emptied.
+func TestSecurityCORSSurvivesClearedRing(t *testing.T) {
+	stored := map[string]string{
+		"access-control-allow-origin":      "*",
+		"access-control-allow-credentials": "true",
+	}
+	ring := map[string]string{
+		"Access-Control-Allow-Origin":      "*",
+		"Access-Control-Allow-Credentials": "true",
+	}
+	tests := []struct {
+		name string
+		ring map[string]string
+	}{
+		{"ring still holds the document", ring},
+		{"ring cleared by clear_logs", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			headers, captured := documentHeaders(tt.ring, "", "", stored)
+			if !captured {
+				t.Fatal("the stored capture was not applied")
+			}
+			check := securityCORSCheck(headers)
+			if check.Status != "warn" {
+				t.Fatalf("status = %q, want warn (detail %q)", check.Status, check.Detail)
+			}
+			if !strings.Contains(check.Evidence, "Access-Control-Allow-Origin: *") {
+				t.Errorf("evidence = %q, want the wildcard origin quoted", check.Evidence)
+			}
+			if !strings.Contains(check.Evidence, "Access-Control-Allow-Credentials: true") {
+				t.Errorf("evidence = %q, want the credential flag quoted", check.Evidence)
 			}
 		})
 	}
@@ -867,36 +952,65 @@ func TestSecurityHeaderChecksSurviveClearedRing(t *testing.T) {
 	}
 }
 
-// TestSecurityUnsafeInlineIsScriptScoped proves the csp_unsafe_inline check
-// judges the effective script directive only: a token in style-src leaves it
-// clean, a token in script-src warns and names script-src, and a script token
-// inherited from default-src warns and names default-src.
-func TestSecurityUnsafeInlineIsScriptScoped(t *testing.T) {
+// TestSecurityWeakScriptSourceQuotesDirective proves the csp_unsafe_inline and
+// csp_unsafe_eval checks quote the directive they judged on every status: a
+// hash-locked script-src passes with its own text, a token in script-src or in
+// the default-src fallback warns with that directive, and a policy carrying
+// neither directive degrades to info quoting the policy.
+func TestSecurityWeakScriptSourceQuotesDirective(t *testing.T) {
 	tests := []struct {
-		name         string
-		policy       string
-		wantStatus   string
-		wantDetail   string
-		wantEvidence string
+		name       string
+		id         string
+		policy     string
+		wantStatus string
+		wantDetail string
+		wantQuote  string
 	}{
 		{
-			name:       "style-src token does not raise a script warning",
+			name:       "hash-locked script-src passes and quotes itself",
+			id:         "csp_unsafe_inline",
 			policy:     "default-src 'self'; script-src 'self' 'sha256-AbCdEf'; style-src 'self' 'unsafe-inline'",
 			wantStatus: "ok",
+			wantQuote:  "script-src 'self' 'sha256-AbCdEf'",
 		},
 		{
-			name:         "script-src token warns and names script-src",
-			policy:       "default-src 'self'; script-src 'self' 'unsafe-inline'",
-			wantStatus:   "warn",
-			wantDetail:   "script-src allows 'unsafe-inline'",
-			wantEvidence: "script-src 'self' 'unsafe-inline'",
+			name:       "script-src token warns and names script-src",
+			id:         "csp_unsafe_inline",
+			policy:     "default-src 'self'; script-src 'self' 'unsafe-inline'",
+			wantStatus: "warn",
+			wantDetail: "script-src allows 'unsafe-inline'",
+			wantQuote:  "script-src 'self' 'unsafe-inline'",
 		},
 		{
-			name:         "default-src fallback names default-src",
-			policy:       "default-src 'self' 'unsafe-inline'",
-			wantStatus:   "warn",
-			wantDetail:   "default-src allows 'unsafe-inline'",
-			wantEvidence: "default-src 'self' 'unsafe-inline'",
+			name:       "default-src fallback names default-src",
+			id:         "csp_unsafe_inline",
+			policy:     "default-src 'self' 'unsafe-inline'",
+			wantStatus: "warn",
+			wantDetail: "default-src allows 'unsafe-inline'",
+			wantQuote:  "default-src 'self' 'unsafe-inline'",
+		},
+		{
+			name:       "unsafe-eval pass quotes the script directive",
+			id:         "csp_unsafe_eval",
+			policy:     "script-src 'self' 'nonce-abc'; object-src 'none'",
+			wantStatus: "ok",
+			wantQuote:  "script-src 'self' 'nonce-abc'",
+		},
+		{
+			name:       "unsafe-eval warns and quotes script-src",
+			id:         "csp_unsafe_eval",
+			policy:     "script-src 'self' 'unsafe-eval'",
+			wantStatus: "warn",
+			wantDetail: "script-src allows 'unsafe-eval'",
+			wantQuote:  "script-src 'self' 'unsafe-eval'",
+		},
+		{
+			name:       "no script directive is info quoting the policy",
+			id:         "csp_unsafe_inline",
+			policy:     "img-src 'self'; style-src 'self'",
+			wantStatus: "info",
+			wantDetail: "'unsafe-inline' is not judged",
+			wantQuote:  "img-src 'self'; style-src 'self'",
 		},
 	}
 	for _, tt := range tests {
@@ -907,9 +1021,9 @@ func TestSecurityUnsafeInlineIsScriptScoped(t *testing.T) {
 				true,
 				false,
 			)
-			check, ok := securityCheckByID(checks, "csp_unsafe_inline")
+			check, ok := securityCheckByID(checks, tt.id)
 			if !ok {
-				t.Fatal("missing csp_unsafe_inline check")
+				t.Fatalf("missing %s check", tt.id)
 			}
 			if check.Status != tt.wantStatus {
 				t.Fatalf("status = %q, want %q (detail %q)", check.Status, tt.wantStatus, check.Detail)
@@ -917,11 +1031,8 @@ func TestSecurityUnsafeInlineIsScriptScoped(t *testing.T) {
 			if tt.wantDetail != "" && !strings.Contains(check.Detail, tt.wantDetail) {
 				t.Errorf("detail = %q, want it to name %q", check.Detail, tt.wantDetail)
 			}
-			if tt.wantEvidence != "" && check.Evidence != tt.wantEvidence {
-				t.Errorf("evidence = %q, want %q", check.Evidence, tt.wantEvidence)
-			}
-			if tt.wantEvidence == "" && check.Evidence != "" {
-				t.Errorf("evidence = %q, want empty for the clean style-only policy", check.Evidence)
+			if !strings.Contains(check.Evidence, tt.wantQuote) {
+				t.Errorf("evidence = %q, want it to quote %q", check.Evidence, tt.wantQuote)
 			}
 		})
 	}

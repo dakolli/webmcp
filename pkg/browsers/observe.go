@@ -118,6 +118,11 @@ var documentSecurityHeaders = []string{
 	"permissions-policy",
 	"cross-origin-opener-policy",
 	"cross-origin-resource-policy",
+	"access-control-allow-origin",
+	"access-control-allow-credentials",
+	"access-control-allow-methods",
+	"access-control-allow-headers",
+	"access-control-expose-headers",
 }
 
 // documentHeaderCapture is the uncapped header state of the page's current

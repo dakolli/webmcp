@@ -221,6 +221,75 @@ func TestObserverDocumentSecurityHeadersSurviveClear(t *testing.T) {
 	}
 }
 
+// TestObserverDocumentSecurityHeadersIncludeCORS proves the closed set carries
+// the five CORS response headers the audit judges: a value longer than the ring
+// clip survives intact, a header outside the set is not stored, and the exported
+// read returns a copy that survives ClearCapture.
+func TestObserverDocumentSecurityHeadersIncludeCORS(t *testing.T) {
+	const topFrame = proto.PageFrameID("frame-top")
+	longMethods := "GET, POST, PUT, PATCH, DELETE, " + strings.Repeat("x", 600)
+	if len(longMethods) <= networkHeaderValueLimit {
+		t.Fatalf("allow-methods is %d bytes, needs to exceed the %d-byte clip", len(longMethods), networkHeaderValueLimit)
+	}
+
+	page := &Page{observer: newPageObserver()}
+	page.observer.topFrameID = topFrame
+	const id = proto.NetworkRequestID("doc-cors")
+	page.observer.recordRequest(&proto.NetworkRequestWillBeSent{
+		RequestID: id,
+		FrameID:   topFrame,
+		LoaderID:  "loader-1",
+		Type:      proto.NetworkResourceTypeDocument,
+		Request:   &proto.NetworkRequest{Method: "GET", URL: "https://site.test/"},
+		Timestamp: 1,
+	})
+	page.observer.recordResponse(&proto.NetworkResponseReceived{
+		RequestID: id,
+		Type:      proto.NetworkResourceTypeDocument,
+		Response: &proto.NetworkResponse{
+			Status: 200,
+			Headers: proto.NetworkHeaders{
+				"access-control-allow-origin":      gson.New("*"),
+				"access-control-allow-credentials": gson.New("true"),
+				"access-control-allow-methods":     gson.New(longMethods),
+				"access-control-allow-headers":     gson.New("X-Requested-With"),
+				"access-control-expose-headers":    gson.New("X-Total-Count"),
+				"access-control-max-age":           gson.New("600"),
+			},
+		},
+	})
+
+	want := map[string]string{
+		"access-control-allow-origin":      "*",
+		"access-control-allow-credentials": "true",
+		"access-control-allow-methods":     longMethods,
+		"access-control-allow-headers":     "X-Requested-With",
+		"access-control-expose-headers":    "X-Total-Count",
+	}
+	got := page.DocumentSecurityHeaders()
+	for name, value := range want {
+		if got[name] != value {
+			t.Errorf("%s = %q, want %q", name, got[name], value)
+		}
+	}
+	if _, ok := got["access-control-max-age"]; ok {
+		t.Error("a header outside the closed set was stored")
+	}
+
+	got["access-control-allow-origin"] = "mutated"
+	if after := page.DocumentSecurityHeaders(); after["access-control-allow-origin"] != "*" {
+		t.Error("DocumentSecurityHeaders returned the live map, not a copy")
+	}
+
+	page.ClearCapture()
+	after := page.DocumentSecurityHeaders()
+	for name, value := range want {
+		if after[name] != value {
+			t.Errorf("%s lost when the ring was cleared: got %q", name, after[name])
+		}
+	}
+}
+
 func TestObserverDocumentSecurityHeadersReplaceOnNavigation(t *testing.T) {
 	const topFrame = proto.PageFrameID("frame-top")
 
