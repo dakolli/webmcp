@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -1220,5 +1221,337 @@ func TestResetPassthroughOptionsSendsNullInput(t *testing.T) {
 	}
 	if got := string(vars["input"]); got != "null" {
 		t.Errorf("input variable = %s, want null", got)
+	}
+}
+
+func fixtureSitemapClient(t *testing.T, roots string, levels map[string]string) *Client {
+	t.Helper()
+	return testClient(t, func(r *http.Request) (*http.Response, error) {
+		var payload struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read sitemap request: %v", err)
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("decode sitemap request: %v", err)
+		}
+		switch {
+		case strings.Contains(payload.Query, "currentProject"):
+			return gqlData(t, `{"currentProject":{"project":{"name":"webmcp"}}}`), nil
+		case strings.Contains(payload.Query, "sitemapRootEntries"):
+			return gqlData(t, `{"sitemapRootEntries":{"nodes":`+roots+`}}`), nil
+		case strings.Contains(payload.Query, "sitemapDescendantEntries"):
+			parent, _ := payload.Variables["parentId"].(string)
+			nodes, ok := levels[parent]
+			if !ok {
+				nodes = `[]`
+			}
+			return gqlData(t, `{"sitemapDescendantEntries":{"nodes":`+nodes+`}}`), nil
+		default:
+			t.Fatalf("unexpected sitemap query: %s", payload.Query)
+			return nil, nil
+		}
+	})
+}
+
+func fixtureSitemapNode(
+	id string,
+	label string,
+	kind string,
+	parent string,
+	hasDescendants bool,
+	request map[string]any,
+	requests int,
+) map[string]any {
+	node := map[string]any{
+		"id":             id,
+		"label":          label,
+		"kind":           kind,
+		"hasDescendants": hasDescendants,
+		"requests":       map[string]any{"count": map[string]any{"value": requests}},
+	}
+	if parent != "" {
+		node["parentId"] = parent
+	}
+	if request != nil {
+		node["request"] = request
+	}
+	return node
+}
+
+func fixtureSitemapRequest(method, path, query string, status int, createdAt int64) map[string]any {
+	return map[string]any{
+		"method":    method,
+		"path":      path,
+		"query":     query,
+		"createdAt": createdAt,
+		"response":  map[string]any{"statusCode": status},
+	}
+}
+
+func fixtureSitemapNodes(t *testing.T, nodes ...map[string]any) string {
+	t.Helper()
+	data, err := json.Marshal(nodes)
+	if err != nil {
+		t.Fatalf("encode sitemap nodes: %v", err)
+	}
+	return string(data)
+}
+
+func findSitemapRow(rows []SitemapRow, shape string) (SitemapRow, bool) {
+	for _, row := range rows {
+		if row.Shape == shape {
+			return row, true
+		}
+	}
+	return SitemapRow{}, false
+}
+
+func TestSitemapCollapsesShapes(t *testing.T) {
+	roots := fixtureSitemapNodes(t, fixtureSitemapNode("1", "www.gnu.org", "DOMAIN", "", true, nil, 5))
+	levels := map[string]string{
+		"1": fixtureSitemapNodes(t,
+			fixtureSitemapNode("2", "index.html", "REQUEST", "1", false,
+				fixtureSitemapRequest("GET", "/index.html", "", 200, 1000), 1),
+			fixtureSitemapNode("3", "items", "REQUEST", "1", false,
+				fixtureSitemapRequest("GET", "/api/items", "", 200, 1000), 1),
+			fixtureSitemapNode("4", "1", "REQUEST", "1", false,
+				fixtureSitemapRequest("GET", "/user/1", "", 200, 1000), 1),
+			fixtureSitemapNode("5", "2", "REQUEST", "1", false,
+				fixtureSitemapRequest("GET", "/user/2", "", 500, 2000), 1),
+		),
+	}
+
+	result, err := fixtureSitemapClient(t, roots, levels).Sitemap(t.Context(), SitemapQuery{
+		Host:  "www.gnu.org",
+		Depth: 3,
+	})
+	if err != nil {
+		t.Fatalf("Sitemap: %v", err)
+	}
+	if result.Count != 3 {
+		t.Fatalf("count = %d, want 3 rows from 5 nodes", result.Count)
+	}
+	if result.Scanned != 4 {
+		t.Errorf("scanned = %d, want the 4 descendant nodes", result.Scanned)
+	}
+	merged, ok := findSitemapRow(result.Rows, "/user/{id}")
+	if !ok {
+		t.Fatalf("rows = %+v, want a collapsed /user/{id} row", result.Rows)
+	}
+	if merged.Requests != 2 {
+		t.Errorf("/user/{id} requests = %d, want 2", merged.Requests)
+	}
+	if merged.Status != 500 {
+		t.Errorf("/user/{id} status = %d, want the latest 500", merged.Status)
+	}
+	if result.Dropped != 1 {
+		t.Errorf("dropped = %d, want 1 collapsed row", result.Dropped)
+	}
+}
+
+func TestSitemapShapeReplacesNumericAndUUID(t *testing.T) {
+	roots := fixtureSitemapNodes(t, fixtureSitemapNode("1", "shop.example", "DOMAIN", "", true, nil, 2))
+	levels := map[string]string{
+		"1": fixtureSitemapNodes(t,
+			fixtureSitemapNode("2", "42", "REQUEST", "1", false,
+				fixtureSitemapRequest("GET", "/user/42", "", 200, 1000), 1),
+			fixtureSitemapNode("3", "uuid", "REQUEST", "1", false,
+				fixtureSitemapRequest("GET", "/order/550e8400-e29b-41d4-a716-446655440000", "", 200, 1000), 1),
+		),
+	}
+
+	result, err := fixtureSitemapClient(t, roots, levels).Sitemap(t.Context(), SitemapQuery{
+		Host:  "shop.example",
+		Depth: 1,
+	})
+	if err != nil {
+		t.Fatalf("Sitemap: %v", err)
+	}
+	if _, ok := findSitemapRow(result.Rows, "/user/{id}"); !ok {
+		t.Errorf("rows = %+v, want /user/{id}", result.Rows)
+	}
+	if _, ok := findSitemapRow(result.Rows, "/order/{id}"); !ok {
+		t.Errorf("rows = %+v, want /order/{id}", result.Rows)
+	}
+}
+
+func TestSitemapCapsAt200Rows(t *testing.T) {
+	roots := fixtureSitemapNodes(t, fixtureSitemapNode("1", "wide.example", "DOMAIN", "", true, nil, 250))
+	nodes := make([]map[string]any, 0, 250)
+	for i := 0; i < 250; i++ {
+		nodes = append(nodes, fixtureSitemapNode(
+			strconv.Itoa(i+10),
+			fmt.Sprintf("p%d", i),
+			"REQUEST",
+			"1",
+			false,
+			fixtureSitemapRequest("GET", fmt.Sprintf("/p%d", i), "", 200, 1000),
+			1,
+		))
+	}
+	levels := map[string]string{"1": fixtureSitemapNodes(t, nodes...)}
+
+	result, err := fixtureSitemapClient(t, roots, levels).Sitemap(t.Context(), SitemapQuery{
+		Host:  "wide.example",
+		Depth: 1,
+	})
+	if err != nil {
+		t.Fatalf("Sitemap: %v", err)
+	}
+	if result.Count != 200 {
+		t.Errorf("count = %d, want 200", result.Count)
+	}
+	if result.Truncated != 50 {
+		t.Errorf("truncated = %d, want 50", result.Truncated)
+	}
+}
+
+func TestSitemapEmptyTreeNotesHost(t *testing.T) {
+	roots := fixtureSitemapNodes(t, fixtureSitemapNode("1", "example.invalid", "DOMAIN", "", false, nil, 0))
+
+	result, err := fixtureSitemapClient(t, roots, map[string]string{}).Sitemap(t.Context(), SitemapQuery{
+		Host:  "example.invalid",
+		Depth: 3,
+	})
+	if err != nil {
+		t.Fatalf("Sitemap: %v", err)
+	}
+	if len(result.Rows) != 0 {
+		t.Errorf("rows = %+v, want none", result.Rows)
+	}
+	want := `no sitemap entry for host "example.invalid" — the proxy recorded no request for it`
+	if result.Note != want {
+		t.Errorf("note = %q, want %q", result.Note, want)
+	}
+}
+
+func TestSitemapNotesDepthCutChildren(t *testing.T) {
+	roots := fixtureSitemapNodes(t, fixtureSitemapNode("1", "docs.example", "DOMAIN", "", true, nil, 2))
+	levels := map[string]string{
+		"1": fixtureSitemapNodes(t,
+			fixtureSitemapNode("2", "docs", "REQUEST", "1", true,
+				fixtureSitemapRequest("GET", "/docs", "", 200, 1000), 1),
+		),
+		"2": fixtureSitemapNodes(t,
+			fixtureSitemapNode("3", "deep", "REQUEST", "2", true,
+				fixtureSitemapRequest("GET", "/docs/deep", "", 200, 1000), 1),
+		),
+		"3": fixtureSitemapNodes(t,
+			fixtureSitemapNode("4", "a", "REQUEST", "3", false,
+				fixtureSitemapRequest("GET", "/docs/deep/a", "", 200, 1000), 1),
+			fixtureSitemapNode("5", "b", "REQUEST", "3", false,
+				fixtureSitemapRequest("GET", "/docs/deep/b", "", 200, 1000), 1),
+			fixtureSitemapNode("6", "c", "REQUEST", "3", false,
+				fixtureSitemapRequest("GET", "/docs/deep/c", "", 200, 1000), 1),
+		),
+	}
+
+	result, err := fixtureSitemapClient(t, roots, levels).Sitemap(t.Context(), SitemapQuery{
+		Host:  "docs.example",
+		Depth: 2,
+	})
+	if err != nil {
+		t.Fatalf("Sitemap: %v", err)
+	}
+	want := "depth 2 reached — 3 child nodes not walked"
+	if result.Note != want {
+		t.Errorf("note = %q, want %q", result.Note, want)
+	}
+	if result.Count == 0 {
+		t.Fatalf("count = 0, want rows alongside the depth cut")
+	}
+	if result.Truncated != 0 {
+		t.Errorf("truncated = %d, want 0; a depth cut is not a row cut", result.Truncated)
+	}
+}
+
+func TestSitemapDepthCutWithoutRowsNotesDepth(t *testing.T) {
+	roots := fixtureSitemapNodes(t, fixtureSitemapNode("1", "docs.example", "DOMAIN", "", true, nil, 3))
+	levels := map[string]string{
+		"1": fixtureSitemapNodes(t,
+			fixtureSitemapNode("2", "docs", "PATH", "1", true, nil, 3),
+		),
+		"2": fixtureSitemapNodes(t,
+			fixtureSitemapNode("3", "a", "REQUEST", "2", false,
+				fixtureSitemapRequest("GET", "/docs/a", "", 200, 1000), 1),
+			fixtureSitemapNode("4", "b", "REQUEST", "2", false,
+				fixtureSitemapRequest("GET", "/docs/b", "", 200, 1000), 1),
+			fixtureSitemapNode("5", "c", "REQUEST", "2", false,
+				fixtureSitemapRequest("GET", "/docs/c", "", 200, 1000), 1),
+		),
+	}
+
+	result, err := fixtureSitemapClient(t, roots, levels).Sitemap(t.Context(), SitemapQuery{
+		Host:  "docs.example",
+		Depth: 1,
+	})
+	if err != nil {
+		t.Fatalf("Sitemap: %v", err)
+	}
+	if len(result.Rows) != 0 {
+		t.Fatalf("rows = %+v, want none because every request sits below the cap", result.Rows)
+	}
+	want := "depth 1 reached — 3 child nodes not walked"
+	if result.Note != want {
+		t.Errorf("note = %q, want %q", result.Note, want)
+	}
+}
+
+func TestSitemapNoDepthCutNoteEmpty(t *testing.T) {
+	roots := fixtureSitemapNodes(t, fixtureSitemapNode("1", "flat.example", "DOMAIN", "", true, nil, 2))
+	levels := map[string]string{
+		"1": fixtureSitemapNodes(t,
+			fixtureSitemapNode("2", "a", "REQUEST", "1", false,
+				fixtureSitemapRequest("GET", "/a", "", 200, 1000), 1),
+			fixtureSitemapNode("3", "b", "REQUEST", "1", false,
+				fixtureSitemapRequest("GET", "/b", "", 200, 1000), 1),
+		),
+	}
+
+	result, err := fixtureSitemapClient(t, roots, levels).Sitemap(t.Context(), SitemapQuery{
+		Host:  "flat.example",
+		Depth: 5,
+	})
+	if err != nil {
+		t.Fatalf("Sitemap: %v", err)
+	}
+	if result.Note != "" {
+		t.Errorf("note = %q, want empty when the walk visits every child", result.Note)
+	}
+}
+
+func TestSitemapDefaultDepthIsFive(t *testing.T) {
+	roots := fixtureSitemapNodes(t, fixtureSitemapNode("1", "deep.example", "DOMAIN", "", true, nil, 1))
+	levels := map[string]string{
+		"1": fixtureSitemapNodes(t, fixtureSitemapNode("2", "a", "REQUEST", "1", true, nil, 1)),
+		"2": fixtureSitemapNodes(t, fixtureSitemapNode("3", "b", "REQUEST", "2", true, nil, 1)),
+		"3": fixtureSitemapNodes(t, fixtureSitemapNode("4", "c", "REQUEST", "3", true, nil, 1)),
+		"4": fixtureSitemapNodes(t, fixtureSitemapNode("5", "d", "REQUEST", "4", true, nil, 1)),
+		"5": fixtureSitemapNodes(t, fixtureSitemapNode("6", "e", "REQUEST", "5", true,
+			fixtureSitemapRequest("GET", "/a/b/c/d/e", "", 200, 1000), 1)),
+		"6": fixtureSitemapNodes(t,
+			fixtureSitemapNode("7", "f", "REQUEST", "6", false,
+				fixtureSitemapRequest("GET", "/a/b/c/d/e/f", "", 200, 1000), 1),
+			fixtureSitemapNode("8", "g", "REQUEST", "6", false,
+				fixtureSitemapRequest("GET", "/a/b/c/d/e/g", "", 200, 1000), 1),
+		),
+	}
+
+	result, err := fixtureSitemapClient(t, roots, levels).Sitemap(t.Context(), SitemapQuery{
+		Host: "deep.example",
+	})
+	if err != nil {
+		t.Fatalf("Sitemap: %v", err)
+	}
+	if result.Scanned != 5 {
+		t.Errorf("scanned = %d, want 5 levels when depth is unset", result.Scanned)
+	}
+	want := "depth 5 reached — 2 child nodes not walked"
+	if result.Note != want {
+		t.Errorf("note = %q, want %q", result.Note, want)
 	}
 }

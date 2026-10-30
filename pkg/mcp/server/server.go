@@ -239,8 +239,9 @@ func registerAll(
 	r.Register(tools.NewPageList(mgr))      // page_list
 	if cf.Enabled {
 		config.SetActiveCaido(cf)
-		r.Register(tools.NewCaidoSearch()) // caido_search
-		r.Register(tools.NewCaidoStatus()) // caido_status
+		r.Register(tools.NewCaidoSearch())  // caido_search
+		r.Register(tools.NewCaidoSitemap()) // caido_sitemap
+		r.Register(tools.NewCaidoStatus())  // caido_status
 	}
 
 	r.RegisterPrompt(tools.NewFetchAndSummarizePrompt())        // fetch_and_summarize

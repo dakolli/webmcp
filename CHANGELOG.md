@@ -24,6 +24,12 @@
   `total` instead of returning a bare empty list.
 - The MCP `initialize` response names the Caido project and its scopes, so an agent knows which scope
   it reads before it searches.
+- `caido_sitemap` lists the endpoints a host exposes: method, path, kind, status, request count and
+  query parameters. Paths that differ only by a number or a UUID collapse into one row with a count.
+  Depth defaults to 5, and a cut depth reports the children it did not walk.
+- `browser caido sitemap <host>` prints the same rows as a table.
+- `CAIDO_LIVE=1 go test ./pkg/caido/` runs one test against the real instance and skips on a plain
+  run, so the unit suite stays offline.
 - `browser_create.deny_hosts` keeps chosen hosts out of the proxy. A proxied visit now stays clean of
   browser telemetry, so Caido history shows the target and not the browser.
 - `[caido] access_token` takes a direct instance token, and `[caido] allow_guest` (default true)

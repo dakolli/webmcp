@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +31,12 @@ const (
 	maxPages      = 5
 	maxPageRows   = 100
 	maxResponse   = 64 << 20
+
+	defaultSitemapDepth = 5
+	maxSitemapDepth     = 5
+	maxSitemapRows      = 200
+	maxSitemapNodes     = 2000
+	maxSitemapParams    = 10
 )
 
 // probeQuery is the cheapest authenticated query used to test a bearer token.
@@ -61,6 +68,28 @@ const scopesQuery = `query Scopes { scopes { id name allowlist denylist } }`
 
 // currentProjectQuery reads the project the instance has selected.
 const currentProjectQuery = `query CurrentProject { currentProject { project { id name temporary } } }`
+
+// sitemapNodeSelection is the shared selection for one sitemap node. The request
+// carries the path, method and latest status; requests counts every captured hit.
+const sitemapNodeSelection = `id label kind parentId hasDescendants
+      request { id host method path query fileExtension createdAt response { statusCode } }
+      requests { count { value } }`
+
+// sitemapRootsQuery lists every host root in the scope, or in every scope when
+// scopeId is omitted.
+const sitemapRootsQuery = `query SitemapRoots($scopeId: ID) {
+  sitemapRootEntries(scopeId: $scopeId) {
+    nodes { ` + sitemapNodeSelection + ` }
+  }
+}`
+
+// sitemapLevelQuery reads one level of a sitemap subtree. The instance declares
+// depth as an enum of DIRECT or ALL, so the caller walks DIRECT level by level.
+const sitemapLevelQuery = `query SitemapLevel($parentId: ID!, $depth: SitemapDescendantsDepth!) {
+  sitemapDescendantEntries(parentId: $parentId, depth: $depth) {
+    nodes { ` + sitemapNodeSelection + ` }
+  }
+}`
 
 // projectsQuery lists every project the instance holds, so a configured name can
 // be resolved to the id selectProject expects.
@@ -315,6 +344,66 @@ type Capture struct {
 	PassthroughList []string `json:"passthrough_list,omitempty"`
 	OutOfScope      *bool    `json:"out_of_scope,omitempty"`
 	Unfiltered      bool     `json:"unfiltered,omitempty"`
+}
+
+// SitemapQuery bounds one sitemap read. Host is a bare host name, Path is an
+// optional prefix filter, Depth bounds the tree walk and ScopeID is a live scope
+// id, "*" for every scope, or empty for the focus scope.
+type SitemapQuery struct {
+	Host    string
+	Path    string
+	Depth   int
+	ScopeID string
+}
+
+// SitemapEntry is one node of a host's sitemap tree. Request is nil for a
+// directory or domain node, and Requests is every request recorded under it.
+type SitemapEntry struct {
+	ID             string          `json:"id"`
+	Label          string          `json:"label"`
+	Kind           string          `json:"kind"`
+	ParentID       string          `json:"parent_id,omitempty"`
+	HasDescendants bool            `json:"has_descendants"`
+	Request        *SitemapRequest `json:"request,omitempty"`
+	Requests       int             `json:"requests"`
+}
+
+// SitemapRequest is the latest request recorded for an endpoint node.
+type SitemapRequest struct {
+	Method    string `json:"method"`
+	Path      string `json:"path"`
+	Query     string `json:"query,omitempty"`
+	Status    int    `json:"status"`
+	CreatedAt int64  `json:"created_at,omitempty"`
+}
+
+// SitemapRow is one endpoint after shape collapse. Shape is Path with numeric
+// and UUID segments replaced by {id}, and Params is the sorted query keys.
+type SitemapRow struct {
+	Method   string   `json:"method"`
+	Path     string   `json:"path"`
+	Kind     string   `json:"kind"`
+	Status   int      `json:"status"`
+	Mime     string   `json:"mime,omitempty"`
+	Requests int      `json:"requests"`
+	Params   []string `json:"params"`
+	Shape    string   `json:"shape"`
+}
+
+// SitemapResult is the bounded endpoint list for one host. Scanned is the tree
+// nodes walked, Dropped is the rows merged by shape and Truncated is the rows cut
+// by the 200-row cap. Note names an empty result without being an error, or
+// reports the child nodes the depth cap left unvisited.
+type SitemapResult struct {
+	Host      string       `json:"host"`
+	Project   string       `json:"project"`
+	ScopeID   string       `json:"scope_id"`
+	Rows      []SitemapRow `json:"rows"`
+	Count     int          `json:"count"`
+	Scanned   int          `json:"scanned"`
+	Dropped   int          `json:"dropped"`
+	Truncated int          `json:"truncated"`
+	Note      string       `json:"note"`
 }
 
 // Login caches a usable token and reports which path authenticated. It tries an
@@ -710,6 +799,240 @@ func (c *Client) CurrentProject(ctx context.Context) (string, error) {
 		return "", errors.New("caido: no project is selected — select one in the Caido UI")
 	}
 	return data.CurrentProject.Project.Name, nil
+}
+
+// SitemapRoots lists the sitemap host roots the instance holds for one scope. An
+// empty scopeID reads every scope and "*" is treated the same way.
+func (c *Client) SitemapRoots(ctx context.Context, scopeID string) ([]SitemapEntry, error) {
+	token := c.currentToken()
+	if token == "" {
+		return nil, ErrNoCredential
+	}
+	scopeID = strings.TrimSpace(scopeID)
+	vars := map[string]any{}
+	if scopeID != "" && scopeID != "*" {
+		vars["scopeId"] = scopeID
+	}
+	var data struct {
+		Roots sitemapConnection `json:"sitemapRootEntries"`
+	}
+	if err := c.call(ctx, token, sitemapRootsQuery, vars, &data); err != nil {
+		var gql *graphqlError
+		if errors.As(err, &gql) {
+			if scopeID != "" && scopeRejected(gql.Error()) {
+				return nil, &ScopeError{Scope: scopeID, Message: gql.Error()}
+			}
+			return nil, fmt.Errorf("caido: sitemapRootEntries failed: %s", gql.Error())
+		}
+		return nil, err
+	}
+	return mapSitemapNodes(data.Roots.Nodes), nil
+}
+
+// SitemapDescendants walks the sitemap breadth-first from parentID and returns
+// every node up to depth levels plus the count of children the depth cap left
+// unvisited. A depth of 0 or less defaults to 5 and the cap is 5. The instance
+// exposes only a DIRECT or ALL enum, so each level is one query; one extra level
+// counts the children beyond the cap without adding them to the result.
+func (c *Client) SitemapDescendants(
+	ctx context.Context,
+	parentID string,
+	depth int,
+) ([]SitemapEntry, int, error) {
+	token := c.currentToken()
+	if token == "" {
+		return nil, 0, ErrNoCredential
+	}
+	parentID = strings.TrimSpace(parentID)
+	if parentID == "" {
+		return nil, 0, errors.New("caido: sitemap: parent id is empty")
+	}
+	depth = clampSitemapDepth(depth)
+	frontier := []string{parentID}
+	out := make([]SitemapEntry, 0, 32)
+	for level := 0; level < depth && len(frontier) > 0; level++ {
+		next := make([]string, 0, len(frontier))
+		for _, id := range frontier {
+			if err := ctx.Err(); err != nil {
+				return nil, 0, err
+			}
+			children, err := c.sitemapLevel(ctx, token, id)
+			if err != nil {
+				return nil, 0, err
+			}
+			for _, child := range children {
+				out = append(out, child)
+				if child.HasDescendants {
+					next = append(next, child.ID)
+				}
+			}
+			if len(out) >= maxSitemapNodes {
+				return out, 0, nil
+			}
+		}
+		frontier = next
+	}
+	if len(frontier) == 0 {
+		return out, 0, nil
+	}
+	skipped := 0
+	for _, id := range frontier {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
+		children, err := c.sitemapLevel(ctx, token, id)
+		if err != nil {
+			return nil, 0, err
+		}
+		skipped += len(children)
+	}
+	return out, skipped, nil
+}
+
+// Sitemap reads a host's endpoint tree and collapses it to one row per method
+// and path shape. A host without a root, or a tree without endpoints, returns an
+// empty row list with a note rather than an error.
+func (c *Client) Sitemap(ctx context.Context, q SitemapQuery) (SitemapResult, error) {
+	host := strings.TrimSpace(q.Host)
+	project, err := c.CurrentProject(ctx)
+	if err != nil {
+		return SitemapResult{}, err
+	}
+	scopeID := strings.TrimSpace(q.ScopeID)
+	queryScope := scopeID
+	if scopeID == "*" {
+		queryScope = ""
+	}
+	result := SitemapResult{
+		Host:    host,
+		Project: project,
+		ScopeID: scopeID,
+		Rows:    []SitemapRow{},
+	}
+
+	roots, err := c.SitemapRoots(ctx, queryScope)
+	if err != nil {
+		return SitemapResult{}, err
+	}
+	rootID := ""
+	for _, root := range roots {
+		if strings.EqualFold(strings.TrimSpace(root.Label), host) {
+			rootID = root.ID
+			break
+		}
+	}
+	if rootID == "" {
+		result.Note = sitemapEmptyNote(host)
+		return result, nil
+	}
+
+	depth := clampSitemapDepth(q.Depth)
+	nodes, skipped, err := c.SitemapDescendants(ctx, rootID, depth)
+	if err != nil {
+		return SitemapResult{}, err
+	}
+	result.Scanned = len(nodes)
+
+	prefix := strings.TrimSpace(q.Path)
+	type shapeKey struct {
+		method string
+		shape  string
+	}
+	type accumulator struct {
+		row    SitemapRow
+		params map[string]struct{}
+		latest int64
+	}
+	merged := make(map[shapeKey]*accumulator, len(nodes))
+	order := make([]shapeKey, 0, len(nodes))
+	for _, node := range nodes {
+		if node.Request == nil {
+			continue
+		}
+		endpoint := node.Request.Path
+		if endpoint == "" {
+			endpoint = "/"
+		}
+		if prefix != "" && !strings.HasPrefix(endpoint, prefix) {
+			continue
+		}
+		mime := mimeForPath(endpoint)
+		key := shapeKey{
+			method: strings.ToUpper(node.Request.Method),
+			shape:  shapePath(endpoint),
+		}
+		acc, seen := merged[key]
+		if !seen {
+			acc = &accumulator{
+				row: SitemapRow{
+					Method: key.method,
+					Path:   endpoint,
+					Kind:   endpointKind(endpoint, mime),
+					Mime:   mime,
+					Shape:  key.shape,
+				},
+				params: map[string]struct{}{},
+			}
+			merged[key] = acc
+			order = append(order, key)
+		} else {
+			result.Dropped++
+		}
+		acc.row.Requests += node.Requests
+		if node.Request.CreatedAt >= acc.latest {
+			acc.latest = node.Request.CreatedAt
+			acc.row.Status = node.Request.Status
+		}
+		for _, name := range queryParamNames(node.Request.Query) {
+			acc.params[name] = struct{}{}
+		}
+	}
+
+	rows := make([]SitemapRow, 0, len(order))
+	for _, key := range order {
+		acc := merged[key]
+		acc.row.Params = sortedParamNames(acc.params)
+		rows = append(rows, acc.row)
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Requests != rows[j].Requests {
+			return rows[i].Requests > rows[j].Requests
+		}
+		return rows[i].Path < rows[j].Path
+	})
+	if len(rows) > maxSitemapRows {
+		result.Truncated = len(rows) - maxSitemapRows
+		rows = rows[:maxSitemapRows]
+	}
+	result.Rows = rows
+	result.Count = len(rows)
+	switch {
+	case skipped > 0:
+		result.Note = sitemapDepthNote(depth, skipped)
+	case len(rows) == 0:
+		result.Note = sitemapEmptyNote(host)
+	}
+	return result, nil
+}
+
+// sitemapLevel reads the immediate children of one sitemap node.
+func (c *Client) sitemapLevel(
+	ctx context.Context,
+	token string,
+	parentID string,
+) ([]SitemapEntry, error) {
+	vars := map[string]any{"parentId": parentID, "depth": "DIRECT"}
+	var data struct {
+		Entries sitemapConnection `json:"sitemapDescendantEntries"`
+	}
+	if err := c.call(ctx, token, sitemapLevelQuery, vars, &data); err != nil {
+		var gql *graphqlError
+		if errors.As(err, &gql) {
+			return nil, fmt.Errorf("caido: sitemapDescendantEntries failed: %s", gql.Error())
+		}
+		return nil, err
+	}
+	return mapSitemapNodes(data.Entries.Nodes), nil
 }
 
 // Projects lists every project the instance holds, with the temporary flag the
@@ -1212,6 +1535,249 @@ type connection struct {
 		Value int `json:"value"`
 	} `json:"count"`
 	Nodes []requestNode `json:"nodes"`
+}
+
+// sitemapConnection is the Relay-style page returned by a sitemap query.
+type sitemapConnection struct {
+	Nodes []sitemapNode `json:"nodes"`
+}
+
+// sitemapNode is one sitemap entry as the instance returns it.
+type sitemapNode struct {
+	ID             string              `json:"id"`
+	Label          string              `json:"label"`
+	Kind           string              `json:"kind"`
+	ParentID       *string             `json:"parentId"`
+	HasDescendants bool                `json:"hasDescendants"`
+	Request        *sitemapRequestNode `json:"request"`
+	Requests       struct {
+		Count struct {
+			Value int `json:"value"`
+		} `json:"count"`
+	} `json:"requests"`
+}
+
+// sitemapRequestNode is the latest request behind an endpoint node.
+type sitemapRequestNode struct {
+	ID            string `json:"id"`
+	Host          string `json:"host"`
+	Method        string `json:"method"`
+	Path          string `json:"path"`
+	Query         string `json:"query"`
+	FileExtension string `json:"fileExtension"`
+	CreatedAt     int64  `json:"createdAt"`
+	Response      *struct {
+		StatusCode int `json:"statusCode"`
+	} `json:"response"`
+}
+
+// mapSitemapNodes reduces the wire nodes to the public sitemap entries.
+func mapSitemapNodes(nodes []sitemapNode) []SitemapEntry {
+	out := make([]SitemapEntry, 0, len(nodes))
+	for _, node := range nodes {
+		entry := SitemapEntry{
+			ID:             node.ID,
+			Label:          node.Label,
+			Kind:           node.Kind,
+			HasDescendants: node.HasDescendants,
+			Requests:       node.Requests.Count.Value,
+		}
+		if node.ParentID != nil {
+			entry.ParentID = *node.ParentID
+		}
+		if node.Request != nil {
+			request := SitemapRequest{
+				Method:    node.Request.Method,
+				Path:      node.Request.Path,
+				Query:     node.Request.Query,
+				CreatedAt: node.Request.CreatedAt,
+			}
+			if node.Request.Response != nil {
+				request.Status = node.Request.Response.StatusCode
+			}
+			entry.Request = &request
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// clampSitemapDepth applies the default and the cap to a requested depth.
+func clampSitemapDepth(depth int) int {
+	if depth <= 0 {
+		return defaultSitemapDepth
+	}
+	if depth > maxSitemapDepth {
+		return maxSitemapDepth
+	}
+	return depth
+}
+
+// sitemapEmptyNote names the host an empty sitemap read found nothing for.
+func sitemapEmptyNote(host string) string {
+	return fmt.Sprintf("no sitemap entry for host %q — the proxy recorded no request for it", host)
+}
+
+// sitemapDepthNote reports the child nodes the depth cap left unvisited.
+func sitemapDepthNote(depth int, skipped int) string {
+	return fmt.Sprintf("depth %d reached — %d child nodes not walked", depth, skipped)
+}
+
+// queryParamNames returns the query keys, in the order they appear.
+func queryParamNames(query string) []string {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil
+	}
+	names := make([]string, 0, 4)
+	for _, pair := range strings.Split(query, "&") {
+		name, _, _ := strings.Cut(pair, "=")
+		if name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// sortedParamNames renders a parameter set as a sorted, capped list.
+func sortedParamNames(set map[string]struct{}) []string {
+	names := make([]string, 0, len(set))
+	for name := range set {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	if len(names) > maxSitemapParams {
+		names = names[:maxSitemapParams]
+	}
+	return names
+}
+
+// shapePath replaces numeric and UUID path segments with {id}.
+func shapePath(path string) string {
+	segments := strings.Split(path, "/")
+	for i, segment := range segments {
+		if isNumericSegment(segment) || isUUIDSegment(segment) {
+			segments[i] = "{id}"
+		}
+	}
+	return strings.Join(segments, "/")
+}
+
+func isNumericSegment(segment string) bool {
+	if segment == "" {
+		return false
+	}
+	for _, r := range segment {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isUUIDSegment(segment string) bool {
+	if len(segment) != 36 {
+		return false
+	}
+	for i, r := range segment {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if r != '-' {
+				return false
+			}
+			continue
+		}
+		if !isHexRune(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func isHexRune(r rune) bool {
+	return (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')
+}
+
+// endpointKind classifies a path as api, static, or page.
+func endpointKind(path, mime string) string {
+	if isAPIPath(path, mime) {
+		return "api"
+	}
+	if isStaticMime(mime) {
+		return "static"
+	}
+	return "page"
+}
+
+func isAPIPath(path, mime string) bool {
+	if path == "/api" || strings.HasPrefix(path, "/api/") {
+		return true
+	}
+	switch mime {
+	case "application/json", "application/xml", "text/xml":
+		return true
+	}
+	return false
+}
+
+func isStaticMime(mime string) bool {
+	if strings.HasPrefix(mime, "image/") || strings.HasPrefix(mime, "font/") ||
+		strings.HasPrefix(mime, "video/") || strings.HasPrefix(mime, "audio/") {
+		return true
+	}
+	switch mime {
+	case "text/css", "application/javascript", "text/javascript":
+		return true
+	}
+	return false
+}
+
+// mimeForPath guesses a MIME type from the path extension. The sitemap does not
+// expose a content type, so this is the only signal the instance gives.
+func mimeForPath(path string) string {
+	return mimeByExtension[pathExtension(path)]
+}
+
+func pathExtension(path string) string {
+	base := path
+	if i := strings.LastIndexByte(base, '/'); i >= 0 {
+		base = base[i+1:]
+	}
+	if i := strings.LastIndexByte(base, '.'); i >= 0 {
+		return strings.ToLower(base[i:])
+	}
+	return ""
+}
+
+var mimeByExtension = map[string]string{
+	".html":  "text/html",
+	".htm":   "text/html",
+	".xhtml": "application/xhtml+xml",
+	".css":   "text/css",
+	".js":    "application/javascript",
+	".mjs":   "application/javascript",
+	".json":  "application/json",
+	".xml":   "application/xml",
+	".txt":   "text/plain",
+	".csv":   "text/csv",
+	".pdf":   "application/pdf",
+	".png":   "image/png",
+	".jpg":   "image/jpeg",
+	".jpeg":  "image/jpeg",
+	".gif":   "image/gif",
+	".webp":  "image/webp",
+	".avif":  "image/avif",
+	".svg":   "image/svg+xml",
+	".ico":   "image/x-icon",
+	".woff":  "font/woff",
+	".woff2": "font/woff2",
+	".ttf":   "font/ttf",
+	".otf":   "font/otf",
+	".eot":   "application/vnd.ms-fontobject",
+	".mp4":   "video/mp4",
+	".webm":  "video/webm",
+	".mp3":   "audio/mpeg",
+	".wav":   "audio/wav",
+	".ogg":   "audio/ogg",
 }
 
 // entryFromNode maps one metadata row onto the result entry.

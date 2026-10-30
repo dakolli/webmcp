@@ -63,6 +63,7 @@ func NewRegistry() *Registry {
 	if config.ActiveCaido().Enabled {
 		r.Register(NewCaidoSearch())
 		r.Register(NewCaidoStatus())
+		r.Register(NewCaidoSitemap())
 	}
 
 	r.RegisterPrompt(NewFetchAndSummarizePrompt())

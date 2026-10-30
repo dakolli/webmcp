@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -28,6 +29,7 @@ queries Caido directly without starting the serve daemon.`,
 	}
 	cmd.AddCommand(newCaidoStatusCmd())
 	cmd.AddCommand(newCaidoSearchCmd())
+	cmd.AddCommand(newCaidoSitemapCmd())
 	return cmd
 }
 
@@ -184,6 +186,138 @@ Without an expression or a scope the scan is bounded to the newest 500 rows.`,
 	f.BoolVar(&raw, "raw", false, "disable credential redaction")
 	f.BoolVar(&jsonOut, "json", false, "print the result as JSON")
 	return cmd
+}
+
+// newCaidoSitemapCmd constructs the "caido sitemap" command: the human view over
+// the same endpoint tree the caido_sitemap MCP tool reads.
+func newCaidoSitemapCmd() *cobra.Command {
+	var (
+		pathPrefix string
+		depth      int
+		scopeID    string
+		jsonOut    bool
+	)
+	cmd := &cobra.Command{
+		Use:   "sitemap <host>",
+		Short: "List the endpoint tree the Caido sitemap recorded for one host",
+		Long: `Reads one host's sitemap tree and collapses it to one row per method and path
+shape, with numeric and UUID segments replaced by {id}. host is a bare host such as
+www.gnu.org, with no scheme and no path. --path keeps only endpoints under that
+prefix. --scope selects the scope: empty uses the configured focus scope, "*" reads
+every scope, any other value is a scope id from "browser caido status". The result
+caps at 200 rows.`,
+		Example: `  browser caido sitemap www.gnu.org
+  browser caido sitemap www.gnu.org --path /software --depth 2
+  browser caido sitemap www.gnu.org --scope '*' --json`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			host := strings.TrimSpace(args[0])
+			if host == "" {
+				return fmt.Errorf("caido sitemap: host is required")
+			}
+			if strings.Contains(host, "://") || strings.ContainsAny(host, "/?#") {
+				return fmt.Errorf("caido sitemap: host must be a bare host such as www.gnu.org — no scheme and no path")
+			}
+			if depth < 1 {
+				depth = 1
+			}
+			if depth > 5 {
+				depth = 5
+			}
+			cf, err := config.LoadCaido()
+			if err != nil {
+				return fmt.Errorf("caido sitemap: %w", err)
+			}
+			ctx, cancel := context.WithTimeout(cmdCtx(cmd), defaultCmdTimeout)
+			defer cancel()
+
+			client := caido.NewClient(cf.URL)
+			if _, err := client.Login(
+				ctx,
+				cf.AccessToken,
+				cf.PAT,
+				cf.AllowGuest,
+			); err != nil {
+				return fmt.Errorf("caido sitemap: %w", err)
+			}
+
+			scope := strings.TrimSpace(scopeID)
+			scopeName := ""
+			allScopes := scope == "*"
+			if !allScopes {
+				if scope == "" {
+					_, scopeName = caido.Selection()
+				}
+				if scope != "" || scopeName != "" {
+					resolved, err := client.ResolveScope(ctx, scope, scopeName)
+					if err != nil {
+						return fmt.Errorf("caido sitemap: %w", err)
+					}
+					scope, scopeName = resolved.ID, resolved.Name
+				}
+			}
+
+			result, err := client.Sitemap(ctx, caido.SitemapQuery{
+				Host:    host,
+				Path:    strings.TrimSpace(pathPrefix),
+				Depth:   depth,
+				ScopeID: scope,
+			})
+			if err != nil {
+				return fmt.Errorf("caido sitemap: %w", err)
+			}
+			if jsonOut {
+				data, err := json.Marshal(result)
+				if err != nil {
+					return fmt.Errorf("caido sitemap: %w", err)
+				}
+				fmt.Fprintln(cmd.OutOrStdout(), string(data))
+				return nil
+			}
+			printCaidoSitemap(cmd, result)
+			return nil
+		},
+	}
+	f := cmd.Flags()
+	f.StringVar(&pathPrefix, "path", "", "keep only endpoints whose path starts with this prefix")
+	f.IntVar(&depth, "depth", 5, "sitemap tree depth to walk, clamped 1..5")
+	f.StringVar(&scopeID, "scope", "", "scope id, \"*\" for every scope, empty for the configured focus scope")
+	f.BoolVar(&jsonOut, "json", false, "print the envelope as JSON")
+	return cmd
+}
+
+// printCaidoSitemap renders the envelope header and one table row per endpoint.
+func printCaidoSitemap(cmd *cobra.Command, result caido.SitemapResult) {
+	out := cmd.OutOrStdout()
+	fmt.Fprintf(out, "host: %s\n", result.Host)
+	fmt.Fprintf(out, "project: %s\n", result.Project)
+	if result.ScopeID == "" {
+		fmt.Fprintf(out, "scope_id: (none)\n")
+	} else {
+		fmt.Fprintf(out, "scope_id: %s\n", result.ScopeID)
+	}
+	fmt.Fprintf(out, "count: %d scanned: %d dropped: %d truncated: %d\n",
+		result.Count, result.Scanned, result.Dropped, result.Truncated)
+	if result.Note != "" {
+		fmt.Fprintf(out, "note: %s\n", result.Note)
+	}
+	if len(result.Rows) == 0 {
+		return
+	}
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "METHOD\tPATH\tKIND\tSTATUS\tREQUESTS\tMIME\tPARAMS")
+	for _, row := range result.Rows {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%d\t%s\t%s\n",
+			row.Method,
+			row.Path,
+			row.Kind,
+			row.Status,
+			row.Requests,
+			row.Mime,
+			strings.Join(row.Params, ","),
+		)
+	}
+	_ = tw.Flush()
 }
 
 // printCaidoSearch renders the filter that ran and one line per transaction.
