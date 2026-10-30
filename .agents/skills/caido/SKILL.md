@@ -1,6 +1,6 @@
 ---
 name: caido
-description: Read the recorded HTTP history of a local Caido proxy with the caido_status, caido_sitemap, caido_search and caido_finding MCP tools. Use when a task needs the requests and responses that pages sent through the Caido proxy on 127.0.0.1:8081. The record covers headers, bodies, status codes, timings, endpoints and findings.
+description: Read and replay a local Caido proxy's HTTP history with caido_status, caido_sitemap, caido_search, caido_finding and caido_replay. Use when a task needs the requests and responses that pages sent through the Caido proxy on 127.0.0.1:8081. The record covers headers, bodies, status codes, timings, endpoints and findings.
 ---
 
 # caido skill
@@ -20,9 +20,9 @@ after the page closes. A human starts the instance with `make caido`. These tool
 - A page records only through the proxy. Create a browser with `browser_create {"proxy":"127.0.0.1:8081","ignore_certs":true}`.
 - The history is shared. Every client of the instance writes to one list.
 - A guest session loses its history when the instance stops.
-- The tools never change, replay or block traffic. `caido_finding` create writes a finding only.
+- `caido_status`, `caido_sitemap`, `caido_search` and `caido_finding` create never change or block traffic. `caido_replay` sends one new request and records its exchange. `caido_finding` create writes a finding only.
 
-## The four tools
+## The five tools
 
 | Tool | What it answers | Key argument |
 | :--- | :--- | :--- |
@@ -30,6 +30,7 @@ after the page closes. A human starts the instance with `make caido`. These tool
 | `caido_sitemap` | Which endpoints one host recorded, one row per method and path shape. | `host` |
 | `caido_search` | Which requests match one filter, newest first. | `httpql` |
 | `caido_finding` | Which bugs you proved, linked to one captured request id. | `action` |
+| `caido_replay` | The exchange one resent request recorded, as a new history row. | `request_id` |
 
 ## The read flow
 
@@ -37,6 +38,7 @@ after the page closes. A human starts the instance with `make caido`. These tool
 2. Call `caido_sitemap` for the host. It lists endpoints, not requests.
 3. Call `caido_search` with `httpql` when you know what you want.
 4. Call `caido_finding` to record what you proved.
+5. Call `caido_replay` when the request lives only in history.
 
 ## Every argument
 
@@ -66,6 +68,11 @@ after the page closes. A human starts the instance with `make caido`. These tool
 | `caido_finding` | `title` | string | no | `""` | Finding title. `create` needs it. |
 | `caido_finding` | `request_id` | string | no | `""` | Captured request id from `caido_search`, never a URL. `create` needs it. |
 | `caido_finding` | `notes` | string | no | `""` | Finding description, cut at 4096 bytes. |
+| `caido_replay` | `request_id` | string | yes | — | Captured request id from `caido_search`, never a URL. |
+| `caido_replay` | `method` | string | no | captured | An HTTP token, upper-cased. A change to `GET`, `HEAD` or `DELETE` drops the body. |
+| `caido_replay` | `headers` | object | no | `{}` | Each name is a token and each value has no newline. A named header replaces its captured value. |
+| `caido_replay` | `query` | object | no | `{}` | A non-empty value replaces one URL parameter. An empty value removes it. |
+| `caido_replay` | `body` | string | no | captured | Replaces the body. An empty string sends an empty body and `content-length: 0`. |
 
 ## What a search returns
 
@@ -94,7 +101,8 @@ after the page closes. A human starts the instance with `make caido`. These tool
 - Raise the window when `entries` is empty and `dropped_since` is above zero. Do not conclude that history is empty.
 - Read `total` as the server count. It ignores `since`, so count 0 beside a total of 25 is normal.
 - Keep redaction on for a report. `raw:true` prints live cookies and tokens into your context.
-- Take `request_id` from a `caido_search` row before you create a finding.
+- Take `request_id` from a `caido_search` row before you create a finding or replay it.
+- `caido_replay` sends one request. Read `caido_status` first when the project matters.
 
 ## `deny_hosts` and capture
 
@@ -110,7 +118,7 @@ no row for it.
 | What did the whole browser send across tabs and navigations? | Caido. The record outlives the page and the bodies stay on the server. |
 | What did one page send, with timing, in one call? | `page_fetch what=network`. No proxy is needed. |
 | What is one captured body? | `caido_search` with `part` and `body_bytes`, or `page_fetch what=body`. |
-| What can I replay? | `page_act replay` on a browser entry. Caido never replays. |
+| What can I replay? | `caido_replay` for a Caido history row. `page_act replay` for a live browser entry. |
 
 Reach for Caido when the browser has closed, when several tabs matter, or when the body must survive a
 navigation. Reach for `page_fetch` when one live page owns the question.
@@ -128,6 +136,8 @@ navigation. Reach for `page_fetch` when one live page owns the question.
 | `caido_search: unknown argument "<key>" — valid arguments are …` | `invalid_args` | Remove the key. The message lists all 13. |
 | `caido_sitemap: invalid arguments: host must be a bare host such as www.gnu.org — no scheme and no path` | `invalid_args` | Strip the scheme and the path. |
 | `caido_finding: invalid arguments: create needs title and request_id — take a request id from caido_search` | `invalid_args` | Take an id from a search row. |
+| `caido_replay: invalid arguments: request_id is required — take a request id from caido_search` | `invalid_args` | Send `request_id`. |
+| `caido: no request with id "…" — take a request id from caido_search` | `not_found` | Search again and take a live id. |
 | `caido: createFinding failed: UnknownIdUserError (UNKNOWN_ID)` | `unknown` | The request id is not on the instance. Search again. |
 
 A `caido_search: invalid arguments` failure also carries `hint: fix the arguments per the tool InputSchema (required fields, enum values)`.

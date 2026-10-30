@@ -285,7 +285,7 @@ falls through to the next step, so a bad PAT still yields a working guest sessio
 `allow_guest = false` the tool returns `caido: no session — the instance rejected the credential and
 guest access is off`. Guest history lasts only while the instance runs.
 
-Four tools read and record that history:
+Five tools read, record and replay that history:
 
 | Tool | Purpose |
 | :--- | :--- |
@@ -293,14 +293,16 @@ Four tools read and record that history:
 | `caido_sitemap` | The endpoints one host recorded, one row per method and path shape. |
 | `caido_search` | The captured requests, filtered by `httpql` or the typed keys. |
 | `caido_finding` | A finding linked to one captured request id, so it outlives the chat. |
+| `caido_replay` | Resend one captured request and read the exchange it records. |
 
 The `[caido] capture` key picks what the proxy records: `all` records every host, and `in-scope`
 records only the `scope_allow` hosts. `browser_create` `deny_hosts` routes a host outside the proxy,
-so that host never reaches history. The request still leaves the machine. The tools never change
-traffic. Credential-shaped header names and credential-shaped keys in JSON, form and plain bodies come
-back as `<redacted>` unless `raw` is true. `count` is the rows returned and `total` is the whole
-matching history, which ignores `since`. A search with no filter scans the newest 500 rows, and a
-filtered search pages until `limit`. `body_bytes: 0` returns headers with empty bodies.
+so that host never reaches history. The request still leaves the machine. The read tools never change
+captured history. `caido_replay` sends one new request. Credential-shaped header names and
+credential-shaped keys in JSON, form and plain bodies come back as `<redacted>` unless `raw` is true.
+`count` is the rows returned and `total` is the whole matching history, which ignores `since`. A search
+with no filter scans the newest 500 rows, and a filtered search pages until `limit`.
+`body_bytes: 0` returns headers with empty bodies.
 
 ## Licence
 
