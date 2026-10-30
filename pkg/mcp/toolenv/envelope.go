@@ -117,6 +117,7 @@ var invalidArgsMarkers = []string{
 	"intercept: duplicate rule id",
 	"intercept: rule id is required",
 	"intercept: rule",
+	"intercept is already enabled",
 }
 
 // decodeArgsMarkers identify a failure raised while decoding or validating

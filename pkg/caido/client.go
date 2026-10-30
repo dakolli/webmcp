@@ -61,6 +61,7 @@ const statusQuery = `query Status {
   scopes: scopes { id name allowlist denylist }
   capture: passthroughOptions { captureList passthroughList outOfScope }
   history: requestsByOffset(limit: 1) { count { value } }
+  intercept: tamperRuleCollections { rules { id } }
 }`
 
 // scopesQuery lists the instance's scopes with the lists a launch compares, so a
@@ -198,6 +199,66 @@ const (
 	replayPollInterval = 100 * time.Millisecond
 	replayPollBudget   = 10 * time.Second
 )
+
+// interceptRulePrefix names every rule caido_intercept creates, so a rule a
+// previous agent left is recognisable.
+const interceptRulePrefix = "webmcp-intercept"
+
+// interceptQuery reads the global intercept switch, the per-direction options,
+// the persistent rewrite rules and the queued message count in one request.
+const interceptQuery = `query Intercept {
+  status: interceptStatus
+  options: interceptOptions {
+    request { enabled filter { ... on HTTPQL { code } } }
+    response { enabled filter { ... on HTTPQL { code } } }
+    streamWs { enabled }
+    scope { scopeId }
+  }
+  collections: tamperRuleCollections {
+    id
+    rules { id name sources enable { rank } }
+  }
+  messages: interceptMessages(kind: RESPONSE, first: 1) { count { value } }
+}`
+
+// interceptCollectionsQuery lists the rule collections a new rule is filed
+// under. The instance always holds one default collection.
+const interceptCollectionsQuery = `query InterceptCollections { tamperRuleCollections { id name } }`
+
+// createInterceptRuleMutation creates one response rewrite rule scoped to the
+// INTERCEPT source. A created rule is disabled, so the caller toggles it next.
+const createInterceptRuleMutation = `mutation CreateInterceptRule($input: CreateTamperRuleInput!) {
+  createTamperRule(input: $input) {
+    rule { id name }
+    error { __typename }
+  }
+}`
+
+// toggleInterceptRuleMutation enables or disables one rewrite rule.
+const toggleInterceptRuleMutation = `mutation ToggleInterceptRule($id: ID!, $enabled: Boolean!) {
+  toggleTamperRule(id: $id, enabled: $enabled) {
+    rule { id name }
+    error { __typename }
+  }
+}`
+
+// deleteInterceptRuleMutation removes one rewrite rule for the kill switch.
+const deleteInterceptRuleMutation = `mutation DeleteInterceptRule($id: ID!) {
+  deleteTamperRule(id: $id) { deletedId }
+}`
+
+// setInterceptOptionsMutation replaces the per-direction intercept switches and
+// their HTTPQL filters in one write. The instance declares all three direction
+// objects non-null, so every write sends a complete option set.
+const setInterceptOptionsMutation = `mutation SetInterceptOptions($input: InterceptOptionsInput!) {
+  setInterceptOptions(input: $input) {
+    options {
+      request { enabled filter { ... on HTTPQL { code } } }
+      response { enabled filter { ... on HTTPQL { code } } }
+      streamWs { enabled }
+    }
+  }
+}`
 
 // guestMutation exchanges guest access for an access token.
 const guestMutation = `mutation Guest { loginAsGuest { token { accessToken refreshToken expiresAt } error { __typename } } }`
@@ -431,6 +492,8 @@ type Status struct {
 	Scopes  []ScopeStatus `json:"scopes"`
 	Capture Capture       `json:"capture"`
 	History int           `json:"history"`
+
+	Intercept InterceptCount `json:"intercept"`
 }
 
 // ProjectStatus is the current project with its read-only flag.
@@ -463,6 +526,73 @@ type Capture struct {
 	PassthroughList []string `json:"passthrough_list,omitempty"`
 	OutOfScope      *bool    `json:"out_of_scope,omitempty"`
 	Unfiltered      bool     `json:"unfiltered,omitempty"`
+}
+
+// InterceptCount is the armed rewrite-rule count caido_status reports, so a rule
+// a previous agent left armed is visible without a second call.
+type InterceptCount struct {
+	Rules int `json:"rules"`
+}
+
+// InterceptRule is one persistent Caido rewrite rule with the INTERCEPT source.
+// It outlives this process and rewrites traffic from every browser that uses the
+// proxy. Enabled is false for a rule that exists but is toggled off.
+type InterceptRule struct {
+	ID      string   `json:"id"`
+	Name    string   `json:"name"`
+	Enabled bool     `json:"enabled"`
+	Sources []string `json:"sources,omitempty"`
+}
+
+// InterceptDirection is one intercept category's switch and HTTPQL filter.
+type InterceptDirection struct {
+	Enabled bool   `json:"enabled"`
+	Filter  string `json:"filter,omitempty"`
+}
+
+// Intercept is the live intercept surface: the global switch, the per-direction
+// options, the persistent rules and the queued message count.
+type Intercept struct {
+	Status   string             `json:"status"`
+	Rules    []InterceptRule    `json:"rules"`
+	Count    int                `json:"count"`
+	IDs      []string           `json:"ids"`
+	Queued   int                `json:"queued"`
+	ScopeID  string             `json:"scope_id,omitempty"`
+	Request  InterceptDirection `json:"request"`
+	Response InterceptDirection `json:"response"`
+	StreamWS InterceptDirection `json:"stream_ws"`
+}
+
+// InterceptWrite is the outcome of one add or clear: the rules that remain, the
+// ids touched, the rules armed before the write, the live direction state, the
+// live queue depth and an optional note when the read-back failed.
+type InterceptWrite struct {
+	Rules       []InterceptRule    `json:"rules"`
+	Count       int                `json:"count"`
+	IDs         []string           `json:"ids"`
+	Existing    []InterceptRule    `json:"existing,omitempty"`
+	CountBefore int                `json:"count_before"`
+	Status      string             `json:"status,omitempty"`
+	Queued      int                `json:"queued"`
+	ScopeID     string             `json:"scope_id,omitempty"`
+	Filter      string             `json:"filter"`
+	Request     InterceptDirection `json:"request"`
+	Response    InterceptDirection `json:"response"`
+	StreamWS    InterceptDirection `json:"stream_ws"`
+	Note        string             `json:"note,omitempty"`
+}
+
+// InterceptRequest describes the rewrites one add arms. URLFilter is the HTTPQL
+// expression written to each rule's condition and to the response intercept
+// filter, and is required. A zero Status, nil Body and empty Headers are absent;
+// at least one must be set.
+type InterceptRequest struct {
+	Status    int
+	Body      *string
+	Headers   map[string]string
+	ScopeID   string
+	URLFilter string
 }
 
 // SitemapQuery bounds one sitemap read. Host is a bare host name, Path is an
@@ -1470,6 +1600,11 @@ func (c *Client) Status(
 				Value int `json:"value"`
 			} `json:"count"`
 		} `json:"history"`
+		Intercept []struct {
+			Rules []struct {
+				ID string `json:"id"`
+			} `json:"rules"`
+		} `json:"intercept"`
 	}
 	if err := c.call(ctx, token, statusQuery, nil, &data); err != nil {
 		var gql *graphqlError
@@ -1523,7 +1658,663 @@ func (c *Client) Status(
 			Focus:     focusScope != "" && s.Name == focusScope,
 		})
 	}
+	for _, collection := range data.Intercept {
+		st.Intercept.Rules += len(collection.Rules)
+	}
 	return st, nil
+}
+
+// interceptQL is the HTTPQL member of the intercept filter union.
+type interceptQL struct {
+	Code string `json:"code"`
+}
+
+// interceptRuleNode is one raw rewrite rule row from the GraphQL selection. A
+// null enable object means the rule exists but is toggled off.
+type interceptRuleNode struct {
+	ID      string   `json:"id"`
+	Name    string   `json:"name"`
+	Sources []string `json:"sources"`
+	Enable  *struct {
+		Rank json.RawMessage `json:"rank"`
+	} `json:"enable"`
+}
+
+// rule reduces the wire row to the public rule.
+func (n interceptRuleNode) rule() InterceptRule {
+	return InterceptRule{
+		ID:      n.ID,
+		Name:    n.Name,
+		Enabled: n.Enable != nil,
+		Sources: n.Sources,
+	}
+}
+
+// interceptSection is one response rewrite, which becomes a single rewrite rule
+// because the instance allows one section per rule.
+type interceptSection struct {
+	name  string
+	input map[string]any
+}
+
+// ReadIntercept reads the global intercept switch, the per-direction options,
+// the persistent rewrite rules and the queued message count.
+func (c *Client) ReadIntercept(ctx context.Context, scopeID string) (Intercept, error) {
+	token := c.currentToken()
+	if token == "" {
+		return Intercept{}, ErrNoCredential
+	}
+	var data struct {
+		Status  string `json:"status"`
+		Options struct {
+			Request struct {
+				Enabled bool         `json:"enabled"`
+				Filter  *interceptQL `json:"filter"`
+			} `json:"request"`
+			Response struct {
+				Enabled bool         `json:"enabled"`
+				Filter  *interceptQL `json:"filter"`
+			} `json:"response"`
+			StreamWS struct {
+				Enabled bool `json:"enabled"`
+			} `json:"streamWs"`
+			Scope *struct {
+				ScopeID string `json:"scopeId"`
+			} `json:"scope"`
+		} `json:"options"`
+		Collections []struct {
+			Rules []interceptRuleNode `json:"rules"`
+		} `json:"collections"`
+		Messages struct {
+			Count struct {
+				Value int `json:"value"`
+			} `json:"count"`
+		} `json:"messages"`
+	}
+	if err := c.call(ctx, token, interceptQuery, nil, &data); err != nil {
+		var gql *graphqlError
+		if errors.As(err, &gql) {
+			return Intercept{}, fmt.Errorf("caido: intercept query failed: %s", gql.Error())
+		}
+		return Intercept{}, err
+	}
+	rules := make([]InterceptRule, 0, 4)
+	ids := make([]string, 0, 4)
+	for _, collection := range data.Collections {
+		for _, node := range collection.Rules {
+			rule := node.rule()
+			rules = append(rules, rule)
+			ids = append(ids, rule.ID)
+		}
+	}
+	scopeID = strings.TrimSpace(scopeID)
+	if scopeID == "" && data.Options.Scope != nil {
+		scopeID = data.Options.Scope.ScopeID
+	}
+	request := InterceptDirection{
+		Enabled: data.Options.Request.Enabled,
+		Filter:  qlCode(data.Options.Request.Filter),
+	}
+	response := InterceptDirection{
+		Enabled: data.Options.Response.Enabled,
+		Filter:  qlCode(data.Options.Response.Filter),
+	}
+	streamWS := InterceptDirection{Enabled: data.Options.StreamWS.Enabled}
+	status := data.Status
+	if !request.Enabled && !response.Enabled && !streamWS.Enabled {
+		status = "DISABLED"
+	}
+	return Intercept{
+		Status:   status,
+		Rules:    rules,
+		Count:    len(rules),
+		IDs:      ids,
+		Queued:   data.Messages.Count.Value,
+		ScopeID:  scopeID,
+		Request:  request,
+		Response: response,
+		StreamWS: streamWS,
+	}, nil
+}
+
+// ValidateInterceptFilter rejects an absent, wildcard, response-only or
+// malformed HTTPQL expression, because an add must never arm a rewrite over all
+// traffic. A response expression cannot select which request is rewritten.
+func ValidateInterceptFilter(filter string) error {
+	f := strings.TrimSpace(filter)
+	if f == "" || f == "*" {
+		return errors.New(
+			`caido_intercept: invalid arguments: add needs url_filter — an HTTPQL expression such as req.host.eq:"example.com"`,
+		)
+	}
+	if strings.HasPrefix(f, "res.") {
+		return fmt.Errorf(
+			`caido_intercept: invalid arguments: url_filter %q is a response expression; use a request expression such as req.host.eq:"example.com"`,
+			f,
+		)
+	}
+	if !strings.HasPrefix(f, "req.") {
+		return fmt.Errorf(
+			`caido_intercept: invalid arguments: url_filter %q must be a request HTTPQL expression such as req.host.eq:"example.com"`,
+			f,
+		)
+	}
+	rest := strings.TrimPrefix(f, "req.")
+	field, opValue, ok := strings.Cut(rest, ".")
+	if !ok || strings.TrimSpace(field) == "" {
+		return malformedFilterError(f)
+	}
+	op, value, ok := strings.Cut(opValue, ":")
+	if !ok || strings.TrimSpace(op) == "" || strings.TrimSpace(value) == "" {
+		return malformedFilterError(f)
+	}
+	return nil
+}
+
+// malformedFilterError names the expected request expression shape.
+func malformedFilterError(filter string) error {
+	return fmt.Errorf(
+		`caido_intercept: invalid arguments: url_filter %q is malformed; expected req.<field>.<operator>:<value>, e.g. req.host.eq:"example.com"`,
+		filter,
+	)
+}
+
+// AddIntercept enables response interception for one HTTPQL filter and creates
+// one enabled rewrite rule per requested response change. It refuses to replace a
+// filter another caller already armed, and a failed rule write restores the prior
+// option state.
+func (c *Client) AddIntercept(
+	ctx context.Context,
+	r InterceptRequest,
+) (InterceptWrite, error) {
+	filter := strings.TrimSpace(r.URLFilter)
+	if err := ValidateInterceptFilter(filter); err != nil {
+		return InterceptWrite{}, err
+	}
+	sections, err := interceptSections(r)
+	if err != nil {
+		return InterceptWrite{}, err
+	}
+	token := c.currentToken()
+	if token == "" {
+		return InterceptWrite{}, ErrNoCredential
+	}
+	before, err := c.ReadIntercept(ctx, r.ScopeID)
+	if err != nil {
+		return InterceptWrite{}, err
+	}
+	if err := interceptFilterConflict(before, filter); err != nil {
+		return InterceptWrite{}, err
+	}
+	condition, err := c.interceptCondition(ctx, r.ScopeID, filter)
+	if err != nil {
+		return InterceptWrite{}, err
+	}
+	collection, err := c.interceptCollection(ctx, token)
+	if err != nil {
+		return InterceptWrite{}, err
+	}
+	armed := before
+	armed.Request = InterceptDirection{}
+	armed.Response = InterceptDirection{Enabled: true, Filter: filter}
+	armed.StreamWS = InterceptDirection{}
+	if err := c.writeInterceptOptions(ctx, token, armed); err != nil {
+		return InterceptWrite{}, err
+	}
+	created := make([]string, 0, len(sections))
+	for _, section := range sections {
+		id, err := c.createInterceptRule(ctx, token, collection, section, condition)
+		if err != nil {
+			return InterceptWrite{}, errors.Join(
+				err,
+				c.deleteInterceptRules(ctx, token, created),
+				c.writeInterceptOptions(ctx, token, before),
+			)
+		}
+		created = append(created, id)
+	}
+	write := InterceptWrite{
+		Rules:       armed.Rules,
+		Count:       len(armed.Rules),
+		IDs:         created,
+		Existing:    before.Rules,
+		CountBefore: before.Count,
+		Status:      "RUNNING",
+		Queued:      armed.Queued,
+		ScopeID:     strings.TrimSpace(r.ScopeID),
+		Filter:      filter,
+		Request:     armed.Request,
+		Response:    armed.Response,
+		StreamWS:    armed.StreamWS,
+	}
+	after, err := c.ReadIntercept(ctx, r.ScopeID)
+	if err != nil {
+		write.Note = "rules armed, but the read-back failed: " + err.Error()
+		return write, nil
+	}
+	write.Rules = after.Rules
+	write.Count = after.Count
+	write.Status = after.Status
+	write.Queued = after.Queued
+	write.Filter = after.Response.Filter
+	write.Request = after.Request
+	write.Response = after.Response
+	write.StreamWS = after.StreamWS
+	return write, nil
+}
+
+// ClearIntercept deletes one rule by id, or every rule this tool created when id
+// is empty. Rules are project-global, so there is no scope: a no-id clear removes
+// only the webmcp-intercept rules, leaves a human's rule in place, then disables
+// every direction and clears the filters. Survivors are reported either way.
+func (c *Client) ClearIntercept(ctx context.Context, id string) (InterceptWrite, error) {
+	token := c.currentToken()
+	if token == "" {
+		return InterceptWrite{}, ErrNoCredential
+	}
+	before, err := c.ReadIntercept(ctx, "")
+	if err != nil {
+		return InterceptWrite{}, err
+	}
+	id = strings.TrimSpace(id)
+	targets := make([]string, 0, len(before.Rules))
+	if id != "" {
+		targets = append(targets, id)
+	} else {
+		targets = interceptRuleTargets(before.Rules)
+	}
+	deleteErr := c.deleteInterceptRules(ctx, token, targets)
+	var optionErr error
+	if id == "" {
+		optionErr = c.writeInterceptOptions(ctx, token, Intercept{})
+	}
+	write := InterceptWrite{
+		Rules:       before.Rules,
+		Count:       before.Count,
+		IDs:         targets,
+		Existing:    before.Rules,
+		CountBefore: before.Count,
+		ScopeID:     before.ScopeID,
+	}
+	after, err := c.ReadIntercept(ctx, "")
+	if err != nil {
+		write.Note = "rules cleared, but the read-back failed: " + err.Error()
+		return write, errors.Join(deleteErr, optionErr)
+	}
+	write.Rules = after.Rules
+	write.Count = after.Count
+	write.Status = after.Status
+	write.Queued = after.Queued
+	write.Filter = after.Response.Filter
+	write.Request = after.Request
+	write.Response = after.Response
+	write.StreamWS = after.StreamWS
+	if survivors := survivingRules(targets, after.Rules); len(survivors) > 0 {
+		return write, errors.Join(
+			fmt.Errorf(
+				"caido_intercept: clear incomplete — %d rule(s) remain: %s",
+				len(survivors),
+				describeRules(survivors),
+			),
+			deleteErr,
+			optionErr,
+		)
+	}
+	return write, errors.Join(deleteErr, optionErr)
+}
+
+// interceptRuleTargets returns the ids of the rules this tool created. Only a
+// name that starts with the prefix belongs to us, so a foreign rule that merely
+// contains it is never swept up by the kill switch.
+func interceptRuleTargets(rules []InterceptRule) []string {
+	targets := make([]string, 0, len(rules))
+	for _, rule := range rules {
+		if strings.HasPrefix(rule.Name, interceptRulePrefix) {
+			targets = append(targets, rule.ID)
+		}
+	}
+	return targets
+}
+
+// survivingRules returns the rules still live among the ids a clear targeted.
+func survivingRules(targets []string, rules []InterceptRule) []InterceptRule {
+	wanted := make(map[string]struct{}, len(targets))
+	for _, id := range targets {
+		wanted[id] = struct{}{}
+	}
+	survivors := make([]InterceptRule, 0, len(rules))
+	for _, rule := range rules {
+		if _, ok := wanted[rule.ID]; ok {
+			survivors = append(survivors, rule)
+		}
+	}
+	return survivors
+}
+
+// describeRules renders rules as "id name" pairs for an error message.
+func describeRules(rules []InterceptRule) string {
+	parts := make([]string, 0, len(rules))
+	for _, rule := range rules {
+		parts = append(parts, rule.ID+" "+rule.Name)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// interceptFilterConflictError refuses an add that would overwrite a live
+// filter another caller armed.
+type interceptFilterConflictError struct {
+	Filter string
+}
+
+// Error names the live filter and the call that clears it.
+func (e *interceptFilterConflictError) Error() string {
+	return fmt.Sprintf(
+		"caido_intercept: intercept is already enabled with filter %s — call caido_intercept action:clear before adding a different filter",
+		strconv.Quote(e.Filter),
+	)
+}
+
+// Hint tells the agent to clear the live rules before arming another filter.
+func (e *interceptFilterConflictError) Hint() string {
+	return "clear the live rules before you arm a different filter"
+}
+
+// interceptFilterConflict refuses to overwrite a pause another caller armed with
+// a different filter. Both sides are whitespace-normalised so a spacing variant is
+// not a false conflict, and the live filter is named so the refusal is actionable.
+func interceptFilterConflict(state Intercept, filter string) error {
+	for _, d := range []InterceptDirection{state.Request, state.Response} {
+		if !d.Enabled || normalizeFilter(d.Filter) == normalizeFilter(filter) {
+			continue
+		}
+		live := d.Filter
+		if strings.TrimSpace(live) == "" {
+			live = "(none)"
+		}
+		return &interceptFilterConflictError{Filter: live}
+	}
+	return nil
+}
+
+// normalizeFilter collapses whitespace so spacing-only variants compare equal.
+func normalizeFilter(filter string) string {
+	return strings.Join(strings.Fields(filter), " ")
+}
+
+// writeInterceptOptions replaces the live per-direction switches and HTTPQL
+// filters. The instance declares all three direction objects non-null, so the
+// input always carries a complete option set.
+func (c *Client) writeInterceptOptions(
+	ctx context.Context,
+	token string,
+	state Intercept,
+) error {
+	input := map[string]any{
+		"request":  interceptDirectionInput(state.Request),
+		"response": interceptDirectionInput(state.Response),
+		"streamWs": map[string]any{"enabled": state.StreamWS.Enabled},
+	}
+	var data struct {
+		SetInterceptOptions struct {
+			Options json.RawMessage `json:"options"`
+		} `json:"setInterceptOptions"`
+	}
+	vars := map[string]any{"input": input}
+	if err := c.call(ctx, token, setInterceptOptionsMutation, vars, &data); err != nil {
+		var gql *graphqlError
+		if errors.As(err, &gql) {
+			return fmt.Errorf("caido: intercept: set options: %s", gql.Error())
+		}
+		return fmt.Errorf("caido: intercept: set options: %w", err)
+	}
+	return nil
+}
+
+// interceptDirectionInput renders one direction as the instance's input shape. An
+// empty filter is sent as null, which clears it.
+func interceptDirectionInput(d InterceptDirection) map[string]any {
+	var filter any
+	if f := strings.TrimSpace(d.Filter); f != "" {
+		filter = map[string]any{"HTTPQL": map[string]any{"code": f}}
+	}
+	return map[string]any{"enabled": d.Enabled, "filter": filter}
+}
+
+// interceptSections validates the requested rewrites and renders each as a
+// tamper section input.
+func interceptSections(r InterceptRequest) ([]interceptSection, error) {
+	if r.Status != 0 && (r.Status < 200 || r.Status > 599) {
+		return nil, fmt.Errorf("caido_intercept: invalid arguments: status must be 200..599")
+	}
+	sections := make([]interceptSection, 0, 2+len(r.Headers))
+	if r.Status != 0 {
+		sections = append(sections, interceptSection{
+			name: interceptRulePrefix + " status " + strconv.Itoa(r.Status),
+			input: map[string]any{
+				"responseStatusCode": map[string]any{
+					"operation": map[string]any{
+						"update": map[string]any{
+							"replacer": interceptTerm(strconv.Itoa(r.Status)),
+						},
+					},
+				},
+			},
+		})
+	}
+	if r.Body != nil {
+		sections = append(sections, interceptSection{
+			name: interceptRulePrefix + " body",
+			input: map[string]any{
+				"responseBody": map[string]any{
+					"operation": map[string]any{
+						"raw": map[string]any{
+							"matcher":  map[string]any{"full": map[string]any{"full": true}},
+							"replacer": interceptTerm(*r.Body),
+						},
+					},
+				},
+			},
+		})
+	}
+	names := make([]string, 0, len(r.Headers))
+	for name := range r.Headers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if strings.TrimSpace(name) == "" {
+			return nil, fmt.Errorf("caido_intercept: invalid arguments: header name must not be empty")
+		}
+		sections = append(sections, interceptSection{
+			name: interceptRulePrefix + " header " + name,
+			input: map[string]any{
+				"responseHeader": map[string]any{
+					"operation": map[string]any{
+						"update": map[string]any{
+							"matcher":  map[string]any{"name": name},
+							"replacer": interceptTerm(r.Headers[name]),
+						},
+					},
+				},
+			},
+		})
+	}
+	if len(sections) == 0 {
+		return nil, fmt.Errorf("caido_intercept: invalid arguments: add needs status, body, or headers")
+	}
+	return sections, nil
+}
+
+// interceptTerm wraps a literal replacement in the replacer input shape.
+func interceptTerm(term string) map[string]any {
+	return map[string]any{"term": map[string]any{"term": term}}
+}
+
+// interceptCondition builds the HTTPQL expression written to a new rule's own
+// condition, which is what selects the traffic the rule rewrites. The required
+// url_filter is always the base; a scope id narrows it to that scope's allowlist
+// hosts, because Caido rules are project-global and have no scope field.
+func (c *Client) interceptCondition(
+	ctx context.Context,
+	scopeID string,
+	urlFilter string,
+) (string, error) {
+	base := strings.TrimSpace(urlFilter)
+	scopeID = strings.TrimSpace(scopeID)
+	if scopeID == "" || scopeID == "*" {
+		return base, nil
+	}
+	scope, err := c.ResolveScope(ctx, scopeID, "")
+	if err != nil {
+		return "", err
+	}
+	clauses := make([]string, 0, len(scope.Allowlist))
+	for _, host := range scope.Allowlist {
+		if host = strings.TrimSpace(host); host != "" {
+			clauses = append(clauses, "req.host.eq:"+strconv.Quote(host))
+		}
+	}
+	if len(clauses) == 0 {
+		return base, nil
+	}
+	return "(" + base + ") AND (" + strings.Join(clauses, " OR ") + ")", nil
+}
+
+// interceptCollection returns the collection a new rule is filed under.
+func (c *Client) interceptCollection(ctx context.Context, token string) (string, error) {
+	var data struct {
+		Collections []struct {
+			ID string `json:"id"`
+		} `json:"tamperRuleCollections"`
+	}
+	if err := c.call(ctx, token, interceptCollectionsQuery, nil, &data); err != nil {
+		var gql *graphqlError
+		if errors.As(err, &gql) {
+			return "", fmt.Errorf("caido: intercept collections query failed: %s", gql.Error())
+		}
+		return "", err
+	}
+	if len(data.Collections) == 0 {
+		return "", errors.New(
+			"caido: intercept: the instance has no rewrite-rule collection — create one in the Caido UI",
+		)
+	}
+	return data.Collections[0].ID, nil
+}
+
+// createInterceptRule creates one rewrite rule and enables it, because a new
+// rule is disabled by default.
+func (c *Client) createInterceptRule(
+	ctx context.Context,
+	token string,
+	collectionID string,
+	section interceptSection,
+	condition string,
+) (string, error) {
+	input := map[string]any{
+		"collectionId": collectionID,
+		"name":         section.name,
+		"section":      section.input,
+		"sources":      []string{"INTERCEPT"},
+	}
+	if condition != "" {
+		input["condition"] = map[string]any{"HTTPQL": map[string]any{"code": condition}}
+	}
+	var data struct {
+		CreateInterceptRule struct {
+			Rule *struct {
+				ID string `json:"id"`
+			} `json:"rule"`
+			Error *struct {
+				Typename string `json:"__typename"`
+			} `json:"error"`
+		} `json:"createTamperRule"`
+	}
+	vars := map[string]any{"input": input}
+	if err := c.call(ctx, token, createInterceptRuleMutation, vars, &data); err != nil {
+		var gql *graphqlError
+		if errors.As(err, &gql) {
+			return "", fmt.Errorf("caido: intercept: create rule: %s", gql.Error())
+		}
+		return "", fmt.Errorf("caido: intercept: create rule: %w", err)
+	}
+	payload := data.CreateInterceptRule
+	if payload.Error != nil {
+		return "", fmt.Errorf("caido: intercept: create rule failed: %s", payload.Error.Typename)
+	}
+	if payload.Rule == nil || payload.Rule.ID == "" {
+		return "", errors.New("caido: intercept: create rule returned no id")
+	}
+	if err := c.toggleInterceptRule(ctx, token, payload.Rule.ID, true); err != nil {
+		return "", errors.Join(err, c.deleteInterceptRules(ctx, token, []string{payload.Rule.ID}))
+	}
+	return payload.Rule.ID, nil
+}
+
+// toggleInterceptRule enables or disables one rewrite rule.
+func (c *Client) toggleInterceptRule(ctx context.Context, token, id string, enabled bool) error {
+	var data struct {
+		ToggleInterceptRule struct {
+			Error *struct {
+				Typename string `json:"__typename"`
+			} `json:"error"`
+		} `json:"toggleTamperRule"`
+	}
+	vars := map[string]any{"id": id, "enabled": enabled}
+	if err := c.call(ctx, token, toggleInterceptRuleMutation, vars, &data); err != nil {
+		var gql *graphqlError
+		if errors.As(err, &gql) {
+			return fmt.Errorf("caido: intercept: toggle rule %q: %s", id, gql.Error())
+		}
+		return fmt.Errorf("caido: intercept: toggle rule %q: %w", id, err)
+	}
+	if data.ToggleInterceptRule.Error != nil {
+		return fmt.Errorf(
+			"caido: intercept: toggle rule %q failed: %s",
+			id,
+			data.ToggleInterceptRule.Error.Typename,
+		)
+	}
+	return nil
+}
+
+// deleteInterceptRules attempts every id and returns every failure joined, so one
+// unreachable rule never hides the ones that could still be deleted.
+func (c *Client) deleteInterceptRules(
+	ctx context.Context,
+	token string,
+	ids []string,
+) error {
+	errs := make([]error, 0, len(ids))
+	for _, id := range ids {
+		var data struct {
+			DeleteInterceptRule struct {
+				DeletedID string `json:"deletedId"`
+			} `json:"deleteTamperRule"`
+		}
+		vars := map[string]any{"id": id}
+		if err := c.call(ctx, token, deleteInterceptRuleMutation, vars, &data); err != nil {
+			var gql *graphqlError
+			if errors.As(err, &gql) {
+				errs = append(errs, fmt.Errorf("caido: intercept: delete rule %q: %s", id, gql.Error()))
+				continue
+			}
+			errs = append(errs, fmt.Errorf("caido: intercept: delete rule %q: %w", id, err))
+			continue
+		}
+		if data.DeleteInterceptRule.DeletedID == "" {
+			errs = append(errs, fmt.Errorf("caido: intercept: delete rule %q returned no deleted id", id))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// qlCode returns the HTTPQL text of an intercept filter, or empty.
+func qlCode(q *interceptQL) string {
+	if q == nil {
+		return ""
+	}
+	return q.Code
 }
 
 // ResolveScope resolves a scope id, or a configured scope name when id is

@@ -240,11 +240,12 @@ func registerAll(
 	r.Register(tools.NewPageList(mgr))      // page_list
 	if cf.Enabled {
 		config.SetActiveCaido(cf)
-		r.Register(caidotools.NewCaidoSearch())  // caido_search
-		r.Register(caidotools.NewCaidoSitemap()) // caido_sitemap
-		r.Register(caidotools.NewCaidoStatus())  // caido_status
-		r.Register(caidotools.NewCaidoFinding()) // caido_finding
-		r.Register(caidotools.NewCaidoReplay())  // caido_replay
+		r.Register(caidotools.NewCaidoSearch())    // caido_search
+		r.Register(caidotools.NewCaidoSitemap())   // caido_sitemap
+		r.Register(caidotools.NewCaidoStatus())    // caido_status
+		r.Register(caidotools.NewCaidoFinding())   // caido_finding
+		r.Register(caidotools.NewCaidoReplay())    // caido_replay
+		r.Register(caidotools.NewCaidoIntercept()) // caido_intercept
 	}
 
 	r.RegisterPrompt(tools.NewFetchAndSummarizePrompt())        // fetch_and_summarize

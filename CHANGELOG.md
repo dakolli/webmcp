@@ -39,6 +39,11 @@
   row beside each exchange, so one replay adds two history rows.
 - `browser caido replay <id>` does the same from the terminal, with `--method`, `--header`, `--set`,
   `--remove` and `--body`.
+- `caido_intercept` lists, arms and clears proxy-level response rewrites: a status code, a body and
+  header overrides. An arm needs an HTTPQL `url_filter`, so one target changes and other traffic
+  passes untouched. `clear --confirm` is the kill switch and removes only rules this tool created.
+  A rule outlives the process, so call clear before you stop.
+- `browser caido intercept list|add|clear` does the same from the terminal.
 - `browser_create.deny_hosts` keeps chosen hosts out of the proxy. A proxied visit now stays clean of
   browser telemetry, so Caido history shows the target and not the browser.
 - `[caido] access_token` takes a direct instance token, and `[caido] allow_guest` (default true)

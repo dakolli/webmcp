@@ -21,7 +21,9 @@ const caidoStatusDescription = "Reports which Caido project, scopes, capture mod
 	"matches \"allowlist\" records only its allowlist. project.selected is the " +
 	"instance's project and project.configured is the [caido] project in " +
 	"webmcp.toml, so a mismatch is visible. capture is the passthroughOptions " +
-	"object, or {\"unfiltered\": true} when Caido filters nothing. Takes no " +
+	"object, or {\"unfiltered\": true} when Caido filters nothing. intercept.rules " +
+	"is the number of armed rewrite rules; a non-zero count means a rule outlives " +
+	"the process that armed it, so clear it with caido_intercept. Takes no " +
 	"arguments. Example: {} returns " +
 	`{"ok":true,"data":{"auth":"guest","url":"http://127.0.0.1:8080/graphql",` +
 	`"project":{"id":"063ae3b3-...","name":"webmcp","path":"/tmp/webmcp",` +
@@ -29,7 +31,7 @@ const caidoStatusDescription = "Reports which Caido project, scopes, capture mod
 	`"selected":"webmcp","configured":"webmcp"},` +
 	`"scopes":[{"id":"1","name":"target","allowlist":[],"denylist":[],` +
 	`"matches":"all traffic","focus":true}],` +
-	`"capture":{"unfiltered":true},"history":1879}}` + toolenv.ResultEnvelopeDoc
+	`"capture":{"unfiltered":true},"history":1879,"intercept":{"rules":0}}}` + toolenv.ResultEnvelopeDoc
 
 // CaidoStatus implements the "caido_status" tool: it reports the project,
 // scopes and capture settings that shape what caido_search can see.

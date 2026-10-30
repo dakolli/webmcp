@@ -32,6 +32,7 @@ queries Caido directly without starting the serve daemon.`,
 	cmd.AddCommand(newCaidoSitemapCmd())
 	cmd.AddCommand(newCaidoFindingCmd())
 	cmd.AddCommand(newCaidoReplayCmd())
+	cmd.AddCommand(newCaidoInterceptCmd())
 	return cmd
 }
 
@@ -376,6 +377,7 @@ func printCaidoStatus(cmd *cobra.Command, status caido.Status) {
 	fmt.Fprintf(out, "  selected: %s\n", status.Project.Selected)
 	fmt.Fprintf(out, "  configured: %s\n", status.Project.Configured)
 	fmt.Fprintf(out, "history: %d\n", status.History)
+	fmt.Fprintf(out, "intercept: rules=%d\n", status.Intercept.Rules)
 	fmt.Fprintf(out, "scopes: %d\n", len(status.Scopes))
 	for _, s := range status.Scopes {
 		fmt.Fprintf(out, "  scope: %s\n", s.Name)
@@ -728,4 +730,250 @@ func printCaidoFinding(cmd *cobra.Command, finding caido.Finding) {
 	if finding.Description != "" {
 		fmt.Fprintf(out, "description: %s\n", finding.Description)
 	}
+}
+
+// newCaidoInterceptCmd constructs the "caido intercept" command group: the human
+// view over the persistent response rewrite rules Caido applies to intercepted
+// proxy traffic.
+func newCaidoInterceptCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "intercept",
+		Short: "List, add and clear Caido intercept rewrite rules",
+		Long: `Manages the persistent response rewrite rules Caido applies to intercepted
+proxy traffic. A rule outlives this process and keeps rewriting traffic from every
+browser that uses the proxy, so clear it when you are done. list shows the global
+intercept state and every rule, add arms rules for a status code, a body and header
+overrides, and clear deletes one rule or every webmcp rule.`,
+		Args: cobra.NoArgs,
+	}
+	cmd.AddCommand(newCaidoInterceptListCmd())
+	cmd.AddCommand(newCaidoInterceptAddCmd())
+	cmd.AddCommand(newCaidoInterceptClearCmd())
+	return cmd
+}
+
+// newCaidoInterceptListCmd constructs the "caido intercept list" command.
+func newCaidoInterceptListCmd() *cobra.Command {
+	var (
+		scopeID string
+		jsonOut bool
+	)
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List the intercept state and every rewrite rule",
+		Long: `Reads the global intercept switch, the per-direction options, the queued
+message count and every persistent rewrite rule with its id and enabled state.`,
+		Example: `  browser caido intercept list
+  browser caido intercept list --scope-id '*' --json`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			client, ctx, cancel, err := caidoCommandClient(cmd, "caido intercept")
+			if err != nil {
+				return err
+			}
+			defer cancel()
+			state, err := client.ReadIntercept(ctx, strings.TrimSpace(scopeID))
+			if err != nil {
+				return fmt.Errorf("caido intercept: %w", err)
+			}
+			if jsonOut {
+				data, err := json.Marshal(state)
+				if err != nil {
+					return fmt.Errorf("caido intercept: %w", err)
+				}
+				fmt.Fprintln(cmd.OutOrStdout(), string(data))
+				return nil
+			}
+			printCaidoIntercept(cmd, state)
+			return nil
+		},
+	}
+	f := cmd.Flags()
+	f.StringVar(&scopeID, "scope-id", "", "scope id, \"*\" for every scope, empty for the configured focus scope")
+	f.BoolVar(&jsonOut, "json", false, "print the result as JSON")
+	return cmd
+}
+
+// newCaidoInterceptAddCmd constructs the "caido intercept add" command.
+func newCaidoInterceptAddCmd() *cobra.Command {
+	var (
+		status    int
+		body      string
+		headers   []string
+		scopeID   string
+		urlFilter string
+		jsonOut   bool
+	)
+	cmd := &cobra.Command{
+		Use:   "add",
+		Short: "Arm rewrite rules for a response status, body or headers",
+		Long: `Requires --filter, an HTTPQL expression such as req.host.eq:"example.com", and
+writes it to each new rule's own condition and to the response intercept filter, so
+only matching traffic is paused and rewritten. --status replaces the response
+status code (200..599), --body replaces the whole response body, and --header
+NAME=VALUE replaces a named response header. At least one of the three is required.
+Caido allows one section per rule, so all three create three rules and ids lists
+every one. Existing rules are reported before the write. A rule outlives this
+process; clear it when you are done.`,
+		Example: `  browser caido intercept add --filter 'req.host.eq:"example.com"' --status 599
+  browser caido intercept add --filter 'req.host.eq:"example.com"' --body '{"ok":true}' --json`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			overrides := make(map[string]string, len(headers))
+			for _, raw := range headers {
+				name, value, ok := strings.Cut(raw, "=")
+				name = strings.TrimSpace(name)
+				if !ok || name == "" {
+					return fmt.Errorf("caido intercept: --header %q must be NAME=VALUE", raw)
+				}
+				overrides[name] = value
+			}
+			var bodyPtr *string
+			if cmd.Flags().Changed("body") {
+				bodyPtr = &body
+			}
+			if err := caido.ValidateInterceptFilter(urlFilter); err != nil {
+				return err
+			}
+			if status != 0 && (status < 200 || status > 599) {
+				return fmt.Errorf("caido intercept: --status must be 200..599")
+			}
+			if status == 0 && bodyPtr == nil && len(overrides) == 0 {
+				return fmt.Errorf("caido intercept: add needs --status, --body, or --header")
+			}
+			client, ctx, cancel, err := caidoCommandClient(cmd, "caido intercept")
+			if err != nil {
+				return err
+			}
+			defer cancel()
+			write, err := client.AddIntercept(ctx, caido.InterceptRequest{
+				Status:    status,
+				Body:      bodyPtr,
+				Headers:   overrides,
+				ScopeID:   strings.TrimSpace(scopeID),
+				URLFilter: urlFilter,
+			})
+			if err != nil {
+				return fmt.Errorf("caido intercept: %w", err)
+			}
+			if jsonOut {
+				data, err := json.Marshal(write)
+				if err != nil {
+					return fmt.Errorf("caido intercept: %w", err)
+				}
+				fmt.Fprintln(cmd.OutOrStdout(), string(data))
+				return nil
+			}
+			printCaidoInterceptWrite(cmd, write)
+			return nil
+		},
+	}
+	f := cmd.Flags()
+	f.StringVar(&urlFilter, "filter", "", "required HTTPQL expression selecting the traffic, e.g. 'req.host.eq:\"example.com\"'")
+	f.IntVar(&status, "status", 0, "response status code to write, 200..599")
+	f.StringVar(&body, "body", "", "replacement response body; pass an empty value to send an empty body")
+	f.StringArrayVar(&headers, "header", nil, "response header override NAME=VALUE (repeatable)")
+	f.StringVar(&scopeID, "scope-id", "", "scope id, \"*\" for every scope, empty for the configured focus scope")
+	f.BoolVar(&jsonOut, "json", false, "print the result as JSON")
+	return cmd
+}
+
+// newCaidoInterceptClearCmd constructs the "caido intercept clear" command, the
+// kill switch that deletes one rule or every rule.
+func newCaidoInterceptClearCmd() *cobra.Command {
+	var (
+		confirm bool
+		jsonOut bool
+	)
+	cmd := &cobra.Command{
+		Use:   "clear [id]",
+		Short: "Delete one intercept rule, or every webmcp rule with --confirm",
+		Long: `Deletes the rule named by id. With no id and --confirm it is the kill switch:
+it deletes only the rules this tool created (their names carry webmcp-intercept),
+leaves any other rule in place, disables every intercept direction and clears the
+filters. A rule is project-global, so clear takes no scope.`,
+		Example: `  browser caido intercept clear 3
+  browser caido intercept clear --confirm
+  browser caido intercept clear --confirm --json`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id := ""
+			if len(args) > 0 {
+				id = strings.TrimSpace(args[0])
+			}
+			if id == "" && !confirm {
+				return fmt.Errorf("caido intercept: clear needs --confirm or an id")
+			}
+			client, ctx, cancel, err := caidoCommandClient(cmd, "caido intercept")
+			if err != nil {
+				return err
+			}
+			defer cancel()
+			write, err := client.ClearIntercept(ctx, id)
+			if err != nil {
+				return fmt.Errorf("caido intercept: %w", err)
+			}
+			if jsonOut {
+				data, err := json.Marshal(write)
+				if err != nil {
+					return fmt.Errorf("caido intercept: %w", err)
+				}
+				fmt.Fprintln(cmd.OutOrStdout(), string(data))
+				return nil
+			}
+			printCaidoInterceptWrite(cmd, write)
+			return nil
+		},
+	}
+	f := cmd.Flags()
+	f.BoolVar(&confirm, "confirm", false, "required to clear every webmcp rule when no id is given")
+	f.BoolVar(&jsonOut, "json", false, "print the result as JSON")
+	return cmd
+}
+
+// printCaidoIntercept renders the intercept state and one line per rule.
+func printCaidoIntercept(cmd *cobra.Command, state caido.Intercept) {
+	out := cmd.OutOrStdout()
+	fmt.Fprintf(out, "status: %s\n", state.Status)
+	fmt.Fprintf(out, "count: %d queued: %d\n", state.Count, state.Queued)
+	fmt.Fprintf(out, "ids: %s\n", strings.Join(state.IDs, ","))
+	if state.ScopeID != "" {
+		fmt.Fprintf(out, "scope_id: %s\n", state.ScopeID)
+	}
+	fmt.Fprintf(out, "request: enabled=%t filter=%s\n",
+		state.Request.Enabled, caidoFilter(state.Request.Filter))
+	fmt.Fprintf(out, "response: enabled=%t filter=%s\n",
+		state.Response.Enabled, caidoFilter(state.Response.Filter))
+	fmt.Fprintf(out, "stream_ws: enabled=%t\n", state.StreamWS.Enabled)
+	for _, rule := range state.Rules {
+		fmt.Fprintf(out, "rule: %s enabled=%t name=%s\n", rule.ID, rule.Enabled, rule.Name)
+	}
+}
+
+// printCaidoInterceptWrite renders one add or clear outcome.
+func printCaidoInterceptWrite(cmd *cobra.Command, write caido.InterceptWrite) {
+	out := cmd.OutOrStdout()
+	fmt.Fprintf(out, "ids: %s\n", strings.Join(write.IDs, ","))
+	fmt.Fprintf(out, "count_before: %d count: %d\n", write.CountBefore, write.Count)
+	fmt.Fprintf(out, "status: %s queued: %d\n", write.Status, write.Queued)
+	fmt.Fprintf(out, "filter: %s\n", caidoFilter(write.Filter))
+	fmt.Fprintf(out, "request: enabled=%t filter=%s\n",
+		write.Request.Enabled, caidoFilter(write.Request.Filter))
+	fmt.Fprintf(out, "response: enabled=%t filter=%s\n",
+		write.Response.Enabled, caidoFilter(write.Response.Filter))
+	fmt.Fprintf(out, "stream_ws: enabled=%t\n", write.StreamWS.Enabled)
+	for _, rule := range write.Existing {
+		fmt.Fprintf(out, "existing: %s %s\n", rule.ID, rule.Name)
+	}
+	for _, rule := range write.Rules {
+		fmt.Fprintf(out, "rule: %s enabled=%t name=%s\n", rule.ID, rule.Enabled, rule.Name)
+	}
+}
+
+// caidoFilter renders an empty HTTPQL filter as "(none)".
+func caidoFilter(filter string) string {
+	if strings.TrimSpace(filter) == "" {
+		return "(none)"
+	}
+	return filter
 }
