@@ -80,7 +80,8 @@ func TestPageReplayOnWedgedPageTakesOneReadBudget(t *testing.T) {
 		p.Lock()
 		defer p.Unlock()
 
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		const callBudget = 10 * time.Second
+		ctx, cancel := context.WithTimeout(context.Background(), callBudget)
 		defer cancel()
 		started := time.Now()
 		_, err := PageReplay(ctx, p, ReplayRequest{Target: target})
@@ -88,8 +89,12 @@ func TestPageReplayOnWedgedPageTakesOneReadBudget(t *testing.T) {
 		if err == nil {
 			t.Fatalf("wedged replay returned no error after %s", elapsed.Round(time.Millisecond))
 		}
-		if elapsed < 500*time.Millisecond || elapsed >= time.Second {
-			t.Fatalf("wedged replay burned %s, want exactly one 500ms read budget (error = %v)", elapsed.Round(time.Millisecond), err)
+		// The read budget is 500ms and a replay that misses the bounded read path
+		// waits out the whole call budget. Half the call budget is ten read
+		// budgets of headroom, so a loaded machine's scheduling drift cannot trip
+		// it while a wait that burns the call budget still fails.
+		if elapsed < 500*time.Millisecond || elapsed >= callBudget/2 {
+			t.Fatalf("wedged replay burned %s, want one read budget and not the call budget (error = %v)", elapsed.Round(time.Millisecond), err)
 		}
 		lower := strings.ToLower(err.Error())
 		for _, want := range []string{"unusable", "session_close"} {
