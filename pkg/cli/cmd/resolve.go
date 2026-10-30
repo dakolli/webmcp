@@ -526,6 +526,7 @@ type actArgFlags struct {
 	attrName       string
 	mode           string
 	fieldFlags     []string
+	fieldsJSON     []string
 	formValueFlags []string
 	submit         string
 }
@@ -886,7 +887,7 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 		a.mode = f.mode
 	}
 	if len(a.fields) == 0 && a.action == "fill_form" {
-		fields, err := parsePairFlags(f.fieldFlags, "--field")
+		fields, err := parseFieldsFlags(f.fieldFlags, f.fieldsJSON)
 		if err != nil {
 			return a, err
 		}
@@ -938,21 +939,83 @@ func canonicalAction(action string) string {
 	return action
 }
 
+// parseFieldsFlags resolves fill_form's selector→value pairs from the repeatable
+// --field flags or the JSON --fields objects. The two forms are mutually
+// exclusive.
+func parseFieldsFlags(pairs, objects []string) (map[string]string, error) {
+	if len(pairs) > 0 && len(objects) > 0 {
+		return nil, fmt.Errorf("page act: --field and --fields are mutually exclusive; pass one")
+	}
+	if len(objects) > 0 {
+		return parseFieldsJSON(objects)
+	}
+	return parsePairFlags(pairs, "--field")
+}
+
+// parseFieldsJSON merges the JSON objects given to --fields into one selector to
+// value map. A selector repeated across objects is an error, never a silent
+// overwrite.
+func parseFieldsJSON(objects []string) (map[string]string, error) {
+	out := make(map[string]string)
+	for _, raw := range objects {
+		var add map[string]string
+		if err := json.Unmarshal([]byte(raw), &add); err != nil {
+			return nil, fmt.Errorf("page act: --fields %q is not a JSON object of selector to value: %w", raw, err)
+		}
+		for k, v := range add {
+			if k == "" {
+				return nil, fmt.Errorf("page act: --fields %q has an empty selector", raw)
+			}
+			if _, dup := out[k]; dup {
+				return nil, fmt.Errorf("page act: --fields repeats selector %q", k)
+			}
+			out[k] = v
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("page act: --fields must carry at least one selector")
+	}
+	return out, nil
+}
+
 // parsePairFlags turns repeatable KEY=VALUE flags into a map. It splits at the
-// first '=' so a value may contain '='.
+// first '=' outside a bracket group, so a selector and a value may both contain
+// '='.
 func parsePairFlags(flags []string, label string) (map[string]string, error) {
 	if len(flags) == 0 {
 		return nil, nil
 	}
 	out := make(map[string]string, len(flags))
 	for _, raw := range flags {
-		key, value, ok := strings.Cut(raw, "=")
-		if !ok || key == "" {
+		key, value, ok := splitPairFlag(raw)
+		if !ok {
 			return nil, fmt.Errorf("page act: %s %q must be KEY=VALUE", label, raw)
 		}
 		out[key] = value
 	}
 	return out, nil
+}
+
+// splitPairFlag splits KEY=VALUE at the first '=' that is outside a [...] bracket
+// group. A selector such as input[name=email] therefore stays in the key, and a
+// value may contain '='.
+func splitPairFlag(raw string) (key, value string, ok bool) {
+	depth := 0
+	for i := range len(raw) {
+		switch raw[i] {
+		case '[':
+			depth++
+		case ']':
+			if depth > 0 {
+				depth--
+			}
+		case '=':
+			if depth == 0 && i > 0 {
+				return raw[:i], raw[i+1:], true
+			}
+		}
+	}
+	return "", "", false
 }
 
 // parseFuzzPoints builds replay_fuzz injection points from --points values.

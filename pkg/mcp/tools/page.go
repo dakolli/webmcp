@@ -128,6 +128,11 @@ func (t *Page) Execute(ctx context.Context, args json.RawMessage) (string, error
 	if a.What == "" {
 		return failResult(fmt.Errorf("page_fetch: missing required argument %q", "what"))
 	}
+	if a.What == "dom" && a.Selector != "" {
+		return failResult(fmt.Errorf(
+			"page_fetch: invalid arguments: what=dom rejects selector — the DOM snapshot is document-wide; use what=html with selector for a scoped read",
+		))
+	}
 	if a.MaxBytes <= 0 {
 		a.MaxBytes = pageops.DefaultPageMaxBytes
 	}

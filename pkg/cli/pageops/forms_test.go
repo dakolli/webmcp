@@ -2,9 +2,12 @@ package pageops
 
 import (
 	"encoding/json"
+	"errors"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/go-rod/rod"
 )
 
 // TestFormsAspectRegistered pins the registry entry: forms validates, owns its
@@ -215,5 +218,103 @@ func TestFillFormResultHasNoDeltaSuffix(t *testing.T) {
 	}
 	if got := ActStateDeltaFor("click", before, after); got == "" {
 		t.Fatal("click lost its state delta")
+	}
+}
+
+// TestPickValueCandidate pins values selection: an exact value match wins a
+// radio or checkbox member, a lone control resolves by name, and several
+// candidates with no value match fail naming them.
+func TestPickValueCandidate(t *testing.T) {
+	radioGroup := []fillFormResolved{
+		{Selector: "#small", Name: "size", Tag: "input", Type: "radio", Value: "small", HasValue: true},
+		{Selector: "#medium", Name: "size", Tag: "input", Type: "radio", Value: "medium", HasValue: true},
+		{Selector: "#large", Name: "size", Tag: "input", Type: "radio", Value: "large", HasValue: true},
+	}
+
+	tests := []struct {
+		name   string
+		query  fillFormValueQuery
+		want   string
+		ok     bool
+		errSub string
+	}{
+		{
+			name:  "radio matching value",
+			query: fillFormValueQuery{Key: "size", Value: "medium", Candidates: radioGroup},
+			want:  "#medium",
+			ok:    true,
+		},
+		{
+			name: "checkbox matching value",
+			query: fillFormValueQuery{
+				Key:   "topping",
+				Value: "cheese",
+				Candidates: []fillFormResolved{
+					{Selector: "#ham", Name: "topping", Tag: "input", Type: "checkbox", Value: "ham", HasValue: true},
+					{Selector: "#cheese", Name: "topping", Tag: "input", Type: "checkbox", Value: "cheese", HasValue: true},
+				},
+			},
+			want: "#cheese",
+			ok:   true,
+		},
+		{
+			name: "checkbox without value resolves by name",
+			query: fillFormValueQuery{
+				Key:        "agree",
+				Value:      "yes",
+				Candidates: []fillFormResolved{{Selector: "#agree", Name: "agree", Tag: "input", Type: "checkbox"}},
+			},
+			want: "#agree",
+			ok:   true,
+		},
+		{
+			name: "lone control resolves by name despite a stale value attribute",
+			query: fillFormValueQuery{
+				Key:        "q",
+				Value:      "new",
+				Candidates: []fillFormResolved{{Selector: "#q", Name: "q", Tag: "input", Type: "text", Value: "old", HasValue: true}},
+			},
+			want: "#q",
+			ok:   true,
+		},
+		{
+			name:  "no control with the name is skipped",
+			query: fillFormValueQuery{Key: "missing", Value: "x"},
+			ok:    false,
+		},
+		{
+			name:   "several controls with no value match is ambiguous",
+			query:  fillFormValueQuery{Key: "size", Value: "huge", Candidates: radioGroup},
+			ok:     false,
+			errSub: `value="small"`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok, err := pickValueCandidate(tc.query)
+			if tc.errSub != "" {
+				if err == nil {
+					t.Fatalf("pickValueCandidate() error = nil, want a message naming %q", tc.errSub)
+				}
+				if !strings.Contains(err.Error(), tc.errSub) || !strings.Contains(err.Error(), "candidates:") {
+					t.Fatalf("error = %q, want it to name the candidates", err)
+				}
+				var missing *rod.ElementNotFoundError
+				if !errors.As(err, &missing) {
+					t.Fatalf("error %q does not wrap *rod.ElementNotFoundError", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("pickValueCandidate() error = %v", err)
+			}
+			if ok != tc.ok {
+				t.Fatalf("ok = %v, want %v", ok, tc.ok)
+			}
+			if ok && got.Selector != tc.want {
+				t.Fatalf("selector = %q, want %q", got.Selector, tc.want)
+			}
+		})
 	}
 }

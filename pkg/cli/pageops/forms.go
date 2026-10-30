@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/dakolli/webmcp/pkg/browsers"
+	"github.com/go-rod/rod"
 )
 
 const (
@@ -422,27 +423,36 @@ type fillFormArg struct {
 const fillFormResolveJS = `(formSelector, fields, values) => {` + cssPathJS + `
   const form = formSelector ? document.querySelector(formSelector) : null;
   const scope = form || document;
-  const describe = (el, value) => ({
-    selector: cssPath(el),
-    name: el.getAttribute('name') || '',
-    tag: el.tagName.toLowerCase(),
-    type: (el.tagName.toLowerCase() === 'input' ? (el.getAttribute('type') || 'text').toLowerCase() : ''),
-    value: value
-  });
+  const base = (el) => {
+    const tag = el.tagName.toLowerCase();
+    const attr = el.getAttribute('value');
+    return {
+      selector: cssPath(el),
+      name: el.getAttribute('name') || '',
+      tag: tag,
+      type: (tag === 'input' ? (el.getAttribute('type') || 'text').toLowerCase() : ''),
+      has_value: attr !== null,
+      value: attr === null ? '' : attr
+    };
+  };
   const found = [];
   const skipped = [];
   for (const f of fields) {
     let el = null;
     try { el = scope.querySelector(f.key); } catch (e) { el = null; }
     if (!el) { skipped.push({selector: f.key, reason: 'no element matched'}); continue; }
-    found.push(describe(el, f.value));
+    const entry = base(el);
+    entry.value = f.value;
+    found.push(entry);
   }
+  const value_queries = [];
   if (form) {
     for (const v of values) {
-      let el = null;
-      for (const cand of form.elements) { if (cand.name === v.key) { el = cand; break; } }
-      if (!el) { skipped.push({selector: '[name="' + v.key + '"]', reason: 'no field named ' + v.key + ' in the form'}); continue; }
-      found.push(describe(el, v.value));
+      const candidates = [];
+      for (const cand of form.elements) {
+        if (cand.name === v.key) candidates.push(base(cand));
+      }
+      value_queries.push({key: v.key, value: v.value, candidates: candidates});
     }
   }
   let resolved = form;
@@ -453,7 +463,7 @@ const fillFormResolveJS = `(formSelector, fields, values) => {` + cssPathJS + `
       if (c) { resolved = c; break; }
     }
   }
-  return {form: resolved ? cssPath(resolved) : '', found: found, skipped: skipped};
+  return {form: resolved ? cssPath(resolved) : '', found: found, skipped: skipped, value_queries: value_queries};
 }`
 
 // fillFormApplyJS writes every resolved control through its native setter and
@@ -556,13 +566,71 @@ type fillFormResolved struct {
 	Tag      string `json:"tag"`
 	Type     string `json:"type"`
 	Value    string `json:"value"`
+	HasValue bool   `json:"has_value"`
+}
+
+// fillFormValueQuery is the candidate set one values key matched by name.
+type fillFormValueQuery struct {
+	Key        string             `json:"key"`
+	Value      string             `json:"value"`
+	Candidates []fillFormResolved `json:"candidates"`
 }
 
 // fillFormResolve is the resolve script's wire shape.
 type fillFormResolve struct {
-	Form    string             `json:"form"`
-	Found   []fillFormResolved `json:"found"`
-	Skipped []fillFormSkip     `json:"skipped"`
+	Form         string               `json:"form"`
+	Found        []fillFormResolved   `json:"found"`
+	Skipped      []fillFormSkip       `json:"skipped"`
+	ValueQueries []fillFormValueQuery `json:"value_queries"`
+}
+
+// pickValueCandidate selects the control a values key targets. An exact value
+// match wins, a lone control without a value attribute or a lone candidate
+// resolves by name, and ok is false when no control carries the name. Several
+// candidates with no value match fail as an ambiguous element error.
+func pickValueCandidate(q fillFormValueQuery) (fillFormResolved, bool, error) {
+	if len(q.Candidates) == 0 {
+		return fillFormResolved{}, false, nil
+	}
+	for _, c := range q.Candidates {
+		if c.HasValue && c.Value == q.Value {
+			return c, true, nil
+		}
+	}
+	var valueless []fillFormResolved
+	for _, c := range q.Candidates {
+		if !c.HasValue {
+			valueless = append(valueless, c)
+		}
+	}
+	if len(valueless) == 1 {
+		return valueless[0], true, nil
+	}
+	if len(q.Candidates) == 1 {
+		return q.Candidates[0], true, nil
+	}
+	return fillFormResolved{}, false, ambiguousValueError(q)
+}
+
+// ambiguousValueError names the controls a values key matched when no value
+// selects one. It keeps *rod.ElementNotFoundError in the wrap chain so surfaces
+// classify the failure as element_not_found.
+func ambiguousValueError(q fillFormValueQuery) error {
+	labels := make([]string, 0, len(q.Candidates))
+	for _, c := range q.Candidates {
+		if c.HasValue {
+			labels = append(labels, fmt.Sprintf("value=%q", c.Value))
+			continue
+		}
+		labels = append(labels, "(no value)")
+	}
+	return fmt.Errorf(
+		"fill_form: no element matched field %q value %q — candidates: %s: %w",
+		q.Key,
+		q.Value,
+		strings.Join(labels, ", "),
+		&rod.ElementNotFoundError{},
+	)
 }
 
 // fillFormSkip is one field the fill could not write, with the reason.
@@ -665,11 +733,14 @@ func ValidateFillForm(selector, submit string, fields, values map[string]string)
 // PageFillForm fills a form's fields in one call and optionally submits it. The
 // target form is selector, or empty when fields carries full field selectors.
 // fields maps a field selector to its value; values maps a field name to its
-// value and requires a form selector. Each control is written through its native
-// setter and then receives the events React and Vue listen for. submit is
-// requestSubmit (default), click or none; waitMode (load, idle or stable) waits
-// after the submit. A field that does not resolve is reported in skipped, never
-// as an error; a missing form is an element_not_found. The action never moves the
+// value and requires a form selector. A values key selects its control by name
+// and value, so a radio or checkbox member is picked by its value attribute;
+// several controls with no value match fail as an element_not_found that names
+// the candidates. Each control is written through its native setter and then
+// receives the events React and Vue listen for. submit is requestSubmit
+// (default), click or none; waitMode (load, idle or stable) waits after the
+// submit. A field that does not resolve is reported in skipped, never as an
+// error; a missing form is an element_not_found. The action never moves the
 // pointer or presses a key.
 func PageFillForm(
 	ctx context.Context,
@@ -716,6 +787,22 @@ func PageFillForm(
 
 		if mode != "none" && resolved.Form == "" {
 			return fillFormPhase{}, fmt.Errorf("fill_form: invalid arguments: submit %q requires a form (pass a form selector or a field inside a <form>)", mode)
+		}
+
+		for _, q := range resolved.ValueQueries {
+			c, ok, err := pickValueCandidate(q)
+			if err != nil {
+				return fillFormPhase{}, err
+			}
+			if !ok {
+				resolved.Skipped = append(resolved.Skipped, fillFormSkip{
+					Selector: fmt.Sprintf("[name=%q]", q.Key),
+					Reason:   "no field named " + q.Key + " in the form",
+				})
+				continue
+			}
+			c.Value = q.Value
+			resolved.Found = append(resolved.Found, c)
 		}
 
 		writes := make([]fieldWrite, 0, len(resolved.Found))

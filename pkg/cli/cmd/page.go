@@ -579,6 +579,7 @@ func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 		attrName       string
 		mode           string
 		fieldFlags     []string
+		fieldsJSON     []string
 		formValueFlags []string
 		submit         string
 	)
@@ -621,7 +622,7 @@ prevents a false transport timeout; it never extends the action.
   click        [selector]
   hover        [selector]
   select       [selector] [value]
-  fill_form    [selector]  (fields via --field selector=VALUE; names via --form-value name=VALUE; submit via --submit)
+  fill_form    [selector]  (fields via --field selector=VALUE or --fields '{selector:VALUE}'; names via --form-value name=VALUE; submit via --submit)
   input        [selector] [text]
   press_key    [key]
   click_at     [x] [y]
@@ -656,17 +657,20 @@ prevents a false transport timeout; it never extends the action.
 
 fill_form fills a form and optionally submits it in one call. The optional
 positional selector names the <form>; --field SELECTOR=VALUE fills by selector
-(repeatable) and --form-value NAME=VALUE fills by name inside the form
-(repeatable), so pass one shape per call. Each control is written through its
-native setter and then receives the input and change events React and Vue listen
-for: a checkbox or radio is checked, a select takes the option value, a textarea
-takes the value, and every other control takes the value. --submit is
+(repeatable, split at the first '=' outside a [] group) or --fields
+'{"SELECTOR":"VALUE"}' passes a JSON object (repeatable, the escape hatch when a
+selector or value contains '='), and --form-value NAME=VALUE fills by name
+inside the form (repeatable). Pass one shape per call. Each control is written
+through its native setter and then receives the input and change events React and
+Vue listen for: a checkbox or radio is checked, a select takes the option value, a
+textarea takes the value, and every other control takes the value. --submit is
 requestSubmit (default, form.requestSubmit()), click, or none; --wait load|idle|stable
 waits after the submit (ms and interactable are ignored). The action never moves
 the pointer or presses a key. It prints
 {form,filled:[{name,selector}],skipped:[{selector,reason}],submit,url_after};
 an unresolved field lands in skipped, never as an error, and a missing form is
-element_not_found.
+element_not_found. A --form-value name that matches several controls with no
+matching value is element_not_found and names the candidates.
 
 clear_logs empties the network, console, websocket and dialog buffers and prints
 {"network":N,"console":M,"websocket":K,"dialogs":D}.
@@ -760,6 +764,7 @@ without opening or touching a page; use --variants to narrow the labels.`,
   web-cli page act last set_html 'body' append '<b id=wm1>hi</b>'  # append markup, print created elements
   web-cli page act last set_html '#host' outer '<p id=wm2>new</p>' # replace the element with markup
   web-cli page act last fill_form 'form#login' --field '#user=a' --field '#pass=b' --submit requestSubmit
+  web-cli page act last fill_form 'form#login' --fields '{"input[name=user]":"a","input[name=pass]":"b"}'
   web-cli page act last fill_form 'form#search' --form-value q=wm1 --submit click
   web-cli page act encode attr-double '<script>alert(1)</script>'  # page-free: payload variants, no page needed
   web-cli page act last replay /api/user --method PUT --value '{"id":2}'  # replay with an edited body
@@ -792,7 +797,7 @@ without opening or touching a page; use --variants to narrow the labels.`,
 				valueSet: cmd.Flags().Changed("value"),
 				context:  actContext, variants: variants,
 				attrName: attrName, mode: mode,
-				fieldFlags: fieldFlags, formValueFlags: formValueFlags, submit: submit,
+				fieldFlags: fieldFlags, fieldsJSON: fieldsJSON, formValueFlags: formValueFlags, submit: submit,
 			})
 			if err != nil {
 				return err
@@ -1192,7 +1197,8 @@ without opening or touching a page; use --variants to narrow the labels.`,
 	cmd.Flags().StringVar(&name, "name", "", "auth snapshot name, unique per site (auth_save, auth_restore)")
 	cmd.Flags().StringVar(&attrName, "attr-name", "", "attribute name for set_attr (e.g. href, src, onerror, srcdoc)")
 	cmd.Flags().StringVar(&mode, "mode", "", "set_html mode: inner (default, innerHTML), outer (outerHTML) or append (insertAdjacentHTML beforeend)")
-	cmd.Flags().StringArrayVar(&fieldFlags, "field", nil, "fill_form: field selector=VALUE (repeatable; maps to fields)")
+	cmd.Flags().StringArrayVar(&fieldFlags, "field", nil, "fill_form: field selector=VALUE (repeatable; splits at the first '=' outside a [] group, maps to fields)")
+	cmd.Flags().StringArrayVar(&fieldsJSON, "fields", nil, "fill_form: JSON object of selector to value (repeatable; the escape hatch when a selector or value contains '='; maps to fields)")
 	cmd.Flags().StringArrayVar(&formValueFlags, "form-value", nil, "fill_form: field name=VALUE resolved inside the form (repeatable; maps to values)")
 	cmd.Flags().StringVar(&submit, "submit", "", "fill_form: submit mode: requestSubmit (default), click or none")
 	cmd.Flags().BoolVar(&force, "force", false, "auth_restore: restore even when the live page user agent differs from the stored one")

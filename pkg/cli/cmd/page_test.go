@@ -1170,3 +1170,59 @@ func TestReportFallbackBrowserID(t *testing.T) {
 		})
 	}
 }
+
+// TestFillFormFieldFlags pins the fill_form pair split and the JSON --fields
+// escape hatch: an '=' inside a selector or inside the value must not move the
+// split, and --field plus --fields is refused.
+func TestFillFormFieldFlags(t *testing.T) {
+	t.Run("selector and value may contain '='", func(t *testing.T) {
+		got, err := parsePairFlags([]string{
+			"input[name=custemail]=x",
+			"input[name=size][value=large]=on",
+			"q=a=b",
+		}, "--field")
+		if err != nil {
+			t.Fatalf("parsePairFlags() error = %v", err)
+		}
+		want := map[string]string{
+			"input[name=custemail]":         "x",
+			"input[name=size][value=large]": "on",
+			"q":                             "a=b",
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("parsePairFlags() = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("JSON object escape hatch merges", func(t *testing.T) {
+		got, err := parseFieldsJSON([]string{
+			`{"input[name=a=b]":"x=y"}`,
+			`{"#second":"z"}`,
+		})
+		if err != nil {
+			t.Fatalf("parseFieldsJSON() error = %v", err)
+		}
+		want := map[string]string{
+			"input[name=a=b]": "x=y",
+			"#second":         "z",
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("parseFieldsJSON() = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("--field and --fields are mutually exclusive", func(t *testing.T) {
+		_, err := parseFieldsFlags([]string{"#a=b"}, []string{`{"#b":"c"}`})
+		if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+			t.Fatalf("parseFieldsFlags() error = %v, want a mutual-exclusion error", err)
+		}
+	})
+
+	t.Run("unbalanced or empty pair is rejected", func(t *testing.T) {
+		for _, raw := range []string{"noequals", "=value"} {
+			if _, err := parsePairFlags([]string{raw}, "--field"); err == nil {
+				t.Errorf("parsePairFlags(%q) error = nil, want an error", raw)
+			}
+		}
+	})
+}
