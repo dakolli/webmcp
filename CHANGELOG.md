@@ -4,7 +4,18 @@
 
 ### Added
 - `page_act set_style` writes a CSS declaration list onto one element and reports which declarations the browser kept and which it dropped. An empty value clears the inline style. This turns a CSS injection probe into two calls instead of five.
+- `page_act set_attr` and `page_act set_html` write an attribute or markup into the page and report the nodes the browser created, the scripts it parsed and whether one ran.
+- `page_act fill_form` fills a form from a selector-to-value map and submits it in one call, with React and Vue seeing each write.
+- `page_act encode` returns one payload in the encodings a given context needs, so a bypass test does not hand-write entities or escapes.
+- `page_fetch what=reflections` finds a marker in the page and reports where it landed, the context that received it, which special characters survived, and whether that is dangerous, escaped or inert.
+- `page_fetch what=security` now parses the effective CSP into directives, nonce and hashes, and records `securitypolicyviolation` events. The policy and the response-header checks come from a page-side capture, so they survive `clear_logs` and a header over 512 bytes parses whole.
+- The sink tracer names more DOM XSS sources: `window.name`, `document.referrer`, `document.cookie` (value redacted), local and session storage reads, `history.state`, `message` events and `URLSearchParams` reads.
 - `page_act eval` no longer appends the `→ url=… title="…"` change line. Its result is parseable JSON again.
+
+### Fixed
+- `page_fetch what=reflections` returned a decode error on every call instead of a result.
+- `page_act fill_form` returned its result as a JSON string, not an object.
+- `csp_unsafe_inline` warned on a `style-src` token while `script-src` was hash-locked. It now tests the effective script directive only.
 
 ## 0.3.0 - 2026-10-30
 
