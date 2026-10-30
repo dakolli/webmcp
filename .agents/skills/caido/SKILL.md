@@ -1,6 +1,6 @@
 ---
 name: caido
-description: Read and replay a local Caido proxy's HTTP history with caido_status, caido_sitemap, caido_search, caido_finding and caido_replay. Use when a task needs the requests and responses that pages sent through the Caido proxy on 127.0.0.1:8081. The record covers headers, bodies, status codes, timings, endpoints and findings.
+description: Read and replay a local Caido proxy's HTTP history with caido_status, caido_sitemap, caido_search, caido_finding, caido_replay and caido_intercept. Use when a task needs the requests and responses that pages sent through the Caido proxy on 127.0.0.1:8081. The record covers headers, bodies, status codes, timings, endpoints and findings.
 ---
 
 # caido skill
@@ -20,9 +20,9 @@ after the page closes. A human starts the instance with `make caido`. These tool
 - A page records only through the proxy. Create a browser with `browser_create {"proxy":"127.0.0.1:8081","ignore_certs":true}`.
 - The history is shared. Every client of the instance writes to one list.
 - A guest session loses its history when the instance stops.
-- `caido_status`, `caido_sitemap`, `caido_search` and `caido_finding` create never change or block traffic. `caido_replay` sends one new request and records its exchange. `caido_finding` create writes a finding only.
+- `caido_status`, `caido_sitemap`, `caido_search` and `caido_finding` create never change or block traffic. `caido_replay` sends one new request and records its exchange. `caido_finding` create writes a finding only. `caido_intercept` add pauses and rewrites live responses until you clear it.
 
-## The five tools
+## The six tools
 
 | Tool | What it answers | Key argument |
 | :--- | :--- | :--- |
@@ -31,6 +31,7 @@ after the page closes. A human starts the instance with `make caido`. These tool
 | `caido_search` | Which requests match one filter, newest first. | `httpql` |
 | `caido_finding` | Which bugs you proved, linked to one captured request id. | `action` |
 | `caido_replay` | The exchange one resent request recorded, as a new history row. | `request_id` |
+| `caido_intercept` | Which response rewrite rules are armed, and the change one rule writes. | `action` |
 
 ## The read flow
 
@@ -39,6 +40,8 @@ after the page closes. A human starts the instance with `make caido`. These tool
 3. Call `caido_search` with `httpql` when you know what you want.
 4. Call `caido_finding` to record what you proved.
 5. Call `caido_replay` when the request lives only in history.
+
+`caido_intercept` sits outside the read flow. Arm a rule only to rewrite a live response. Clear it at once.
 
 ## Every argument
 
@@ -73,6 +76,14 @@ after the page closes. A human starts the instance with `make caido`. These tool
 | `caido_replay` | `headers` | object | no | `{}` | Each name is a token and each value has no newline. A named header replaces its captured value. |
 | `caido_replay` | `query` | object | no | `{}` | A non-empty value replaces one URL parameter. An empty value removes it. |
 | `caido_replay` | `body` | string | no | captured | Replaces the body. An empty string sends an empty body and `content-length: 0`. |
+| `caido_intercept` | `action` | string | yes | — | `list`, `add` or `clear`. |
+| `caido_intercept` | `url_filter` | string | add | — | HTTPQL request expression such as `req.host.eq:"www.gnu.org"`. Blank, `*`, `res.` and malformed values are refused. |
+| `caido_intercept` | `status` | integer | no | 0 | Response code to write, 200..599. 0 leaves it alone. |
+| `caido_intercept` | `body` | string | no | absent | Replaces the whole response body. An empty string writes an empty body. |
+| `caido_intercept` | `headers` | object | no | `{}` | Header name to value. Each named response header is replaced. |
+| `caido_intercept` | `scope_id` | string | no | `""` | `""` uses the focus scope and `"*"` every scope. It narrows a new rule to the scope allowlist hosts. |
+| `caido_intercept` | `id` | string | no | `""` | One rule id from `list`. An empty id selects the kill switch. |
+| `caido_intercept` | `confirm` | boolean | clear | false | Must be `true` when `id` is empty. |
 
 ## What a search returns
 
@@ -103,6 +114,12 @@ after the page closes. A human starts the instance with `make caido`. These tool
 - Keep redaction on for a report. `raw:true` prints live cookies and tokens into your context.
 - Take `request_id` from a `caido_search` row before you create a finding or replay it.
 - `caido_replay` sends one request. Read `caido_status` first when the project matters.
+- Clear a `caido_intercept` rule before you end the task. A rule outlives this process.
+- A `caido_intercept` rule is project-global. It rewrites traffic from every browser that uses the proxy.
+- A `caido_intercept` add needs `url_filter`. A blank value, `*` or a `res.` expression is refused.
+- A no-id `caido_intercept` clear needs `confirm:true`. It deletes only `webmcp-intercept` rules.
+- A no-id `caido_intercept` clear also deletes a `webmcp-intercept` rule that another caller armed.
+- A `caido_intercept` rule rewrites only the traffic that `url_filter` selects. The value is also the response intercept filter.
 
 ## `deny_hosts` and capture
 
@@ -137,6 +154,10 @@ navigation. Reach for `page_fetch` when one live page owns the question.
 | `caido_sitemap: invalid arguments: host must be a bare host such as www.gnu.org — no scheme and no path` | `invalid_args` | Strip the scheme and the path. |
 | `caido_finding: invalid arguments: create needs title and request_id — take a request id from caido_search` | `invalid_args` | Take an id from a search row. |
 | `caido_replay: invalid arguments: request_id is required — take a request id from caido_search` | `invalid_args` | Send `request_id`. |
+| `caido_intercept: invalid arguments: add needs url_filter — an HTTPQL expression such as req.host.eq:"example.com"` | `invalid_args` | Send a request expression. |
+| `caido_intercept: intercept is already enabled with filter "…" — call caido_intercept action:clear before adding a different filter` | `invalid_args` | Clear the live rule first. |
+| `caido_intercept: invalid arguments: clear needs confirm:true or an id` | `invalid_args` | Send `confirm:true` or an `id`. |
+| `caido_intercept: clear incomplete — N rule(s) remain: …` | `unknown` | Read `list` and clear the ids again. |
 | `caido: no request with id "…" — take a request id from caido_search` | `not_found` | Search again and take a live id. |
 | `caido: createFinding failed: UnknownIdUserError (UNKNOWN_ID)` | `unknown` | The request id is not on the instance. Search again. |
 

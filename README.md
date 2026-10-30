@@ -276,33 +276,95 @@ the default target, and `--max-bytes 0` for unbounded output.
 
 ## Caido history
 
-`caido_search` reads recorded history from a Caido instance on the same host. The proxy listens on
-`127.0.0.1:8081`; the UI and GraphQL API listen on `127.0.0.1:8080`. Enable it in `webmcp.toml`
-(`enabled = true`). Authentication tries `access_token` first (a direct instance token copied from
-the Caido UI console with `JSON.parse(localStorage.CAIDO_AUTHENTICATION).accessToken`) as the bearer,
-then a `pat`, then a guest session when `allow_guest = true` (the default). A rejected credential
-falls through to the next step, so a bad PAT still yields a working guest session; with
-`allow_guest = false` the tool returns `caido: no session — the instance rejected the credential and
-guest access is off`. Guest history lasts only while the instance runs.
+Six `caido_*` tools work with a Caido instance on the same host. Five read the recorded history and one rewrites a live response.
 
-Five tools read, record and replay that history:
+| Listener | Address |
+| :--- | :--- |
+| Proxy | `127.0.0.1:8081` |
+| UI and GraphQL API | `127.0.0.1:8080` |
+
+### Enable the tools
+
+The tools register only when one condition is true:
+
+1. `[caido] enabled = true` in `~/.config/browser-mcp/webmcp.toml` (mode `0600`).
+2. `browser serve mcp --caido` runs. The flag forces the tools on.
+
+| Task | Command |
+| :--- | :--- |
+| Create the file once | `browser config init` |
+| Print its path | `browser config path` |
+| Show the resolved settings | `browser config show` |
+
+`browser config init` writes the file one time. It never overwrites an existing file.
+
+Two launch errors turn the tools off, even when `enabled = true`:
+
+- `[caido] capture` is not `all`, `in-scope`, or `auto`.
+- `[caido] project` names a project that the instance does not have.
+
+A failed login does not turn them off. The tools register, and each call returns the login error.
+
+### Authentication
+
+The client tries each credential in this order:
+
+1. `access_token` as the bearer.
+2. `pat` as the bearer.
+3. A guest session, when `allow_guest = true`. This is the default.
+
+A rejected credential falls through to the next step. A bad PAT still gives a working guest session.
+Guest history lasts only while the instance runs.
+
+Each credential comes from the first source that sets it. The two flags belong to `browser serve mcp`.
+
+| Credential | Flag | Environment | File key |
+| :--- | :--- | :--- | :--- |
+| Access token | `--caido-token` | `CAIDO_ACCESS_TOKEN` | `access_token` |
+| PAT | `--caido-pat` | `CAIDO_PAT` | `pat` |
+
+Copy the access token from the Caido UI console. It expires after about 7 days.
+
+```js
+JSON.parse(localStorage.CAIDO_AUTHENTICATION).accessToken
+```
+
+With `allow_guest = false` and no accepted credential, the tool returns this error:
+
+```
+caido: no session — the instance rejected the credential and guest access is off
+```
+
+### Tools
 
 | Tool | Purpose |
 | :--- | :--- |
-| `caido_status` | The project, the scopes, the capture mode and the row count. Call it first. |
-| `caido_sitemap` | The endpoints one host recorded, one row per method and path shape. |
-| `caido_search` | The captured requests, filtered by `httpql` or the typed keys. |
-| `caido_finding` | A finding linked to one captured request id, so it outlives the chat. |
+| `caido_status` | Project, scopes, capture mode and row count. Call it first. |
+| `caido_sitemap` | The endpoints one host recorded. One row per method and path shape. |
+| `caido_search` | The captured requests. Filter with `httpql` or the typed keys. |
+| `caido_finding` | Read or create a finding linked to one captured request id. |
 | `caido_replay` | Resend one captured request and read the exchange it records. |
+| `caido_intercept` | List, add or clear rewrite rules that change a live response. |
 
-The `[caido] capture` key picks what the proxy records: `all` records every host, and `in-scope`
-records only the `scope_allow` hosts. `browser_create` `deny_hosts` routes a host outside the proxy,
-so that host never reaches history. The request still leaves the machine. The read tools never change
-captured history. `caido_replay` sends one new request. Credential-shaped header names and
-credential-shaped keys in JSON, form and plain bodies come back as `<redacted>` unless `raw` is true.
-`count` is the rows returned and `total` is the whole matching history, which ignores `since`. A search
-with no filter scans the newest 500 rows, and a filtered search pages until `limit`.
-`body_bytes: 0` returns headers with empty bodies.
+### What the proxy records
+
+| Setting | Effect |
+| :--- | :--- |
+| `[caido] capture = "all"` | The proxy records every host. |
+| `[caido] capture = "in-scope"` | The proxy records only `scope_allow` hosts. |
+| `[caido] capture = "auto"` | The instance keeps its stored filter. |
+| `browser_create` `deny_hosts` | The host skips the proxy, so it never reaches history. |
+
+`deny_hosts` keeps a host out of history. The request still leaves the machine.
+
+### Limits
+
+- `caido_status`, `caido_sitemap`, `caido_search` and `caido_finding` never change captured history.
+- `caido_replay` sends one new request. `caido_intercept` changes live responses, not history.
+- Credential-shaped header names and body keys return as `<redacted>`. Pass `raw: true` to disable redaction.
+- `count` is the rows returned. `total` is the whole matching history, and it ignores `since`.
+- A search with no filter scans the newest 500 rows.
+- `body_bytes: 0` returns headers with empty bodies.
 
 ## Licence
 

@@ -5,7 +5,7 @@ description: Drive a live, stateful Chromium browser over the web-mcp MCP server
 
 # web-mcp — MCP browser skill
 
-This skill covers the 14 `web-mcp` MCP tools: 9 browser tools and 5 Caido tools. It does not replace the tool descriptions.
+This skill covers the 15 `web-mcp` MCP tools: 9 browser tools and 6 Caido tools. It does not replace the tool descriptions.
 This file is the single entry. It carries the cross-cutting rules. Tool detail lives in the references.
 
 ## Read order
@@ -65,6 +65,7 @@ Install or refresh this skill with `browser skill <harness|path|.>`. With no arg
 | `caido_search` | [caido_search.md](/home/dakolli/github.com/webmcp/.agents/skills/caido/references/tools/caido_search.md) | [caido_search_example.md](/home/dakolli/github.com/webmcp/.agents/skills/caido/references/examples/caido_search_example.md) | tested |
 | `caido_finding` | [caido_finding.md](/home/dakolli/github.com/webmcp/.agents/skills/caido/references/tools/caido_finding.md) | [caido_finding_example.md](/home/dakolli/github.com/webmcp/.agents/skills/caido/references/examples/caido_finding_example.md) | tested |
 | `caido_replay` | [caido_replay.md](/home/dakolli/github.com/webmcp/.agents/skills/caido/references/tools/caido_replay.md) | [caido_replay_example.md](/home/dakolli/github.com/webmcp/.agents/skills/caido/references/examples/caido_replay_example.md) | tested |
+| `caido_intercept` | [caido_intercept.md](/home/dakolli/github.com/webmcp/.agents/skills/caido/references/tools/caido_intercept.md) | [caido_intercept_example.md](/home/dakolli/github.com/webmcp/.agents/skills/caido/references/examples/caido_intercept_example.md) | tested |
 
 ## Cross-cutting rules
 
