@@ -247,6 +247,9 @@ func registerAll(
 		r.Register(caidotools.NewCaidoReplay())    // caido_replay
 		r.Register(caidotools.NewCaidoIntercept()) // caido_intercept
 	}
+	for _, rt := range tools.ReconTools() { // one tool per registered recon scanner
+		r.Register(rt)
+	}
 
 	r.RegisterPrompt(tools.NewFetchAndSummarizePrompt())        // fetch_and_summarize
 	r.RegisterPrompt(tools.NewInspectPageDecompositionPrompt()) // inspect_page_decomposition
