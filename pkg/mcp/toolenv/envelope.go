@@ -145,6 +145,7 @@ var userAgentMismatchMarkers = []string{
 // notFoundMarkers identify a named resource missing from a local store.
 var notFoundMarkers = []string{
 	"auth snapshot not found",
+	"caido: no request with id",
 }
 
 // hintedError is an error that carries its own one-line remediation. The

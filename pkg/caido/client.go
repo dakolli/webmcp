@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -154,6 +155,49 @@ const findingReporter = "webmcp"
 
 // maxFindingDescription is the 4 KB cap applied to a finding's description.
 const maxFindingDescription = 4096
+
+// replayRequestQuery reads the captured request a replay copies: its connection
+// and the raw HTTP/1.1 message the instance stored.
+const replayRequestQuery = `query ReplayRequest($id: ID!) {
+  request(id: $id) { id method host path query port isTls raw }
+}`
+
+// createReplaySessionMutation opens a replay session from a captured request id,
+// or from a rewritten raw message when the caller overrides anything.
+const createReplaySessionMutation = `mutation CreateReplaySession($input: CreateReplaySessionInput!) {
+  createReplaySession(input: $input) {
+    session { __typename id ... on ReplaySessionHttp { name } }
+    error { __typename }
+  }
+}`
+
+// startReplayTaskMutation sends the session's active entry exactly once.
+const startReplayTaskMutation = `mutation StartReplayTask($sessionId: ID!) {
+  startReplayTask(sessionId: $sessionId) {
+    task { id replayEntry { __typename id } }
+    error { __typename }
+  }
+}`
+
+// replayEntryQuery reads what a replay recorded: the new request row and the
+// response it received.
+const replayEntryQuery = `query ReplayEntry($id: ID!, $kind: ReplaySessionKind!) {
+  replayEntry(id: $id, sessionKind: $kind) {
+    __typename
+    id
+    ... on ReplayEntryHttp {
+      error
+      request { id method host path query port isTls response { id statusCode length roundtripTime } }
+    }
+  }
+}`
+
+// replayPollInterval and replayPollBudget bound the read-back after a task
+// starts, because the instance records the exchange asynchronously.
+const (
+	replayPollInterval = 100 * time.Millisecond
+	replayPollBudget   = 10 * time.Second
+)
 
 // guestMutation exchanges guest access for an access token.
 const guestMutation = `mutation Guest { loginAsGuest { token { accessToken refreshToken expiresAt } error { __typename } } }`
@@ -344,6 +388,37 @@ type Finding struct {
 	CreatedAt      string `json:"created_at,omitempty"`
 	Description    string `json:"description,omitempty"`
 	DescriptionCut bool   `json:"description_cut,omitempty"`
+}
+
+// ReplayRequest is one captured request with optional rewrites. An empty Method,
+// nil Headers and nil Query keep the captured values, a Query value that is empty
+// removes that parameter, and a non-nil Body replaces the body (an empty string
+// sends an empty body). A method change to GET, HEAD or DELETE drops the body.
+type ReplayRequest struct {
+	RequestID string
+	Method    string
+	Headers   map[string]string
+	Query     map[string]string
+	Body      *string
+}
+
+// ReplayResult is the exchange a replay recorded. RequestID is the new history
+// row, so the next caido_search with since:0 finds it, while EntryID and
+// SessionID are the replay-side identity. Status, MS and ResponseBytes come from
+// the recorded response, where ResponseBytes is its body size, matching
+// caido_search. Error carries the instance's failure to complete the exchange and
+// Note explains a row that never appeared.
+type ReplayResult struct {
+	RequestID     string `json:"request_id,omitempty"`
+	EntryID       string `json:"entry_id,omitempty"`
+	SessionID     string `json:"session_id,omitempty"`
+	Method        string `json:"method,omitempty"`
+	URL           string `json:"url,omitempty"`
+	Status        int    `json:"status"`
+	MS            int    `json:"ms"`
+	ResponseBytes int    `json:"response_bytes"`
+	Error         string `json:"error,omitempty"`
+	Note          string `json:"note,omitempty"`
 }
 
 // Status is the resolved view of the Caido instance that caido_search reads.
@@ -847,6 +922,512 @@ func findingErrorText(e findingError) string {
 		return e.Typename + " (" + e.Code + ")"
 	}
 	return e.Typename
+}
+
+// replayError is one member of a replay mutation's error union.
+type replayError struct {
+	Typename string `json:"__typename"`
+	Code     string `json:"code"`
+}
+
+// replayNotFoundError reports that no captured request matches the replay id.
+type replayNotFoundError struct {
+	ID string
+}
+
+// Error names the missing id and the call that supplies a live one.
+func (e *replayNotFoundError) Error() string {
+	return fmt.Sprintf("caido: no request with id %q — take a request id from caido_search", e.ID)
+}
+
+// Hint tells the agent where to find a replayable request id.
+func (e *replayNotFoundError) Hint() string {
+	return "read caido_search for a live request id, then replay that id"
+}
+
+// replaySourceNode is the captured request a rewrite starts from.
+type replaySourceNode struct {
+	ID    string `json:"id"`
+	Host  string `json:"host"`
+	Port  int    `json:"port"`
+	IsTLS bool   `json:"isTls"`
+	Raw   string `json:"raw"`
+}
+
+// replayEntryNode is one replay entry with the request row it recorded.
+type replayEntryNode struct {
+	Typename string       `json:"__typename"`
+	ID       string       `json:"id"`
+	Error    string       `json:"error"`
+	Request  *requestNode `json:"request"`
+}
+
+// Replay resends one captured request through Caido's replay lane and waits for
+// the recorded row. It sends exactly one request per call: a replay with no
+// override copies the captured id, otherwise the stored raw message is rewritten
+// and sent as a custom source.
+func (c *Client) Replay(
+	ctx context.Context,
+	r ReplayRequest,
+) (ReplayResult, error) {
+	token := c.currentToken()
+	if token == "" {
+		return ReplayResult{}, ErrNoCredential
+	}
+	source, err := c.replaySource(ctx, token, r)
+	if err != nil {
+		return ReplayResult{}, err
+	}
+
+	var created struct {
+		CreateReplaySession struct {
+			Session *struct {
+				ID string `json:"id"`
+			} `json:"session"`
+			Error *replayError `json:"error"`
+		} `json:"createReplaySession"`
+	}
+	vars := map[string]any{
+		"input": map[string]any{"kind": "HTTP", "requestSource": source},
+	}
+	if err := c.call(ctx, token, createReplaySessionMutation, vars, &created); err != nil {
+		return ReplayResult{}, fmt.Errorf("caido: replay: create session: %w", err)
+	}
+	session := created.CreateReplaySession
+	if session.Error != nil {
+		if session.Error.Typename == "UnknownIdUserError" {
+			return ReplayResult{}, &replayNotFoundError{ID: r.RequestID}
+		}
+		return ReplayResult{}, fmt.Errorf(
+			"caido: replay: create session failed: %s — confirm request_id with caido_search",
+			session.Error.Typename,
+		)
+	}
+	if session.Session == nil || session.Session.ID == "" {
+		return ReplayResult{}, fmt.Errorf(
+			"caido: replay: createReplaySession returned no session — confirm request_id with caido_search",
+		)
+	}
+
+	var started struct {
+		StartReplayTask struct {
+			Task *struct {
+				ID          string `json:"id"`
+				ReplayEntry *struct {
+					ID string `json:"id"`
+				} `json:"replayEntry"`
+			} `json:"task"`
+			Error *replayError `json:"error"`
+		} `json:"startReplayTask"`
+	}
+	if err := c.call(ctx, token, startReplayTaskMutation, map[string]any{
+		"sessionId": session.Session.ID,
+	}, &started); err != nil {
+		return ReplayResult{}, fmt.Errorf("caido: replay: start task: %w", err)
+	}
+	task := started.StartReplayTask
+	if task.Error != nil {
+		if task.Error.Typename == "UnknownIdUserError" {
+			return ReplayResult{}, &replayNotFoundError{ID: r.RequestID}
+		}
+		return ReplayResult{}, fmt.Errorf("caido: replay: start task failed: %s", task.Error.Typename)
+	}
+	if task.Task == nil || task.Task.ReplayEntry == nil || task.Task.ReplayEntry.ID == "" {
+		return ReplayResult{
+			SessionID: session.Session.ID,
+			Note:      "the instance started the replay but returned no entry id, so the row cannot be read back",
+		}, nil
+	}
+
+	entry, err := c.awaitReplayEntry(ctx, token, task.Task.ReplayEntry.ID)
+	if err != nil {
+		return ReplayResult{}, err
+	}
+	result := ReplayResult{
+		SessionID: session.Session.ID,
+		EntryID:   task.Task.ReplayEntry.ID,
+	}
+	if entry == nil {
+		result.Note = fmt.Sprintf(
+			"the replay ran but its row did not appear within %s — read it with caido_search since:0",
+			replayPollBudget,
+		)
+		return result, nil
+	}
+	result.Error = entry.Error
+	if entry.Request == nil {
+		result.Note = "the replay ran but recorded no request row — read it with caido_search since:0"
+		return result, nil
+	}
+	if entry.Request.Response == nil && result.Error == "" {
+		result.Note = "the replay recorded only its session row, not the exchange — read it with caido_search since:0"
+		return result, nil
+	}
+	result.RequestID = entry.Request.ID
+	result.Method = entry.Request.Method
+	result.URL = composeURL(*entry.Request)
+	if entry.Request.Response != nil {
+		result.Status = entry.Request.Response.StatusCode
+		result.MS = entry.Request.Response.RoundtripTime
+		result.ResponseBytes = entry.Request.Response.Length
+	}
+	return result, nil
+}
+
+// replaySource builds the createReplaySession requestSource. No override copies
+// the captured id so the instance resolves the message itself; any override needs
+// the stored raw message, which is rewritten before the session opens.
+func (c *Client) replaySource(
+	ctx context.Context,
+	token string,
+	r ReplayRequest,
+) (map[string]any, error) {
+	if strings.TrimSpace(r.Method) == "" && len(r.Headers) == 0 && len(r.Query) == 0 && r.Body == nil {
+		return map[string]any{"id": r.RequestID}, nil
+	}
+	var data struct {
+		Request *replaySourceNode `json:"request"`
+	}
+	if err := c.call(ctx, token, replayRequestQuery, map[string]any{"id": r.RequestID}, &data); err != nil {
+		var gql *graphqlError
+		if errors.As(err, &gql) {
+			return nil, fmt.Errorf(
+				"caido: replay: read request %q: %s — take a request id from caido_search",
+				r.RequestID,
+				gql.Error(),
+			)
+		}
+		return nil, fmt.Errorf("caido: replay: read request: %w", err)
+	}
+	if data.Request == nil {
+		return nil, &replayNotFoundError{ID: r.RequestID}
+	}
+	raw, err := rewriteReplayRaw(*data.Request, r)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"raw": map[string]any{
+			"connectionInfo": map[string]any{
+				"host":  data.Request.Host,
+				"port":  data.Request.Port,
+				"isTLS": data.Request.IsTLS,
+			},
+			"raw": raw,
+		},
+	}, nil
+}
+
+// awaitReplayEntry polls the replay entry until the instance attaches the
+// exchange row or records an error. The session row alone does not count, because
+// one replay writes both. A nil node means the budget expired first.
+func (c *Client) awaitReplayEntry(
+	ctx context.Context,
+	token string,
+	id string,
+) (*replayEntryNode, error) {
+	deadline := time.Now().Add(replayPollBudget)
+	for {
+		var data struct {
+			ReplayEntry *replayEntryNode `json:"replayEntry"`
+		}
+		vars := map[string]any{"id": id, "kind": "HTTP"}
+		if err := c.call(ctx, token, replayEntryQuery, vars, &data); err != nil {
+			var gql *graphqlError
+			if errors.As(err, &gql) {
+				return nil, fmt.Errorf("caido: replay: read entry %q: %s", id, gql.Error())
+			}
+			return nil, fmt.Errorf("caido: replay: read entry: %w", err)
+		}
+		if data.ReplayEntry != nil &&
+			(data.ReplayEntry.Error != "" ||
+				(data.ReplayEntry.Request != nil && data.ReplayEntry.Request.Response != nil)) {
+			return data.ReplayEntry, nil
+		}
+		if !time.Now().Before(deadline) {
+			return data.ReplayEntry, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("caido: replay: waiting for entry %q: %w", id, ctx.Err())
+		case <-time.After(replayPollInterval):
+		}
+	}
+}
+
+// rewriteReplayRaw decodes a captured HTTP/1.1 message, applies the caller's
+// overrides and returns the base64 message the replay session accepts. The
+// captured message may use CRLF or LF endings and the rewrite always emits CRLF.
+// Repeated header names keep their first captured value.
+func rewriteReplayRaw(node replaySourceNode, r ReplayRequest) (string, error) {
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(node.Raw))
+	if err != nil {
+		return "", fmt.Errorf("caido: replay: request %q raw is not base64: %w", r.RequestID, err)
+	}
+	head, body, ok := cutReplayHead(decoded)
+	if !ok {
+		return "", fmt.Errorf(
+			"caido: replay: request %q raw has no blank line between headers and body",
+			r.RequestID,
+		)
+	}
+	lines := replayHeadLines(head)
+	parts := strings.SplitN(lines[0], " ", 3)
+	if len(parts) != 3 {
+		return "", fmt.Errorf(
+			"caido: replay: request %q start line %q is not METHOD TARGET PROTO",
+			r.RequestID,
+			lines[0],
+		)
+	}
+	method, target, proto := parts[0], parts[1], parts[2]
+	methodChanged := false
+	if override := strings.TrimSpace(r.Method); override != "" {
+		if !replayToken(override) {
+			return "", fmt.Errorf(
+				"caido: replay: invalid arguments: method %q must be an HTTP token",
+				override,
+			)
+		}
+		method = strings.ToUpper(override)
+		methodChanged = true
+	}
+	for name, value := range r.Headers {
+		if !replayToken(name) || strings.ContainsAny(value, "\r\n") {
+			return "", fmt.Errorf(
+				"caido: replay: invalid arguments: header %q must be a token and its value must not contain a newline",
+				name,
+			)
+		}
+	}
+	if len(r.Query) > 0 {
+		target, err = replayTargetQuery(target, r.Query)
+		if err != nil {
+			return "", err
+		}
+	}
+	headers := replayRawHeaders(lines[1:], r.Headers)
+	if r.Body != nil {
+		body = []byte(*r.Body)
+		headers = setReplayContentLength(headers, len(body))
+	}
+	if methodChanged && replayBodyForbidden(method) {
+		body = nil
+		headers = dropReplayBodyFraming(headers)
+	}
+	var message strings.Builder
+	message.WriteString(method)
+	message.WriteString(" ")
+	message.WriteString(target)
+	message.WriteString(" ")
+	message.WriteString(proto)
+	message.WriteString("\r\n")
+	for _, line := range headers {
+		message.WriteString(line)
+		message.WriteString("\r\n")
+	}
+	message.WriteString("\r\n")
+	message.Write(body)
+	return base64.StdEncoding.EncodeToString([]byte(message.String())), nil
+}
+
+// cutReplayHead splits a captured message at the blank line that ends its head,
+// accepting CRLF or LF line endings.
+func cutReplayHead(decoded []byte) (head, body []byte, ok bool) {
+	if i := bytes.Index(decoded, []byte("\r\n\r\n")); i >= 0 {
+		return decoded[:i], decoded[i+4:], true
+	}
+	if i := bytes.Index(decoded, []byte("\n\n")); i >= 0 {
+		return decoded[:i], decoded[i+2:], true
+	}
+	return nil, nil, false
+}
+
+// replayHeadLines splits a captured head into lines with any trailing CR removed.
+func replayHeadLines(head []byte) []string {
+	raw := strings.Split(string(head), "\n")
+	lines := make([]string, 0, len(raw))
+	for _, line := range raw {
+		lines = append(lines, strings.TrimSuffix(line, "\r"))
+	}
+	return lines
+}
+
+// replayToken reports whether s is a non-empty RFC 7230 token.
+func replayToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if !replayTokenChar(s[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// replayTokenChar reports whether c is an RFC 7230 tchar.
+func replayTokenChar(c byte) bool {
+	switch {
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		return true
+	}
+	return strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0
+}
+
+// replayBodyForbidden reports whether a method never carries a request body.
+func replayBodyForbidden(method string) bool {
+	switch method {
+	case "GET", "HEAD", "DELETE":
+		return true
+	default:
+		return false
+	}
+}
+
+// replayRawHeaders turns the captured header lines into the replay's list,
+// replacing an overridden name in place and appending a new one at the end.
+func replayRawHeaders(lines []string, overrides map[string]string) []string {
+	headers := make([]string, 0, len(lines)+len(overrides))
+	seen := make(map[string]bool, len(lines)+len(overrides))
+	names := make([]string, 0, len(overrides))
+	for name := range overrides {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, line := range lines {
+		name, _, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		lower := strings.ToLower(strings.TrimSpace(name))
+		if lower == "" || seen[lower] {
+			continue
+		}
+		seen[lower] = true
+		headers = append(headers, line)
+	}
+	for _, name := range names {
+		value := name + ": " + overrides[name]
+		lower := strings.ToLower(name)
+		if !seen[lower] {
+			seen[lower] = true
+			headers = append(headers, value)
+			continue
+		}
+		for i, line := range headers {
+			lineName, _, _ := strings.Cut(line, ":")
+			if strings.EqualFold(strings.TrimSpace(lineName), name) {
+				headers[i] = value
+				break
+			}
+		}
+	}
+	return headers
+}
+
+// setReplayContentLength replaces the body framing after a body override: the
+// chunked encoding is dropped and Content-Length matches the new body.
+func setReplayContentLength(headers []string, size int) []string {
+	out := make([]string, 0, len(headers)+1)
+	replaced := false
+	for _, line := range headers {
+		name, _, ok := strings.Cut(line, ":")
+		lower := strings.ToLower(strings.TrimSpace(name))
+		if !ok {
+			out = append(out, line)
+			continue
+		}
+		switch lower {
+		case "transfer-encoding":
+			continue
+		case "content-length":
+			if replaced {
+				continue
+			}
+			replaced = true
+			out = append(out, "Content-Length: "+strconv.Itoa(size))
+		default:
+			out = append(out, line)
+		}
+	}
+	if !replaced {
+		out = append(out, "Content-Length: "+strconv.Itoa(size))
+	}
+	return out
+}
+
+// dropReplayBodyFraming removes the headers that describe a body the rewritten
+// message will not send.
+func dropReplayBodyFraming(headers []string) []string {
+	out := make([]string, 0, len(headers))
+	for _, line := range headers {
+		name, _, ok := strings.Cut(line, ":")
+		if !ok {
+			out = append(out, line)
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(name)) {
+		case "content-length", "transfer-encoding":
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+// replayTargetQuery applies query edits to a captured request target. A non-empty
+// value replaces the parameter, collapsing duplicates, and an empty value removes
+// every occurrence. Untouched parameters keep their original order and encoding.
+func replayTargetQuery(target string, edits map[string]string) (string, error) {
+	path, rawQuery, _ := strings.Cut(target, "?")
+	if len(edits) == 0 {
+		return target, nil
+	}
+	pending := make(map[string]string, len(edits))
+	for name, value := range edits {
+		pending[name] = value
+	}
+	applied := make(map[string]bool, len(edits))
+	out := make([]string, 0, len(edits)+1)
+	if rawQuery != "" {
+		for _, segment := range strings.Split(rawQuery, "&") {
+			rawName, _, _ := strings.Cut(segment, "=")
+			name, err := url.QueryUnescape(rawName)
+			if err != nil {
+				name = rawName
+			}
+			value, ok := pending[name]
+			if !ok {
+				out = append(out, segment)
+				continue
+			}
+			if value == "" || applied[name] {
+				continue
+			}
+			applied[name] = true
+			if rawName == "" {
+				rawName = url.QueryEscape(name)
+			}
+			out = append(out, rawName+"="+url.QueryEscape(value))
+		}
+	}
+	names := make([]string, 0, len(pending))
+	for name := range pending {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		value := pending[name]
+		if value == "" || applied[name] {
+			continue
+		}
+		out = append(out, url.QueryEscape(name)+"="+url.QueryEscape(value))
+	}
+	if len(out) == 0 {
+		return path, nil
+	}
+	return path + "?" + strings.Join(out, "&"), nil
 }
 
 // Status reads the project, every scope, the capture settings and the history

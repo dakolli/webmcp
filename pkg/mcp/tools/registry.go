@@ -42,10 +42,11 @@ func NewRegistry() *Registry {
 	r.Register(NewBrowserClose(mgr))
 	r.Register(NewPageList(mgr))
 	if config.ActiveCaido().Enabled {
-		r.Register(caidotools.NewCaidoSearch())
-		r.Register(caidotools.NewCaidoStatus())
-		r.Register(caidotools.NewCaidoSitemap())
-		r.Register(caidotools.NewCaidoFinding())
+		r.Register(caidotools.NewCaidoSearch())  // caido_search
+		r.Register(caidotools.NewCaidoStatus())  // caido_status
+		r.Register(caidotools.NewCaidoSitemap()) // caido_sitemap
+		r.Register(caidotools.NewCaidoFinding()) // caido_finding
+		r.Register(caidotools.NewCaidoReplay())  // caido_replay
 	}
 
 	r.RegisterPrompt(NewFetchAndSummarizePrompt())

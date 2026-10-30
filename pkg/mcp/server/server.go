@@ -244,6 +244,7 @@ func registerAll(
 		r.Register(caidotools.NewCaidoSitemap()) // caido_sitemap
 		r.Register(caidotools.NewCaidoStatus())  // caido_status
 		r.Register(caidotools.NewCaidoFinding()) // caido_finding
+		r.Register(caidotools.NewCaidoReplay())  // caido_replay
 	}
 
 	r.RegisterPrompt(tools.NewFetchAndSummarizePrompt())        // fetch_and_summarize

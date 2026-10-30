@@ -31,6 +31,7 @@ queries Caido directly without starting the serve daemon.`,
 	cmd.AddCommand(newCaidoSearchCmd())
 	cmd.AddCommand(newCaidoSitemapCmd())
 	cmd.AddCommand(newCaidoFindingCmd())
+	cmd.AddCommand(newCaidoReplayCmd())
 	return cmd
 }
 
@@ -424,18 +425,19 @@ updates a finding.`,
 	return cmd
 }
 
-// caidoFindingClient loads the Caido settings and returns a logged-in client with
-// a bounded context, so every finding subcommand shares one auth path.
-func caidoFindingClient(cmd *cobra.Command) (*caido.Client, context.Context, context.CancelFunc, error) {
+// caidoCommandClient loads the Caido settings and returns a logged-in client with
+// a bounded context, so every caido subcommand shares one auth path. op is the
+// command name used as the error prefix.
+func caidoCommandClient(cmd *cobra.Command, op string) (*caido.Client, context.Context, context.CancelFunc, error) {
 	cf, err := config.LoadCaido()
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("caido finding: %w", err)
+		return nil, nil, nil, fmt.Errorf("%s: %w", op, err)
 	}
 	ctx, cancel := context.WithTimeout(cmdCtx(cmd), defaultCmdTimeout)
 	client := caido.NewClient(cf.URL)
 	if _, err := client.Login(ctx, cf.AccessToken, cf.PAT, cf.AllowGuest); err != nil {
 		cancel()
-		return nil, nil, nil, fmt.Errorf("caido finding: %w", err)
+		return nil, nil, nil, fmt.Errorf("%s: %w", op, err)
 	}
 	return client, ctx, cancel, nil
 }
@@ -453,7 +455,7 @@ caido_search row.`,
   browser caido finding list --json`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			client, ctx, cancel, err := caidoFindingClient(cmd)
+			client, ctx, cancel, err := caidoCommandClient(cmd, "caido finding")
 			if err != nil {
 				return err
 			}
@@ -497,7 +499,7 @@ time and description. A missing id is an error naming "finding list".`,
 			if id == "" {
 				return fmt.Errorf("caido finding: get needs id")
 			}
-			client, ctx, cancel, err := caidoFindingClient(cmd)
+			client, ctx, cancel, err := caidoCommandClient(cmd, "caido finding")
 			if err != nil {
 				return err
 			}
@@ -545,7 +547,7 @@ at 4 KB. The command prints the new finding so its id can be reused.`,
 			if title == "" || requestID == "" {
 				return fmt.Errorf("caido finding: create needs title and request_id — take a request id from caido_search")
 			}
-			client, ctx, cancel, err := caidoFindingClient(cmd)
+			client, ctx, cancel, err := caidoCommandClient(cmd, "caido finding")
 			if err != nil {
 				return err
 			}
@@ -572,6 +574,130 @@ at 4 KB. The command prints the new finding so its id can be reused.`,
 	f.StringVar(&notes, "notes", "", "finding description, cut at 4096 bytes")
 	f.BoolVar(&jsonOut, "json", false, "print the result as JSON")
 	return cmd
+}
+
+// newCaidoReplayCmd constructs the "caido replay" command: it resends one
+// captured request through Caido and prints the row the instance recorded.
+func newCaidoReplayCmd() *cobra.Command {
+	var (
+		method  string
+		headers []string
+		sets    []string
+		removes []string
+		body    string
+		jsonOut bool
+	)
+	cmd := &cobra.Command{
+		Use:   "replay <request_id>",
+		Short: "Resend one captured request through Caido and read back the new row",
+		Long: `Resends one captured request through Caido's replay lane, which records the new
+exchange in project history. request_id is a request id from "browser caido search",
+not a URL. --method replaces the captured method (a change to GET, HEAD or DELETE
+drops the body and Content-Length), --header NAME=VALUE replaces one header value,
+--set NAME=VALUE replaces one URL parameter (an empty value removes it), --remove
+NAME removes a parameter, and --body replaces the captured body (an empty value
+sends an empty body). It sends exactly one request per call.
+
+One replay writes two history rows, a session row with status 0 and the exchange
+row. The output names the new request id (request_id) of the exchange row that a
+"browser caido search" with no --since finds, plus the replay entry and session ids
+and the status, ms, response_bytes and url of the recorded response. response_bytes
+is the response body size, the same field "browser caido search" reports.`,
+		Example: `  browser caido replay 2085
+  browser caido replay 2085 --method PUT --header X-Env=staging --set debug=1 --remove page --body '{"id":2}'
+  browser caido replay 2085 --set debug=1 --json`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			requestID := strings.TrimSpace(args[0])
+			if requestID == "" {
+				return fmt.Errorf("caido replay: request_id is required — take a request id from caido search")
+			}
+			headerOverrides := make(map[string]string, len(headers))
+			for _, raw := range headers {
+				name, value, ok := strings.Cut(raw, "=")
+				name = strings.TrimSpace(name)
+				if !ok || name == "" {
+					return fmt.Errorf("caido replay: --header %q must be NAME=VALUE", raw)
+				}
+				headerOverrides[name] = value
+			}
+			var bodyPtr *string
+			if cmd.Flags().Changed("body") {
+				bodyPtr = &body
+			}
+			query := make(map[string]string, len(sets)+len(removes))
+			for _, raw := range sets {
+				name, value, ok := strings.Cut(raw, "=")
+				name = strings.TrimSpace(name)
+				if !ok || name == "" {
+					return fmt.Errorf(
+						"caido replay: --set %q must be NAME=VALUE (an empty value removes the parameter)",
+						raw,
+					)
+				}
+				query[name] = value
+			}
+			for _, raw := range removes {
+				name := strings.TrimSpace(raw)
+				if name == "" {
+					return fmt.Errorf("caido replay: --remove needs a parameter name")
+				}
+				query[name] = ""
+			}
+			client, ctx, cancel, err := caidoCommandClient(cmd, "caido replay")
+			if err != nil {
+				return err
+			}
+			defer cancel()
+			result, err := client.Replay(ctx, caido.ReplayRequest{
+				RequestID: requestID,
+				Method:    method,
+				Headers:   headerOverrides,
+				Query:     query,
+				Body:      bodyPtr,
+			})
+			if err != nil {
+				return fmt.Errorf("caido replay: %w", err)
+			}
+			if jsonOut {
+				data, err := json.Marshal(result)
+				if err != nil {
+					return fmt.Errorf("caido replay: %w", err)
+				}
+				fmt.Fprintln(cmd.OutOrStdout(), string(data))
+				return nil
+			}
+			printCaidoReplay(cmd, result)
+			return nil
+		},
+	}
+	f := cmd.Flags()
+	f.StringVar(&method, "method", "", "HTTP method override; omit to keep the captured method")
+	f.StringArrayVar(&headers, "header", nil, "header override NAME=VALUE (repeatable); each replaces the captured value")
+	f.StringArrayVar(&sets, "set", nil, "URL parameter override NAME=VALUE (repeatable); an empty value removes it")
+	f.StringArrayVar(&removes, "remove", nil, "URL parameter to remove (repeatable)")
+	f.StringVar(&body, "body", "", "request body override; pass an empty value to send an empty body")
+	f.BoolVar(&jsonOut, "json", false, "print the result as JSON")
+	return cmd
+}
+
+// printCaidoReplay renders one replay result as field per line.
+func printCaidoReplay(cmd *cobra.Command, result caido.ReplayResult) {
+	out := cmd.OutOrStdout()
+	fmt.Fprintf(out, "request_id: %s\n", result.RequestID)
+	fmt.Fprintf(out, "entry_id: %s\n", result.EntryID)
+	fmt.Fprintf(out, "session_id: %s\n", result.SessionID)
+	fmt.Fprintf(out, "method: %s\n", result.Method)
+	fmt.Fprintf(out, "url: %s\n", result.URL)
+	fmt.Fprintf(out, "status: %d\n", result.Status)
+	fmt.Fprintf(out, "ms: %d\n", result.MS)
+	fmt.Fprintf(out, "response_bytes: %d\n", result.ResponseBytes)
+	if result.Error != "" {
+		fmt.Fprintf(out, "error: %s\n", result.Error)
+	}
+	if result.Note != "" {
+		fmt.Fprintf(out, "note: %s\n", result.Note)
+	}
 }
 
 // printCaidoFindings renders the count and one table row per finding.

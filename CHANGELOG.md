@@ -33,6 +33,12 @@
 - `caido_finding` lists, reads and creates Caido findings. A finding links to a captured request id,
   so a proven bug becomes a record in the project instead of a line in a chat.
 - `browser caido finding list|get|create` does the same from the terminal.
+- `caido_replay` resends a captured request through the instance with an edited method, headers,
+  query or body. The replay lands in project history beside the original, and the result carries the
+  new request id so the next `caido_search` finds it. One request per call. Caido records a session
+  row beside each exchange, so one replay adds two history rows.
+- `browser caido replay <id>` does the same from the terminal, with `--method`, `--header`, `--set`,
+  `--remove` and `--body`.
 - `browser_create.deny_hosts` keeps chosen hosts out of the proxy. A proxied visit now stays clean of
   browser telemetry, so Caido history shows the target and not the browser.
 - `[caido] access_token` takes a direct instance token, and `[caido] allow_guest` (default true)
