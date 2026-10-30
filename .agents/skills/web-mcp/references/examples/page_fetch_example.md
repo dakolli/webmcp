@@ -49,6 +49,20 @@ List `css` first when you need a URL, then copy a `url` exactly.
 
 Expect a `// url=` line, a `// bytes=6881` line, then raw CSS. `js` works the same way.
 
+An inline `<style>` block is listed as a label-only row, `inline-style[1]`, with no real URL. `target` fetches a file resource only, so it cannot reach that row:
+
+```json
+{"tool":"page_fetch","arguments":{"session_id":"page-1","what":"css","target":"inline-style[1]"}}
+```
+
+Expect `{"ok":false,"error":{"type":"unknown","message":"page_fetch: resource \"inline-style[1]\" not found in the page's resource tree: {-32000 No resource with given URL found }",…}}`. Read the block with `page_act` `eval` instead. Swap `'style'` for `'script'` to read an inline script:
+
+```json
+{"tool":"page_act","arguments":{"session_id":"page-1","action":"eval","value":"() => document.querySelectorAll('style')[0].textContent"}}
+```
+
+Expect the CSS text in `data`. `js` never lists inline `<script>` blocks, so `eval` is the only read for one.
+
 ## 5. Read the action map
 
 ```json
