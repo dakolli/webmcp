@@ -28,3 +28,6 @@ dist/
 .live-schema.json
 RELEASING.md
 scripts/bump.sh
+harness/
+Makefile.local
+.ignore

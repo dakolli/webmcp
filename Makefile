@@ -314,3 +314,7 @@ release:
 tools:
 	@printf '%s\n' 'go install github.com/goreleaser/goreleaser/v2@v2.17.0'
 	@printf '%s\n' 'cargo install git-cliff --locked   # git-cliff is Rust: no go install line exists'
+
+# Local, machine-specific overrides. The file is untracked (see .gitignore) and
+# make ignores it when it is absent. Keep it out of commits.
+-include Makefile.local
