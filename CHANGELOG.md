@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.3.5 - 2026-10-30
+
+### Highlights
+- Nine `recon_*` tools wrap pinned external scanners. An agent enumerates subdomains, resolves
+  records, probes hosts, scans ports, crawls URLs, fuzzes paths, parses JavaScript and runs
+  templates. `recon_run` chains the eight scanners over one registrable domain.
+- The XSS analysis lane adds `page_act set_style`, `set_attr`, `set_html`, `fill_form` and
+  `encode`, plus `page_fetch what=reflections`. A CSS or DOM injection probe now takes two calls.
+- `page_fetch what=security` parses the effective CSP into directives, nonce and hashes, and
+  records `securitypolicyviolation` events.
+
 ### Added
 - `page_act set_style` writes a CSS declaration list onto one element and reports which declarations the browser kept and which it dropped. An empty value clears the inline style. This turns a CSS injection probe into two calls instead of five.
 - `page_act set_attr` and `page_act set_html` write an attribute or markup into the page and report the nodes the browser created, the scripts it parsed and whether one ran.
