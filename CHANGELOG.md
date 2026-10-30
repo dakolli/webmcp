@@ -30,6 +30,9 @@
 - `browser caido sitemap <host>` prints the same rows as a table.
 - `CAIDO_LIVE=1 go test ./pkg/caido/` runs one test against the real instance and skips on a plain
   run, so the unit suite stays offline.
+- `caido_finding` lists, reads and creates Caido findings. A finding links to a captured request id,
+  so a proven bug becomes a record in the project instead of a line in a chat.
+- `browser caido finding list|get|create` does the same from the terminal.
 - `browser_create.deny_hosts` keeps chosen hosts out of the proxy. A proxied visit now stays clean of
   browser telemetry, so Caido history shows the target and not the browser.
 - `[caido] access_token` takes a direct instance token, and `[caido] allow_guest` (default true)

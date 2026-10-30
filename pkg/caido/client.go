@@ -123,6 +123,38 @@ const setPassthroughOptionsMutation = `mutation SetPassthroughOptions($input: Se
   setPassthroughOptions(input: $input) { options { captureList passthroughList outOfScope } }
 }`
 
+// findingSelection is the finding fields every read and write shares. The linked
+// request is a nested object on this build, so request_id comes from request.id.
+const findingSelection = `id title description createdAt request { id }`
+
+// findingsQuery lists findings newest first, bounded by first.
+const findingsQuery = `query Findings($first: Int) {
+  findings(first: $first) {
+    count { value }
+    nodes { ` + findingSelection + ` }
+  }
+}`
+
+// findingQuery reads one finding by id.
+const findingQuery = `query Finding($id: ID!) {
+  finding(id: $id) { ` + findingSelection + ` }
+}`
+
+// createFindingMutation links a finding to a captured request. The instance
+// declares requestId a top-level argument and reporter a required input field.
+const createFindingMutation = `mutation CreateFinding($requestId: ID!, $input: CreateFindingInput!) {
+  createFinding(requestId: $requestId, input: $input) {
+    finding { ` + findingSelection + ` }
+    error { __typename ... on UnknownIdUserError { code } ... on OtherUserError { code } }
+  }
+}`
+
+// findingReporter names this tool as the record's author.
+const findingReporter = "webmcp"
+
+// maxFindingDescription is the 4 KB cap applied to a finding's description.
+const maxFindingDescription = 4096
+
 // guestMutation exchanges guest access for an access token.
 const guestMutation = `mutation Guest { loginAsGuest { token { accessToken refreshToken expiresAt } error { __typename } } }`
 
@@ -300,6 +332,18 @@ type Entry struct {
 	ReqCut        bool                `json:"request_cut,omitempty"`
 	RespCut       bool                `json:"response_cut,omitempty"`
 	URLRedacted   bool                `json:"url_redacted,omitempty"`
+}
+
+// Finding is one Caido finding reduced to the record an agent links back to a
+// captured request. DescriptionCut reports that a description over 4 KB was
+// shortened before it was returned.
+type Finding struct {
+	ID             string `json:"id"`
+	Title          string `json:"title"`
+	RequestID      string `json:"request_id"`
+	CreatedAt      string `json:"created_at,omitempty"`
+	Description    string `json:"description,omitempty"`
+	DescriptionCut bool   `json:"description_cut,omitempty"`
 }
 
 // Status is the resolved view of the Caido instance that caido_search reads.
@@ -640,6 +684,169 @@ search:
 		LimitApplied:     limitApplied,
 		BodyBytesApplied: bodyBytesApplied,
 	}, nil
+}
+
+// Findings lists the instance's findings newest first, capped at 100 rows.
+func (c *Client) Findings(ctx context.Context) ([]Finding, error) {
+	token := c.currentToken()
+	if token == "" {
+		return nil, ErrNoCredential
+	}
+	var data struct {
+		Findings struct {
+			Count struct {
+				Value int `json:"value"`
+			} `json:"count"`
+			Nodes []findingNode `json:"nodes"`
+		} `json:"findings"`
+	}
+	if err := c.call(ctx, token, findingsQuery, map[string]any{"first": maxLimit}, &data); err != nil {
+		var gql *graphqlError
+		if errors.As(err, &gql) {
+			return nil, fmt.Errorf("caido: findings query failed: %s", gql.Error())
+		}
+		return nil, err
+	}
+	findings := make([]Finding, 0, len(data.Findings.Nodes))
+	for _, n := range data.Findings.Nodes {
+		findings = append(findings, findingFromNode(n))
+	}
+	return findings, nil
+}
+
+// Finding reads one finding by id. A missing id is an error naming the list
+// action, not an empty record.
+func (c *Client) Finding(ctx context.Context, id string) (Finding, error) {
+	token := c.currentToken()
+	if token == "" {
+		return Finding{}, ErrNoCredential
+	}
+	var data struct {
+		Finding *findingNode `json:"finding"`
+	}
+	if err := c.call(ctx, token, findingQuery, map[string]any{"id": id}, &data); err != nil {
+		var gql *graphqlError
+		if errors.As(err, &gql) {
+			return Finding{}, fmt.Errorf("caido: finding query failed: %s", gql.Error())
+		}
+		return Finding{}, err
+	}
+	if data.Finding == nil {
+		return Finding{}, fmt.Errorf("caido: no finding with id %q — call caido_finding action:list", id)
+	}
+	return findingFromNode(*data.Finding), nil
+}
+
+// CreateFinding links a finding to a captured request. The instance requires a
+// reporter, and a description over 4 KB is cut before it is sent.
+func (c *Client) CreateFinding(
+	ctx context.Context,
+	title string,
+	requestID string,
+	description string,
+) (Finding, error) {
+	token := c.currentToken()
+	if token == "" {
+		return Finding{}, ErrNoCredential
+	}
+	description, cut := cutFindingText(description)
+	input := map[string]any{
+		"title":    title,
+		"reporter": findingReporter,
+	}
+	if description != "" {
+		input["description"] = description
+	}
+	vars := map[string]any{"requestId": requestID, "input": input}
+	var data struct {
+		CreateFinding struct {
+			Finding *findingNode  `json:"finding"`
+			Error   *findingError `json:"error"`
+		} `json:"createFinding"`
+	}
+	if err := c.call(ctx, token, createFindingMutation, vars, &data); err != nil {
+		var gql *graphqlError
+		if errors.As(err, &gql) {
+			return Finding{}, fmt.Errorf("caido: createFinding failed: %s", gql.Error())
+		}
+		return Finding{}, err
+	}
+	if data.CreateFinding.Error != nil {
+		return Finding{}, fmt.Errorf("caido: createFinding failed: %s", findingErrorText(*data.CreateFinding.Error))
+	}
+	if data.CreateFinding.Finding == nil {
+		return Finding{}, fmt.Errorf("caido: createFinding returned no finding — confirm request_id with caido_search")
+	}
+	f := findingFromNode(*data.CreateFinding.Finding)
+	f.DescriptionCut = cut
+	return f, nil
+}
+
+// findingNode is one raw finding row from the GraphQL selection.
+type findingNode struct {
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	CreatedAt   int64  `json:"createdAt"`
+	Request     *struct {
+		ID string `json:"id"`
+	} `json:"request"`
+}
+
+// findingFromNode maps a raw row onto the record, redacting the description.
+func findingFromNode(n findingNode) Finding {
+	f := Finding{
+		ID:          n.ID,
+		Title:       n.Title,
+		CreatedAt:   formatMillis(n.CreatedAt),
+		Description: redactFindingText(n.Description),
+	}
+	if n.Request != nil {
+		f.RequestID = n.Request.ID
+	}
+	if f.Description != "" {
+		f.Description, f.DescriptionCut = cutFindingText(f.Description)
+	}
+	return f
+}
+
+// redactFindingText scrubs credential-shaped key/value pairs from a description
+// so a stored token never reaches a caller.
+func redactFindingText(text string) string {
+	if text == "" {
+		return ""
+	}
+	scrubbed, _, err := RedactBody(text)
+	if err != nil {
+		return text
+	}
+	return scrubbed
+}
+
+// cutFindingText bounds a description at 4 KB on a UTF-8 boundary.
+func cutFindingText(text string) (string, bool) {
+	if len(text) <= maxFindingDescription {
+		return text, false
+	}
+	cut := text[:maxFindingDescription]
+	for len(cut) > 0 && !utf8.ValidString(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut, true
+}
+
+// findingError is one member of the createFinding error union.
+type findingError struct {
+	Typename string `json:"__typename"`
+	Code     string `json:"code"`
+}
+
+// findingErrorText renders a createFinding union error as one clause.
+func findingErrorText(e findingError) string {
+	if e.Code != "" {
+		return e.Typename + " (" + e.Code + ")"
+	}
+	return e.Typename
 }
 
 // Status reads the project, every scope, the capture settings and the history

@@ -30,6 +30,7 @@ queries Caido directly without starting the serve daemon.`,
 	cmd.AddCommand(newCaidoStatusCmd())
 	cmd.AddCommand(newCaidoSearchCmd())
 	cmd.AddCommand(newCaidoSitemapCmd())
+	cmd.AddCommand(newCaidoFindingCmd())
 	return cmd
 }
 
@@ -403,4 +404,202 @@ func jsonValue(value any) string {
 		return ""
 	}
 	return string(data)
+}
+
+// newCaidoFindingCmd constructs the "caido finding" command group: the human
+// view over the findings the caido_finding MCP tool lists and creates.
+func newCaidoFindingCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "finding",
+		Short: "List, read and create Caido findings",
+		Long: `Reads and creates Caido findings. A finding links a title and notes to one
+captured request id, and the Caido UI shows it. list shows the newest findings, get
+reads one by id, and create records a new finding. The command never deletes or
+updates a finding.`,
+		Args: cobra.NoArgs,
+	}
+	cmd.AddCommand(newCaidoFindingListCmd())
+	cmd.AddCommand(newCaidoFindingGetCmd())
+	cmd.AddCommand(newCaidoFindingCreateCmd())
+	return cmd
+}
+
+// caidoFindingClient loads the Caido settings and returns a logged-in client with
+// a bounded context, so every finding subcommand shares one auth path.
+func caidoFindingClient(cmd *cobra.Command) (*caido.Client, context.Context, context.CancelFunc, error) {
+	cf, err := config.LoadCaido()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("caido finding: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(cmdCtx(cmd), defaultCmdTimeout)
+	client := caido.NewClient(cf.URL)
+	if _, err := client.Login(ctx, cf.AccessToken, cf.PAT, cf.AllowGuest); err != nil {
+		cancel()
+		return nil, nil, nil, fmt.Errorf("caido finding: %w", err)
+	}
+	return client, ctx, cancel, nil
+}
+
+// newCaidoFindingListCmd constructs the "caido finding list" command.
+func newCaidoFindingListCmd() *cobra.Command {
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List the newest Caido findings",
+		Long: `Lists the instance's findings newest first. Each row carries its id, title,
+linked request id and creation time, so a finding can be linked back to a
+caido_search row.`,
+		Example: `  browser caido finding list
+  browser caido finding list --json`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			client, ctx, cancel, err := caidoFindingClient(cmd)
+			if err != nil {
+				return err
+			}
+			defer cancel()
+			findings, err := client.Findings(ctx)
+			if err != nil {
+				return fmt.Errorf("caido finding: %w", err)
+			}
+			if jsonOut {
+				payload := struct {
+					Findings []caido.Finding `json:"findings"`
+					Count    int             `json:"count"`
+				}{Findings: findings, Count: len(findings)}
+				data, err := json.Marshal(payload)
+				if err != nil {
+					return fmt.Errorf("caido finding: %w", err)
+				}
+				fmt.Fprintln(cmd.OutOrStdout(), string(data))
+				return nil
+			}
+			printCaidoFindings(cmd, findings)
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "print the result as JSON")
+	return cmd
+}
+
+// newCaidoFindingGetCmd constructs the "caido finding get" command.
+func newCaidoFindingGetCmd() *cobra.Command {
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "get <id>",
+		Short: "Read one Caido finding by id",
+		Long: `Reads one finding by id and prints its title, linked request id, creation
+time and description. A missing id is an error naming "finding list".`,
+		Example: `  browser caido finding get 1`,
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id := strings.TrimSpace(args[0])
+			if id == "" {
+				return fmt.Errorf("caido finding: get needs id")
+			}
+			client, ctx, cancel, err := caidoFindingClient(cmd)
+			if err != nil {
+				return err
+			}
+			defer cancel()
+			finding, err := client.Finding(ctx, id)
+			if err != nil {
+				return fmt.Errorf("caido finding: %w", err)
+			}
+			if jsonOut {
+				data, err := json.Marshal(finding)
+				if err != nil {
+					return fmt.Errorf("caido finding: %w", err)
+				}
+				fmt.Fprintln(cmd.OutOrStdout(), string(data))
+				return nil
+			}
+			printCaidoFinding(cmd, finding)
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "print the result as JSON")
+	return cmd
+}
+
+// newCaidoFindingCreateCmd constructs the "caido finding create" command.
+func newCaidoFindingCreateCmd() *cobra.Command {
+	var (
+		title     string
+		requestID string
+		notes     string
+		jsonOut   bool
+	)
+	cmd := &cobra.Command{
+		Use:   "create",
+		Short: "Create a Caido finding linked to a captured request",
+		Long: `Creates a finding from a title and a captured request id. request_id is a
+request id from caido_search, not a URL. notes becomes the description and is cut
+at 4 KB. The command prints the new finding so its id can be reused.`,
+		Example: `  browser caido finding create --title "IDOR on /api/orders" --request-id 994
+  browser caido finding create --title "IDOR" --request-id 994 --notes "User A reads user B's order" --json`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			title = strings.TrimSpace(title)
+			requestID = strings.TrimSpace(requestID)
+			if title == "" || requestID == "" {
+				return fmt.Errorf("caido finding: create needs title and request_id — take a request id from caido_search")
+			}
+			client, ctx, cancel, err := caidoFindingClient(cmd)
+			if err != nil {
+				return err
+			}
+			defer cancel()
+			finding, err := client.CreateFinding(ctx, title, requestID, notes)
+			if err != nil {
+				return fmt.Errorf("caido finding: %w", err)
+			}
+			if jsonOut {
+				data, err := json.Marshal(finding)
+				if err != nil {
+					return fmt.Errorf("caido finding: %w", err)
+				}
+				fmt.Fprintln(cmd.OutOrStdout(), string(data))
+				return nil
+			}
+			printCaidoFinding(cmd, finding)
+			return nil
+		},
+	}
+	f := cmd.Flags()
+	f.StringVar(&title, "title", "", "finding title")
+	f.StringVar(&requestID, "request-id", "", "captured request id from caido_search")
+	f.StringVar(&notes, "notes", "", "finding description, cut at 4096 bytes")
+	f.BoolVar(&jsonOut, "json", false, "print the result as JSON")
+	return cmd
+}
+
+// printCaidoFindings renders the count and one table row per finding.
+func printCaidoFindings(cmd *cobra.Command, findings []caido.Finding) {
+	out := cmd.OutOrStdout()
+	fmt.Fprintf(out, "count: %d\n", len(findings))
+	if len(findings) == 0 {
+		return
+	}
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "ID\tREQUEST\tCREATED\tTITLE")
+	for _, f := range findings {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", f.ID, f.RequestID, f.CreatedAt, f.Title)
+	}
+	_ = tw.Flush()
+}
+
+// printCaidoFinding renders one finding as field per line.
+func printCaidoFinding(cmd *cobra.Command, finding caido.Finding) {
+	out := cmd.OutOrStdout()
+	fmt.Fprintf(out, "id: %s\n", finding.ID)
+	fmt.Fprintf(out, "title: %s\n", finding.Title)
+	fmt.Fprintf(out, "request_id: %s\n", finding.RequestID)
+	fmt.Fprintf(out, "created_at: %s\n", finding.CreatedAt)
+	if finding.DescriptionCut {
+		fmt.Fprintf(out, "description_cut: true\n")
+	}
+	if finding.Description != "" {
+		fmt.Fprintf(out, "description: %s\n", finding.Description)
+	}
 }

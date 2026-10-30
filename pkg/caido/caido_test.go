@@ -1,6 +1,7 @@
 package caido
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -1553,5 +1554,89 @@ func TestSitemapDefaultDepthIsFive(t *testing.T) {
 	want := "depth 5 reached — 2 child nodes not walked"
 	if result.Note != want {
 		t.Errorf("note = %q, want %q", result.Note, want)
+	}
+}
+
+func TestFindingsParsesRows(t *testing.T) {
+	body := `{"findings":{"count":{"value":2},"nodes":[` +
+		`{"id":"1","title":"IDOR","description":"a","createdAt":1700000000000,"request":{"id":"994"}},` +
+		`{"id":"2","title":"XSS","description":"","createdAt":1700000001000,"request":{"id":"991"}}]}}`
+	c := testClient(t, func(*http.Request) (*http.Response, error) {
+		return gqlData(t, body), nil
+	})
+
+	findings, err := c.Findings(context.Background())
+	if err != nil {
+		t.Fatalf("Findings: %v", err)
+	}
+	if len(findings) != 2 {
+		t.Fatalf("got %d findings, want 2", len(findings))
+	}
+	if findings[0].ID != "1" || findings[0].Title != "IDOR" || findings[0].RequestID != "994" {
+		t.Fatalf("unexpected first finding: %+v", findings[0])
+	}
+	if findings[0].CreatedAt == "" {
+		t.Fatal("expected created_at to be formatted")
+	}
+	if findings[1].RequestID != "991" {
+		t.Fatalf("got request id %q, want 991", findings[1].RequestID)
+	}
+}
+
+func TestCreateFindingSendsRequestIDAndTitle(t *testing.T) {
+	var sent map[string]any
+	c := testClient(t, func(r *http.Request) (*http.Response, error) {
+		if err := json.NewDecoder(r.Body).Decode(&sent); err != nil {
+			t.Fatalf("decoding request: %v", err)
+		}
+		return gqlData(t,
+			`{"createFinding":{"finding":{"id":"7","title":"IDOR","createdAt":1700000000000,"request":{"id":"994"}},"error":null}}`,
+		), nil
+	})
+
+	f, err := c.CreateFinding(context.Background(), "IDOR", "994", "notes")
+	if err != nil {
+		t.Fatalf("CreateFinding: %v", err)
+	}
+	if f.ID != "7" || f.RequestID != "994" {
+		t.Fatalf("unexpected finding: %+v", f)
+	}
+	vars, ok := sent["variables"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing variables: %v", sent)
+	}
+	if vars["requestId"] != "994" {
+		t.Fatalf("got requestId %v, want 994", vars["requestId"])
+	}
+	input, ok := vars["input"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing input: %v", vars)
+	}
+	if input["title"] != "IDOR" {
+		t.Fatalf("got title %v, want IDOR", input["title"])
+	}
+	if input["reporter"] != findingReporter {
+		t.Fatalf("got reporter %v, want %q", input["reporter"], findingReporter)
+	}
+}
+
+func TestCreateFindingGraphQLErrorIsOneSentence(t *testing.T) {
+	c := testClient(t, func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"errors":[{"message":"boom"}]}`)),
+		}, nil
+	})
+
+	f, err := c.CreateFinding(context.Background(), "t", "1", "")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if err.Error() != "caido: createFinding failed: boom" {
+		t.Fatalf("got %q, want one sentence", err.Error())
+	}
+	if f != (Finding{}) {
+		t.Fatalf("expected a nil finding, got %+v", f)
 	}
 }
