@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+- `page_act set_style` writes a CSS declaration list onto one element and reports which declarations the browser kept and which it dropped. An empty value clears the inline style. This turns a CSS injection probe into two calls instead of five.
+- `page_act eval` no longer appends the `→ url=… title="…"` change line. Its result is parseable JSON again.
+
 ## 0.3.0 - 2026-10-30
 
 ### Highlights

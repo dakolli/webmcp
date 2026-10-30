@@ -754,6 +754,8 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		out, err = pageops.PageReload(ctx, page)
 	case "hover":
 		out, err = pageops.PageHover(ctx, page, p.Handle, p.Selector)
+	case "set_style":
+		out, err = pageops.PageSetStyle(ctx, page, p.Handle, p.Selector, p.Value)
 	case "scroll":
 		out, err = pageops.PageScroll(ctx, page, p.X, p.Y)
 	case "select":

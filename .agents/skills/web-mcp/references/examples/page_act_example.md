@@ -73,6 +73,19 @@ Expect `clicked handle="gcq7sm3ng-b48"`, `clicked at (34.0, 33.0) button=left co
 
 Expect `navigated to "https://react.dev/learn/describing-the-ui" (title "Describing the UI – React")` with no delta, then `navigated back to "https://react.dev/learn"`, `navigated forward to "https://react.dev/learn/describing-the-ui"`, `reloaded page`, `{"ready":"complete","title":"Describing the UI – React"}` (a DOM node returns `{}`), `{"network":132,"console":1,"websocket":0}`, `set viewport to 1024x768`, and `emulated device: IPadPro`. The page then reports `1024x1366` at DPR 2. `emulate` wins, and `{"device":"clear"}` resets both.
 
+## 5b. Set inline CSS with set_style
+
+Set a declaration list on one element, then clear it:
+
+```json
+{"tool":"page_act","arguments":{"session_id":"page-5","action":"set_style","selector":".site-footer","value":"background-image:url('/favicon.ico?wmstyle=1');--page-bg:red"}}
+{"tool":"page_fetch","arguments":{"session_id":"page-5","what":"network","filter":"image"}}
+{"tool":"page_act","arguments":{"session_id":"page-5","action":"eval","value":"() => getComputedStyle(document.querySelector('.site-footer')).backgroundImage"}}
+{"tool":"page_act","arguments":{"session_id":"page-5","action":"set_style","selector":".site-footer","value":""}}
+```
+
+Expect compact JSON inside `data`, for example `{"target":"selector=\".site-footer\"","cleared":false,"applied":["background-image","--page-bg"],"rejected":[],"style":"background-image: url(\"/favicon.ico?wmstyle=1\"); --page-bg: red;"}`. The image request shows as type `Image` in `what=network`, and the `eval` returns the new computed URL. The final call returns `{"target":"selector=\".site-footer\"","cleared":true,"applied":[],"rejected":[],"style":""}`. A declaration the CSSOM drops appears in `rejected`, never silently: `{"value":"color:notacolor"}` returns `"rejected":["color:notacolor"]`. The CLI form is `browser page act set_style '.site-footer' 'background-image:url("/favicon.ico?x=1")'`, or `--handle g3k9x2ab-b6 --value 'color:red !important'` when targeting a handle.
+
 ## 6. Drag and drop
 
 Open the W3Schools drag page as `page-4`, then drag the range slider:

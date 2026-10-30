@@ -714,6 +714,9 @@ needs no page.`,
   web-cli page act 12 click_at 100 200                     # click at x=100 y=200
   web-cli page act 12 navigate https://news.ycombinator.com # go somewhere
   web-cli page act last eval '() => document.title'         # run JS on the latest page
+  web-cli page act last set_style '.site-footer' 'background-image:url("/favicon.ico?x=1")'  # write inline CSS
+  web-cli page act last set_style --handle g3k9x2ab-b6 --value 'color:red !important'  # same, by handle
+  web-cli page act last set_style '.site-footer' ''          # clear the inline style, print cleared:true
   web-cli page act last replay /api/user --method PUT --value '{"id":2}'  # replay with an edited body
   web-cli page act last replay --target /api/user --header X-Env=staging  # header override, same target
   web-cli page act last replay-fuzz /api/search --points q:query --payloads a --payloads b  # 2 sniper runs
@@ -969,6 +972,8 @@ needs no page.`,
 				out, err = pageops.PageReload(ctx, p)
 			case "hover":
 				out, err = pageops.PageHover(ctx, p, handle, selector)
+			case "set_style":
+				out, err = pageops.PageSetStyle(ctx, p, handle, selector, value)
 			case "scroll":
 				out, err = pageops.PageScroll(ctx, p, x, y)
 			case "select":
@@ -1055,10 +1060,10 @@ needs no page.`,
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to act on (optional with one page open; 'last'; or a bare number)")
-	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, replay_fuzz, inject_canary, postmessage_install, postmessage_clear, post_message, wait_open, intercept_add, intercept_list, intercept_clear, auth_save, auth_restore, auth_list, poc_bundle, dialog_accept, dialog_dismiss, http_auth")
+	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, set_style, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, replay_fuzz, inject_canary, postmessage_install, postmessage_clear, post_message, wait_open, intercept_add, intercept_list, intercept_clear, auth_save, auth_restore, auth_list, poc_bundle, dialog_accept, dialog_dismiss, http_auth")
 	cmd.Flags().StringVar(&selector, "selector", "", "CSS selector targeting the element (element actions)")
 	cmd.Flags().StringVar(&handle, "handle", "", "element handle from page fetch (g<document>-b<backendNodeId>, scoped to its document); wins over --selector (element actions)")
-	cmd.Flags().StringVar(&value, "value", "", "value for eval (JS function), input (text), type (text), navigate (URL), select (option value), or inject_canary (custom canary)")
+	cmd.Flags().StringVar(&value, "value", "", "value for eval (JS function), input (text), type (text), navigate (URL), select (option value), set_style (CSS declarations; empty clears), or inject_canary (custom canary)")
 	cmd.Flags().StringVar(&key, "key", "", "key or key combo for press_key action (e.g. Enter, Escape, Control+A)")
 	cmd.Flags().StringVar(&button, "button", "left", "mouse button for click and click_at: left, right, middle")
 	cmd.Flags().IntVar(&clickCount, "click-count", 1, "click count for click and click_at (1 for single click, 2 for double click)")

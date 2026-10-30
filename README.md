@@ -192,6 +192,7 @@ reports `truncated` and `omitted` instead of cutting an object in half.
 | Mouse | `click`, `click_at`, `hover`, `hover_at`, `drag_and_drop` |
 | Keyboard | `input`, `type`, `press_key` with combos such as `Control+a` |
 | Forms | `select`, `upload_file` |
+| Style | `set_style` (inline CSS declarations, or clear with an empty value) |
 | Navigation | `navigate`, `back`, `forward`, `reload` |
 | View and time | `scroll`, `wait`, `set_viewport`, `emulate` |
 | Code and logs | `eval`, `clear_logs` |
@@ -211,6 +212,8 @@ When an action changes the address or the title, the result ends with one line:
 clicked selector="a.next"
 → url=https://example.com/next title="Next page"
 ```
+
+`eval` never appends a delta, so its result is always parseable JSON.
 
 ## CLI
 

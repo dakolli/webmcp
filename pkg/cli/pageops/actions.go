@@ -30,6 +30,7 @@ var actions = []Action{
 	{Name: "forward", Summary: "Go forward in history."},
 	{Name: "reload", Summary: "Reload the page."},
 	{Name: "hover", NeedsSelector: true, Summary: "Hover an element matched by selector or handle."},
+	{Name: "set_style", NeedsSelector: true, NeedsValue: true, Summary: "Set inline CSS declarations on an element, or clear them with an empty value."},
 	{Name: "scroll", Summary: "Scroll the page by x and y."},
 	{Name: "select", NeedsSelector: true, NeedsValue: true, Summary: "Select an option in a select element."},
 	{Name: "wait", Summary: "Wait for a readiness mode."},

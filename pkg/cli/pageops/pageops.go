@@ -64,7 +64,7 @@ const inputAckTimeout = 2 * time.Second
 var dispatchActions = []string{
 	"click", "input", "type", "press_key", "click_at", "hover_at",
 	"drag_and_drop", "upload_file", "eval", "navigate",
-	"back", "forward", "reload", "hover", "scroll", "select",
+	"back", "forward", "reload", "hover", "set_style", "scroll", "select",
 	"wait", "set_viewport", "emulate", "clear_logs",
 	"sinks_install", "sinks_clear", "replay", "inject_canary",
 	"postmessage_install", "postmessage_clear", "post_message",
@@ -1128,9 +1128,10 @@ func settleAfterAction(
 }
 
 // ActStateDeltaFor formats the state change for one action. Navigation actions
-// already report their destination, so they produce no suffix.
+// already report their destination, and eval returns its own JSON, so those
+// produce no suffix.
 func ActStateDeltaFor(action string, before, after PageState) string {
-	if action == "navigate" || action == "poc_bundle" {
+	if action == "navigate" || action == "poc_bundle" || action == "eval" {
 		return ""
 	}
 	return ActStateDelta(before, after)
@@ -2135,6 +2136,185 @@ func PageHoverAt(ctx context.Context, p *browsers.Page, x, y float64) (string, e
 			return "", err
 		}
 		return fmt.Sprintf("hovered at (%.1f, %.1f)", x, y), nil
+	})
+}
+
+// maxStyleTextRunes caps the cssText echoed in a set_style result.
+const maxStyleTextRunes = 2000
+
+// setStyleResult is the page_act set_style payload: the resolved target, whether
+// the inline style was cleared, the property names the CSSOM kept, the
+// declarations it dropped, and the resulting cssText.
+type setStyleResult struct {
+	Target   string   `json:"target"`
+	Cleared  bool     `json:"cleared"`
+	Applied  []string `json:"applied"`
+	Rejected []string `json:"rejected"`
+	Style    string   `json:"style"`
+}
+
+// setStyleScript applies a declaration list to the element bound as this. A
+// detached probe validates each declaration first, so an invalid value is
+// reported in rejected even when the element already held that property. A
+// trailing !important becomes the setProperty priority rather than part of the
+// value.
+const setStyleScript = `(decls) => {
+	const el = this;
+	const probe = document.createElement('div').style;
+	const applied = [];
+	const rejected = [];
+	for (const decl of decls) {
+		const i = decl.indexOf(':');
+		if (i <= 0) { rejected.push(decl); continue; }
+		const prop = decl.slice(0, i).trim();
+		let val = decl.slice(i + 1).trim();
+		let priority = '';
+		const important = /!\s*important\s*$/i.exec(val);
+		if (important) {
+			val = val.slice(0, important.index).trim();
+			priority = 'important';
+		}
+		if (prop === '' || val === '') { rejected.push(decl); continue; }
+		probe.setProperty(prop, val, priority);
+		if (probe.getPropertyValue(prop) === '') { rejected.push(decl); continue; }
+		el.style.setProperty(prop, val, priority);
+		applied.push(prop);
+	}
+	return {applied, rejected, style: el.style.cssText};
+}`
+
+// splitStyleDeclarations splits a CSS declaration list on semicolons at bracket
+// depth zero and outside quotes, so url('a;b'), quoted strings and rgb(1,2,3)
+// survive. Empty segments are dropped.
+func splitStyleDeclarations(decls string) []string {
+	var out []string
+	var quote rune
+	depth := 0
+	start := 0
+	runes := []rune(decls)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		if quote != 0 {
+			if r == '\\' {
+				i++
+				continue
+			}
+			if r == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch r {
+		case '\'', '"':
+			quote = r
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+		case ';':
+			if depth == 0 {
+				if seg := strings.TrimSpace(string(runes[start:i])); seg != "" {
+					out = append(out, seg)
+				}
+				start = i + 1
+			}
+		}
+	}
+	if seg := strings.TrimSpace(string(runes[start:])); seg != "" {
+		out = append(out, seg)
+	}
+	return out
+}
+
+// styleTarget renders the resolved set_style target for the result.
+func styleTarget(handle, selector string) string {
+	if handle != "" {
+		return fmt.Sprintf("handle=%q", handle)
+	}
+	return fmt.Sprintf("selector=%q", selector)
+}
+
+// clipStyleText caps cssText at maxStyleTextRunes on a rune boundary, appending
+// an ellipsis when it cuts.
+func clipStyleText(s string) string {
+	r := []rune(s)
+	if len(r) <= maxStyleTextRunes {
+		return s
+	}
+	return string(r[:maxStyleTextRunes]) + "…"
+}
+
+// PageSetStyle sets inline CSS declarations on the element targeted by handle
+// or selector. An empty declarations value removes the inline style attribute.
+// The result reports the target, the property names the CSSOM kept, the
+// declarations it dropped, and the resulting cssText.
+func PageSetStyle(
+	ctx context.Context,
+	p *browsers.Page,
+	handle, selector, declarations string,
+) (string, error) {
+	return browsers.GuardPage(ctx, p, "set_style", func(ctx context.Context) (string, error) {
+		if p.Rod == nil {
+			return "", fmt.Errorf("page session is closed")
+		}
+
+		page := p.Rod.Context(ctx)
+		el, err := actTarget(page, handle, selector)
+		if err != nil {
+			return "", actionError("set_style", handle, selector, err)
+		}
+
+		if err := p.PauseAction(ctx, "set_style"); err != nil {
+			return "", err
+		}
+
+		result := setStyleResult{
+			Target:   styleTarget(handle, selector),
+			Cleared:  declarations == "",
+			Applied:  []string{},
+			Rejected: []string{},
+		}
+		if declarations == "" {
+			if _, err := el.Eval(`() => { this.removeAttribute('style'); return true; }`); err != nil {
+				return "", targetFailure("set_style", handle, selector, err)
+			}
+		} else {
+			decls := splitStyleDeclarations(declarations)
+			if decls == nil {
+				decls = []string{}
+			}
+			res, err := el.Eval(setStyleScript, decls)
+			if err != nil {
+				return "", targetFailure("set_style", handle, selector, err)
+			}
+			var got struct {
+				Applied  []string `json:"applied"`
+				Rejected []string `json:"rejected"`
+				Style    string   `json:"style"`
+			}
+			if err := res.Value.Unmarshal(&got); err != nil {
+				return "", fmt.Errorf("set_style: decode result: %w", err)
+			}
+			if got.Applied != nil {
+				result.Applied = got.Applied
+			}
+			if got.Rejected != nil {
+				result.Rejected = got.Rejected
+			}
+			result.Style = clipStyleText(got.Style)
+		}
+
+		if err := p.PauseAction(ctx, "set_style"); err != nil {
+			return "", err
+		}
+
+		b, err := json.Marshal(result)
+		if err != nil {
+			return "", fmt.Errorf("set_style: encode result: %w", err)
+		}
+		return string(b), nil
 	})
 }
 

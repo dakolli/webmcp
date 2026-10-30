@@ -117,7 +117,7 @@ type actArgs struct {
 // optional numeric fields can be distinguished from an explicit zero.
 func (a *actArgs) validate(provided map[string]json.RawMessage) error {
 	switch a.Action {
-	case "click", "input", "type", "hover", "select", "upload_file":
+	case "click", "input", "type", "hover", "select", "upload_file", "set_style":
 		if a.Handle == "" && a.Selector == "" {
 			return fmt.Errorf("%s requires selector (or a handle from page_fetch what=interactives)", a.Action)
 		}
@@ -282,6 +282,8 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 		out, err = pageops.PageReload(ctx, p)
 	case "hover":
 		out, err = pageops.PageHover(ctx, p, a.Handle, a.Selector)
+	case "set_style":
+		out, err = pageops.PageSetStyle(ctx, p, a.Handle, a.Selector, a.Value)
 	case "scroll":
 		out, err = pageops.PageScroll(ctx, p, a.X, a.Y)
 	case "select":

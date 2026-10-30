@@ -51,6 +51,7 @@ func isAction(name string) bool {
 var actPayloadSpecs = map[string][]string{
 	"click":               {"selector"},
 	"hover":               {"selector"},
+	"set_style":           {"selector", "decls"},
 	"select":              {"selector", "value"},
 	"input":               {"selector", "text"},
 	"navigate":            {"url"},
@@ -601,7 +602,7 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 	// Fill the per-action fields from the validated payload.
 	xSet, ySet, txSet, tySet, wSet, hSet := false, false, false, false, false, false
 	switch a.action {
-	case "click", "hover", "select", "input", "type":
+	case "click", "hover", "select", "input", "type", "set_style":
 		if len(payload) >= 1 {
 			a.selector = payload[0]
 		}
