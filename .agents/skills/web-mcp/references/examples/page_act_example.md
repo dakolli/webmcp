@@ -1,46 +1,40 @@
-> Tool: `page_act` · Server: web-mcp · Surface: MCP · Tested: 2026-10-28
+> Tool: `page_act` · Server: web-mcp · Surface: MCP · Tested: 2026-10-30
 
 # page_act example
 
-Use this file only when tool calling for `page_act` fails. The tool description is primary, and every result rides the envelope with the payload at `data`. One success and one failure appear in full envelope form. Reference: `.agents/skills/web-mcp/references/tools/page_act.md`.
+Use this file only when tool calling for `page_act` fails. The tool description is primary, and every result rides the envelope with the payload at `data`. Reference: `.agents/skills/web-mcp/references/tools/page_act.md`.
 
 ## 1. Create and confirm your browser
 
 ```json
-{"tool":"browser_create","arguments":{"headless":true,"stealth":true,"profile":"skill-page-act-example"}}
+{"tool":"browser_create","arguments":{"headless":true,"stealth":true,"persist":false}}
 ```
 
-Expect `{"browser_id":"browser-10"}` in `data`. A bare create call used the shared default profile and failed with a SingletonLock error. Use only your id and never close an empty id.
+Expect `{"browser_id":"browser-10"}` in `data`. Use only your id and never close an empty id.
 
 ## 2. Form input, type, verify, and submit
 
 ```json
 {"tool":"fetch_page","arguments":{"url":"https://httpbin.org/forms/post","browser_id":"browser-10","wait_for":"load"}}
-```
-
-Expect `{"session_id":"page-1","title":"httpbin.org/forms/post","html_bytes":1404}`.
-
-```json
 {"tool":"page_act","arguments":{"session_id":"page-1","action":"input","selector":"input[name=\"custname\"]","value":"Ada Lovelace"}}
 {"tool":"page_act","arguments":{"session_id":"page-1","action":"input","selector":"input[name=\"custtel\"]","value":"555-0100"}}
 {"tool":"page_act","arguments":{"session_id":"page-1","action":"type","selector":"input[name=\"custtel\"]","value":" EXT"}}
 {"tool":"page_act","arguments":{"session_id":"page-1","action":"eval","value":"() => ({name: document.querySelector('input[name=\"custname\"]').value, tel: document.querySelector('input[name=\"custtel\"]').value})"}}
 {"tool":"page_act","arguments":{"session_id":"page-1","action":"press_key","selector":"input[name=\"custname\"]","key":"Enter"}}
-{"tool":"page_act","arguments":{"session_id":"page-1","action":"wait","wait_mode":"load","timeout_ms":1000}}
 ```
 
-Expect `set input selector="input[name=\"custname\"]" length=12`, `set input selector="input[name=\"custtel\"]" length=8`, `typed selector="input[name=\"custtel\"]" length=4`, then the eval result `{"name":"Ada Lovelace","tel":"555-0100 EXT"}` proving the field state, then the redirect delta inside one `data` string, then `waited for "load"`. Neither confirmation echoes the value. `input` replaces, `type` appends at the caret.
+Expect `set input selector="input[name=\"custname\"]" length=12`, `length=8`, `typed … length=4`, then `{"name":"Ada Lovelace","tel":"555-0100 EXT"}`. Neither confirmation echoes the value. `input` replaces, `type` appends at the caret, and `Enter` submits.
 
 ## 3. select and upload_file
 
-The httpbin form has no `<select>` and no file input, so open the Selenium web-form page as `page-2`:
+The httpbin form has no `<select>` or file input, so use the Selenium web-form page as `page-2`:
 
 ```json
 {"tool":"page_act","arguments":{"session_id":"page-2","action":"select","selector":"select[name=\"my-select\"]","value":"2"}}
 {"tool":"page_act","arguments":{"session_id":"page-2","action":"upload_file","selector":"input[type=\"file\"]","paths":["/tmp/opencode/example.txt"]}}
 ```
 
-Expect `selected option value="2" in selector="select[name=\"my-select\"]"` and `uploaded files [/tmp/opencode/example.txt] to selector="input[type=\"file\"]"`. `select` matches the option `value`, not its text.
+Expect `selected option value="2" …` and `uploaded files [/tmp/opencode/example.txt] …`. `select` matches the option `value`, not its text.
 
 ## 4. Clicks, hover, coordinates, scroll, and keys
 
@@ -71,20 +65,23 @@ Expect `clicked handle="gcq7sm3ng-b48"`, `clicked at (34.0, 33.0) button=left co
 {"tool":"page_act","arguments":{"session_id":"page-5","action":"emulate","device":"IPadPro"}}
 ```
 
-Expect `navigated to "https://react.dev/learn/describing-the-ui" (title "Describing the UI – React")` with no delta, then `navigated back to "https://react.dev/learn"`, `navigated forward to "https://react.dev/learn/describing-the-ui"`, `reloaded page`, `{"ready":"complete","title":"Describing the UI – React"}` (a DOM node returns `{}`), `{"network":132,"console":1,"websocket":0}`, `set viewport to 1024x768`, and `emulated device: IPadPro`. The page then reports `1024x1366` at DPR 2. `emulate` wins, and `{"device":"clear"}` resets both.
+Expect `navigated to …` with no delta, then `navigated back to …`, `navigated forward to …`, `reloaded page`, `{"ready":"complete","title":"…"}`, `{"network":132,"console":1,"websocket":0}`, `set viewport to 1024x768`, and `emulated device: IPadPro`. A DOM node from `eval` returns `{}`. The page then reports `1024x1366` at DPR 2, and `{"device":"clear"}` resets both.
 
 ## 5b. Set inline CSS with set_style
 
-Set a declaration list on one element, then clear it:
+Open `https://www.debian.org` as `page-8`, then restyle the footer:
 
 ```json
-{"tool":"page_act","arguments":{"session_id":"page-5","action":"set_style","selector":".site-footer","value":"background-image:url('/favicon.ico?wmstyle=1');--page-bg:red"}}
-{"tool":"page_fetch","arguments":{"session_id":"page-5","what":"network","filter":"image"}}
-{"tool":"page_act","arguments":{"session_id":"page-5","action":"eval","value":"() => getComputedStyle(document.querySelector('.site-footer')).backgroundImage"}}
-{"tool":"page_act","arguments":{"session_id":"page-5","action":"set_style","selector":".site-footer","value":""}}
+{"tool":"fetch_page","arguments":{"url":"https://www.debian.org","browser_id":"browser-10","wait_for":"idle"}}
+{"tool":"page_act","arguments":{"session_id":"page-8","action":"set_style","selector":"#footer","value":"background-color:#003366; color:#ffffff; --debian-accent:#d70a53; colr:red"}}
+{"tool":"page_fetch","arguments":{"session_id":"page-8","what":"interactives","selector":"#footer"}}
+{"tool":"page_act","arguments":{"session_id":"page-8","action":"eval","value":"() => ({background:getComputedStyle(document.querySelector('#footer')).backgroundColor,accent:getComputedStyle(document.querySelector('#footer')).getPropertyValue('--debian-accent')})"}}
+{"tool":"page_act","arguments":{"session_id":"page-8","action":"set_style","selector":"#footer","value":""}}
 ```
 
-Expect compact JSON inside `data`, for example `{"target":"selector=\".site-footer\"","cleared":false,"applied":["background-image","--page-bg"],"rejected":[],"style":"background-image: url(\"/favicon.ico?wmstyle=1\"); --page-bg: red;"}`. The image request shows as type `Image` in `what=network`, and the `eval` returns the new computed URL. The final call returns `{"target":"selector=\".site-footer\"","cleared":true,"applied":[],"rejected":[],"style":""}`. A declaration the CSSOM drops appears in `rejected`, never silently: `{"value":"color:notacolor"}` returns `"rejected":["color:notacolor"]`. The CLI form is `browser page act set_style '.site-footer' 'background-image:url("/favicon.ico?x=1")'`, or `--handle g3k9x2ab-b6 --value 'color:red !important'` when targeting a handle.
+Expect `{"target":"selector=\"#footer\"","cleared":false,"applied":["background-color","color","--debian-accent"],"rejected":["colr:red"],"style":"background-color: rgb(0, 51, 102); color: rgb(255, 255, 255); --debian-accent: #d70a53;"}`. The scoped `interactives` read still resolves the footer links, and the computed style reads `rgb(0, 51, 102)` and `#d70a53`. Declarations split only at bracket depth zero, so `url('a;b')` and `rgb(1,2,3)` stay intact. An empty `value` clears the inline style and returns `"cleared":true`, `"applied":[]`, `"style":""`. The CLI form is `browser page act set_style '#footer' 'color:red'`, or `--handle g3k9x2ab-b6 --value 'color:red !important'`.
+
+Verified: 2026-10-30 https://www.debian.org
 
 ## 5c. Encode a payload for a context (no page needed)
 
@@ -92,209 +89,130 @@ Expect compact JSON inside `data`, for example `{"target":"selector=\".site-foot
 
 ```json
 {"tool":"page_act","arguments":{"action":"encode","context":"attr-double","value":"<script>alert(1)</script>"}}
-{"tool":"page_act","arguments":{"action":"encode","context":"attr-double","value":"a&b\"c'd e","variants":["entity"]}}
 {"tool":"page_act","arguments":{"action":"encode","context":"js-string","value":"<script>alert(1)</script>"}}
+{"tool":"page_act","arguments":{"action":"encode","context":"url-query","value":"wm 307 & <x>"}}
 {"tool":"page_act","arguments":{"action":"encode","context":"html","value":"x"}}
 ```
 
-Expect `{"context":"attr-double","variants":[{"label":"raw","value":"<script>alert(1)</script>"},{"label":"entity","value":"&lt;script&gt;alert(1)&lt;/script&gt;"},{"label":"url","value":"%3Cscript%3Ealert%281%29%3C%2Fscript%3E"},{"label":"html5-attr","value":"&lt;script&gt;alert(1)&lt;/script&gt;"}]}`. The second call narrows to `raw` and `entity`, and the `entity` value is `a&amp;b&#34;c&#39;d e` with no bare `"`. The `js-string` call returns `\x3cscript\x3ealert(1)\x3c\/script\x3e` as its `js` variant. The unknown `html` context fails as `invalid_args` and lists every accepted context.
+Expect `{"context":"attr-double","variants":[{"label":"raw",…},{"label":"entity","value":"&lt;script&gt;alert(1)&lt;/script&gt;"},{"label":"url",…},{"label":"html5-attr",…}]}`, then the `js` variant `\x3cscript\x3ealert(1)\x3c\/script\x3e`, then `{"context":"url-query","variants":[{"label":"raw","value":"wm 307 & <x>"},{"label":"url","value":"wm+307+%26+%3Cx%3E"},{"label":"url-double","value":"wm%2B307%2B%2526%2B%253Cx%253E"}]}`. One `URLSearchParams` decode turns `url` back into the payload and two turn `url-double` back into it. `decodeURIComponent` alone does not round-trip a query value because `+` means space. The unknown `html` context fails as `invalid_args` and lists every accepted context.
 
-From a shell with or without the daemon:
-
-```sh
-browser page act encode attr-double '<script>alert(1)</script>'
-browser page act encode js-string 'a&b"c' --variants js,js-hex
-```
+Verified: 2026-10-30 https://www.mozilla.org
 
 ## 5d. Write an attribute and markup with set_attr and set_html
 
-Write an `onerror` attribute, then remove it, then inject markup in two modes:
+Open `https://www.kernel.org` as `page-9` and `https://www.gimp.org` as `page-10`:
 
 ```json
-{"tool":"page_act","arguments":{"session_id":"page-5","action":"set_attr","selector":"img","name":"onerror","value":"window.wmAttr=1"}}
-{"tool":"page_act","arguments":{"session_id":"page-5","action":"set_attr","selector":"img","name":"onerror","value":""}}
-{"tool":"page_act","arguments":{"session_id":"page-5","action":"set_html","selector":"body","mode":"append","value":"<b id=\"wm1\">hi</b><script>window.wmScript=1</script>"}}
-{"tool":"page_act","arguments":{"session_id":"page-5","action":"set_html","selector":"#wm1","mode":"outer","value":"<i id=\"wm2\">replaced</i>"}}
-{"tool":"page_fetch","arguments":{"session_id":"page-5","what":"dom","selector":"#wm2"}}
+{"tool":"fetch_page","arguments":{"url":"https://www.kernel.org","browser_id":"browser-10","wait_for":"idle"}}
+{"tool":"fetch_page","arguments":{"url":"https://www.gimp.org","browser_id":"browser-10","wait_for":"idle"}}
+{"tool":"page_act","arguments":{"session_id":"page-9","action":"set_attr","selector":"#logo-akamai","name":"data-wm-307","value":"set-state"}}
+{"tool":"page_act","arguments":{"session_id":"page-9","action":"set_attr","selector":"#logo-akamai","name":"data-wm-307","value":""}}
+{"tool":"page_act","arguments":{"session_id":"page-10","action":"set_html","selector":"#cap-photos","mode":"inner","value":"<div id=\"wm-307\"><h3>Replaced by set_html</h3><p>web-mcp probe 307</p></div>"}}
+{"tool":"page_fetch","arguments":{"session_id":"page-10","what":"html","selector":"#wm-307"}}
 ```
 
-Expect the first call to return `{"target":"selector=\"img\"","name":"onerror","value":"window.wmAttr=1","removed":false,"nodes_added":0}`. The second returns the same shape with `"value":"","removed":true`. The append call returns `{"target":"selector=\"body\"","mode":"append","nodes_added":4,"elements":[{"tag":"b","attributes":{"id":"wm1"}},{"tag":"script","attributes":{}}],"scripts":1,"executed":false}`; `nodes_added` counts the text nodes too, and markup inserted this way does not execute its `<script>` children, so `executed` stays false unless a nested sink hit appears after `sinks_install`. The outer call replaces `#wm1` with `<i id="wm2">`, and the final read finds it. A `name:"srcdoc"` write on an iframe reports `nodes_added:1` for the frame node.
+Expect `{"target":"selector=\"#logo-akamai\"","name":"data-wm-307","value":"set-state","removed":false,"nodes_added":0}`, then the same shape with `"value":"","removed":true`. The `set_html` call returns `{"target":"selector=\"#cap-photos\"","mode":"inner","nodes_added":5,"elements":[{"tag":"div","attributes":{"id":"wm-307"}}],"scripts":0,"executed":false}`, and the scoped `html` read returns `<div id="wm-307">…</div>`. `nodes_added` counts text nodes and `elements` caps at 50. `executed` is true only when the tracer saw a hit beyond the write, and markup inserted this way does not run its `<script>` children. A `srcdoc` write on an iframe reports `nodes_added:1`. `dom` ignores `selector`, so a scoped subtree read is `html` or `interactives`, never `dom`. The CLI forms are `browser page act set_attr 'a' href 'javascript:void(0)'` and `browser page act set_html 'body' append '<b id=wm1>hi</b>'`.
 
-CLI forms:
-
-```sh
-browser page act set_attr 'a' href 'javascript:void(0)'
-browser page act set_attr 'img' src ''
-browser page act set_html 'body' append '<b id=wm1>hi</b>'
-browser page act set_html '#host' outer '<p id=wm2>new</p>'
-```
+Verified: 2026-10-30 https://www.kernel.org
+Verified: 2026-10-30 https://www.gimp.org
 
 ## 5e. Fill a form and submit it with fill_form
 
-Read the form with `page_fetch` `what=forms`, then fill by selector or by name and submit in one call:
+Read the form with `what=forms`, then fill seven control types in one call without submitting:
 
 ```json
-{"tool":"page_fetch","arguments":{"session_id":"page-5","what":"forms"}}
-{"tool":"page_act","arguments":{"session_id":"page-5","action":"fill_form","selector":"form#search","fields":{"#q":"web-mcp"},"submit":"requestSubmit"}}
-{"tool":"page_act","arguments":{"session_id":"page-5","action":"fill_form","selector":"form#login","values":{"user":"alice","pass":"s3cret"},"submit":"click","wait_mode":"load"}}
-{"tool":"page_act","arguments":{"session_id":"page-5","action":"fill_form","fields":{"input[name=email]":"a@b.test"},"submit":"none"}}
+{"tool":"page_fetch","arguments":{"session_id":"page-1","what":"forms"}}
+{"tool":"page_act","arguments":{"session_id":"page-1","action":"fill_form","selector":"form","fields":{"form > p:nth-of-type(1) input":"Ada Lovelace","form > p:nth-of-type(2) input":"+15550100","form > p:nth-of-type(3) input":"ada@example.com","fieldset:nth-of-type(1) > p:nth-of-type(2) input":"on","fieldset:nth-of-type(2) > p:nth-of-type(4) input":"on","form > p:nth-of-type(4) input":"18:30","form > p:nth-of-type(5) textarea":"Ring twice"},"submit":"none"}}
 ```
 
-Expect `{"form":"form#search","filled":[{"name":"q","selector":"form#search > input"}],"skipped":[],"submit":"requestSubmit","url_after":"https://example.test/search?q=web-mcp"}`. The `values` call resolves each name inside `form#login`, so `filled` names the controls. A selector that matches nothing lands in `skipped` with `"reason":"no element matched"`, never as an error; a form selector that matches nothing returns `element_not_found`. Each control is written through its native setter and receives `input`/`change` (or `change` for a checkbox, radio, or select, and `input` for a textarea), so a React or Vue field keeps the value.
+Expect `{"form":"html > body > form","filled":[{"name":"size","selector":"…"},{"name":"topping","selector":"…"},{"name":"custname","selector":"…"},…],"skipped":[],"submit":"none","url_after":"https://httpbin.org/forms/post"}`. The `forms` read proves each write with `has_value:true`, including the Medium radio with `Small` still false. A name-to-value `values` entry cannot select a radio or checkbox member: the resolver takes the first control with that name and discards the value, so `{"size":"medium"}` checks `Small`. Use `fields` with an explicit selector to pick a member, and note a checkbox is only checked, never cleared. `skipped` carries a reason and is never an error. The CLI `--field` flag splits at the first `=`, so `--field 'input[name=size][value=large]=on'` sends the key `input[name` and Chrome resolves that fragment as an attribute-presence selector, filling the wrong element with no error. Prefer `--form-value`, or a selector without `=` such as one read from `what=forms`.
 
-CLI forms:
-
-```sh
-browser page act fill_form 'form#login' --field '#user=a' --field '#pass=b' --submit requestSubmit
-browser page act fill_form 'form#search' --form-value q=wm1 --submit click --wait load
-```
-
-`--field` and `--form-value` split at the first `=`, so use a selector without `=`, or read the selectors from `what=forms`.
+Verified: 2026-10-30 https://httpbin.org/forms/post
 
 ## 6. Drag and drop
 
-Open the W3Schools drag page as `page-4`, then drag the range slider:
-
 ```json
-{"tool":"page_act","arguments":{"session_id":"page-4","action":"drag_and_drop","selector":"#img1","target_x":170,"target_y":533}}
+{"tool":"page_act","arguments":{"session_id":"page-2","action":"drag_and_drop","selector":"#img1","target_x":170,"target_y":533}}
 ```
 
-Expect `dragged from (97.0, 532.2) to (170.0, 533.0)`. This is a mouse drag and it moved a live range slider from `5` to `9`. Native HTML5 drag-and-drop does not fire: on `w3schools.com/html/html5_draganddrop.asp` the drop listener stayed `0`, so use `eval` to dispatch `dragstart` and `drop` on HTML5 pages.
+Expect `dragged from (97.0, 532.2) to (170.0, 533.0)`. This is a mouse drag and it moved a live range slider from `5` to `9`. Native HTML5 drag-and-drop does not fire, so use `eval` to dispatch `dragstart` and `drop` on those pages.
 
 ## 7. Replay a captured request
 
-Open `https://news.ycombinator.com/news` as `page-6` and read its captured ring:
+Open `https://news.ycombinator.com/news` as `page-6`, read the ring, and replay one entry:
 
 ```json
 {"tool":"page_fetch","arguments":{"session_id":"page-6","what":"network"}}
 {"tool":"page_act","arguments":{"session_id":"page-6","action":"replay","target":"2"}}
 ```
 
-The second `target` is the seq of this run's `news.css` request. Success rides `data`:
+Expect `{"status":200,"headers":{"Content-Type":["text/css; charset=utf-8"],…},"body":"…","bytes":7418,"ms":63,"request":{"method":"GET","url":"https://news.ycombinator.com/news.css?…"}}`. Then edit a URL parameter and fuzz one entry:
 
 ```json
-{"ok":true,"data":{"status":200,"headers":{"Content-Type":["text/css; charset=utf-8"],"Server":["nginx"],"Vary":["Accept-Encoding"]},"body":"body  { font-family:Verdana, Geneva, sans-serif; … }","bytes":7418,"ms":63,"request":{"method":"GET","url":"https://news.ycombinator.com/news.css?EieZrD3Ae1qf3cIQQaRb","headers":{"Accept-Language":"en","Referer":"https://news.ycombinator.com/","User-Agent":"Mozilla/5.0 …"}}}}
+{"tool":"page_act","arguments":{"session_id":"page-6","action":"replay","target":"1","query":{"probe":"two"},"max_bytes":300}}
+{"tool":"page_act","arguments":{"session_id":"page-6","action":"replay_fuzz","target":"1","points":[{"param":"probe","location":"query"}],"payloads":["a","b"],"strategy":"sniper","max_bytes":500}}
 ```
 
-Then edit one URL parameter and fuzz one captured entry. Open `https://www.freebsd.org/?probe=one` as `page-8`:
-
-```json
-{"tool":"fetch_page","arguments":{"url":"https://www.freebsd.org/?probe=one","browser_id":"browser-10","wait_for":"load"}}
-{"tool":"page_act","arguments":{"session_id":"page-8","action":"replay","target":"1","query":{"probe":"two"},"max_bytes":300}}
-{"tool":"page_act","arguments":{"session_id":"page-8","action":"replay","target":"1","query":{"probe":""},"max_bytes":300}}
-{"tool":"page_act","arguments":{"session_id":"page-8","action":"replay_fuzz","target":"1","points":[{"param":"probe","location":"query"}],"payloads":["a","b"],"strategy":"sniper","max_bytes":500}}
-```
-
-`request.url` reads `https://www.freebsd.org/?probe=two` on the first replay, then `https://www.freebsd.org/` on the second. A non-empty value replaces, `""` removes, and every other parameter keeps its captured value. Parameter order can change, so `request.url` is the only proof of the edit. The fuzz result carries `"summary":{"baseline":{"status":200,"bytes":22060,"cold_ms":30,"ms":44},"anomalies":[]}`. `cold_ms` is the first sample and `ms` the second warm sample that each run compares against, so a `time_delta` inside that spread is suppressed. An over-bound matrix is refused before any request:
-
-```json
-{"ok":false,"error":{"type":"invalid_args","message":"page_act: replay_fuzz: requests computed 243, over the 100 bound","hint":"lower the payload count or the point count, or use strategy sniper (points*payloads) to stay under the 100-request bound"}}
-```
-
-Replay re-reads the request and carries the page's cookies for the target host, and it never writes to the page. Pass `method` to override the method, `headers` to replace captured headers, or `value` to replace the request body. From a shell with the daemon up, the same replay is `browser page act last replay 2`, or `browser page act last replay /news.css --method GET --max-bytes 4000 --value ''`. The first positional is the target, and `--value` (not a positional) carries the replacement body.
+`request.url` proves the edit, because parameter order can change. The fuzz result carries `"summary":{"baseline":{"status":200,"bytes":22060,"cold_ms":30,"ms":44},"anomalies":[]}`. An over-bound matrix is refused before any request: `page_act: replay_fuzz: requests computed 243, over the 100 bound`. Replay carries the page's cookies for the target host and never writes to the page. Pass `method`, `headers`, or `value` to override them; `""` removes a query parameter.
 
 ## 8. Intercept and rewrite requests
-
-Reuse `page-6` from §7: fulfill its `news.css`, reload, then read the tag and clear:
 
 ```json
 {"tool":"page_act","arguments":{"session_id":"page-6","action":"intercept_add","rules":[{"id":"css","url_pattern":"*news.css*","action":"fulfill","status":200,"headers":{"Content-Type":"text/css"},"body":"body{background:#fff}"}]}}
 {"tool":"page_act","arguments":{"session_id":"page-6","action":"reload"}}
 {"tool":"page_fetch","arguments":{"session_id":"page-6","what":"network"}}
-{"tool":"page_act","arguments":{"session_id":"page-6","action":"intercept_list"}}
 {"tool":"page_act","arguments":{"session_id":"page-6","action":"intercept_clear"}}
 ```
 
-Expect `{"rules":[{"id":"css","url_pattern":"*news.css*","action":"fulfill","headers":{"Content-Type":"text/css"},"status":200,"body":"body{background:#fff}"}],"count":1,"active":true}`, then `reloaded page`, then a `news.css` entry carrying `"intercepted":"fulfill"`, `"intercept_rule_id":"css"`, `"status":200`, and `"mime":"text/css"`. `intercept_list` repeats the rule, and `intercept_clear` returns `{"rules_removed":1,"active":false}`. `block`, `allow`, and `rewrite` rules work the same way, and every match is tagged on the ring. The three actions work on MCP, CLI, and IPC: `browser page act last intercept_add --rules '<json>'` reaches the same engine. Three limits apply. A response served from cache bypasses the rules, so a rule for a cached CSS file does nothing until you use a fresh context or clear the cache. `rewrite` cannot change the HTTP method, because `method` is a match filter only. A rewritten header does not appear in the network ring's `req_headers`.
+Expect `{"rules":[…],"count":1,"active":true}`, then a `news.css` entry carrying `"intercepted":"fulfill"`, `"intercept_rule_id":"css"`, and `"status":200`, then `{"rules_removed":1,"active":false}`. A cached response bypasses the rules, `rewrite` cannot change the method, and a rewritten header does not appear in `req_headers`.
 
 ## 9. Arm the sink tracer and inject a canary
 
-Open `https://www.sqlite.org/index.html` as `page-7`, install, inject the hash, read the hits, then clear:
-
 ```json
-{"tool":"fetch_page","arguments":{"url":"https://www.sqlite.org/index.html","browser_id":"browser-10","wait_for":"idle"}}
 {"tool":"page_act","arguments":{"session_id":"page-7","action":"sinks_install"}}
 {"tool":"page_act","arguments":{"session_id":"page-7","action":"inject_canary","targets":["hash"]}}
-{"tool":"page_act","arguments":{"session_id":"page-7","action":"eval","value":"() => { const d=document.createElement('div'); d.id='probe'; d.innerHTML=location.hash; document.body.appendChild(d); return d.textContent }"}}
 {"tool":"page_fetch","arguments":{"session_id":"page-7","what":"sinks"}}
 {"tool":"page_act","arguments":{"session_id":"page-7","action":"sinks_clear"}}
 ```
 
-Expect `{"installed":true}`, then `{"canary":"wm-canary-…","injected":[{"target":"hash","where":"https://www.sqlite.org/index.html"}],"hits":[],"installed":true}`. The static page has no hash sink, so `hits:[]` is a clean result. The control eval makes a real finding: `{"source":"location.hash","sink":"innerHTML","context":"html","selector":"div#probe","value":"#wm-canary-…","stack":[…]}`. `selector` and `stack` are omitted when empty. Without `sinks_install` the call fails with `page_act: inject_canary needs the sink tracer — run action "sinks_install" first`. Then `{"cleared":1}` and a second `sinks_install` is a no-op.
+Expect `{"installed":true}`, then `{"canary":"wm-canary-…","injected":[{"target":"hash","where":"…"}],"hits":[],"installed":true}`. A static page with no hash sink returns `hits:[]`, which is a clean result. Without `sinks_install` the call fails with `page_act: inject_canary needs the sink tracer — run action "sinks_install" first`.
 
 ## 10. Failure examples
 
-An ambiguous replay URL substring anchors the failure path (tested live on 2026-10-26):
-
 ```json
 {"tool":"page_act","arguments":{"session_id":"page-6","action":"replay","target":"news.ycombinator.com/news"}}
-```
-
-```json
-{"ok":false,"error":{"type":"invalid_args","message":"page_act: replay: target \"news.ycombinator.com/news\" matches 2 network entries — pass a seq or a longer URL substring: seq=1 GET https://news.ycombinator.com/news; seq=2 GET https://news.ycombinator.com/news.css?EieZrD3Ae1qf3cIQQaRb"}}
-```
-
-```json
 {"tool":"page_act","arguments":{"session_id":"page-2","action":"click"}}
 {"tool":"page_act","arguments":{"session_id":"page-2","action":"press_key","key":"Banana"}}
 {"tool":"page_act","arguments":{"session_id":"page-2","action":"eval","value":"() => {"}}
 ```
 
-Expect `page_act: click requires selector (or a handle from page_fetch what=interactives)`, `page_act: press_key: unknown key name "Banana"`, and `page_act: evaluate js: eval js error: SyntaxError: Unexpected token ')' <nil>`. Stale handles return the `page_act: handle "…" is stale — …` message, so re-read `interactives`. Do not send an unknown `select` value: a live `"value":"nope"` returned `MCP error -32001: Request timed out` and wedged the whole server.
+Expect the ambiguous replay message naming both candidate `seq` values, `page_act: click requires selector (or a handle from page_fetch what=interactives)`, `page_act: press_key: unknown key name "Banana"`, and `page_act: evaluate js: eval js error: SyntaxError: Unexpected token ')' <nil>`. Stale handles return `page_act: handle "…" is stale — …`, so re-read `interactives`. Do not send an unknown `select` value: it can wedge the server.
 
 ## 11. Save and restore a login
 
-Log in on `www.saucedemo.com`, save the session, close the browser, then restore it into a new browser and a new identity:
-
 ```json
-{"tool":"browser_create","arguments":{"owner":"auth-demo","headless":true,"stealth":true}}
-{"tool":"fetch_page","arguments":{"url":"https://www.saucedemo.com/","browser_id":"browser-11","wait_for":"load"}}
-{"tool":"page_act","arguments":{"browser_id":"browser-11","session_id":"page-1","action":"input","selector":"#user-name","value":"standard_user"}}
-{"tool":"page_act","arguments":{"browser_id":"browser-11","session_id":"page-1","action":"input","selector":"#password","value":"secret_sauce"}}
-{"tool":"page_act","arguments":{"browser_id":"browser-11","session_id":"page-1","action":"click","selector":"#login-button"}}
-{"tool":"page_fetch","arguments":{"browser_id":"browser-11","session_id":"page-1","what":"meta"}}
-{"tool":"page_act","arguments":{"browser_id":"browser-11","session_id":"page-1","action":"auth_save","site":"www.saucedemo.com","name":"main"}}
-{"tool":"browser_close","arguments":{"browser_id":"browser-11"}}
-{"tool":"browser_create","arguments":{"owner":"auth-demo-2","headless":true,"stealth":true}}
-{"tool":"fetch_page","arguments":{"url":"https://www.saucedemo.com/","browser_id":"browser-12","identity":"restored","wait_for":"load"}}
-{"tool":"page_act","arguments":{"browser_id":"browser-12","session_id":"page-1","action":"auth_restore","site":"www.saucedemo.com","name":"main"}}
-{"tool":"page_act","arguments":{"browser_id":"browser-12","session_id":"page-1","action":"navigate","value":"https://www.saucedemo.com/inventory.html"}}
-{"tool":"page_fetch","arguments":{"browser_id":"browser-12","session_id":"page-1","what":"meta"}}
+{"tool":"page_act","arguments":{"session_id":"page-1","action":"input","selector":"#user-name","value":"standard_user"}}
+{"tool":"page_act","arguments":{"session_id":"page-1","action":"input","selector":"#password","value":"secret_sauce"}}
+{"tool":"page_act","arguments":{"session_id":"page-1","action":"click","selector":"#login-button"}}
+{"tool":"page_act","arguments":{"session_id":"page-1","action":"auth_save","site":"www.saucedemo.com","name":"main"}}
+{"tool":"page_act","arguments":{"session_id":"page-1","action":"auth_restore","site":"www.saucedemo.com","name":"main"}}
+{"tool":"page_act","arguments":{"action":"auth_list","site":"www.saucedemo.com"}}
 ```
 
-Expect the login click to land on `https://www.saucedemo.com/inventory.html` with title `Swag Labs`. `auth_save` returns `{"site":"www.saucedemo.com","name":"main","cookies":N,"origins":1,"user_agent":"…","updated_at":"…","warning":"auth snapshots are stored unencrypted in the local state database (mode 0600) …"}`. `auth_list` needs no session: it answers with a stale `session_id` and with no live browser, returning `{"snapshots":[{"site":"www.saucedemo.com","name":"main","cookie_count":N,"origin_count":1,"user_agent":"…","updated_at":"…"}],"count":1,"warning":"…"}` and never a value. `auth_restore` returns counts plus `forced:false` and the same `warning`, and the new identity renders the inventory page. The host-only `session-username` cookie stays scoped to `www.saucedemo.com` after restore. The store is plaintext with mode 0600, so the `warning` is the only confidentiality signal. Verified live on 2026-10-27.
+Expect `auth_save` to return counts plus `warning`, `auth_restore` to return counts and `forced:false`, and `auth_list` to work with no live session. The store is plaintext at mode 0600, so the `warning` is the only confidentiality signal. Host-only cookies stay scoped to their host.
 
 ## 11b. Bundle a finding as a PoC
-
-After you confirm a finding, package it in one call. `value` is the finding title and `paths[0]` is an empty absolute directory:
 
 ```json
 {"tool":"page_act","arguments":{"session_id":"page-6","action":"poc_bundle","value":"Stored XSS in search","paths":["/tmp/poc-xss"]}}
 ```
 
-Expect a compact JSON result:
-
-```json
-{"directory":"/tmp/poc-xss","files":[{"name":"meta.json","bytes":231},{"name":"request.http","bytes":812},{"name":"response.http","bytes":1044},{"name":"screenshot.png","bytes":48120},{"name":"dom.html","bytes":9321},{"name":"storage.json","bytes":407},{"name":"README.md","bytes":318}],"omitted":[{"name":"sinks.json","reason":"not installed"}]}
-```
-
-The directory holds `meta.json`, `request.http`, `response.http`, `screenshot.png`, `dom.html`, `storage.json` and `README.md`, all mode 0600. Run `sinks_install` before the payload to add `sinks.json` and prove source-to-sink reachability. Pass `target` (a `seq` or URL substring) to pin the request that proves the finding instead of the main document.
-
-A relative path is refused with `poc_bundle: "poc-xss" must be absolute`. A non-empty directory is refused with `poc_bundle: /tmp/poc-xss is not empty — pass a new directory or remove its contents`. Cookie, Set-Cookie, Authorization and X-CSRF-Token header values stay `<redacted>` unless the page opted into secret capture. A redacted header value produces `{"name":"secret values","reason":"secrets hidden"}` in `omitted`; secret capture suppresses that row.
-
-From a shell with the daemon up:
-
-```sh
-browser page act last poc_bundle --value "Stored XSS in search" --paths /tmp/poc-xss
-```
-
-It prints the directory and one line per file.
+Expect `{"directory":"/tmp/poc-xss","files":[{"name":"meta.json","bytes":231},…],"omitted":[{"name":"sinks.json","reason":"not installed"}]}`. The directory holds the request/response pair, screenshot, DOM, storage, and README at mode 0600. Run `sinks_install` first to add `sinks.json`, and pass `target` to pin the request. A relative path or a non-empty directory is refused, and secret header values stay `<redacted>`.
 
 ## 12. Clean up
 
 ```json
-{"tool":"browser_close","arguments":{"browser_id":"browser-12"}}
 {"tool":"browser_close","arguments":{"browser_id":"browser-10"}}
 ```
 
-Expect each browser to disappear from `browser_list`. Close only your own ids and never close an empty id.
+Expect the browser to disappear from `browser_list`. Close only your own id and never close an empty id.

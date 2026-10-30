@@ -5,7 +5,7 @@ description: Drive a live, stateful Chromium browser over the web-mcp MCP server
 
 # web-mcp — MCP browser skill
 
-This skill covers the 15 `web-mcp` MCP tools: 9 browser tools and 6 Caido tools. It does not replace the tool descriptions.
+This skill covers the 24 `web-mcp` MCP tools. They span three lanes: 9 browser tools, 6 Caido tools, and 9 recon tools. It does not replace the tool descriptions.
 This file is the single entry. It carries the cross-cutting rules. Tool detail lives in the references.
 
 ## Read order
@@ -13,8 +13,9 @@ This file is the single entry. It carries the cross-cutting rules. Tool detail l
 1. Read the tool description and input schema first. They are authoritative.
 2. Read `references/tools/<tool>.md` when the description is unclear, incomplete, or a call failed.
 3. Read `references/examples/<tool>_example.md` when tool calling itself fails.
+4. Read `.agents/skills/recon/SKILL.md` before any `recon_*` call.
 
-Do not invent parameters. The Go source in `pkg/mcp/tools/` is the schema source of truth.
+Do not invent parameters. The browser and Caido schemas live in `pkg/mcp/tools/`. The recon schemas live in `pkg/recon/tools/`.
 
 ## Install
 
@@ -66,6 +67,23 @@ Install or refresh this skill with `browser skill <harness|path|.>`. With no arg
 | `caido_finding` | [caido_finding.md](/home/dakolli/github.com/webmcp/.agents/skills/caido/references/tools/caido_finding.md) | [caido_finding_example.md](/home/dakolli/github.com/webmcp/.agents/skills/caido/references/examples/caido_finding_example.md) | tested |
 | `caido_replay` | [caido_replay.md](/home/dakolli/github.com/webmcp/.agents/skills/caido/references/tools/caido_replay.md) | [caido_replay_example.md](/home/dakolli/github.com/webmcp/.agents/skills/caido/references/examples/caido_replay_example.md) | tested |
 | `caido_intercept` | [caido_intercept.md](/home/dakolli/github.com/webmcp/.agents/skills/caido/references/tools/caido_intercept.md) | [caido_intercept_example.md](/home/dakolli/github.com/webmcp/.agents/skills/caido/references/examples/caido_intercept_example.md) | tested |
+| `recon_subdomains` | [recon_subdomains.md](../recon/references/tools/recon_subdomains.md) | [recon_subdomains_example.md](../recon/references/examples/recon_subdomains_example.md) | tested |
+| `recon_dns` | [recon_dns.md](../recon/references/tools/recon_dns.md) | [recon_dns_example.md](../recon/references/examples/recon_dns_example.md) | tested |
+| `recon_http` | [recon_http.md](../recon/references/tools/recon_http.md) | [recon_http_example.md](../recon/references/examples/recon_http_example.md) | tested |
+| `recon_ports` | [recon_ports.md](../recon/references/tools/recon_ports.md) | [recon_ports_example.md](../recon/references/examples/recon_ports_example.md) | tested |
+| `recon_urls` | [recon_urls.md](../recon/references/tools/recon_urls.md) | [recon_urls_example.md](../recon/references/examples/recon_urls_example.md) | tested |
+| `recon_fuzz` | [recon_fuzz.md](../recon/references/tools/recon_fuzz.md) | [recon_fuzz_example.md](../recon/references/examples/recon_fuzz_example.md) | tested |
+| `recon_js` | [recon_js.md](../recon/references/tools/recon_js.md) | [recon_js_example.md](../recon/references/examples/recon_js_example.md) | tested |
+| `recon_templates` | [recon_templates.md](../recon/references/tools/recon_templates.md) | [recon_templates_example.md](../recon/references/examples/recon_templates_example.md) | tested |
+| `recon_run` | [recon_run.md](../recon/references/tools/recon_run.md) | [recon_run_example.md](../recon/references/examples/recon_run_example.md) | tested |
+
+## Recon lane
+
+- The eight scanners and `recon_run` are documented in [.agents/skills/recon/SKILL.md](../recon/SKILL.md).
+- Every call needs `authorized: true`.
+- `scope` defaults to the literal target.
+- The first call bootstraps a binary with `go install`. That call can take minutes.
+- The CLI runs the lane in process and never through the daemon.
 
 ## Cross-cutting rules
 
@@ -176,6 +194,10 @@ Each tool reference states only its own payload and its failure types, and links
 - `page_fetch` `har` always returns an empty `response.cookies`, because Chrome omits `Set-Cookie` from CDP events. `request.cookies` is populated from the browser jar and redacted.
 - `page_fetch` `har` reports `headersSize` and `bodySize` as `-1` when the size was not measured (`code://pkg/har/har.go#L764-L776`).
 - A client caches `tools/list` for its whole connection, so a live argument can look missing. `make schema` is the authority. A name in `make schema` and absent from your client means a stale client cache, not a server defect.
+- `recon_ports` `mode: syn` needs libpcap. `connect` is the default.
+- `recon_http` reports an error, not a zero-entry success, when a target answers nothing.
+- `recon_run` takes a bare registrable `domain`, not target URLs.
+- The recon binaries live in `<config>/recon/bin`, mode 0700. `PATH` is never used.
 
 ## Unresponsive page recovery
 
@@ -212,7 +234,7 @@ Keep these shapes in the rotation, with a new host each time:
 
 ## Maintainer status
 
-- All 9 tools have a tested reference and an example.
+- All 24 tools have a tested reference and an example. The browser references are local. The Caido and recon references live in their own trees.
 - `poc_bundle` is on the tool surface: one call captures the request/response pair, screenshot, DOM, storage, sink ring (when armed) and a README index for a report.
 - The result envelope is documented once here and referenced from every tool page.
 - Lifecycle, proxy, scope, headers, `what=body`, `what=security` and `page_act replay` are documented.

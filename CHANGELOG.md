@@ -11,11 +11,20 @@
 - `page_fetch what=security` now parses the effective CSP into directives, nonce and hashes, and records `securitypolicyviolation` events. The policy and the response-header checks come from a page-side capture, so they survive `clear_logs` and a header over 512 bytes parses whole.
 - The sink tracer names more DOM XSS sources: `window.name`, `document.referrer`, `document.cookie` (value redacted), local and session storage reads, `history.state`, `message` events and `URLSearchParams` reads.
 - `page_act eval` no longer appends the `→ url=… title="…"` change line. Its result is parseable JSON again.
+- Nine recon tools wrap pinned external scanners: `recon_subdomains` (subfinder), `recon_dns` (dnsx), `recon_http` (httpx), `recon_ports` (naabu), `recon_urls` (katana), `recon_fuzz` (ffuf), `recon_js` (jsluice), `recon_templates` (nuclei), plus the `recon_run` pipeline. Each returns compact entries with honest `truncated` and `dropped` counters, and can write the raw report to an absolute `output_file`.
+- Every recon call needs `authorized: true`. `scope` sits beside it as a host allowlist that defaults to the literal target, so one missing argument does not mean the whole internet.
+- The scanners install on first use into `<config>/recon/bin`. `PATH` is never used, so the Python `httpx` on this host cannot be run by mistake.
+- `recon_run` chains stages over one registrable domain in a fixed order, adds the stage a later one needs, and records a failed stage without ending the run.
+- `browser recon list` and `browser recon run <tool>` run in process, never through the serve daemon, so a scan is not cut at 30 seconds. `--json` reaches every typed field.
 
 ### Fixed
 - `page_fetch what=reflections` returned a decode error on every call instead of a result.
 - `page_act fill_form` returned its result as a JSON string, not an object.
 - `csp_unsafe_inline` warned on a `style-src` token while `script-src` was hash-locked. It now tests the effective script directive only.
+- `page_fetch what=security` read the `cors` check from the network ring, so `clear_logs` erased it. It now reads the page-side document record and quotes the headers it judged on every status.
+- `page_act fill_form` ignored the value in `values`, so a radio group's first member got checked. It now matches by name and value, and names the candidates when several match.
+- The CLI `page act --field` split at the first `=`, so a selector that contained one wrote the wrong element with no error. It now splits outside brackets, and `--fields` takes a JSON map.
+- `page_fetch what=dom` silently ignored `selector`. It now fails and points at `what=html` for a scoped read.
 
 ## 0.3.0 - 2026-10-30
 

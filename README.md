@@ -276,6 +276,49 @@ browser serve stop
 CLI conveniences: `--json` on `fetch`, page-id shorthand (`last`, `5` for `page-5`), one open page as
 the default target, and `--max-bytes 0` for unbounded output.
 
+## Recon lane
+
+The recon lane adds nine MCP tools: eight scanners and one pipeline. Every recon tool call
+requires `authorized: true`. Set it only for targets you may scan. `scope` defaults to the literal target.
+The caps are 500 hosts, 5000 URLs and 200 ports per call. An absolute `output_file` receives the
+raw report with mode 0600.
+
+| Tool | Purpose |
+| :--- | :--- |
+| `recon_subdomains` | Passive subdomain enumeration with subfinder. |
+| `recon_dns` | Resolve records or brute-force names with dnsx. |
+| `recon_http` | Probe hosts and URLs with httpx. |
+| `recon_ports` | Scan TCP and UDP ports with naabu. |
+| `recon_urls` | Crawl seeds with katana and return in-scope URLs. |
+| `recon_fuzz` | Run ffuf for content discovery and parameter tests. |
+| `recon_js` | Parse JavaScript with jsluice for URLs, paths and secrets. |
+| `recon_templates` | Scan targets with nuclei templates and return findings. |
+| `recon_run` | Chain the selected stages over one bare registrable domain. |
+
+`recon_run` runs the selected stages in this fixed order:
+`subdomains → dns → http → ports → urls → js → fuzz → templates`.
+It adds a stage that a selected stage needs. It records a failed stage and continues the run.
+`stop_on_empty` defaults to false.
+
+```sh
+browser recon list
+browser recon run recon_http --authorized --target https://example.com --json '{"title":true,"tech":true}'
+```
+
+`browser recon list` prints each scanner, its pin and its install state. `browser recon run` runs
+one scanner in the CLI process. It never uses the serve daemon, because the IPC socket caps a
+request at 30 seconds. The friendly flags include `--target`, `--scope`, `--authorized`,
+`--output-file`, `--max-entries` and `--timeout-ms`. Pass `--json` for any typed field. Arguments
+after `--` reach the scanner.
+
+The first call to a scanner installs its pinned binary with `go install` into `<config>/recon/bin`
+(mode 0700).
+A cold install can take minutes. The lane never uses `PATH`, because `httpx` on this host is a
+Python script. `recon_js` builds with CGO. The other scanners build without it. `recon_ports`
+uses CONNECT by default. `mode: syn` needs libpcap and fails with a named error.
+
+For agent usage, read `.agents/skills/recon/SKILL.md`.
+
 ---
 
 ## Configuration
