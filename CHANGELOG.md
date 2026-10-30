@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-10-30
+
+### Highlights
+- Six Caido tools now sit beside the browser tools: `caido_search`, `caido_status`, `caido_sitemap`,
+  `caido_finding`, `caido_replay` and `caido_intercept`. An agent reads recorded proxy traffic,
+  replays one request and records the finding.
+- `browser serve` matches the Caido instance at launch from `[caido]`: project, scope and capture
+  filter, one log line each.
+- `browser_create.deny_hosts` keeps browser telemetry out of the proxy, so history shows the target.
+- Chromium switches are configurable, and a quiet set is on by default.
+
 ### Added
 - Chromium switches are now configurable. `[browser] chromium_flags` in `webmcp.toml`, `browser create --chromium-arg`, and `browser_create.chromium_args` all add to one resolved list.
 - A built-in quiet set is on by default for `browser serve` and every created browser. It stops Brave and Chromium background traffic, component updates, sync, breakpad and first-run noise. `[browser] quiet = false` turns it off.
