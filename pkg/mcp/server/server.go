@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/dakolli/webmcp/pkg/browsers"
+	caidotools "github.com/dakolli/webmcp/pkg/caido/tools"
 	"github.com/dakolli/webmcp/pkg/config"
 	"github.com/dakolli/webmcp/pkg/mcp/models"
 	"github.com/dakolli/webmcp/pkg/mcp/tools"
@@ -239,10 +240,10 @@ func registerAll(
 	r.Register(tools.NewPageList(mgr))      // page_list
 	if cf.Enabled {
 		config.SetActiveCaido(cf)
-		r.Register(tools.NewCaidoSearch())  // caido_search
-		r.Register(tools.NewCaidoSitemap()) // caido_sitemap
-		r.Register(tools.NewCaidoStatus())  // caido_status
-		r.Register(tools.NewCaidoFinding()) // caido_finding
+		r.Register(caidotools.NewCaidoSearch())  // caido_search
+		r.Register(caidotools.NewCaidoSitemap()) // caido_sitemap
+		r.Register(caidotools.NewCaidoStatus())  // caido_status
+		r.Register(caidotools.NewCaidoFinding()) // caido_finding
 	}
 
 	r.RegisterPrompt(tools.NewFetchAndSummarizePrompt())        // fetch_and_summarize

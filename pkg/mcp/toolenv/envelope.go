@@ -1,11 +1,10 @@
-package tools
+package toolenv
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 	"strings"
 	"time"
 
@@ -25,33 +24,33 @@ const ResultEnvelopeDoc = " Every result is one JSON envelope: " +
 	"not_interactable, anti_bot, page_closed, timeout, nav_failed, unknown), " +
 	"apply error.hint when present, and read success payloads under data."
 
-// Error types carried in resultEnvelope.Error.Type. They are the agent's
+// Error types carried in ResultEnvelope.Error.Type. They are the agent's
 // machine branch signal; the human sentence stays in Error.Message.
 const (
-	errInvalidArgs     = "invalid_args"
-	errNotFound        = "not_found"
-	errElementNotFound = "element_not_found"
-	errNotInteractable = "not_interactable"
-	errAntiBot         = "anti_bot"
-	errPageClosed      = "page_closed"
-	errTimeout         = "timeout"
-	errNavFailed       = "nav_failed"
-	errUnknown         = "unknown"
+	ErrInvalidArgs     = "invalid_args"
+	ErrNotFound        = "not_found"
+	ErrElementNotFound = "element_not_found"
+	ErrNotInteractable = "not_interactable"
+	ErrAntiBot         = "anti_bot"
+	ErrPageClosed      = "page_closed"
+	ErrTimeout         = "timeout"
+	ErrNavFailed       = "nav_failed"
+	ErrUnknown         = "unknown"
 )
 
-// resultEnvelope is the single result shape every tool returns. Delta is the
+// ResultEnvelope is the single result shape every tool returns. Delta is the
 // reserved slot for the post-action state delta; it stays omitted until that
 // feature fills it.
-type resultEnvelope struct {
+type ResultEnvelope struct {
 	OK    bool            `json:"ok"`
 	Data  json.RawMessage `json:"data,omitempty"`
-	Error *envelopeError  `json:"error,omitempty"`
+	Error *EnvelopeError  `json:"error,omitempty"`
 	Delta json.RawMessage `json:"delta,omitempty"`
 }
 
-// envelopeError is the machine-readable failure branch: a stable type, the
+// EnvelopeError is the machine-readable failure branch: a stable type, the
 // existing human sentence, and an optional one-line remediation.
-type envelopeError struct {
+type EnvelopeError struct {
 	Type    string `json:"type"`
 	Message string `json:"message"`
 	Hint    string `json:"hint,omitempty"`
@@ -212,10 +211,10 @@ var navFailedMarkers = []string{
 	"net::err_",
 }
 
-// okResult builds the success envelope. A JSON payload is embedded raw so its
+// OKResult builds the success envelope. A JSON payload is embedded raw so its
 // fields stay addressable as data.<field>; prose becomes a JSON string.
-func okResult(payload string) (string, error) {
-	env := resultEnvelope{OK: true}
+func OKResult(payload string) (string, error) {
+	env := ResultEnvelope{OK: true}
 	if json.Valid([]byte(payload)) {
 		env.Data = json.RawMessage(payload)
 	} else {
@@ -225,17 +224,17 @@ func okResult(payload string) (string, error) {
 		}
 		env.Data = json.RawMessage(quoted)
 	}
-	return marshalEnvelope(env)
+	return MarshalEnvelope(env)
 }
 
-// failResult builds the failure envelope from err alone.
-func failResult(err error) (string, error) {
+// FailResult builds the failure envelope from err alone.
+func FailResult(err error) (string, error) {
 	return marshalFailure(err, challengeState{})
 }
 
-// failResultForPage builds the failure envelope, using the live page's title
+// FailResultForPage builds the failure envelope, using the live page's title
 // and URL to recognize a bot challenge when the error text is generic.
-func failResultForPage(
+func FailResultForPage(
 	ctx context.Context,
 	p *browsers.Page,
 	err error,
@@ -246,8 +245,8 @@ func failResultForPage(
 // marshalFailure is the single failure-envelope builder.
 func marshalFailure(err error, ch challengeState) (string, error) {
 	c := classifyError(err, ch)
-	return marshalEnvelope(resultEnvelope{
-		Error: &envelopeError{
+	return MarshalEnvelope(ResultEnvelope{
+		Error: &EnvelopeError{
 			Type:    c.Type,
 			Message: err.Error(),
 			Hint:    c.Hint,
@@ -255,8 +254,8 @@ func marshalFailure(err error, ch challengeState) (string, error) {
 	})
 }
 
-// marshalEnvelope encodes one compact envelope.
-func marshalEnvelope(env resultEnvelope) (string, error) {
+// MarshalEnvelope encodes one compact envelope.
+func MarshalEnvelope(env ResultEnvelope) (string, error) {
 	out, err := json.Marshal(env)
 	if err != nil {
 		return "", fmt.Errorf("encode result: %w", err)
@@ -330,7 +329,7 @@ func classifyError(err error, ch challengeState) classification {
 // and timeout before nav_failed.
 func classifyErrorType(err error, ch challengeState) classification {
 	if err == nil {
-		return classification{Type: errUnknown}
+		return classification{Type: ErrUnknown}
 	}
 	msg := strings.ToLower(err.Error())
 
@@ -338,54 +337,54 @@ func classifyErrorType(err error, ch challengeState) classification {
 	case isAs[*browsers.PageLookupError](err):
 		return lookupFailure(err)
 	case isAs[*browsers.PageLimitError](err):
-		return classification{Type: errInvalidArgs, Hint: hintPageCap}
+		return classification{Type: ErrInvalidArgs, Hint: hintPageCap}
 	case isAs[*browsers.FuzzBoundsError](err):
-		return plain(errInvalidArgs)
+		return plain(ErrInvalidArgs)
 	case errors.Is(err, browsers.ErrCanaryNeedsTracer):
-		return classification{Type: errInvalidArgs, Hint: hintCanaryTracer}
+		return classification{Type: ErrInvalidArgs, Hint: hintCanaryTracer}
 	case errors.Is(err, browsers.ErrUnknownBrowser):
-		return classification{Type: errInvalidArgs, Hint: hintUnknownBrowser}
+		return classification{Type: ErrInvalidArgs, Hint: hintUnknownBrowser}
 	case errors.Is(err, browsers.ErrReplayTargetAmbiguous),
 		errors.Is(err, browsers.ErrReplayTargetNotFound):
-		return plain(errInvalidArgs)
+		return plain(ErrInvalidArgs)
 	case containsAny(msg, notFoundMarkers):
 		// Stands in for a typed not-found error from the auth store.
-		return classification{Type: errNotFound, Hint: hintAuthSnapshot}
+		return classification{Type: ErrNotFound, Hint: hintAuthSnapshot}
 	case containsAny(msg, handleArgsMarkers):
 		// Stands in for a typed stale-handle error.
-		return classification{Type: errInvalidArgs, Hint: hintStaleHandle}
+		return classification{Type: ErrInvalidArgs, Hint: hintStaleHandle}
 	case containsAny(msg, userAgentMismatchMarkers):
 		// Stands in for a typed user-agent mismatch error.
-		return classification{Type: errInvalidArgs, Hint: hintUserAgentForce}
+		return classification{Type: ErrInvalidArgs, Hint: hintUserAgentForce}
 	case isAs[*browsers.ScopeError](err):
-		return classification{Type: errInvalidArgs, Hint: hintOf[*browsers.ScopeError](err)}
+		return classification{Type: ErrInvalidArgs, Hint: hintOf[*browsers.ScopeError](err)}
 	case isAs[*browsers.RateLimitError](err):
 		// A rate limit is a retryable delay, so it shares the timeout type.
-		return classification{Type: errTimeout, Hint: hintOf[*browsers.RateLimitError](err)}
+		return classification{Type: ErrTimeout, Hint: hintOf[*browsers.RateLimitError](err)}
 	case isAs[*browsers.ReplayTransportError](err):
 		return replayFailure(err)
 	case containsAny(msg, invalidArgsMarkers):
 		// Stands in for typed validation errors raised across the tools.
 		if containsAny(msg, decodeArgsMarkers) {
-			return plain(errInvalidArgs)
+			return plain(ErrInvalidArgs)
 		}
-		return classification{Type: errInvalidArgs}
+		return classification{Type: ErrInvalidArgs}
 	case isAs[*rod.ElementNotFoundError](err), containsAny(msg, elementNotFoundMarkers):
-		return plain(errElementNotFound)
+		return plain(ErrElementNotFound)
 	case isAs[*rod.NotInteractableError](err), containsAny(msg, notInteractableMarkers):
-		return plain(errNotInteractable)
+		return plain(ErrNotInteractable)
 	case ch.challenged(), containsAny(msg, antiBotMarkers):
-		return plain(errAntiBot)
+		return plain(ErrAntiBot)
 	case isAs[*rod.PageCloseCanceledError](err), containsAny(msg, pageClosedMarkers):
-		return plain(errPageClosed)
+		return plain(ErrPageClosed)
 	case errors.Is(err, context.DeadlineExceeded),
 		errors.Is(err, context.Canceled),
 		containsAny(msg, timeoutMarkers):
-		return plain(errTimeout)
+		return plain(ErrTimeout)
 	case isAs[*rod.NavigationError](err), containsAny(msg, navFailedMarkers):
-		return plain(errNavFailed)
+		return plain(ErrNavFailed)
 	default:
-		return plain(errUnknown)
+		return plain(ErrUnknown)
 	}
 }
 
@@ -394,39 +393,39 @@ func classifyErrorType(err error, ch challengeState) classification {
 func lookupFailure(err error) classification {
 	lookup, _ := errors.AsType[*browsers.PageLookupError](err)
 	if lookup.Kind == browsers.PageLookupAmbiguous {
-		return classification{Type: errInvalidArgs, Hint: hintLookupAmbiguous}
+		return classification{Type: ErrInvalidArgs, Hint: hintLookupAmbiguous}
 	}
-	return classification{Type: errNotFound, Hint: hintLookupMissing}
+	return classification{Type: ErrNotFound, Hint: hintLookupMissing}
 }
 
 // replayFailure classifies a replay transport failure by whether it timed out.
 func replayFailure(err error) classification {
 	replay, _ := errors.AsType[*browsers.ReplayTransportError](err)
 	if replay.TimedOut() {
-		return classification{Type: errTimeout, Hint: hintReplaySlow}
+		return classification{Type: ErrTimeout, Hint: hintReplaySlow}
 	}
-	return classification{Type: errNavFailed, Hint: hintReplayTransport}
+	return classification{Type: ErrNavFailed, Hint: hintReplayTransport}
 }
 
 // hintFor returns the one-line remediation for an error type. The unknown type
 // has no obvious fix, so it carries no hint.
 func hintFor(errType string) string {
 	switch errType {
-	case errInvalidArgs:
+	case ErrInvalidArgs:
 		return "fix the arguments per the tool InputSchema (required fields, enum values)"
-	case errNotFound:
+	case ErrNotFound:
 		return "the session is not in that browser or owner, or no longer exists — call session_list for the live ids, then pass the matching browser_id or owner"
-	case errElementNotFound:
+	case ErrElementNotFound:
 		return "no element matched the selector — read what=dom or what=links and retry with an exact selector"
-	case errNotInteractable:
+	case ErrNotInteractable:
 		return "element exists but is not clickable/visible (covered or off-viewport) — scroll it into view or pick a visible element from what=dom"
-	case errAntiBot:
+	case ErrAntiBot:
 		return "the site presented a bot challenge — retry after a wait, toggle stealth via browser_create, or hand off to a human"
-	case errPageClosed:
+	case ErrPageClosed:
 		return "the page was closed, swept by the idle TTL, or the browser restarted — call fetch_page to re-open the URL"
-	case errTimeout:
+	case ErrTimeout:
 		return "the call exceeded its timeout (default 30s) — retry with a higher timeout_ms, narrow the selector, or the page is wedged"
-	case errNavFailed:
+	case ErrNavFailed:
 		return "the page navigation failed — verify the URL is reachable, retry, or re-fetch the page"
 	default:
 		return ""
@@ -472,93 +471,4 @@ func containsAny(s string, markers []string) bool {
 		}
 	}
 	return false
-}
-
-// coerceNumberString rewrites an argument that failed to decode because a JSON
-// string was sent for a numeric field, when that string is a bare number that
-// fits the field's type. Clients that stringify scalars can still set numeric
-// fields; a non-numeric string keeps the original type error.
-func coerceNumberString(args json.RawMessage, err error) (json.RawMessage, bool) {
-	var typeErr *json.UnmarshalTypeError
-	if !errors.As(err, &typeErr) || typeErr.Field == "" {
-		return nil, false
-	}
-	want := typeErr.Type
-	for want != nil && want.Kind() == reflect.Pointer {
-		want = want.Elem()
-	}
-	if want == nil || !isNumberKind(want.Kind()) {
-		return nil, false
-	}
-	raw, ok := fieldValue(args, typeErr.Field)
-	if !ok {
-		return nil, false
-	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return nil, false
-	}
-	literal := strings.TrimSpace(s)
-	if !isBareNumber(literal) {
-		return nil, false
-	}
-	if err := json.Unmarshal([]byte(literal), reflect.New(want).Interface()); err != nil {
-		return nil, false
-	}
-	return setArgument(args, typeErr.Field, json.RawMessage(literal))
-}
-
-// isNumberKind reports whether a Go kind holds a schema number or integer.
-func isNumberKind(k reflect.Kind) bool {
-	switch k {
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
-		reflect.Float32, reflect.Float64:
-		return true
-	}
-	return false
-}
-
-// isBareNumber reports whether s is a JSON number literal with no surrounding
-// text, so "8000" and "-1.5" qualify but "8,000", "eight" and "null" do not.
-func isBareNumber(s string) bool {
-	if s == "" {
-		return false
-	}
-	if s[0] != '-' && (s[0] < '0' || s[0] > '9') {
-		return false
-	}
-	return json.Valid([]byte(s))
-}
-
-// setArgument replaces a dotted field path in args with val, re-encoding each
-// enclosing object so a nested numeric field is rewritten in place.
-func setArgument(
-	args json.RawMessage,
-	field string,
-	val json.RawMessage,
-) (json.RawMessage, bool) {
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(args, &obj); err != nil {
-		return nil, false
-	}
-	head, rest, nested := strings.Cut(field, ".")
-	if !nested {
-		obj[head] = val
-	} else {
-		child, ok := obj[head]
-		if !ok {
-			return nil, false
-		}
-		rewritten, ok := setArgument(child, rest, val)
-		if !ok {
-			return nil, false
-		}
-		obj[head] = rewritten
-	}
-	out, err := json.Marshal(obj)
-	if err != nil {
-		return nil, false
-	}
-	return out, true
 }

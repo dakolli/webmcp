@@ -162,3 +162,16 @@ func TestBrowserCloseCleanupArgValidation(t *testing.T) {
 		})
 	}
 }
+
+// mustEnvelope decodes a result envelope and fails the test on invalid JSON.
+func mustEnvelope(t *testing.T, out string) resultEnvelope {
+	t.Helper()
+	if !json.Valid([]byte(out)) {
+		t.Fatalf("result = %s, not valid JSON", out)
+	}
+	var env resultEnvelope
+	if err := json.Unmarshal([]byte(out), &env); err != nil {
+		t.Fatalf("unmarshal result %s: %v", out, err)
+	}
+	return env
+}

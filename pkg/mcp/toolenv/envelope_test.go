@@ -1,4 +1,4 @@
-package tools
+package toolenv
 
 import (
 	"context"
@@ -14,32 +14,39 @@ import (
 	"github.com/dakolli/webmcp/pkg/browsers"
 )
 
+// decodeProbe is the subset of page_fetch arguments these tests decode into.
+type decodeProbe struct {
+	SessionID string `json:"session_id"`
+	What      string `json:"what"`
+	MaxBytes  int    `json:"max_bytes"`
+}
+
 // TestDecodeArgsCoercesNumericStrings pins that a quoted integer is accepted for
 // max_bytes while a non-numeric string keeps the existing invalid_args sentence.
 func TestDecodeArgsCoercesNumericStrings(t *testing.T) {
 	t.Run("quoted number is coerced", func(t *testing.T) {
-		var a pageFetchArgs
-		err := decodeArgs("page_fetch", json.RawMessage(
+		var a decodeProbe
+		err := DecodeArgs("page_fetch", json.RawMessage(
 			`{"session_id":"page-1","what":"dom","max_bytes":"8000"}`,
 		), &a)
 		if err != nil {
-			t.Fatalf("decodeArgs() error = %v", err)
+			t.Fatalf("DecodeArgs() error = %v", err)
 		}
 		if a.MaxBytes != 8000 {
 			t.Fatalf("max_bytes = %d, want 8000", a.MaxBytes)
 		}
 	})
 	t.Run("non-numeric string is refused", func(t *testing.T) {
-		var a pageFetchArgs
-		err := decodeArgs("page_fetch", json.RawMessage(
+		var a decodeProbe
+		err := DecodeArgs("page_fetch", json.RawMessage(
 			`{"session_id":"page-1","what":"dom","max_bytes":"eight"}`,
 		), &a)
 		if err == nil {
-			t.Fatal("decodeArgs() = nil, want an argument type error")
+			t.Fatal("DecodeArgs() = nil, want an argument type error")
 		}
 		want := `page_fetch: "max_bytes" must be a number, but the request sent the string "eight".`
 		if err.Error() != want {
-			t.Fatalf("decodeArgs() = %q, want %q", err, want)
+			t.Fatalf("DecodeArgs() = %q, want %q", err, want)
 		}
 	})
 }
@@ -48,15 +55,15 @@ func TestDecodeArgsCoercesNumericStrings(t *testing.T) {
 // coerced: a string sent for a string field and an object sent for a number are
 // still rejected.
 func TestDecodeArgsKeepsNonNumericWrongType(t *testing.T) {
-	var a pageFetchArgs
-	err := decodeArgs("page_fetch", json.RawMessage(
+	var a decodeProbe
+	err := DecodeArgs("page_fetch", json.RawMessage(
 		`{"session_id":"page-1","what":"dom","max_bytes":{"value":8000}}`,
 	), &a)
 	if err == nil {
-		t.Fatal("decodeArgs() = nil, want an argument type error")
+		t.Fatal("DecodeArgs() = nil, want an argument type error")
 	}
 	if !strings.Contains(err.Error(), `"max_bytes" must be a number`) {
-		t.Fatalf("decodeArgs() = %q, want the max_bytes type error", err)
+		t.Fatalf("DecodeArgs() = %q, want the max_bytes type error", err)
 	}
 }
 
@@ -89,48 +96,48 @@ func TestOkResultEmbedsJSONPayload(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			out, err := okResult(tt.payload)
+			out, err := OKResult(tt.payload)
 			if err != nil {
-				t.Fatalf("okResult() error = %v", err)
+				t.Fatalf("OKResult() error = %v", err)
 			}
 			if out != tt.want {
-				t.Fatalf("okResult() = %s, want %s", out, tt.want)
+				t.Fatalf("OKResult() = %s, want %s", out, tt.want)
 			}
 			if !json.Valid([]byte(out)) {
-				t.Fatalf("okResult() = %s, not valid JSON", out)
+				t.Fatalf("OKResult() = %s, not valid JSON", out)
 			}
 		})
 	}
 }
 
 func TestFailResultUnknownHasNoHint(t *testing.T) {
-	out, err := failResult(errors.New("unexpected"))
+	out, err := FailResult(errors.New("unexpected"))
 	if err != nil {
-		t.Fatalf("failResult() error = %v", err)
+		t.Fatalf("FailResult() error = %v", err)
 	}
 	want := `{"ok":false,"error":{"type":"unknown","message":"unexpected"}}`
 	if out != want {
-		t.Fatalf("failResult() = %s, want %s", out, want)
+		t.Fatalf("FailResult() = %s, want %s", out, want)
 	}
 	if !json.Valid([]byte(out)) {
-		t.Fatalf("failResult() = %s, not valid JSON", out)
+		t.Fatalf("FailResult() = %s, not valid JSON", out)
 	}
 }
 
 func TestFailResultTypedErrorCarriesHint(t *testing.T) {
-	out, err := failResult(errors.New("page_act: cannot find element"))
+	out, err := FailResult(errors.New("page_act: cannot find element"))
 	if err != nil {
-		t.Fatalf("failResult() error = %v", err)
+		t.Fatalf("FailResult() error = %v", err)
 	}
 	env := mustEnvelope(t, out)
 	if env.OK {
-		t.Fatal("failResult() ok = true, want false")
+		t.Fatal("FailResult() ok = true, want false")
 	}
 	if env.Error == nil {
-		t.Fatal("failResult() error = nil, want the error branch")
+		t.Fatal("FailResult() error = nil, want the error branch")
 	}
-	if env.Error.Type != errElementNotFound {
-		t.Fatalf("type = %q, want %q", env.Error.Type, errElementNotFound)
+	if env.Error.Type != ErrElementNotFound {
+		t.Fatalf("type = %q, want %q", env.Error.Type, ErrElementNotFound)
 	}
 	if env.Error.Message != "page_act: cannot find element" {
 		t.Fatalf("message = %q, want the original sentence", env.Error.Message)
@@ -150,12 +157,12 @@ func TestClassifyError(t *testing.T) {
 		{
 			name: "invalid args marker",
 			err:  errors.New(`fetch_page: missing required argument "url"`),
-			want: errInvalidArgs,
+			want: ErrInvalidArgs,
 		},
 		{
 			name: "invalid args type error",
 			err:  errors.New(`browser_create: "ignore_certs" must be a boolean (true or false), but the request sent the string "yes".`),
-			want: errInvalidArgs,
+			want: ErrInvalidArgs,
 		},
 		{
 			name: "foreign session is not found",
@@ -163,7 +170,7 @@ func TestClassifyError(t *testing.T) {
 				Kind:    browsers.PageLookupForeign,
 				Message: `session "page-2" not found for owner a — held by browser-2 (owner b)`,
 			}),
-			want: errNotFound,
+			want: ErrNotFound,
 		},
 		{
 			name: "missing session is not found",
@@ -171,7 +178,7 @@ func TestClassifyError(t *testing.T) {
 				Kind:    browsers.PageLookupMissing,
 				Message: `session "page-9" not found (live: page-1)`,
 			}),
-			want: errNotFound,
+			want: ErrNotFound,
 		},
 		{
 			name: "typed missing beats the restart marker",
@@ -179,7 +186,7 @@ func TestClassifyError(t *testing.T) {
 				Kind:    browsers.PageLookupMissing,
 				Message: `session "page-1" no longer exists: browser was restarted; call fetch_page to re-open URLs`,
 			}),
-			want: errNotFound,
+			want: ErrNotFound,
 		},
 		{
 			name: "ambiguous session is invalid args",
@@ -187,89 +194,89 @@ func TestClassifyError(t *testing.T) {
 				Kind:    browsers.PageLookupAmbiguous,
 				Message: `session "page-3" needs a browser — 2 browsers are live: browser-1 (owner a), browser-2 (owner b)`,
 			}),
-			want: errInvalidArgs,
+			want: ErrInvalidArgs,
 		},
 		{
 			name: "page limit is invalid args",
 			err:  &browsers.PageLimitError{Browser: "browser-1", Count: 20, Limit: 20},
-			want: errInvalidArgs,
+			want: ErrInvalidArgs,
 		},
 		{
 			name: "element not found typed",
 			err:  fmt.Errorf("page_act: %w", &rod.ElementNotFoundError{}),
-			want: errElementNotFound,
+			want: ErrElementNotFound,
 		},
 		{
 			name: "element not found marker",
 			err:  errors.New("page_act: cannot find element"),
-			want: errElementNotFound,
+			want: ErrElementNotFound,
 		},
 		{
 			name: "not interactable typed",
 			err:  fmt.Errorf("page_act: %w", &rod.NotInteractableError{}),
-			want: errNotInteractable,
+			want: ErrNotInteractable,
 		},
 		{
 			name: "not interactable marker",
 			err:  errors.New("page_act: element is not cursor interactable"),
-			want: errNotInteractable,
+			want: ErrNotInteractable,
 		},
 		{
 			name: "anti bot marker",
 			err:  errors.New("Access to this page has been denied"),
-			want: errAntiBot,
+			want: ErrAntiBot,
 		},
 		{
 			name: "anti bot page title",
 			err:  errors.New("fetch_page: context deadline exceeded"),
 			page: challengeState{title: "Just a moment..."},
-			want: errAntiBot,
+			want: ErrAntiBot,
 		},
 		{
 			name: "anti bot page url",
 			err:  errors.New("page_act: navigation failed"),
 			page: challengeState{url: "https://example.com/captcha"},
-			want: errAntiBot,
+			want: ErrAntiBot,
 		},
 		{
 			name: "page closed nil rod handle",
 			err:  errors.New("page_act: page is closed (nil rod handle)"),
-			want: errPageClosed,
+			want: ErrPageClosed,
 		},
 		{
 			name: "page closed manager restart",
 			err:  errors.New(`session "page-1" no longer exists: browser was restarted; call fetch_page to re-open URLs`),
-			want: errPageClosed,
+			want: ErrPageClosed,
 		},
 		{
 			name: "page closed inspected target",
 			err:  errors.New("-32000 Inspected target navigated or closed"),
-			want: errPageClosed,
+			want: ErrPageClosed,
 		},
 		{
 			name: "page closed typed",
 			err:  fmt.Errorf("page_act: %w", &rod.PageCloseCanceledError{}),
-			want: errPageClosed,
+			want: ErrPageClosed,
 		},
 		{
 			name: "timeout deadline exceeded",
 			err:  fmt.Errorf("page_fetch: %w", context.DeadlineExceeded),
-			want: errTimeout,
+			want: ErrTimeout,
 		},
 		{
 			name: "timeout canceled",
 			err:  context.Canceled,
-			want: errTimeout,
+			want: ErrTimeout,
 		},
 		{
 			name: "nav failed typed",
 			err:  fmt.Errorf("page_act: %w", &rod.NavigationError{Reason: "net::ERR_NAME_NOT_RESOLVED"}),
-			want: errNavFailed,
+			want: ErrNavFailed,
 		},
 		{
 			name: "nav failed marker",
 			err:  errors.New("page_act: navigation failed"),
-			want: errNavFailed,
+			want: ErrNavFailed,
 		},
 		{
 			name: "over-bound fuzz matrix is invalid args",
@@ -278,7 +285,7 @@ func TestClassifyError(t *testing.T) {
 				Computed: "243",
 				Bound:    "100",
 			}),
-			want: errInvalidArgs,
+			want: ErrInvalidArgs,
 		},
 		{
 			name: "rate-limited call is a timeout",
@@ -287,57 +294,57 @@ func TestClassifyError(t *testing.T) {
 				Wait: time.Second,
 				Err:  context.DeadlineExceeded,
 			}),
-			want: errTimeout,
+			want: ErrTimeout,
 		},
 		{
 			name: "stale handle is invalid args",
 			err:  errors.New(`page_act: click: handle "g1-b7" is stale — minted for a previous document (re-run page_fetch what=interactives to re-mint handles)`),
-			want: errInvalidArgs,
+			want: ErrInvalidArgs,
 		},
 		{
 			name: "unknown mouse button is invalid args",
 			err:  errors.New(`page_act: click: unknown mouse button "side" (must be left, right, or middle)`),
-			want: errInvalidArgs,
+			want: ErrInvalidArgs,
 		},
 		{
 			name: "canary without the tracer is invalid args",
 			err:  fmt.Errorf("page_act: %w", browsers.ErrCanaryNeedsTracer),
-			want: errInvalidArgs,
+			want: ErrInvalidArgs,
 		},
 		{
 			name: "intercept rule validation is invalid args",
 			err:  errors.New(`page_act: intercept: rule "r1" has status 700 (must be 100-599)`),
-			want: errInvalidArgs,
+			want: ErrInvalidArgs,
 		},
 		{
 			name: "poc_bundle relative path is invalid args",
 			err:  errors.New(`page_act: poc_bundle: "poc-xss" must be absolute`),
-			want: errInvalidArgs,
+			want: ErrInvalidArgs,
 		},
 		{
 			name: "poc_bundle non-empty directory is invalid args",
 			err:  errors.New("page_act: poc_bundle: /tmp/poc-xss is not empty — pass a new directory or remove its contents"),
-			want: errInvalidArgs,
+			want: ErrInvalidArgs,
 		},
 		{
 			name: "auth user-agent mismatch is invalid args",
 			err:  errors.New(`page_act: auth_restore: stored user agent "Chrome/1" does not match the live page user agent "Chrome/2" — re-capture on this browser, or pass force=true to restore anyway`),
-			want: errInvalidArgs,
+			want: ErrInvalidArgs,
 		},
 		{
 			name: "missing auth snapshot is not found",
 			err:  errors.New("page_act: auth_restore: store: auth snapshot not found: example.org/main"),
-			want: errNotFound,
+			want: ErrNotFound,
 		},
 		{
 			name: "wait_open on a closed browser is page closed",
 			err:  errors.New("page_act: browsers: wait_open: browser browser-1 is closed"),
-			want: errPageClosed,
+			want: ErrPageClosed,
 		},
 		{
 			name: "unknown eval error stays verbatim",
 			err:  errors.New("page_act: eval js error: TypeError: boom"),
-			want: errUnknown,
+			want: ErrUnknown,
 		},
 	}
 	for _, tt := range tests {
@@ -346,10 +353,10 @@ func TestClassifyError(t *testing.T) {
 			if c.Type != tt.want {
 				t.Fatalf("classifyError() = %q, want %q", c.Type, tt.want)
 			}
-			if c.Type == errUnknown && c.Hint != "" {
+			if c.Type == ErrUnknown && c.Hint != "" {
 				t.Fatalf("unknown hint = %q, want none", c.Hint)
 			}
-			if c.Type != errUnknown && c.Type != errInvalidArgs && c.Hint == "" {
+			if c.Type != ErrUnknown && c.Type != ErrInvalidArgs && c.Hint == "" {
 				t.Fatalf("%s hint = empty, want a remediation", c.Type)
 			}
 		})
@@ -373,7 +380,7 @@ func TestPolicyRefusalHints(t *testing.T) {
 				Allowed: "developer.android.com",
 				Scope:   "developer.android.com",
 			}),
-			wantType: errInvalidArgs,
+			wantType: ErrInvalidArgs,
 			wantHint: []string{"browser_create", "scope"},
 		},
 		{
@@ -383,15 +390,15 @@ func TestPolicyRefusalHints(t *testing.T) {
 				Wait: time.Second,
 				Err:  context.DeadlineExceeded,
 			}),
-			wantType: errTimeout,
+			wantType: ErrTimeout,
 			wantHint: []string{"rps", "burst"},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			out, err := failResult(tt.err)
+			out, err := FailResult(tt.err)
 			if err != nil {
-				t.Fatalf("failResult() error = %v", err)
+				t.Fatalf("FailResult() error = %v", err)
 			}
 			env := mustEnvelope(t, out)
 			if env.Error == nil {
@@ -408,7 +415,7 @@ func TestPolicyRefusalHints(t *testing.T) {
 			if strings.Contains(env.Error.Hint, "InputSchema") {
 				t.Fatalf("hint = %q, want the policy fix, not the schema remediation", env.Error.Hint)
 			}
-			if env.Error.Hint == hintFor(errInvalidArgs) {
+			if env.Error.Hint == hintFor(ErrInvalidArgs) {
 				t.Fatalf("hint = %q, want the policy hint, not the schema hint", env.Error.Hint)
 			}
 		})
@@ -424,22 +431,22 @@ func TestClassifyErrorPrecedence(t *testing.T) {
 		{
 			name: "invalid args beats page closed",
 			err:  errors.New(`missing required argument "session_id": page session is closed`),
-			want: errInvalidArgs,
+			want: ErrInvalidArgs,
 		},
 		{
 			name: "page closed beats timeout",
 			err:  fmt.Errorf("page session is closed: %w", context.DeadlineExceeded),
-			want: errPageClosed,
+			want: ErrPageClosed,
 		},
 		{
 			name: "anti bot beats nav failed",
 			err:  errors.New("navigation failed: access denied"),
-			want: errAntiBot,
+			want: ErrAntiBot,
 		},
 		{
 			name: "timeout beats nav failed",
 			err:  fmt.Errorf("navigation failed: %w", context.DeadlineExceeded),
-			want: errTimeout,
+			want: ErrTimeout,
 		},
 	}
 	for _, tt := range tests {
@@ -447,12 +454,12 @@ func TestClassifyErrorPrecedence(t *testing.T) {
 			if got := classifyError(tt.err, challengeState{}); got.Type != tt.want {
 				t.Fatalf("classifyError() = %q, want %q", got.Type, tt.want)
 			}
-			out, err := failResult(tt.err)
+			out, err := FailResult(tt.err)
 			if err != nil {
-				t.Fatalf("failResult() error = %v", err)
+				t.Fatalf("FailResult() error = %v", err)
 			}
 			if env := mustEnvelope(t, out); env.Error == nil || env.Error.Type != tt.want {
-				t.Fatalf("failResult() type = %v, want %q", env.Error, tt.want)
+				t.Fatalf("FailResult() type = %v, want %q", env.Error, tt.want)
 			}
 		})
 	}
@@ -473,32 +480,32 @@ func TestSessionLookupEnvelopes(t *testing.T) {
 			name:     "foreign",
 			kind:     browsers.PageLookupForeign,
 			msg:      `session "page-2" is not in owner task-a — held by browser-2 (owner task-b); pass browser_id to reach it on purpose`,
-			wantType: errNotFound,
+			wantType: ErrNotFound,
 			wantHint: "the session is not in that browser or owner — call session_list for the live ids, or pass the matching browser_id or owner",
 		},
 		{
 			name:     "missing",
 			kind:     browsers.PageLookupMissing,
 			msg:      `session "page-9" not found (live: page-1)`,
-			wantType: errNotFound,
+			wantType: ErrNotFound,
 			wantHint: "the session is not in that browser or owner — call session_list for the live ids, or pass the matching browser_id or owner",
 		},
 		{
 			name:     "ambiguous",
 			kind:     browsers.PageLookupAmbiguous,
 			msg:      `session "page-3" needs a browser — 2 browsers are live: browser-1 (owner task-a), browser-2 (owner task-b); pass browser_id or owner`,
-			wantType: errInvalidArgs,
+			wantType: ErrInvalidArgs,
 			wantHint: "this session id needs a browser — pass browser_id or owner to choose the browser that holds it",
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			out, err := failResult(fmt.Errorf("page_fetch: %w", &browsers.PageLookupError{
+			out, err := FailResult(fmt.Errorf("page_fetch: %w", &browsers.PageLookupError{
 				Kind:    tc.kind,
 				Message: tc.msg,
 			}))
 			if err != nil {
-				t.Fatalf("failResult() error = %v", err)
+				t.Fatalf("FailResult() error = %v", err)
 			}
 			t.Logf("payload: %s", out)
 			env := mustEnvelope(t, out)
@@ -534,8 +541,8 @@ func TestAntiBotMarkersArePinned(t *testing.T) {
 	}
 	for _, marker := range markers {
 		t.Run(marker, func(t *testing.T) {
-			if got := classifyError(errors.New(marker), challengeState{}); got.Type != errAntiBot {
-				t.Fatalf("classifyError(%q) = %q, want %q", marker, got.Type, errAntiBot)
+			if got := classifyError(errors.New(marker), challengeState{}); got.Type != ErrAntiBot {
+				t.Fatalf("classifyError(%q) = %q, want %q", marker, got.Type, ErrAntiBot)
 			}
 		})
 	}
@@ -556,7 +563,7 @@ func TestChallengeURLIsNotAntiBot(t *testing.T) {
 				browsers.ErrReplayTargetAmbiguous,
 				"site.test",
 			)),
-			want: errInvalidArgs,
+			want: ErrInvalidArgs,
 		},
 		{
 			name: "replay transport failure naming a challenge URL is nav_failed",
@@ -566,7 +573,7 @@ func TestChallengeURLIsNotAntiBot(t *testing.T) {
 				Budget: 30 * time.Second,
 				Err:    errors.New("dial tcp: connection refused"),
 			}),
-			want: errNavFailed,
+			want: ErrNavFailed,
 		},
 	}
 	for _, tt := range tests {
@@ -590,12 +597,12 @@ func TestClassifyReplayErrors(t *testing.T) {
 		{
 			name: "ambiguous target",
 			err:  fmt.Errorf("page_act: %w: target %q matches 2 network entries: seq=1 GET https://a.test/x, seq=2 GET https://a.test/x/y", browsers.ErrReplayTargetAmbiguous, "a.test"),
-			want: errInvalidArgs,
+			want: ErrInvalidArgs,
 		},
 		{
 			name: "missing target",
 			err:  fmt.Errorf("page_act: %w: no network entry matches target %q", browsers.ErrReplayTargetNotFound, "nope"),
-			want: errInvalidArgs,
+			want: ErrInvalidArgs,
 		},
 		{
 			name: "replay timeout is a timeout",
@@ -605,7 +612,7 @@ func TestClassifyReplayErrors(t *testing.T) {
 				Budget: 30 * time.Second,
 				Err:    fmt.Errorf("Get %q: %w", "https://slow.test/", context.DeadlineExceeded),
 			}),
-			want: errTimeout,
+			want: ErrTimeout,
 		},
 		{
 			name: "replay transport failure is nav_failed",
@@ -615,7 +622,7 @@ func TestClassifyReplayErrors(t *testing.T) {
 				Budget: 30 * time.Second,
 				Err:    errors.New("dial tcp: no such host"),
 			}),
-			want: errNavFailed,
+			want: ErrNavFailed,
 		},
 	}
 	for _, tt := range tests {
@@ -623,13 +630,13 @@ func TestClassifyReplayErrors(t *testing.T) {
 			if got := classifyError(tt.err, challengeState{}); got.Type != tt.want {
 				t.Fatalf("classifyError() = %q, want %q", got.Type, tt.want)
 			}
-			out, err := failResult(tt.err)
+			out, err := FailResult(tt.err)
 			if err != nil {
-				t.Fatalf("failResult() error = %v", err)
+				t.Fatalf("FailResult() error = %v", err)
 			}
 			env := mustEnvelope(t, out)
 			if env.Error == nil || env.Error.Type != tt.want {
-				t.Fatalf("failResult() error branch = %+v, want type %q", env.Error, tt.want)
+				t.Fatalf("FailResult() error branch = %+v, want type %q", env.Error, tt.want)
 			}
 		})
 	}
@@ -644,16 +651,16 @@ func TestPageLimitEnvelopeIsInvalidArgs(t *testing.T) {
 		Count:   20,
 		Limit:   20,
 	})
-	out, marshalErr := failResult(err)
+	out, marshalErr := FailResult(err)
 	if marshalErr != nil {
-		t.Fatalf("failResult() error = %v", marshalErr)
+		t.Fatalf("FailResult() error = %v", marshalErr)
 	}
 	env := mustEnvelope(t, out)
 	if env.Error == nil {
 		t.Fatal("envelope has no error branch")
 	}
-	if env.Error.Type != errInvalidArgs {
-		t.Fatalf("type = %q, want %q", env.Error.Type, errInvalidArgs)
+	if env.Error.Type != ErrInvalidArgs {
+		t.Fatalf("type = %q, want %q", env.Error.Type, ErrInvalidArgs)
 	}
 	for _, want := range []string{"browser browser-1", "20 live pages", "max 20"} {
 		if !strings.Contains(env.Error.Message, want) {
@@ -677,16 +684,16 @@ func TestOverBoundFuzzEnvelopeIsInvalidArgs(t *testing.T) {
 		Computed: "243",
 		Bound:    "100",
 	})
-	out, marshalErr := failResult(err)
+	out, marshalErr := FailResult(err)
 	if marshalErr != nil {
-		t.Fatalf("failResult() error = %v", marshalErr)
+		t.Fatalf("FailResult() error = %v", marshalErr)
 	}
 	env := mustEnvelope(t, out)
 	if env.Error == nil {
 		t.Fatal("envelope has no error branch")
 	}
-	if env.Error.Type != errInvalidArgs {
-		t.Fatalf("type = %q, want %q", env.Error.Type, errInvalidArgs)
+	if env.Error.Type != ErrInvalidArgs {
+		t.Fatalf("type = %q, want %q", env.Error.Type, ErrInvalidArgs)
 	}
 	if want := "page_act: replay_fuzz: requests computed 243, over the 100 bound"; env.Error.Message != want {
 		t.Fatalf("message = %q, want %q", env.Error.Message, want)
@@ -706,16 +713,16 @@ func TestActionTimeoutEnvelopeNamesBothEscapes(t *testing.T) {
 		Page: "page-1",
 		Err:  context.DeadlineExceeded,
 	})
-	out, marshalErr := failResult(err)
+	out, marshalErr := FailResult(err)
 	if marshalErr != nil {
-		t.Fatalf("failResult() error = %v", marshalErr)
+		t.Fatalf("FailResult() error = %v", marshalErr)
 	}
 	env := mustEnvelope(t, out)
 	if env.Error == nil {
 		t.Fatal("envelope has no error branch")
 	}
-	if env.Error.Type != errTimeout {
-		t.Fatalf("type = %q, want %q", env.Error.Type, errTimeout)
+	if env.Error.Type != ErrTimeout {
+		t.Fatalf("type = %q, want %q", env.Error.Type, ErrTimeout)
 	}
 	for _, want := range []string{"raw:true", "timeout_ms"} {
 		if !strings.Contains(env.Error.Hint, want) {
@@ -733,10 +740,10 @@ func TestSpecificHintBeatsGenericHint(t *testing.T) {
 		Err:  context.DeadlineExceeded,
 	})
 	got := classifyError(timeoutErr, challengeState{})
-	if got.Type != errTimeout {
-		t.Fatalf("type = %q, want %q", got.Type, errTimeout)
+	if got.Type != ErrTimeout {
+		t.Fatalf("type = %q, want %q", got.Type, ErrTimeout)
 	}
-	if got.Hint == hintFor(errTimeout) {
+	if got.Hint == hintFor(ErrTimeout) {
 		t.Fatalf("hint = %q, want the typed hint, not the generic one", got.Hint)
 	}
 	if !strings.Contains(got.Hint, "raw:true") {
@@ -749,10 +756,10 @@ func TestSpecificHintBeatsGenericHint(t *testing.T) {
 		Bound:    "50",
 	})
 	got = classifyError(fuzzErr, challengeState{})
-	if got.Type != errInvalidArgs {
-		t.Fatalf("type = %q, want %q", got.Type, errInvalidArgs)
+	if got.Type != ErrInvalidArgs {
+		t.Fatalf("type = %q, want %q", got.Type, ErrInvalidArgs)
 	}
-	if got.Hint == hintFor(errInvalidArgs) {
+	if got.Hint == hintFor(ErrInvalidArgs) {
 		t.Fatalf("hint = %q, want the typed hint, not the generic one", got.Hint)
 	}
 	if !strings.Contains(got.Hint, "50") {
@@ -782,26 +789,26 @@ func TestInvalidArgsHintOnlyForDecodeFailures(t *testing.T) {
 		{
 			name:     "type mismatch keeps the schema hint",
 			err:      errors.New(`browser_create: "ignore_certs" must be a boolean (true or false), but the request sent the string "yes".`),
-			wantHint: hintFor(errInvalidArgs),
+			wantHint: hintFor(ErrInvalidArgs),
 		},
 		{
 			name:     "structured decode failure keeps the schema hint",
 			err:      errors.New(`page_act: invalid arguments: json: cannot unmarshal number into Go struct field args.timeout_ms`),
-			wantHint: hintFor(errInvalidArgs),
+			wantHint: hintFor(ErrInvalidArgs),
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			out, err := failResult(tt.err)
+			out, err := FailResult(tt.err)
 			if err != nil {
-				t.Fatalf("failResult() error = %v", err)
+				t.Fatalf("FailResult() error = %v", err)
 			}
 			env := mustEnvelope(t, out)
 			if env.Error == nil {
 				t.Fatal("envelope has no error branch")
 			}
-			if env.Error.Type != errInvalidArgs {
-				t.Fatalf("type = %q, want %q", env.Error.Type, errInvalidArgs)
+			if env.Error.Type != ErrInvalidArgs {
+				t.Fatalf("type = %q, want %q", env.Error.Type, ErrInvalidArgs)
 			}
 			if env.Error.Hint != tt.wantHint {
 				t.Fatalf("hint = %q, want %q", env.Error.Hint, tt.wantHint)
@@ -823,12 +830,12 @@ func (e hintedArgsError) Hint() string {
 	return "pass an absolute directory that does not exist yet"
 }
 
-func mustEnvelope(t *testing.T, out string) resultEnvelope {
+func mustEnvelope(t *testing.T, out string) ResultEnvelope {
 	t.Helper()
 	if !json.Valid([]byte(out)) {
 		t.Fatalf("result = %s, not valid JSON", out)
 	}
-	var env resultEnvelope
+	var env ResultEnvelope
 	if err := json.Unmarshal([]byte(out), &env); err != nil {
 		t.Fatalf("unmarshal result %s: %v", out, err)
 	}
