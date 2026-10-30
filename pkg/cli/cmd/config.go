@@ -87,6 +87,17 @@ func newConfigShowCmd() *cobra.Command {
 			defer cancel()
 			fmt.Fprintf(out, "caido: %s, %s\n", caidoState, cf.URL)
 			fmt.Fprintf(out, "auth: %s\n", caidoAuthState(authCtx, cf))
+			project := cf.Project
+			if project == "" {
+				project = "(instance default)"
+			}
+			scope := cf.ScopeName
+			if scope == "" {
+				scope = "(none)"
+			}
+			fmt.Fprintf(out, "project: %s\n", project)
+			fmt.Fprintf(out, "scope: %s allow=%v deny=%v\n", scope, cf.ScopeAllow, cf.ScopeDeny)
+			fmt.Fprintf(out, "capture: %s\n", captureLabel(cf))
 			quiet := "quiet"
 			if !bf.Quiet {
 				quiet = "quiet off"
@@ -97,6 +108,22 @@ func newConfigShowCmd() *cobra.Command {
 			}
 			return nil
 		},
+	}
+}
+
+// captureLabel renders the configured capture mode for `config show`.
+func captureLabel(cf config.CaidoFile) string {
+	mode, err := cf.CaptureMode()
+	if err != nil {
+		return "invalid"
+	}
+	switch mode {
+	case config.CaptureAll:
+		return "all"
+	case config.CaptureInScope:
+		return "in-scope"
+	default:
+		return "unchanged"
 	}
 }
 

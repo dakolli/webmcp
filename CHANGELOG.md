@@ -29,6 +29,15 @@
 - `[caido] access_token` takes a direct instance token, and `[caido] allow_guest` (default true)
   allows the local guest session. `config show` now reports which one worked, for example
   `auth: pat (rejected), guest`.
+- `[caido] project`, `scope_name`, `scope_allow` and `scope_deny` make `browser serve` match the
+  instance at launch: it selects the named project and creates or updates one scope. The scope id
+  stays stable, and the tool never deletes a scope.
+- `browser serve` prints one line each for the auth mode, the project, the scope with its id and
+  allowlist, and the capture mode. A focus scope with an empty allowlist warns that it matches all
+  traffic.
+- `[caido] capture = "in-scope"` makes the proxy record only hosts in the scope allowlist.
+  `capture = "all"` records everything. Proven on Caido 0.59.0. An empty value leaves the instance
+  unchanged.
 - `.agents/skills/caido/` documents the tool for an agent.
 
 ## 0.2.5 - 2026-10-28

@@ -260,6 +260,15 @@ the default target, and `--max-bytes 0` for unbounded output.
   `browser serve mcp`, `--caido-token` overrides the file `access_token`, `--caido-pat` overrides
   `CAIDO_PAT`, which overrides the file `pat`, and `--caido` forces the tool on. An `access_token`
   wins over a `pat`; a rejected credential falls back to a guest session unless `allow_guest = false`.
+  `browser serve mcp` applies the `[caido]` selection keys below after it connects:
+
+  | Key | Meaning | Empty means |
+  | :--- | :--- | :--- |
+  | `project` | Engagement project selected at launch. | Use the instance's project and log it. |
+  | `scope_name` | Focus scope inside the project; created when absent, updated in place when a list changes. | Write nothing. |
+  | `scope_allow` | Host globs the scope records. | Keep the stored allowlist of an existing scope. |
+  | `scope_deny` | Host globs the scope skips. | Keep the stored denylist of an existing scope. |
+  | `capture` | Passthrough filter: `all` records everything, `in-scope` records only `scope_allow` hosts. | Keep the instance's stored filter (`auto` too). |
 - Browser settings live in the same file under `[browser]`. `chromium_flags = ["--flag", …]` adds
   Chromium switches to every browser this process starts, and `quiet = false` drops the built-in
   quiet set that disables background telemetry, update and sync traffic (the default is on). Add a

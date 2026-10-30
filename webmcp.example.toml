@@ -15,7 +15,7 @@ enabled = false
 #   project = ""          # -> error that prints the available project names
 project = ""
 
-# Capture mode for the project: "all" | "in-scope" | "none".
+# Capture mode: "auto" (keep Caido's value) | "all" (record everything) | "in-scope" (only scope_allow hosts).
 # Leave it empty to keep the mode that the project already has.
 capture = ""
 

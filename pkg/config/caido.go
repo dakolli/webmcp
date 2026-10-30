@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -30,14 +31,43 @@ allow_guest = true
 url = "http://127.0.0.1:8080/graphql"
 `
 
+// Capture modes a launch applies to the instance's passthrough filter.
+const (
+	CaptureAuto    = ""
+	CaptureAll     = "all"
+	CaptureInScope = "in-scope"
+)
+
 // CaidoFile holds the resolved Caido settings and the file they came from.
+// Project, ScopeName, ScopeAllow, ScopeDeny and Capture are applied to the
+// instance at launch; an empty value means the instance keeps its own.
 type CaidoFile struct {
 	Enabled     bool
 	PAT         string
 	AccessToken string
 	AllowGuest  bool
 	URL         string
+	Project     string
+	ScopeName   string
+	ScopeAllow  []string
+	ScopeDeny   []string
+	Capture     string
 	Path        string
+}
+
+// CaptureMode resolves caido.capture case-insensitively. An empty value or
+// "auto" writes nothing, so the instance keeps its stored filter.
+func (cf CaidoFile) CaptureMode() (string, error) {
+	switch strings.ToLower(strings.TrimSpace(cf.Capture)) {
+	case "", "auto":
+		return CaptureAuto, nil
+	case "all":
+		return CaptureAll, nil
+	case "in-scope":
+		return CaptureInScope, nil
+	default:
+		return "", fmt.Errorf("caido: capture %q is not a mode — use all or in-scope", cf.Capture)
+	}
 }
 
 var (
@@ -119,6 +149,29 @@ func LoadCaido() (CaidoFile, error) {
 	}
 	if cf.URL == "" {
 		cf.URL = defaultCaidoURL
+	}
+	if project, ok := doc.String("caido", "project"); ok {
+		cf.Project = strings.TrimSpace(project)
+	}
+	if scope, ok := doc.String("caido", "scope_name"); ok {
+		cf.ScopeName = strings.TrimSpace(scope)
+	}
+	allow, _, err := doc.Strings("caido", "scope_allow")
+	if err != nil {
+		return CaidoFile{}, fmt.Errorf("config: webmcp.toml caido.scope_allow: %w", err)
+	}
+	if len(allow) > 0 {
+		cf.ScopeAllow = allow
+	}
+	deny, _, err := doc.Strings("caido", "scope_deny")
+	if err != nil {
+		return CaidoFile{}, fmt.Errorf("config: webmcp.toml caido.scope_deny: %w", err)
+	}
+	if len(deny) > 0 {
+		cf.ScopeDeny = deny
+	}
+	if capture, ok := doc.String("caido", "capture"); ok {
+		cf.Capture = strings.TrimSpace(capture)
 	}
 	return cf, nil
 }

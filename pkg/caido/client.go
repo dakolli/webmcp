@@ -55,9 +55,44 @@ const statusQuery = `query Status {
   history: requestsByOffset(limit: 1) { count { value } }
 }`
 
-// scopesQuery lists the instance's scopes so a scope id or name can be
-// resolved before a search.
-const scopesQuery = `query Scopes { scopes { id name } }`
+// scopesQuery lists the instance's scopes with the lists a launch compares, so a
+// scope id or name can be resolved and a write can keep a value it was not given.
+const scopesQuery = `query Scopes { scopes { id name allowlist denylist } }`
+
+// currentProjectQuery reads the project the instance has selected.
+const currentProjectQuery = `query CurrentProject { currentProject { project { id name temporary } } }`
+
+// projectsQuery lists every project the instance holds, so a configured name can
+// be resolved to the id selectProject expects.
+const projectsQuery = `query Projects { projects { id name temporary } }`
+
+// selectProjectMutation switches the instance to the project id it is given.
+const selectProjectMutation = `mutation SelectProject($id: ID!) {
+  selectProject(id: $id) { currentProject { project { id name } } error { __typename } }
+}`
+
+// createScopeMutation writes a scope with both lists, because the instance
+// declares every CreateScopeInput field as required.
+const createScopeMutation = `mutation CreateScope($input: CreateScopeInput!) {
+  createScope(input: $input) { scope { id name allowlist denylist } error { __typename } }
+}`
+
+// updateScopeMutation rewrites a scope. The instance declares name, allowlist and
+// denylist all required, so the caller fills an omitted list from the stored one.
+const updateScopeMutation = `mutation UpdateScope($id: ID!, $input: UpdateScopeInput!) {
+  updateScope(id: $id, input: $input) { scope { id name allowlist denylist } error { __typename } }
+}`
+
+// passthroughOptionsQuery reads the instance's stored capture filter.
+const passthroughOptionsQuery = `query PassthroughOptions {
+  passthroughOptions { captureList passthroughList outOfScope }
+}`
+
+// setPassthroughOptionsMutation replaces the capture filter. The instance
+// declares both lists required, so the caller always sends both.
+const setPassthroughOptionsMutation = `mutation SetPassthroughOptions($input: SetPassthroughOptionsInput!) {
+  setPassthroughOptions(input: $input) { options { captureList passthroughList outOfScope } }
+}`
 
 // guestMutation exchanges guest access for an access token.
 const guestMutation = `mutation Guest { loginAsGuest { token { accessToken refreshToken expiresAt } error { __typename } } }`
@@ -85,6 +120,18 @@ const (
 	AuthGuest       AuthPath = "guest"
 	AuthNone        AuthPath = "none"
 )
+
+// Mode renders the credential path as the mode that actually worked, so a
+// rejected PAT that fell back to guest reads as "guest".
+func (p AuthPath) Mode() string {
+	if p == AuthPATGuest {
+		return "guest"
+	}
+	if p == "" {
+		return string(AuthNone)
+	}
+	return string(p)
+}
 
 // RawDecodeError wraps the base64 failure behind ParseRaw.
 type RawDecodeError struct {
@@ -165,10 +212,28 @@ type Result struct {
 	BodyBytesApplied int     `json:"body_bytes_applied,omitempty"`
 }
 
-// Scope is one Caido scope reduced to the id and name a search needs.
+// Project is one Caido project reduced to the fields a launch needs. Temporary
+// marks a project the instance drops when it stops, which the launch log reports.
+type Project struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Temporary bool   `json:"temporary"`
+}
+
+// Scope is one Caido scope with the two host lists a launch reads and writes.
 type Scope struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	Allowlist []string `json:"allowlist,omitempty"`
+	Denylist  []string `json:"denylist,omitempty"`
+}
+
+// PassthroughOptions is the capture filter Caido holds. A zero value is the
+// null state, where the instance records every request.
+type PassthroughOptions struct {
+	CaptureList     []string `json:"capture_list"`
+	PassthroughList []string `json:"passthrough_list"`
+	OutOfScope      bool     `json:"out_of_scope"`
 }
 
 // ScopeError reports that the instance rejected a scope id, or that a scope the
@@ -540,7 +605,7 @@ func (c *Client) Status(
 	configuredProject = strings.TrimSpace(configuredProject)
 	focusScope = strings.TrimSpace(focusScope)
 	st := Status{
-		Auth:    authMode(c.currentAuth()),
+		Auth:    c.currentAuth().Mode(),
 		URL:     c.URL,
 		Scopes:  make([]ScopeStatus, 0, len(data.Scopes)),
 		History: data.History.Count.Value,
@@ -621,9 +686,301 @@ func (c *Client) ResolveScope(ctx context.Context, id, name string) (Scope, erro
 	return Scope{}, nil
 }
 
+// CurrentProject returns the name of the project the instance has selected.
+func (c *Client) CurrentProject(ctx context.Context) (string, error) {
+	token := c.currentToken()
+	if token == "" {
+		return "", ErrNoCredential
+	}
+	var data struct {
+		CurrentProject *struct {
+			Project struct {
+				Name string `json:"name"`
+			} `json:"project"`
+		} `json:"currentProject"`
+	}
+	if err := c.call(ctx, token, currentProjectQuery, nil, &data); err != nil {
+		var gql *graphqlError
+		if errors.As(err, &gql) {
+			return "", fmt.Errorf("caido: currentProject failed: %s", gql.Error())
+		}
+		return "", err
+	}
+	if data.CurrentProject == nil {
+		return "", errors.New("caido: no project is selected — select one in the Caido UI")
+	}
+	return data.CurrentProject.Project.Name, nil
+}
+
+// Projects lists every project the instance holds, with the temporary flag the
+// launch log reports.
+func (c *Client) Projects(ctx context.Context) ([]Project, error) {
+	token := c.currentToken()
+	if token == "" {
+		return nil, ErrNoCredential
+	}
+	var data struct {
+		Projects []Project `json:"projects"`
+	}
+	if err := c.call(ctx, token, projectsQuery, nil, &data); err != nil {
+		var gql *graphqlError
+		if errors.As(err, &gql) {
+			return nil, fmt.Errorf("caido: projects failed: %s", gql.Error())
+		}
+		return nil, err
+	}
+	return data.Projects, nil
+}
+
+// Scopes lists every scope with its allowlist and denylist, so a launch can tell
+// an absent scope from an unchanged one.
+func (c *Client) Scopes(ctx context.Context) ([]Scope, error) {
+	token := c.currentToken()
+	if token == "" {
+		return nil, ErrNoCredential
+	}
+	var data struct {
+		Scopes []Scope `json:"scopes"`
+	}
+	if err := c.call(ctx, token, scopesQuery, nil, &data); err != nil {
+		var gql *graphqlError
+		if errors.As(err, &gql) {
+			return nil, fmt.Errorf("caido: scopes failed: %s", gql.Error())
+		}
+		return nil, err
+	}
+	return data.Scopes, nil
+}
+
+// PassthroughOptions reads the instance's stored capture filter. A null filter
+// returns the zero value, which means every request is recorded.
+func (c *Client) PassthroughOptions(ctx context.Context) (PassthroughOptions, error) {
+	token := c.currentToken()
+	if token == "" {
+		return PassthroughOptions{}, ErrNoCredential
+	}
+	var data struct {
+		PassthroughOptions *struct {
+			CaptureList     []string `json:"captureList"`
+			PassthroughList []string `json:"passthroughList"`
+			OutOfScope      bool     `json:"outOfScope"`
+		} `json:"passthroughOptions"`
+	}
+	if err := c.call(ctx, token, passthroughOptionsQuery, nil, &data); err != nil {
+		var gql *graphqlError
+		if errors.As(err, &gql) {
+			return PassthroughOptions{}, fmt.Errorf("caido: capture filter read failed: %s", gql.Error())
+		}
+		return PassthroughOptions{}, err
+	}
+	if data.PassthroughOptions == nil {
+		return PassthroughOptions{}, nil
+	}
+	return PassthroughOptions{
+		CaptureList:     emptyIfNil(data.PassthroughOptions.CaptureList),
+		PassthroughList: emptyIfNil(data.PassthroughOptions.PassthroughList),
+		OutOfScope:      data.PassthroughOptions.OutOfScope,
+	}, nil
+}
+
+// SetPassthroughOptions writes both capture lists, because the instance
+// declares each one non-null. A nil list is sent as [].
+func (c *Client) SetPassthroughOptions(
+	ctx context.Context,
+	capture []string,
+	passthrough []string,
+	outOfScope bool,
+) error {
+	token := c.currentToken()
+	if token == "" {
+		return ErrNoCredential
+	}
+	vars := map[string]any{"input": map[string]any{
+		"captureList":     emptyIfNil(capture),
+		"passthroughList": emptyIfNil(passthrough),
+		"outOfScope":      outOfScope,
+	}}
+	if err := c.call(ctx, token, setPassthroughOptionsMutation, vars, nil); err != nil {
+		return passthroughWriteError(err)
+	}
+	return nil
+}
+
+// ResetPassthroughOptions clears the capture filter, so the instance records
+// every request again.
+func (c *Client) ResetPassthroughOptions(ctx context.Context) error {
+	token := c.currentToken()
+	if token == "" {
+		return ErrNoCredential
+	}
+	vars := map[string]any{"input": nil}
+	if err := c.call(ctx, token, setPassthroughOptionsMutation, vars, nil); err != nil {
+		return passthroughWriteError(err)
+	}
+	return nil
+}
+
+// passthroughWriteError turns a rejected capture write into one sentence.
+func passthroughWriteError(err error) error {
+	var gql *graphqlError
+	if errors.As(err, &gql) {
+		return fmt.Errorf("caido: capture filter write failed: %s", gql.Error())
+	}
+	return err
+}
+
+// SelectProject switches the instance to the named project. The instance selects
+// by id, so the name is resolved against the live projects first; an unknown name
+// returns one sentence listing the projects the instance holds.
+func (c *Client) SelectProject(ctx context.Context, name string) error {
+	name = strings.TrimSpace(name)
+	projects, err := c.Projects(ctx)
+	if err != nil {
+		return err
+	}
+	names := make([]string, 0, len(projects))
+	id := ""
+	for _, p := range projects {
+		names = append(names, p.Name)
+		if p.Name == name {
+			id = p.ID
+		}
+	}
+	if id == "" {
+		return unknownProject(name, names)
+	}
+
+	var data struct {
+		SelectProject struct {
+			CurrentProject *struct {
+				Project struct {
+					Name string `json:"name"`
+				} `json:"project"`
+			} `json:"currentProject"`
+			Error *userError `json:"error"`
+		} `json:"selectProject"`
+	}
+	vars := map[string]any{"id": id}
+	if err := c.call(ctx, c.currentToken(), selectProjectMutation, vars, &data); err != nil {
+		var gql *graphqlError
+		if errors.As(err, &gql) {
+			return fmt.Errorf("caido: select project %q failed: %s", name, gql.Error())
+		}
+		return err
+	}
+	if data.SelectProject.Error != nil {
+		return fmt.Errorf("caido: select project %q failed: %s", name, data.SelectProject.Error.Typename)
+	}
+	return nil
+}
+
+// CreateScope creates a named scope in the selected project. A nil list is
+// written as empty, because a new scope has no stored value to keep.
+func (c *Client) CreateScope(
+	ctx context.Context,
+	name string,
+	allow []string,
+	deny []string,
+) (Scope, error) {
+	token := c.currentToken()
+	if token == "" {
+		return Scope{}, ErrNoCredential
+	}
+	vars := map[string]any{"input": map[string]any{
+		"name":      name,
+		"allowlist": emptyIfNil(allow),
+		"denylist":  emptyIfNil(deny),
+	}}
+	var data struct {
+		CreateScope struct {
+			Scope *Scope     `json:"scope"`
+			Error *userError `json:"error"`
+		} `json:"createScope"`
+	}
+	if err := c.call(ctx, token, createScopeMutation, vars, &data); err != nil {
+		return Scope{}, scopeWriteError(name, err)
+	}
+	if data.CreateScope.Error != nil {
+		return Scope{}, &ScopeError{Scope: name, Message: data.CreateScope.Error.Typename}
+	}
+	if data.CreateScope.Scope == nil {
+		return Scope{}, &ScopeError{Scope: name, Message: "the instance returned no scope"}
+	}
+	return *data.CreateScope.Scope, nil
+}
+
+// UpdateScope rewrites the allowlist and denylist of an existing scope. The
+// instance declares both lists required on update, so a nil list is filled from
+// the scope's stored value instead of clearing it.
+func (c *Client) UpdateScope(
+	ctx context.Context,
+	id string,
+	allow []string,
+	deny []string,
+) (Scope, error) {
+	id = strings.TrimSpace(id)
+	stored, err := c.ResolveScope(ctx, id, "")
+	if err != nil {
+		return Scope{}, err
+	}
+	if allow == nil {
+		allow = stored.Allowlist
+	}
+	if deny == nil {
+		deny = stored.Denylist
+	}
+
+	vars := map[string]any{"id": id, "input": map[string]any{
+		"name":      stored.Name,
+		"allowlist": emptyIfNil(allow),
+		"denylist":  emptyIfNil(deny),
+	}}
+	var data struct {
+		UpdateScope struct {
+			Scope *Scope     `json:"scope"`
+			Error *userError `json:"error"`
+		} `json:"updateScope"`
+	}
+	if err := c.call(ctx, c.currentToken(), updateScopeMutation, vars, &data); err != nil {
+		return Scope{}, scopeWriteError(id, err)
+	}
+	if data.UpdateScope.Error != nil {
+		return Scope{}, &ScopeError{Scope: id, Message: data.UpdateScope.Error.Typename}
+	}
+	if data.UpdateScope.Scope == nil {
+		return Scope{}, &ScopeError{Scope: id, Message: "the instance returned no scope"}
+	}
+	return *data.UpdateScope.Scope, nil
+}
+
+// userError is one payload error union member reduced to its type name.
+type userError struct {
+	Typename string `json:"__typename"`
+}
+
+// unknownProject builds the launch error that lists the project names the
+// instance holds.
+func unknownProject(name string, names []string) error {
+	available := "none"
+	if len(names) > 0 {
+		available = strings.Join(names, ", ")
+	}
+	return fmt.Errorf("caido: project %q is not on this instance — available: %s", name, available)
+}
+
+// scopeWriteError turns a rejected scope mutation into the invalid-arguments
+// sentence a caller can act on, leaving transport errors untouched.
+func scopeWriteError(scope string, err error) error {
+	var gql *graphqlError
+	if errors.As(err, &gql) {
+		return &ScopeError{Scope: scope, Message: gql.Error()}
+	}
+	return err
+}
+
 // Selection returns the [caido] project and scope_name from webmcp.toml. It
-// reads the file directly because config.CaidoFile does not carry those keys
-// yet; WEB-264 replaces this with typed fields.
+// reads the file directly because the MCP and CLI surfaces that call it do not
+// hold the resolved config.
 func Selection() (project, scope string) {
 	data, err := os.ReadFile(config.CaidoConfigPath())
 	if err != nil {
@@ -636,17 +993,6 @@ func Selection() (project, scope string) {
 	project, _ = doc.String("caido", "project")
 	scope, _ = doc.String("caido", "scope_name")
 	return strings.TrimSpace(project), strings.TrimSpace(scope)
-}
-
-// authMode renders the credential path as the mode that actually worked.
-func authMode(path AuthPath) string {
-	if path == AuthPATGuest {
-		return "guest"
-	}
-	if path == "" {
-		return string(AuthNone)
-	}
-	return string(path)
 }
 
 // emptyIfNil renders an absent list as [] so the JSON stays addressable.

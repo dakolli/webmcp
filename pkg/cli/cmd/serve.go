@@ -9,12 +9,15 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/dakolli/webmcp/pkg/browsers"
+	"github.com/dakolli/webmcp/pkg/caido"
 	"github.com/dakolli/webmcp/pkg/cli/ipc"
 	"github.com/dakolli/webmcp/pkg/config"
 	mcpServer "github.com/dakolli/webmcp/pkg/mcp/server"
@@ -293,6 +296,7 @@ Pass --bind 0.0.0.0 to expose it to the network.
 				return fmt.Errorf("serve mcp: %w", err)
 			}
 			config.SetActiveCaido(caido)
+			applyCaido(cmdCtx(cmd), caido)
 			if caidoPAT != "" {
 				if err := os.Setenv("CAIDO_PAT", caidoPAT); err != nil {
 					return fmt.Errorf("serve mcp: pass token to daemon: %w", err)
@@ -358,6 +362,130 @@ Pass --bind 0.0.0.0 to expose it to the network.
 	mcpCmd.Flags().StringVar(&caidoToken, "caido-token", "",
 		"Caido instance access token; overrides access_token in webmcp.toml")
 	return mcpCmd
+}
+
+// caidoApplyTimeout bounds the whole launch apply, so a slow instance cannot
+// hold up the MCP listener.
+const caidoApplyTimeout = 10 * time.Second
+
+// applyCaido selects the configured project and creates or updates the focus
+// scope inside it. It never blocks startup: an unreachable instance is one
+// warning, and an unknown project only turns the Caido tools off.
+func applyCaido(ctx context.Context, cf config.CaidoFile) {
+	if !cf.Enabled || cf.URL == "" {
+		log.Printf("caido: disabled")
+		return
+	}
+	capture, err := cf.CaptureMode()
+	if err != nil {
+		log.Printf("%v", err)
+		cf.Enabled = false
+		config.SetActiveCaido(cf)
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, caidoApplyTimeout)
+	defer cancel()
+
+	client := caido.NewClient(cf.URL)
+	path, err := client.Login(ctx, cf.AccessToken, cf.PAT, cf.AllowGuest)
+	if err != nil {
+		log.Printf("caido: %v", err)
+		return
+	}
+	log.Printf("caido: auth %s", path.Mode())
+
+	project, err := client.CurrentProject(ctx)
+	if err != nil {
+		log.Printf("caido: %v", err)
+		return
+	}
+	if cf.Project != "" && cf.Project != project {
+		if err := client.SelectProject(ctx, cf.Project); err != nil {
+			log.Printf("caido: %v", err)
+			cf.Enabled = false
+			config.SetActiveCaido(cf)
+			return
+		}
+		project = cf.Project
+	}
+
+	persistence := "persistent"
+	if projects, err := client.Projects(ctx); err == nil {
+		for _, p := range projects {
+			if p.Name == project && p.Temporary {
+				persistence = "temporary"
+			}
+		}
+	}
+	log.Printf("caido: project %s (%s)", project, persistence)
+
+	if cf.ScopeName != "" {
+		scopes, err := client.Scopes(ctx)
+		if err != nil {
+			log.Printf("caido: %v", err)
+			return
+		}
+		var scope caido.Scope
+		found := false
+		for _, s := range scopes {
+			if s.Name == cf.ScopeName {
+				scope, found = s, true
+				break
+			}
+		}
+		switch {
+		case !found:
+			scope, err = client.CreateScope(ctx, cf.ScopeName, cf.ScopeAllow, cf.ScopeDeny)
+		case scopeDrift(scope, cf.ScopeAllow, cf.ScopeDeny):
+			scope, err = client.UpdateScope(ctx, scope.ID, cf.ScopeAllow, cf.ScopeDeny)
+		}
+		if err != nil {
+			log.Printf("caido: %v", err)
+			return
+		}
+
+		log.Printf(
+			"caido: scope %s (id %s) allow=[%s] deny=[%s]",
+			scope.Name,
+			scope.ID,
+			strings.Join(scope.Allowlist, " "),
+			strings.Join(scope.Denylist, " "),
+		)
+		if len(scope.Allowlist) == 0 {
+			log.Printf("caido: focus scope %q matches all traffic", scope.Name)
+		}
+	}
+
+	switch capture {
+	case config.CaptureAll:
+		if err := client.ResetPassthroughOptions(ctx); err != nil {
+			log.Printf("%v", err)
+			return
+		}
+		log.Printf("caido: capture all")
+	case config.CaptureInScope:
+		if len(cf.ScopeAllow) == 0 {
+			log.Printf("caido: capture in-scope needs scope_allow — left capture unchanged")
+			return
+		}
+		if err := client.SetPassthroughOptions(ctx, cf.ScopeAllow, []string{}, true); err != nil {
+			log.Printf("%v", err)
+			return
+		}
+		log.Printf("caido: capture in-scope allow=[%s]", strings.Join(cf.ScopeAllow, " "))
+	}
+}
+
+// scopeDrift reports whether a configured list differs from the scope's stored
+// list. A nil configured list is no opinion and never triggers a write.
+func scopeDrift(scope caido.Scope, allow, deny []string) bool {
+	if allow != nil && !slices.Equal(scope.Allowlist, allow) {
+		return true
+	}
+	if deny != nil && !slices.Equal(scope.Denylist, deny) {
+		return true
+	}
+	return false
 }
 
 // defaultServeMcpPort is the default HTTP port for the in-process MCP/SSE

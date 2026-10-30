@@ -1086,3 +1086,139 @@ func TestSearchSinceEmptiesResult(t *testing.T) {
 		t.Errorf("envelope missing note: %s", encoded)
 	}
 }
+
+func TestUpdateScopeKeepsStoredLists(t *testing.T) {
+	calls := 0
+	var input map[string]any
+	c := testClient(t, func(r *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return gqlData(t, `{"scopes":[{"id":"1","name":"target",`+
+				`"allowlist":["old.example"],"denylist":["ads.example"]}]}`), nil
+		}
+		var req struct {
+			Variables struct {
+				Input map[string]any `json:"input"`
+			} `json:"variables"`
+		}
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("decode updateScope variables: %v", err)
+		}
+		input = req.Variables.Input
+		return gqlData(t, `{"updateScope":{"scope":{"id":"1","name":"target",`+
+			`"allowlist":["new.example"],"denylist":["ads.example"]},"error":null}}`), nil
+	})
+
+	got, err := c.UpdateScope(t.Context(), "1", []string{"new.example"}, nil)
+	if err != nil {
+		t.Fatalf("UpdateScope: %v", err)
+	}
+	if got.ID != "1" || got.Name != "target" {
+		t.Errorf("scope = %+v, want id 1 target", got)
+	}
+	if input["name"] != "target" {
+		t.Errorf("name input = %v, want the stored name", input["name"])
+	}
+	deny, ok := input["denylist"].([]any)
+	if !ok || len(deny) != 1 || deny[0] != "ads.example" {
+		t.Errorf("denylist input = %v, want the stored list", input["denylist"])
+	}
+	allow, ok := input["allowlist"].([]any)
+	if !ok || len(allow) != 1 || allow[0] != "new.example" {
+		t.Errorf("allowlist input = %v, want the caller list", input["allowlist"])
+	}
+}
+
+func TestUpdateScopeRejected(t *testing.T) {
+	calls := 0
+	c := testClient(t, func(*http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return gqlData(t, `{"scopes":[{"id":"1","name":"target",`+
+				`"allowlist":[],"denylist":[]}]}`), nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body: io.NopCloser(strings.NewReader(
+				`{"errors":[{"message":"Invalid glob terms"}]}`,
+			)),
+		}, nil
+	})
+
+	_, err := c.UpdateScope(t.Context(), "1", []string{"[bad"}, nil)
+	var scopeErr *ScopeError
+	if !errors.As(err, &scopeErr) {
+		t.Fatalf("error = %v, want *ScopeError", err)
+	}
+	if !strings.Contains(err.Error(), "Invalid glob terms") {
+		t.Errorf("error = %q, want the rejection message", err)
+	}
+}
+
+func TestSelectProjectUnknownName(t *testing.T) {
+	c := testClient(t, func(*http.Request) (*http.Response, error) {
+		return gqlData(t, `{"projects":[{"id":"uuid-1","name":"webmcp","temporary":false}]}`), nil
+	})
+
+	err := c.SelectProject(t.Context(), "daft")
+	want := `caido: project "daft" is not on this instance — available: webmcp`
+	if err == nil || err.Error() != want {
+		t.Fatalf("error = %v, want %q", err, want)
+	}
+}
+
+func TestSetPassthroughOptionsSendsBothLists(t *testing.T) {
+	var input map[string]any
+	c := testClient(t, func(r *http.Request) (*http.Response, error) {
+		var req struct {
+			Variables struct {
+				Input map[string]any `json:"input"`
+			} `json:"variables"`
+		}
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("decode setPassthroughOptions variables: %v", err)
+		}
+		input = req.Variables.Input
+		return gqlData(t, `{"setPassthroughOptions":{"options":null}}`), nil
+	})
+
+	if err := c.SetPassthroughOptions(t.Context(), nil, nil, true); err != nil {
+		t.Fatalf("SetPassthroughOptions: %v", err)
+	}
+	capture, ok := input["captureList"].([]any)
+	if !ok || len(capture) != 0 {
+		t.Errorf("captureList = %#v, want a sent empty array", input["captureList"])
+	}
+	passthrough, ok := input["passthroughList"].([]any)
+	if !ok || len(passthrough) != 0 {
+		t.Errorf("passthroughList = %#v, want a sent empty array", input["passthroughList"])
+	}
+	if input["outOfScope"] != true {
+		t.Errorf("outOfScope = %#v, want true", input["outOfScope"])
+	}
+}
+
+func TestResetPassthroughOptionsSendsNullInput(t *testing.T) {
+	var vars map[string]json.RawMessage
+	c := testClient(t, func(r *http.Request) (*http.Response, error) {
+		var req struct {
+			Variables map[string]json.RawMessage `json:"variables"`
+		}
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Fatalf("decode reset variables: %v", err)
+		}
+		vars = req.Variables
+		return gqlData(t, `{"setPassthroughOptions":{"options":null}}`), nil
+	})
+
+	if err := c.ResetPassthroughOptions(t.Context()); err != nil {
+		t.Fatalf("ResetPassthroughOptions: %v", err)
+	}
+	if got := string(vars["input"]); got != "null" {
+		t.Errorf("input variable = %s, want null", got)
+	}
+}

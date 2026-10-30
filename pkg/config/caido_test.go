@@ -217,3 +217,74 @@ func TestCaidoErrorsOmitToken(t *testing.T) {
 		t.Error("error message contains a token")
 	}
 }
+
+func TestLoadCaidoProjectScope(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	path := CaidoConfigPath()
+	body := "[caido]\nproject = \" webmcp \"\nscope_name = \"target\"\n" +
+		"scope_allow = [\"daft.ie\", \"*.daft.ie\"]\nscope_deny = [\"ads.daft.ie\"]\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cf, err := LoadCaido()
+	if err != nil {
+		t.Fatalf("LoadCaido: %v", err)
+	}
+	if cf.Project != "webmcp" {
+		t.Errorf("Project = %q, want the trimmed name", cf.Project)
+	}
+	if cf.ScopeName != "target" {
+		t.Errorf("ScopeName = %q, want target", cf.ScopeName)
+	}
+	if len(cf.ScopeAllow) != 2 || cf.ScopeAllow[0] != "daft.ie" || cf.ScopeAllow[1] != "*.daft.ie" {
+		t.Errorf("ScopeAllow = %v, want the parsed array", cf.ScopeAllow)
+	}
+	if len(cf.ScopeDeny) != 1 || cf.ScopeDeny[0] != "ads.daft.ie" {
+		t.Errorf("ScopeDeny = %v, want the parsed array", cf.ScopeDeny)
+	}
+
+	empty := "[caido]\nproject = \"\"\nscope_allow = []\nscope_deny = []\n"
+	if err := os.WriteFile(path, []byte(empty), 0o600); err != nil {
+		t.Fatalf("rewrite config: %v", err)
+	}
+	cf, err = LoadCaido()
+	if err != nil {
+		t.Fatalf("LoadCaido(empty): %v", err)
+	}
+	if cf.Project != "" || cf.ScopeName != "" || cf.ScopeAllow != nil || cf.ScopeDeny != nil {
+		t.Errorf("empty keys = %q/%q/%v/%v, want unset",
+			cf.Project, cf.ScopeName, cf.ScopeAllow, cf.ScopeDeny)
+	}
+}
+
+func TestCaptureMode(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "empty keeps the instance filter", raw: "", want: CaptureAuto},
+		{name: "auto keeps the instance filter", raw: "auto", want: CaptureAuto},
+		{name: "all resets the filter", raw: "all", want: CaptureAll},
+		{name: "in-scope captures the allowlist", raw: "in-scope", want: CaptureInScope},
+		{name: "case insensitive", raw: " ALL ", want: CaptureAll},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := CaidoFile{Capture: tc.raw}.CaptureMode()
+			if err != nil {
+				t.Fatalf("CaptureMode(%q): %v", tc.raw, err)
+			}
+			if got != tc.want {
+				t.Errorf("CaptureMode(%q) = %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+
+	_, err := (CaidoFile{Capture: "none"}).CaptureMode()
+	want := `caido: capture "none" is not a mode — use all or in-scope`
+	if err == nil || err.Error() != want {
+		t.Fatalf("CaptureMode(bogus) = %v, want %q", err, want)
+	}
+}
