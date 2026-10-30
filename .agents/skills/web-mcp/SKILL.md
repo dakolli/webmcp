@@ -5,7 +5,7 @@ description: Drive a live, stateful Chromium browser over the web-mcp MCP server
 
 # web-mcp — MCP browser skill
 
-This skill covers the 9 `web-mcp` MCP tools. It does not replace the tool descriptions.
+This skill covers the 13 `web-mcp` MCP tools: 9 browser tools and 4 Caido tools. It does not replace the tool descriptions.
 This file is the single entry. It carries the cross-cutting rules. Tool detail lives in the references.
 
 ## Read order
@@ -60,7 +60,10 @@ Install or refresh this skill with `browser skill <harness|path|.>`. With no arg
 | `session_close` | [session_close.md](references/tools/session_close.md) | [session_close_example.md](references/examples/session_close_example.md) | tested |
 | `page_fetch` | [page_fetch.md](references/tools/page_fetch.md) | [page_fetch_example.md](references/examples/page_fetch_example.md) | tested |
 | `page_act` | [page_act.md](references/tools/page_act.md) | [page_act_example.md](references/examples/page_act_example.md) | tested |
+| `caido_status` | [caido_status.md](/home/dakolli/github.com/webmcp/.agents/skills/caido/references/tools/caido_status.md) | [caido_status_example.md](/home/dakolli/github.com/webmcp/.agents/skills/caido/references/examples/caido_status_example.md) | tested |
+| `caido_sitemap` | [caido_sitemap.md](/home/dakolli/github.com/webmcp/.agents/skills/caido/references/tools/caido_sitemap.md) | [caido_sitemap_example.md](/home/dakolli/github.com/webmcp/.agents/skills/caido/references/examples/caido_sitemap_example.md) | tested |
 | `caido_search` | [caido_search.md](/home/dakolli/github.com/webmcp/.agents/skills/caido/references/tools/caido_search.md) | [caido_search_example.md](/home/dakolli/github.com/webmcp/.agents/skills/caido/references/examples/caido_search_example.md) | tested |
+| `caido_finding` | [caido_finding.md](/home/dakolli/github.com/webmcp/.agents/skills/caido/references/tools/caido_finding.md) | [caido_finding_example.md](/home/dakolli/github.com/webmcp/.agents/skills/caido/references/examples/caido_finding_example.md) | tested |
 
 ## Cross-cutting rules
 
