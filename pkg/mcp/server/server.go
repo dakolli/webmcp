@@ -42,6 +42,9 @@ type Server struct {
 	addr string
 	// registry holds the MCP tools, all wired to mgr.
 	registry *tools.Registry
+	// caido renders the live Caido project and scope block appended to the
+	// initialize instructions; nil when Caido is disabled.
+	caido *caidoInstructions
 	// httpSrv is the underlying HTTP server; constructed in New.
 	httpSrv *http.Server
 	// ln is an optional pre-bound listener. When set (via SetListener), Serve
@@ -89,13 +92,17 @@ func ListenAddress(host string, port int) (string, error) {
 // drives the injected manager's live browser. Nothing is served until Serve is
 // called.
 func New(mgr *browsers.Manager, addr string) *Server {
+	cf := caidoSettings()
 	s := &Server{
 		mgr:      mgr,
 		addr:     addr,
-		registry: registerAll(mgr),
+		registry: registerAll(mgr, cf),
 		sessions: make(map[string]chan []byte),
 		labels:   make(map[string]string),
 		images:   make(map[string]bool),
+	}
+	if cf.Enabled {
+		s.caido = newCaidoInstructions(cf)
 	}
 	s.httpSrv = &http.Server{Addr: addr, Handler: s.Handler()}
 	return s
@@ -214,8 +221,12 @@ func caidoSettings() config.CaidoFile {
 
 // registerAll wires every MCP tool to the given manager, so a page opened by
 // fetch_page can be read by page_fetch and driven by page_act, and a single
-// Browser (one Chromium instance) backs all sessions.
-func registerAll(mgr *browsers.Manager) *tools.Registry {
+// Browser (one Chromium instance) backs all sessions. The resolved Caido
+// settings decide whether the Caido tools register.
+func registerAll(
+	mgr *browsers.Manager,
+	cf config.CaidoFile,
+) *tools.Registry {
 	r := tools.NewEmptyRegistry()
 	r.Register(tools.NewFetch(mgr))         // fetch_page
 	r.Register(tools.NewPage(mgr))          // page_fetch
@@ -226,8 +237,8 @@ func registerAll(mgr *browsers.Manager) *tools.Registry {
 	r.Register(tools.NewBrowserList(mgr))   // browser_list
 	r.Register(tools.NewBrowserClose(mgr))  // browser_close
 	r.Register(tools.NewPageList(mgr))      // page_list
-	if caido := caidoSettings(); caido.Enabled {
-		config.SetActiveCaido(caido)
+	if cf.Enabled {
+		config.SetActiveCaido(cf)
 		r.Register(tools.NewCaidoSearch()) // caido_search
 		r.Register(tools.NewCaidoStatus()) // caido_status
 	}
@@ -526,7 +537,7 @@ func (s *Server) processRequest(ctx context.Context, req models.JSONRPCRequest) 
 				Tools:   make(map[string]interface{}),
 				Prompts: make(map[string]interface{}),
 			},
-			Instructions: "web-mcp provides stateful Chromium browser automation tools (fetch_page, page_fetch, page_act, session_close, browser_create, etc.) supporting element clicks, text input, key presses/combos (press_key), coordinate mouse movement/clicks (click_at, hover_at), drag-and-drop (drag_and_drop), and file uploads (upload_file). Predefined task templates are available via the prompts/list and prompts/get MCP protocol endpoints to guide common workflows such as page exploration, form filling, and content extraction.",
+			Instructions: s.initializeInstructions(ctx),
 		}
 
 	case "tools/list":

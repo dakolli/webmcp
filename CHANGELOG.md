@@ -17,6 +17,13 @@
   editing the file.
 - `caido_status` reports the selected project, every scope, the capture mode and the history count.
   Call it first when a search returns nothing. `browser caido status` prints the same facts.
+- `caido_search` takes a raw `httpql` expression or a typed `host` key, plus a `scope_id`. The instance
+  filters, so a target is found without scanning a 500-row window. Each call reports the expression it
+  ran and the scope it read.
+- `caido_search` reports `since_seconds` and `dropped_since`, and explains `count 0` beside a larger
+  `total` instead of returning a bare empty list.
+- The MCP `initialize` response names the Caido project and its scopes, so an agent knows which scope
+  it reads before it searches.
 - `browser_create.deny_hosts` keeps chosen hosts out of the proxy. A proxied visit now stays clean of
   browser telemetry, so Caido history shows the target and not the browser.
 - `[caido] access_token` takes a direct instance token, and `[caido] allow_guest` (default true)
