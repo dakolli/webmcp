@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/proto"
+	"github.com/ysmood/gson"
 )
 
 const (
@@ -36,7 +37,54 @@ const (
 	dialogPrompt     = "prompt"
 	dialogBeforeLoad = "beforeunload"
 	dialogAuth       = "auth"
+
+	// violationRingCap bounds the retained CSP violation events per page.
+	violationRingCap = 50
+	// violationBindingName is the page-side global the violation listener
+	// reports to.
+	violationBindingName = "__wmCSPViolation"
+	// maxViolationFieldRunes caps one violation field, so a long blocked URL or
+	// source file cannot dominate the ring.
+	maxViolationFieldRunes = 500
 )
+
+// CSPViolation is one securitypolicyviolation event: the violated directive, the
+// blocked URI, where the violation happened and whether the policy enforced it
+// or only reported it.
+type CSPViolation struct {
+	// Seq is the per-page sequence number, oldest first.
+	Seq int64 `json:"seq"`
+	// Directive is the violated directive, e.g. "script-src".
+	Directive string `json:"directive"`
+	// BlockedURI is the resource the policy blocked, empty when the browser
+	// named none.
+	BlockedURI string `json:"blocked_uri"`
+	// SourceFile is the document or script that triggered the violation.
+	SourceFile string `json:"source_file"`
+	// Line is the 1-based line of the violation, 0 when unknown.
+	Line int `json:"line"`
+	// Column is the 1-based column of the violation, 0 when unknown.
+	Column int `json:"column"`
+	// Disposition is "enforce" or "report".
+	Disposition string `json:"disposition"`
+}
+
+// pageViolations holds one page's CSP violation ring, its page-monotonic
+// sequence and the CDP binding that feeds it. Its mutex is independent of the
+// page operation lock because the reporter runs from the page's own event
+// handler.
+type pageViolations struct {
+	mu     sync.Mutex
+	ring   ringBuffer[CSPViolation]
+	seq    int64
+	remove func() error
+	stop   func() error
+}
+
+// newPageViolations returns a page's violation state with the bounded ring.
+func newPageViolations() *pageViolations {
+	return &pageViolations{ring: ringBuffer[CSPViolation]{cap: violationRingCap}}
+}
 
 // DialogEntry is one answered JavaScript dialog or one rejected HTTP-auth
 // challenge. A dialog is recorded by the engine as it opens and answered at
@@ -123,7 +171,154 @@ func (p *Page) startDialogs() {
 		p.answerDialogEvent(e)
 	})
 	go stop()
+	p.startViolations()
 }
+
+// startViolations binds the CSP violation reporter and registers its listener
+// for every later document, so a violation from the first load is caught. It
+// runs in the same pre-registration window as the dialog listener; capture is
+// best-effort, so a page that cannot be armed reports an empty ring.
+func (p *Page) startViolations() {
+	if p.Rod == nil {
+		return
+	}
+	v := newPageViolations()
+	p.violations = v
+
+	stop, err := p.Rod.Expose(violationBindingName, func(g gson.JSON) (any, error) {
+		v.record(decodeViolation(g))
+		return nil, nil
+	})
+	if err != nil {
+		return
+	}
+	remove, err := p.Rod.EvalOnNewDocument(violationNewDocumentScript)
+	if err != nil {
+		_ = stop()
+		return
+	}
+	v.mu.Lock()
+	v.remove = remove
+	v.stop = stop
+	v.mu.Unlock()
+	_, _ = p.Rod.Eval(violationInstallJS)
+}
+
+// record stamps a page-reported violation with the next page sequence and
+// buffers it, clipping every field first.
+func (v *pageViolations) record(e CSPViolation) {
+	e.Directive, _ = clipRunes(e.Directive, maxViolationFieldRunes)
+	e.BlockedURI, _ = clipRunes(e.BlockedURI, maxViolationFieldRunes)
+	e.SourceFile, _ = clipRunes(e.SourceFile, maxViolationFieldRunes)
+	e.Disposition, _ = clipRunes(e.Disposition, maxViolationFieldRunes)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.seq++
+	e.Seq = v.seq
+	v.ring.push(e)
+}
+
+// CSPViolations returns a copy of the page's violation events oldest first and
+// the number dropped by the ring bound. It touches only the in-memory ring, so
+// it makes no CDP call and never takes the page lock.
+func (p *Page) CSPViolations() ([]CSPViolation, int) {
+	v := p.violations
+	if v == nil {
+		return []CSPViolation{}, 0
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.ring.take(), int(v.ring.dropped)
+}
+
+// ClearCSPViolations empties the violation ring and resets its dropped counter,
+// returning how many events were cleared.
+func (p *Page) ClearCSPViolations() int {
+	v := p.violations
+	if v == nil {
+		return 0
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.ring.clear()
+}
+
+// stopViolations unarms the violation reporter. It is idempotent and makes no
+// assumption about the page lock, so every teardown path may call it.
+func (p *Page) stopViolations() {
+	v := p.violations
+	if v == nil {
+		return
+	}
+	v.mu.Lock()
+	remove, stop := v.remove, v.stop
+	v.remove, v.stop = nil, nil
+	v.mu.Unlock()
+	if remove != nil {
+		_ = remove()
+	}
+	if stop != nil {
+		_ = stop()
+	}
+}
+
+// decodeViolation reads one page-reported violation from the parsed binding
+// argument. rod hands the argument over already parsed, so every field is read
+// off the value.
+func decodeViolation(g gson.JSON) CSPViolation {
+	return CSPViolation{
+		Directive:   violationField(g, "directive"),
+		BlockedURI:  violationField(g, "blocked_uri"),
+		SourceFile:  violationField(g, "source_file"),
+		Line:        g.Get("line").Int(),
+		Column:      g.Get("column").Int(),
+		Disposition: violationField(g, "disposition"),
+	}
+}
+
+// violationField reads one string field from the parsed binding argument,
+// returning "" when the field is absent or null.
+func violationField(g gson.JSON, name string) string {
+	v := g.Get(name)
+	if v.Nil() {
+		return ""
+	}
+	return v.Str()
+}
+
+// violationScript is the document-start listener. It reports every
+// securitypolicyviolation event to the Go binding, which owns the ring and its
+// bound, so the page never keeps an unbounded log.
+const violationScript = `
+if (window.__wmCSPInstalled) return;
+window.__wmCSPInstalled = true;
+const wmCSPField = (raw) => {
+  try { return String(raw == null ? '' : raw); } catch (e) { return ''; }
+};
+document.addEventListener('securitypolicyviolation', (e) => {
+  try {
+    if (typeof window.__wmCSPViolation !== 'function') return;
+    window.__wmCSPViolation({
+      directive: wmCSPField(e.violatedDirective || e.effectiveDirective),
+      blocked_uri: wmCSPField(e.blockedURI),
+      source_file: wmCSPField(e.sourceFile),
+      line: e.lineNumber || 0,
+      column: e.columnNumber || 0,
+      disposition: wmCSPField(e.disposition)
+    });
+  } catch (err) {}
+}, true);
+`
+
+// violationInstallJS runs the listener once in the current document, for a tab
+// that was already loaded when the page was wrapped (a popup).
+var violationInstallJS = "() => {" + violationScript + "}"
+
+// violationNewDocumentScript re-injects the listener before each new document's
+// own scripts. Init scripts run as raw statements, where the body's top-level
+// guard return is a syntax error, so the body runs inside a self-invoking
+// function.
+var violationNewDocumentScript = "(() => {" + violationScript + "})()"
 
 // answerDialogEvent records one dialog and answers it from the current policy
 // without holding the page operation lock.

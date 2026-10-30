@@ -219,8 +219,10 @@ func clipRunes(s string, max int) (string, bool) {
 // document; the installed marker makes a second run a no-op. Every wrapper
 // guards its own recording, never its original operation, so the page behaves
 // as before. The eval wrapper necessarily turns direct eval into indirect
-// (global) eval. The ring and value caps are filled from the Go constants so
-// the page and the envelope cannot drift.
+// (global) eval. Secret sources keep their full value only for in-page
+// attribution and are masked in the recorded hit value, so a cookie never
+// reaches the wire. The ring and value caps are filled from the Go constants
+// so the page and the envelope cannot drift.
 const sinkScriptTemplate = `
 if (window.__wmSinkInstalled) return;
 const WM_CAP = %d;
@@ -242,16 +244,44 @@ const wmClip = (raw) => {
 };
 
 const wmSources = [];
-const wmTag = (name, value) => {
+const wmClipCookie = (raw) => {
+  const parts = String(raw).split(';');
+  const out = [];
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i].trim();
+    if (!part) continue;
+    const eq = part.indexOf('=');
+    if (eq < 0) { out.push(part); continue; }
+    out.push(part.slice(0, eq).trim() + '=' + part.slice(eq + 1).trim().slice(0, 8) + '…');
+  }
+  return out.join('; ');
+};
+const wmTag = (name, value, secret) => {
   if (typeof value !== 'string') return value;
   const v = value.length > 2000 ? value.slice(0, 2000) : value;
   if (v.length < WM_SOURCE_MIN) return value;
   for (let i = 0; i < wmSources.length; i++) {
-    if (wmSources[i].name === name && wmSources[i].value === v) return value;
+    if (wmSources[i].name === name && (wmSources[i].match || wmSources[i].value) === v) return value;
   }
-  wmSources.push({ name: name, value: v });
+  const entry = { name: name, value: v };
+  if (secret) {
+    entry.value = wmClipCookie(v);
+    entry.match = v.slice(0, WM_VALUE_MAX);
+    entry.secret = true;
+  }
+  wmSources.push(entry);
   if (wmSources.length > WM_SOURCE_CAP) wmSources.shift();
   return value;
+};
+
+const wmScrub = (s) => {
+  let out = s;
+  for (let i = wmSources.length - 1; i >= 0; i--) {
+    const src = wmSources[i];
+    if (!src.secret || !src.match || src.match === src.value) continue;
+    if (out.indexOf(src.match) >= 0) out = out.split(src.match).join(src.value);
+  }
+  return out;
 };
 
 const wmLiveLocation = (s) => {
@@ -278,8 +308,9 @@ const wmSourceOf = (value) => {
   for (let i = wmSources.length - 1; i >= 0; i--) {
     const src = wmSources[i];
     if (src.name.indexOf('location.') === 0) continue;
-    if (s.indexOf(src.value) >= 0) return src.name;
-    if (s.length >= 6 && src.value.indexOf(s) >= 0) return src.name;
+    const v = src.match || src.value;
+    if (s.indexOf(v) >= 0) return src.name;
+    if (s.length >= 6 && v.indexOf(s) >= 0) return src.name;
   }
   return wmLiveLocation(s) || 'unknown';
 };
@@ -343,7 +374,7 @@ const __wmPush = (sink, context, raw, node) => {
       source: wmSourceOf(clipped.v),
       sink: sink,
       context: context,
-      value: clipped.v,
+      value: wmScrub(clipped.v),
       stack: __wmStack(),
       selector: wmPath(node),
       ts: Date.now()
@@ -399,6 +430,23 @@ const wmMethod = (proto, name, record) => {
   } catch (e) {}
 };
 
+const wmMethodResult = (proto, name, record) => {
+  try {
+    const d = Object.getOwnPropertyDescriptor(proto, name);
+    if (!d || typeof d.value !== 'function' || !d.configurable) return;
+    Object.defineProperty(proto, name, {
+      configurable: true,
+      enumerable: d.enumerable,
+      writable: true,
+      value: function __wmResultCall() {
+        const v = d.value.apply(this, arguments);
+        try { record.call(this, v); } catch (e) {}
+        return v;
+      }
+    });
+  } catch (e) {}
+};
+
 const wmGlobalMethod = (name, record) => {
   try {
     const d = Object.getOwnPropertyDescriptor(window, name);
@@ -434,16 +482,34 @@ try {
 wmAccessor(Document.prototype, 'URL', function __wmDocumentURL(v) { wmTag('document.URL', v); });
 wmAccessor(Document.prototype, 'referrer', function __wmDocumentReferrer(v) { wmTag('document.referrer', v); });
 
-try {
-  const d = Object.getOwnPropertyDescriptor(window, 'name');
-  if (d && 'value' in d) {
+const wmWrapName = (holder, d) => {
+  if (!d) return false;
+  if (d.get) {
+    Object.defineProperty(holder, 'name', {
+      configurable: true,
+      enumerable: d.enumerable,
+      get: function __wmGetName() { return wmTag('window.name', d.get.call(this)); },
+      set: d.set ? function __wmSetName(v) { return d.set.call(this, v); } : undefined
+    });
+    return true;
+  }
+  if ('value' in d && d.writable) {
     let current = d.value;
-    Object.defineProperty(window, 'name', {
+    Object.defineProperty(holder, 'name', {
       configurable: true,
       enumerable: d.enumerable,
       get: function __wmGetName() { return wmTag('window.name', current); },
       set: function __wmSetName(v) { current = String(v); }
     });
+    return true;
+  }
+  return false;
+};
+
+try {
+  if (!wmWrapName(window, Object.getOwnPropertyDescriptor(window, 'name'))) {
+    const proto = window.Window && window.Window.prototype;
+    if (proto) wmWrapName(proto, Object.getOwnPropertyDescriptor(proto, 'name'));
   }
 } catch (e) {}
 
@@ -470,6 +536,28 @@ try {
   if (window.MessageEvent) {
     wmAccessor(window.MessageEvent.prototype, 'data', function __wmMessageData(v) {
       wmTag('message', typeof v === 'string' ? v : JSON.stringify(v));
+    });
+  }
+} catch (e) {}
+
+wmAccessor(Document.prototype, 'cookie', function __wmDocumentCookie(v) {
+  wmTag('document.cookie', v, true);
+});
+
+try {
+  wmAccessor(History.prototype, 'state', function __wmHistoryState(v) {
+    wmTag('history.state', typeof v === 'string' ? v : JSON.stringify(v));
+  });
+} catch (e) {}
+
+try {
+  if (window.URLSearchParams) {
+    wmMethodResult(URLSearchParams.prototype, 'get', function __wmSearchGet(v) {
+      wmTag('URLSearchParams.get', v);
+    });
+    wmMethodResult(URLSearchParams.prototype, 'getAll', function __wmSearchGetAll(v) {
+      if (!Array.isArray(v)) return;
+      for (let i = 0; i < v.length; i++) wmTag('URLSearchParams.getAll', v[i]);
     });
   }
 } catch (e) {}

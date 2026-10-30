@@ -559,11 +559,12 @@ func (s *Server) handlePageFetch(ctx context.Context, params json.RawMessage) (a
 
 // handlePageAct implements page.act: it performs the requested action on a
 // live page — click, input, type, press_key, click_at, hover_at, drag_and_drop,
-// upload_file, hover, scroll, select, eval, navigate, back, forward, reload,
+// upload_file, hover, set_style, set_attr, set_html, scroll, select, eval, navigate, back, forward, reload,
 // wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay,
 // replay_fuzz, inject_canary, postmessage_install, postmessage_clear,
 // post_message, intercept_add, intercept_list, intercept_clear or wait_open — mirroring the
-// CLI page act command. An unknown action is a -32602 invalid-params error.
+// CLI page act command. The page-free auth_list and encode actions resolve
+// before the session lookup. An unknown action is a -32602 invalid-params error.
 func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any, *Error) {
 	p, rpcErr := decodeParams[PageActParams](params)
 	if rpcErr != nil {
@@ -592,6 +593,13 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 			}
 		}
 	}
+	if p.Action == "encode" {
+		out, err := pageops.EncodePayload(p.Value, p.Context, p.Variants)
+		if err != nil {
+			return nil, &Error{Code: CodeInvalidParams, Message: fmt.Sprintf("page.act: %v", err)}
+		}
+		return PageActResult{Data: out}, nil
+	}
 	if p.Action == "auth_list" {
 		out, err := pageops.PageAuthList(ctx, p.Site)
 		if err != nil {
@@ -612,6 +620,17 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		return nil, &Error{
 			Code:    CodeInvalidParams,
 			Message: "page.act: post_message requires a payload (e.g. 'page act last post_message '{\"t\":\"wm\"}''",
+		}
+	}
+	if p.Action == "set_attr" && p.AttrName == "" {
+		return nil, &Error{
+			Code:    CodeInvalidParams,
+			Message: "page.act: set_attr requires attr_name (the attribute to set, e.g. href)",
+		}
+	}
+	if p.Action == "set_html" {
+		if _, err := pageops.SetHTMLMode(p.Mode); err != nil {
+			return nil, &Error{Code: CodeInvalidParams, Message: fmt.Sprintf("page.act: set_html: %v", err)}
 		}
 	}
 	if p.Action == "replay" {
@@ -689,6 +708,13 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 			}
 		}
 	}
+	if p.Action == "fill_form" {
+		mode, err := pageops.ValidateFillForm(p.Selector, p.Submit, p.Fields, p.Values)
+		if err != nil {
+			return nil, &Error{Code: CodeInvalidParams, Message: fmt.Sprintf("page.act: %v", err)}
+		}
+		p.Submit = mode
+	}
 
 	actionTimeout := PageActTimeout(p.TimeoutMS)
 	actionCtx, cancel := context.WithTimeout(ctx, PageActBudget(p.Action, p.WaitMode, p.TimeoutMS))
@@ -756,10 +782,16 @@ func (s *Server) handlePageAct(ctx context.Context, params json.RawMessage) (any
 		out, err = pageops.PageHover(ctx, page, p.Handle, p.Selector)
 	case "set_style":
 		out, err = pageops.PageSetStyle(ctx, page, p.Handle, p.Selector, p.Value)
+	case "set_attr":
+		out, err = pageops.PageSetAttr(ctx, page, p.Handle, p.Selector, p.AttrName, p.Value)
+	case "set_html":
+		out, err = pageops.PageSetHTML(ctx, page, p.Handle, p.Selector, p.Value, p.Mode)
 	case "scroll":
 		out, err = pageops.PageScroll(ctx, page, p.X, p.Y)
 	case "select":
 		out, err = pageops.PageSelect(ctx, page, p.Handle, p.Selector, p.Value)
+	case "fill_form":
+		out, err = pageops.PageFillForm(ctx, page, p.Selector, p.Fields, p.Values, p.Submit, p.WaitMode)
 	case "wait":
 		out, err = pageops.PageWait(ctx, page, p.WaitMode, p.Handle, p.Selector, time.Duration(p.TimeoutMS)*time.Millisecond)
 	case "set_viewport":

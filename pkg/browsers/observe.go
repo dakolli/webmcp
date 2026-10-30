@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -106,6 +107,37 @@ type ConsoleEntry struct {
 	Seq    int64  `json:"seq"`
 }
 
+// documentSecurityHeaders lists, lowercased, the response headers the audit
+// judges that the page stores uncapped. The set is closed, so the record stays
+// bounded no matter how many headers a response carries.
+var documentSecurityHeaders = []string{
+	"strict-transport-security",
+	"x-content-type-options",
+	"x-frame-options",
+	"referrer-policy",
+	"permissions-policy",
+	"cross-origin-opener-policy",
+	"cross-origin-resource-policy",
+}
+
+// documentHeaderCapture is the uncapped header state of the page's current
+// top-level document response: the two Content-Security-Policy variants plus the
+// closed set of security headers the audit reads. Empty strings mean the
+// response did not carry that header. It is replaced as one record on every
+// top-level document response, so a page holds one bounded state and never
+// accumulates.
+type documentHeaderCapture struct {
+	// Enforced is the Content-Security-Policy value, before the 512-byte clip
+	// the network ring applies to every header.
+	Enforced string
+	// ReportOnly is the Content-Security-Policy-Report-Only value, under the
+	// same uncapped rule.
+	ReportOnly string
+	// Security holds documentSecurityHeaders that the response carried, keyed
+	// by their lowercased name and with repeated values newline-joined.
+	Security map[string]string
+}
+
 // ringBuffer is a bounded FIFO that keeps the newest cap items and counts every
 // evicted one. It is not safe for concurrent use; the observer's mutex guards it.
 type ringBuffer[T any] struct {
@@ -172,6 +204,11 @@ type pageObserver struct {
 	// changes on navigation and on a BFCache restore, so it names the current
 	// document rather than the last one a URL heuristic would pick.
 	topLoaderID proto.NetworkLoaderID
+	// docHeaders holds the uncapped header state of the current top-level
+	// document response. It is not a ring and is never cleared by ClearCapture,
+	// so an audit keeps the document's policy and security headers after
+	// clear_logs.
+	docHeaders documentHeaderCapture
 }
 
 // newPageObserver returns an observer whose rings are bounded to the capture caps.
@@ -331,6 +368,69 @@ func (o *pageObserver) recordResponse(e *proto.NetworkResponseReceived) {
 	entry := &o.net.items[i]
 	o.applyResponse(entry, e.Response)
 	entry.Type = string(e.Type)
+	o.captureDocumentHeaders(e, entry)
+}
+
+// captureDocumentHeaders stores the uncapped CSP text and security headers of
+// the page's current top-level document response. It reads the raw CDP header
+// values, so these names bypass the network ring's 512-byte clip that every
+// other header keeps, and the record survives ClearCapture. A meta-delivered
+// policy is not a network header and is read from the live DOM by the audit
+// instead. The caller holds o.mu.
+func (o *pageObserver) captureDocumentHeaders(e *proto.NetworkResponseReceived, entry *NetworkEntry) {
+	if e.Type != proto.NetworkResourceTypeDocument || e.Response == nil {
+		return
+	}
+	if o.topFrameID == "" || proto.PageFrameID(entry.FrameID) != o.topFrameID {
+		return
+	}
+	security := make(map[string]string, len(documentSecurityHeaders))
+	for _, name := range documentSecurityHeaders {
+		if v := rawHeaderText(e.Response.Headers, name); v != "" {
+			security[name] = v
+		}
+	}
+	o.docHeaders = documentHeaderCapture{
+		Enforced:   joinedHeaderValues(e.Response.Headers, "Content-Security-Policy"),
+		ReportOnly: joinedHeaderValues(e.Response.Headers, "Content-Security-Policy-Report-Only"),
+		Security:   security,
+	}
+}
+
+// joinedHeaderValues returns every value the named header carried, joined with
+// ", " the way a browser combines repeated CSP fields.
+func joinedHeaderValues(h proto.NetworkHeaders, name string) string {
+	raw := rawHeaderText(h, name)
+	if raw == "" {
+		return ""
+	}
+	return strings.Join(strings.Split(raw, "\n"), ", ")
+}
+
+// rawHeaderText returns every value the named header carried, newline-joined so
+// a repeated header keeps its distinct values. Chrome joins repeated header
+// fields with a newline inside one map value, so both the newline separated
+// copies and any case-variant map keys are merged in sorted key order.
+func rawHeaderText(h proto.NetworkHeaders, name string) string {
+	var keys []string
+	for k := range h {
+		if strings.EqualFold(k, name) {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		return ""
+	}
+	sort.Strings(keys)
+	var parts []string
+	for _, k := range keys {
+		for _, line := range strings.Split(h[k].Str(), "\n") {
+			if line = strings.TrimSpace(line); line != "" {
+				parts = append(parts, line)
+			}
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 // recordFinished joins the wire byte count and elapsed milliseconds onto the
@@ -575,6 +675,44 @@ func (p *Page) NetworkEntries() ([]NetworkEntry, int) {
 	out := o.net.take()
 	o.markTopDocument(out)
 	return out, int(o.net.dropped)
+}
+
+// DocumentCSP returns the uncapped Content-Security-Policy text of the page's
+// current top-level document response, in both the enforced and the report-only
+// variants. Empty strings mean the response carried none. The text is captured
+// raw at the network layer before the ring's 512-byte header clip, and it
+// survives ClearCapture, so a security audit keeps the policy after clear_logs.
+func (p *Page) DocumentCSP() (enforced, reportOnly string) {
+	o := p.observer
+	if o == nil {
+		return "", ""
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.docHeaders.Enforced, o.docHeaders.ReportOnly
+}
+
+// DocumentSecurityHeaders returns a copy of the uncapped security response
+// headers of the page's current top-level document response, keyed by the
+// lowercased name. A missing name means the response did not carry it. The
+// values are captured raw at the network layer before the ring's 512-byte
+// header clip, and the record survives ClearCapture, so a security audit keeps
+// its header verdicts after clear_logs.
+func (p *Page) DocumentSecurityHeaders() map[string]string {
+	o := p.observer
+	if o == nil {
+		return nil
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if len(o.docHeaders.Security) == 0 {
+		return nil
+	}
+	headers := make(map[string]string, len(o.docHeaders.Security))
+	for name, value := range o.docHeaders.Security {
+		headers[name] = value
+	}
+	return headers
 }
 
 // CaptureSecrets controls whether headers captured from now on keep the values

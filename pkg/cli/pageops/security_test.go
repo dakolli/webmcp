@@ -574,6 +574,220 @@ func TestSecurityCookieSameSiteMatrix(t *testing.T) {
 	}
 }
 
+// TestSecurityEffectivePolicy covers the parsed policy shaper over saved CSP
+// strings: the header source, a nonce, the meta form and a report-only policy.
+func TestSecurityEffectivePolicy(t *testing.T) {
+	tests := []struct {
+		name       string
+		header     string
+		meta       string
+		reportOnly string
+		want       securityPolicyInfo
+	}{
+		{
+			name:   "unsafe-inline header",
+			header: "script-src 'self' 'unsafe-inline'; object-src 'none'",
+			want: securityPolicyInfo{
+				Present:      true,
+				Source:       "header",
+				ScriptSrc:    "'self' 'unsafe-inline'",
+				UnsafeInline: true,
+			},
+		},
+		{
+			name:   "nonce header",
+			header: "script-src 'self' 'nonce-AbC123'; style-src 'self'",
+			want: securityPolicyInfo{
+				Present:   true,
+				Source:    "header",
+				ScriptSrc: "'self' 'nonce-AbC123'",
+				StyleSrc:  "'self'",
+				Nonce:     "AbC123",
+			},
+		},
+		{
+			name: "meta form",
+			meta: "default-src 'self'; script-src 'self'",
+			want: securityPolicyInfo{
+				Present:    true,
+				Source:     "meta",
+				ScriptSrc:  "'self'",
+				DefaultSrc: "'self'",
+			},
+		},
+		{
+			name:       "report-only header",
+			reportOnly: "script-src 'self' 'unsafe-eval'",
+			want: securityPolicyInfo{
+				Present:    true,
+				Source:     "header",
+				ReportOnly: true,
+				ScriptSrc:  "'self' 'unsafe-eval'",
+				UnsafeEval: true,
+			},
+		},
+		{
+			name:   "default-src fallback for unsafe tokens",
+			header: "default-src 'self' 'unsafe-inline'",
+			want: securityPolicyInfo{
+				Present:      true,
+				Source:       "header",
+				DefaultSrc:   "'self' 'unsafe-inline'",
+				UnsafeInline: true,
+			},
+		},
+		{
+			name: "no policy",
+			want: securityPolicyInfo{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := effectiveSecurityPolicy(tt.header, tt.meta, tt.reportOnly)
+			if got.Present != tt.want.Present {
+				t.Errorf("present = %t, want %t", got.Present, tt.want.Present)
+			}
+			if got.Source != tt.want.Source {
+				t.Errorf("source = %q, want %q", got.Source, tt.want.Source)
+			}
+			if got.ReportOnly != tt.want.ReportOnly {
+				t.Errorf("report_only = %t, want %t", got.ReportOnly, tt.want.ReportOnly)
+			}
+			if got.ScriptSrc != tt.want.ScriptSrc {
+				t.Errorf("script_src = %q, want %q", got.ScriptSrc, tt.want.ScriptSrc)
+			}
+			if got.StyleSrc != tt.want.StyleSrc {
+				t.Errorf("style_src = %q, want %q", got.StyleSrc, tt.want.StyleSrc)
+			}
+			if got.DefaultSrc != tt.want.DefaultSrc {
+				t.Errorf("default_src = %q, want %q", got.DefaultSrc, tt.want.DefaultSrc)
+			}
+			if got.UnsafeInline != tt.want.UnsafeInline {
+				t.Errorf("unsafe_inline = %t, want %t", got.UnsafeInline, tt.want.UnsafeInline)
+			}
+			if got.UnsafeEval != tt.want.UnsafeEval {
+				t.Errorf("unsafe_eval = %t, want %t", got.UnsafeEval, tt.want.UnsafeEval)
+			}
+			if got.Nonce != tt.want.Nonce {
+				t.Errorf("nonce = %q, want %q", got.Nonce, tt.want.Nonce)
+			}
+			if got.Directives == nil {
+				t.Error("directives is nil, want an empty map when absent")
+			}
+			if got.Hashes == nil {
+				t.Error("hashes is nil, want an empty slice when absent")
+			}
+			if len(got.Directives) != 0 && !tt.want.Present {
+				t.Errorf("directives = %v, want an empty map for a page with no policy", got.Directives)
+			}
+		})
+	}
+}
+
+// TestSecurityEffectivePolicyHashes proves a script hash is lifted out of the
+// effective script-src without its quotes.
+func TestSecurityEffectivePolicyHashes(t *testing.T) {
+	got := effectiveSecurityPolicy(
+		"script-src 'self' 'sha256-AbCdEf' 'sha384-GhIjKl'",
+		"",
+		"",
+	)
+	want := []string{"sha256-AbCdEf", "sha384-GhIjKl"}
+	if !slices.Equal(got.Hashes, want) {
+		t.Fatalf("hashes = %v, want %v", got.Hashes, want)
+	}
+	if got.UnsafeInline {
+		t.Error("unsafe_inline = true, want false")
+	}
+}
+
+// longCSPPolicy builds a policy longer than the network ring's 512-byte header
+// clip, with the script nonce and hash at the end so a clipped value would lose
+// them. Every directive name is distinct.
+func longCSPPolicy() string {
+	return strings.Join([]string{
+		"default-src 'none'",
+		"base-uri 'self'",
+		"object-src 'none'",
+		"form-action 'self'",
+		"frame-ancestors 'none'",
+		"img-src 'self' data: https://img-one.test https://img-two.test https://img-three.test",
+		"style-src 'self' https://style-one.test https://style-two.test https://style-three.test",
+		"connect-src 'self' https://api-one.test https://api-two.test https://api-three.test https://api-four.test",
+		"font-src 'self' https://fonts-one.test https://fonts-two.test",
+		"worker-src 'self'",
+		"manifest-src 'self'",
+		"media-src 'self'",
+		"script-src 'self' 'nonce-AbC123' 'sha256-AbCdEf' https://cdn-one.test https://cdn-two.test https://cdn-three.test https://cdn-four.test",
+	}, "; ")
+}
+
+// TestSecurityLongCSPParsesEveryDirective proves the audit parses the uncapped
+// policy: a header longer than the 512-byte ring clip keeps every directive,
+// and the nonce and hash at the end of the value survive.
+func TestSecurityLongCSPParsesEveryDirective(t *testing.T) {
+	policy := longCSPPolicy()
+	if len(policy) <= 512 {
+		t.Fatalf("policy is %d bytes, needs to exceed the 512-byte ring clip", len(policy))
+	}
+
+	headers, _ := documentHeaders(nil, policy, "", nil)
+	info := effectiveSecurityPolicy(headerValue(headers, "content-security-policy"), "", "")
+
+	if !info.Present || info.Source != "header" {
+		t.Fatalf("policy = %+v, want a present header policy", info)
+	}
+	for _, name := range []string{
+		"default-src", "base-uri", "object-src", "form-action", "frame-ancestors",
+		"img-src", "style-src", "connect-src", "font-src", "worker-src",
+		"manifest-src", "media-src", "script-src",
+	} {
+		if _, ok := info.Directives[name]; !ok {
+			t.Errorf("missing directive %q, the policy was cut before it", name)
+		}
+	}
+	if info.Nonce != "AbC123" {
+		t.Errorf("nonce = %q, want AbC123 from the end of the policy", info.Nonce)
+	}
+	if !slices.Contains(info.Hashes, "sha256-AbCdEf") {
+		t.Errorf("hashes = %v, want sha256-AbCdEf from the end of the policy", info.Hashes)
+	}
+}
+
+// TestSecurityPolicySurvivesClearedRing proves the parsed policy no longer
+// depends on the network ring: a cleared ring leaves no response headers, yet
+// the page's stored capture still yields the full policy.
+func TestSecurityPolicySurvivesClearedRing(t *testing.T) {
+	policy := longCSPPolicy()
+
+	headers, _ := documentHeaders(nil, policy, "", nil)
+	info := effectiveSecurityPolicy(headerValue(headers, "content-security-policy"), "", "")
+	if !info.Present {
+		t.Fatal("a cleared ring with a stored capture reported no policy")
+	}
+	if _, ok := info.Directives["script-src"]; !ok {
+		t.Error("the stored policy lost script-src after the ring was cleared")
+	}
+	if info.Nonce != "AbC123" {
+		t.Errorf("nonce = %q, want AbC123 after the ring was cleared", info.Nonce)
+	}
+
+	reportOnly, _ := documentHeaders(nil, "", "img-src 'self'", nil)
+	ro := effectiveSecurityPolicy(
+		headerValue(reportOnly, "content-security-policy"),
+		"",
+		headerValue(reportOnly, "content-security-policy-report-only"),
+	)
+	if !ro.Present || !ro.ReportOnly || len(ro.Directives["img-src"]) == 0 {
+		t.Errorf("report-only policy = %+v, want the stored report-only variant kept", ro)
+	}
+
+	bare := effectiveSecurityPolicy(headerValue(nil, "content-security-policy"), "", "")
+	if bare.Present {
+		t.Error("a cleared ring with no stored capture reported a policy")
+	}
+}
+
 // TestSecurityCookiePass proves a cookie carrying Lax, HttpOnly and Secure yields
 // only ok findings, with no missing-flag warning.
 func TestSecurityCookiePass(t *testing.T) {
@@ -600,5 +814,115 @@ func TestSecurityCookiePass(t *testing.T) {
 		if strings.Contains(c.Detail, "missing") {
 			t.Errorf("%s detail = %q, want no missing-flag warning", c.ID, c.Detail)
 		}
+	}
+}
+
+// TestSecurityHeaderChecksSurviveClearedRing proves the hsts and
+// x-content-type-options verdicts no longer depend on the network ring: an
+// audit after clear_logs supplies an empty ring, yet the page's stored capture
+// still yields ok for both headers. Before the fix these read as absent.
+func TestSecurityHeaderChecksSurviveClearedRing(t *testing.T) {
+	const hsts = "max-age=31536000; includeSubdomains; preload"
+	stored := map[string]string{
+		"strict-transport-security": hsts,
+		"x-content-type-options":    "nosniff",
+	}
+	ring := map[string]string{
+		"strict-transport-security": hsts,
+		"x-content-type-options":    "nosniff",
+	}
+
+	tests := []struct {
+		name string
+		ring map[string]string
+	}{
+		{"ring still holds the document", ring},
+		{"ring cleared by clear_logs", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			headers, captured := documentHeaders(tt.ring, "", "", stored)
+			if !captured {
+				t.Fatal("the stored capture was not applied")
+			}
+			checks := securityHeaderChecks(securityProbe{Scheme: "https"}, headers, true, false)
+			if _, ok := securityCheckByID(checks, "header_conflict"); ok {
+				t.Error("the stored value produced a conflict against the ring copy")
+			}
+			hstsCheck, ok := securityCheckByID(checks, "hsts")
+			if !ok {
+				t.Fatal("missing hsts check")
+			}
+			if hstsCheck.Status != "ok" || hstsCheck.Evidence != hsts {
+				t.Errorf("hsts = %+v, want ok with the stored value", hstsCheck)
+			}
+			xcto, ok := securityCheckByID(checks, "x_content_type_options")
+			if !ok {
+				t.Fatal("missing x_content_type_options check")
+			}
+			if xcto.Status != "ok" || xcto.Evidence != "nosniff" {
+				t.Errorf("x_content_type_options = %+v, want ok nosniff", xcto)
+			}
+		})
+	}
+}
+
+// TestSecurityUnsafeInlineIsScriptScoped proves the csp_unsafe_inline check
+// judges the effective script directive only: a token in style-src leaves it
+// clean, a token in script-src warns and names script-src, and a script token
+// inherited from default-src warns and names default-src.
+func TestSecurityUnsafeInlineIsScriptScoped(t *testing.T) {
+	tests := []struct {
+		name         string
+		policy       string
+		wantStatus   string
+		wantDetail   string
+		wantEvidence string
+	}{
+		{
+			name:       "style-src token does not raise a script warning",
+			policy:     "default-src 'self'; script-src 'self' 'sha256-AbCdEf'; style-src 'self' 'unsafe-inline'",
+			wantStatus: "ok",
+		},
+		{
+			name:         "script-src token warns and names script-src",
+			policy:       "default-src 'self'; script-src 'self' 'unsafe-inline'",
+			wantStatus:   "warn",
+			wantDetail:   "script-src allows 'unsafe-inline'",
+			wantEvidence: "script-src 'self' 'unsafe-inline'",
+		},
+		{
+			name:         "default-src fallback names default-src",
+			policy:       "default-src 'self' 'unsafe-inline'",
+			wantStatus:   "warn",
+			wantDetail:   "default-src allows 'unsafe-inline'",
+			wantEvidence: "default-src 'self' 'unsafe-inline'",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checks := securityHeaderChecks(
+				securityProbe{Scheme: "https"},
+				map[string]string{"content-security-policy": tt.policy},
+				true,
+				false,
+			)
+			check, ok := securityCheckByID(checks, "csp_unsafe_inline")
+			if !ok {
+				t.Fatal("missing csp_unsafe_inline check")
+			}
+			if check.Status != tt.wantStatus {
+				t.Fatalf("status = %q, want %q (detail %q)", check.Status, tt.wantStatus, check.Detail)
+			}
+			if tt.wantDetail != "" && !strings.Contains(check.Detail, tt.wantDetail) {
+				t.Errorf("detail = %q, want it to name %q", check.Detail, tt.wantDetail)
+			}
+			if tt.wantEvidence != "" && check.Evidence != tt.wantEvidence {
+				t.Errorf("evidence = %q, want %q", check.Evidence, tt.wantEvidence)
+			}
+			if tt.wantEvidence == "" && check.Evidence != "" {
+				t.Errorf("evidence = %q, want empty for the clean style-only policy", check.Evidence)
+			}
+		})
 	}
 }

@@ -8,7 +8,7 @@ import (
 // TestActions pins the page-act table: the expected row count, unique names,
 // dashed lookup and one dispatch case per row.
 func TestActions(t *testing.T) {
-	const wantRows = 40
+	const wantRows = 44
 	table := Actions()
 	if len(table) != wantRows {
 		t.Fatalf("action table has %d rows, want %d", len(table), wantRows)

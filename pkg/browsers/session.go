@@ -102,6 +102,11 @@ type Page struct {
 	// while an operation holds the page. Assigned once in the pre-registration
 	// window.
 	dialogs *pageDialogs
+	// violations holds the page's bound CSP violation ring, fed by a
+	// document-start listener through a CDP binding. It has its own mutex and
+	// sits outside the operation lock, because the reporter runs from the page's
+	// own event handler. Assigned once in the pre-registration window.
+	violations *pageViolations
 	// intercept holds the page's request interception state, nil until the first
 	// rule is added and after it is cleared. It is guarded by interceptMu, never
 	// by the operation lock, because its handlers make CDP calls from their own
@@ -728,6 +733,7 @@ func (p *Page) Close(ctx context.Context) error {
 	}
 	defer p.Unlock()
 	p.stopObservation()
+	p.stopViolations()
 	if p.Rod == nil {
 		return nil
 	}

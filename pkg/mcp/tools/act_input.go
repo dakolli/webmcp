@@ -1,6 +1,9 @@
 package tools
 
-import "github.com/dakolli/webmcp/pkg/mcp/models"
+import (
+	"github.com/dakolli/webmcp/pkg/cli/pageops"
+	"github.com/dakolli/webmcp/pkg/mcp/models"
+)
 
 // PageActDescription is the LLM-facing description of the Act tool.
 const PageActDescription = "Interacts with a live page opened by fetch_page: click (supports button selection & double-click), " +
@@ -12,6 +15,21 @@ const PageActDescription = "Interacts with a live page opened by fetch_page: cli
 	"url('a;b') and rgb(1,2,3) survive; an empty value removes the inline style; returns " +
 	"{target,cleared,applied,rejected,style} where applied lists the property names the CSSOM kept " +
 	"and rejected the declarations it dropped), " +
+	"set_attr (set one attribute from name and value onto the element; an empty value removes it; " +
+	"there is no allowlist, so javascript: and onerror values reach the page unchanged; returns " +
+	"{target,name,value,removed,nodes_added}), " +
+	"set_html (write markup from value into the element; mode is inner (default, innerHTML), outer " +
+	"(outerHTML) or append (insertAdjacentHTML beforeend); no sanitisation; returns " +
+	"{target,mode,nodes_added,elements,scripts,executed} where elements caps at 50 and executed is " +
+	"true only when the tracer recorded a hit beyond the write itself, so run sinks_install to " +
+	"observe it), " +
+	"fill_form (fill a form and optionally submit it in one call: pass fields as a selector→value " +
+	"object, or selector naming the <form> plus values as a name→value object resolved inside it; " +
+	"submit is requestSubmit (default), click or none, and wait_mode load|idle|stable waits after " +
+	"the submit; each control gets its native setter and the input/change events React and Vue " +
+	"listen for, a checkbox or radio is checked, a select takes the option value, a textarea takes " +
+	"the value; returns {form,filled:[{name,selector}],skipped:[{selector,reason}],submit,url_after} " +
+	"where an unresolved field is skipped, never an error, and a missing form is element_not_found), " +
 	"navigate, back, forward, reload, hover, scroll, select, wait, set_viewport, emulate, " +
 	"clear_logs (empties the network, console, websocket and dialog buffers, the dialog ring covering " +
 	"alert, confirm, prompt, beforeunload and auth challenges, returning the cleared counts, e.g. " +
@@ -116,6 +134,12 @@ const PageActDescription = "Interacts with a live page opened by fetch_page: cli
 	"no body, no network entry, cap reached or secrets hidden; it refuses a relative path or a non-empty " +
 	"directory, and keeps Cookie, Set-Cookie, Authorization and X-CSRF-Token values redacted unless the page " +
 	"opted into secret capture). " +
+	"encode (a page-free helper: encodes value for context and returns " +
+	"{context,variants:[{label,value}]} with the mechanically equivalent payloads raw, entity, " +
+	"url, url-double, js, js-hex, unicode and html5-attr; context is html-text, attr-double, " +
+	"attr-single, attr-unquoted, js-string, js-template, css-value, url-query or url-path; " +
+	"variants narrows the labels; it needs value and context but no session_id and never " +
+	"opens, locks or touches a page). " +
 	"Pass session_id plus action=... and any required parameters. When more than " +
 	"one browser is live, pass browser_id or owner to declare which browser holds " +
 	"the session; with one live browser both may be omitted, and a session held " +
@@ -159,11 +183,11 @@ func newActInputSchema() models.InputSchema {
 			"action": map[string]any{
 				"type":        "string",
 				"enum":        append([]string(nil), actActionNames...),
-				"description": "The interaction to perform: click (selector), input (set field text; the result reports the target and rune length, never the value, plus value_redacted=true for a password or hidden field), type (keystrokes, same result rule as input), press_key (key/combo e.g. Enter, Escape, Control+A), click_at/hover_at ({x, y} coordinates), drag_and_drop (from {x,y}/selector to {target_x,target_y}/target_selector), upload_file (set file input paths), eval (run JS), navigate (URL), back/forward/reload, hover (selector), set_style (write inline CSS declarations from a value such as \"background-image:url('/a.png');--page-bg:red\", split only at bracket depth zero; an empty value removes the inline style; returns {target,cleared,applied,rejected,style}), scroll (x/y), select (option value), wait (readiness mode), set_viewport (W x H), emulate (device preset), clear_logs (empty the network, console, websocket and dialog buffers; no parameters; returns {\"network\":N,\"console\":M,\"websocket\":K,\"dialogs\":D} cleared counts), dialog_accept (set the dialog policy to accept; value is the prompt text; the engine answers every dialog as it opens, so a dialog that arrived before the policy was set was already dismissed; returns {policy,prompt_text,count,dropped,last}), dialog_dismiss (set the dialog policy to dismiss; the default), http_auth (set a per-page HTTP basic-auth credential; value is user:password split at the first colon, an empty value clears it, the credential is never echoed and applies to later 401 challenges on that page; returns {http_auth:\"armed\"} or {http_auth:\"cleared\"}, plus note when Chromium already cached a credential for this origin, so open a new page to test a different credential; http_auth and intercept_add both need the Fetch domain, so one must be cleared first), sinks_install (arm the source-to-sink tracer; no parameters; returns {\"installed\":true}; capture is opt-in, changes page behavior, survives client-side route changes and full navigations while its per-document ring resets on a full navigation; read it with page_fetch what=sinks, which is read-only and never arms capture), sinks_clear (empty the tracer ring; no parameters; returns {\"cleared\":N}), replay (resend one captured network entry; needs target, optionally method, headers, query, value and max_bytes, where query edits URL parameters (an empty value or JSON null removes one) and request.url shows the edited URL; returns {status,headers,body,bytes,truncated,body_redactions,ms,request,chain} with sensitive headers and text-body secrets redacted and truncated/chain always present), replay_fuzz (bounded matrix over one captured entry; needs target, points:[{param,location}] and payloads (each also accepted as a stringified JSON array), optional strategy sniper|pitchfork|clusterbomb (default sniper) and max_bytes; computes and refuses the size before any request (max 100 matrix requests, 20 points, 50 payloads, 200 runes each; 5 in flight, 10s each); the baseline is probed twice, so summary.baseline:{status,bytes,cold_ms,ms} compares against the warm second sample and a time_delta inside the cold-to-warm spread is suppressed; returns {runs:[{seq,payload,point,status,ms,bytes,body_cut,body_redactions}],summary:{baseline,anomalies}}), inject_canary (inject a canary into query/hash/postmessage/name — default all four, narrow with targets — and return {canary, injected:[{target, where}], hits:[{sink, context, selector, value, stack}], installed}; requires sinks_install first; query reloads, hash does not; capped at 20 frames), postmessage_install (arm the postMessage recorder: one capture-phase listener per window and iframe without wrapping addEventListener, so page listeners keep their identity; no parameters; returns {\"installed\":true}; read it with page_fetch what=postmessage), postmessage_clear (empty every recorder ring; no parameters; returns {\"cleared\":N}), post_message (deliver value to window.top/self/parent when target_selector is \"top\", \"self\", \"parent\" or omitted, or to the contentWindow of the <iframe>/<frame> matched by any other target_selector; a selector that is not a frame errors instead of falling back to top; origin is the target origin, default \"*\"; arms the recorder first and returns {origin,target}), wait_open (block until this page opens a popup or new tab — target=\"_blank\" or window.open — and return {session_id,url,opener}; timeout_ms bounds the wait; a popup opened before the call is returned immediately), intercept_add (arm a page-scoped in-flight request interceptor with rules=[{id,url_pattern,method,action,headers,rewrite_method,status,body,delay_ms}]; action is block|allow|rewrite|fulfill, url_pattern is a wildcard glob (default *), rewrite continues with headers/body/rewrite_method, a miss continues immediately, and the page holds at most 50 rules across calls (page-wide, not per call); opt-in, changes page behaviour and disables the page HTTP cache while armed so cached subresources still match; returns {rules,count,remaining,active}), intercept_list (return the page's rules with sensitive header values redacted and the remaining rule budget; returns {rules,count,remaining,active}), intercept_clear (remove every rule, continue any paused request, disable interception and restore the cache; returns {rules_removed,active:false}). Rules are per session and never outlive the page. poc_bundle (package one finding as a self-contained evidence directory: value is the finding title, paths[0] is the absolute output directory, and optional target selects the captured request by seq or URL substring; writes meta.json, request.http, response.http, screenshot.png, dom.html, storage.json and README.md, plus sinks.json only when the tracer was installed, and returns {directory,files,omitted}). Logs are cumulative from page creation — filter client-side or clear_logs right before the step under observation.",
+				"description": "The interaction to perform: click (selector), input (set field text; the result reports the target and rune length, never the value, plus value_redacted=true for a password or hidden field), type (keystrokes, same result rule as input), press_key (key/combo e.g. Enter, Escape, Control+A), click_at/hover_at ({x, y} coordinates), drag_and_drop (from {x,y}/selector to {target_x,target_y}/target_selector), upload_file (set file input paths), eval (run JS), navigate (URL), back/forward/reload, hover (selector), set_style (write inline CSS declarations from a value such as \"background-image:url('/a.png');--page-bg:red\", split only at bracket depth zero; an empty value removes the inline style; returns {target,cleared,applied,rejected,style}), set_attr (set one attribute from name and value on the element; an empty value removes it; no allowlist, so javascript: and onerror reach the page unchanged; returns {target,name,value,removed,nodes_added}), set_html (write markup from value; mode is inner (default, innerHTML), outer (outerHTML) or append (insertAdjacentHTML beforeend); no sanitisation; returns {target,mode,nodes_added,elements,scripts,executed}, elements capped at 50, executed true only when the tracer saw a hit beyond the write itself), fill_form (fill a form and optionally submit it in one call: fields is a selector→value object, or selector names the <form> and values is a name→value object resolved inside it; submit is requestSubmit (default), click or none; wait_mode load|idle|stable waits after the submit; returns {form,filled:[{name,selector}],skipped:[{selector,reason}],submit,url_after}; an unresolved field is skipped, never an error, and a missing form is element_not_found), scroll (x/y), select (option value), wait (readiness mode), set_viewport (W x H), emulate (device preset), clear_logs (empty the network, console, websocket and dialog buffers; no parameters; returns {\"network\":N,\"console\":M,\"websocket\":K,\"dialogs\":D} cleared counts), dialog_accept (set the dialog policy to accept; value is the prompt text; the engine answers every dialog as it opens, so a dialog that arrived before the policy was set was already dismissed; returns {policy,prompt_text,count,dropped,last}), dialog_dismiss (set the dialog policy to dismiss; the default), http_auth (set a per-page HTTP basic-auth credential; value is user:password split at the first colon, an empty value clears it, the credential is never echoed and applies to later 401 challenges on that page; returns {http_auth:\"armed\"} or {http_auth:\"cleared\"}, plus note when Chromium already cached a credential for this origin, so open a new page to test a different credential; http_auth and intercept_add both need the Fetch domain, so one must be cleared first), sinks_install (arm the source-to-sink tracer; no parameters; returns {\"installed\":true}; capture is opt-in, changes page behavior, survives client-side route changes and full navigations while its per-document ring resets on a full navigation; read it with page_fetch what=sinks, which is read-only and never arms capture), sinks_clear (empty the tracer ring; no parameters; returns {\"cleared\":N}), replay (resend one captured network entry; needs target, optionally method, headers, query, value and max_bytes, where query edits URL parameters (an empty value or JSON null removes one) and request.url shows the edited URL; returns {status,headers,body,bytes,truncated,body_redactions,ms,request,chain} with sensitive headers and text-body secrets redacted and truncated/chain always present), replay_fuzz (bounded matrix over one captured entry; needs target, points:[{param,location}] and payloads (each also accepted as a stringified JSON array), optional strategy sniper|pitchfork|clusterbomb (default sniper) and max_bytes; computes and refuses the size before any request (max 100 matrix requests, 20 points, 50 payloads, 200 runes each; 5 in flight, 10s each); the baseline is probed twice, so summary.baseline:{status,bytes,cold_ms,ms} compares against the warm second sample and a time_delta inside the cold-to-warm spread is suppressed; returns {runs:[{seq,payload,point,status,ms,bytes,body_cut,body_redactions}],summary:{baseline,anomalies}}), inject_canary (inject a canary into query/hash/postmessage/name — default all four, narrow with targets — and return {canary, injected:[{target, where}], hits:[{sink, context, selector, value, stack}], installed}; requires sinks_install first; query reloads, hash does not; capped at 20 frames), postmessage_install (arm the postMessage recorder: one capture-phase listener per window and iframe without wrapping addEventListener, so page listeners keep their identity; no parameters; returns {\"installed\":true}; read it with page_fetch what=postmessage), postmessage_clear (empty every recorder ring; no parameters; returns {\"cleared\":N}), post_message (deliver value to window.top/self/parent when target_selector is \"top\", \"self\", \"parent\" or omitted, or to the contentWindow of the <iframe>/<frame> matched by any other target_selector; a selector that is not a frame errors instead of falling back to top; origin is the target origin, default \"*\"; arms the recorder first and returns {origin,target}), wait_open (block until this page opens a popup or new tab — target=\"_blank\" or window.open — and return {session_id,url,opener}; timeout_ms bounds the wait; a popup opened before the call is returned immediately), intercept_add (arm a page-scoped in-flight request interceptor with rules=[{id,url_pattern,method,action,headers,rewrite_method,status,body,delay_ms}]; action is block|allow|rewrite|fulfill, url_pattern is a wildcard glob (default *), rewrite continues with headers/body/rewrite_method, a miss continues immediately, and the page holds at most 50 rules across calls (page-wide, not per call); opt-in, changes page behaviour and disables the page HTTP cache while armed so cached subresources still match; returns {rules,count,remaining,active}), intercept_list (return the page's rules with sensitive header values redacted and the remaining rule budget; returns {rules,count,remaining,active}), intercept_clear (remove every rule, continue any paused request, disable interception and restore the cache; returns {rules_removed,active:false}). Rules are per session and never outlive the page. poc_bundle (package one finding as a self-contained evidence directory: value is the finding title, paths[0] is the absolute output directory, and optional target selects the captured request by seq or URL substring; writes meta.json, request.http, response.http, screenshot.png, dom.html, storage.json and README.md, plus sinks.json only when the tracer was installed, and returns {directory,files,omitted}). encode (encode a payload for a context and return the mechanically equivalent variants — raw, entity, url, url-double, js, js-hex, unicode, html5-attr; needs value and context but no session_id, never touches the page, and returns {context,variants:[{label,value}]}). Logs are cumulative from page creation — filter client-side or clear_logs right before the step under observation.",
 			},
 			"selector": map[string]any{
 				"type":        "string",
-				"description": "CSS selector or XPath identifying the target element. Required by click, input, type, hover, select, set_style and upload_file; optional for press_key and the drag_and_drop source; unused by click_at/hover_at (pass x/y), eval/navigate (pass value), scroll and the navigation actions. Use handle= for an element handle from page_fetch. Example: { \"session_id\": \"page-1\", \"action\": \"click\", \"selector\": \"a.primary\" }.",
+				"description": "CSS selector or XPath identifying the target element. Required by click, input, type, hover, select, set_style, set_attr, set_html and upload_file; optional for press_key and the drag_and_drop source; for fill_form it names the <form> and may be omitted when fields carries full selectors; unused by click_at/hover_at (pass x/y), eval/navigate (pass value), scroll and the navigation actions. Use handle= for an element handle from page_fetch. Example: { \"session_id\": \"page-1\", \"action\": \"click\", \"selector\": \"a.primary\" }.",
 			},
 			"handle": map[string]any{
 				"type":        "string",
@@ -171,7 +195,25 @@ func newActInputSchema() models.InputSchema {
 			},
 			"value": map[string]any{
 				"type":        "string",
-				"description": "Payload value for input/type (text; the result never echoes it), press_key (key combo fallback), eval (JS source), navigate (URL), select (option value), upload_file (single path fallback), set_style (a CSS declaration list such as \"background-image:url('/a.png');--page-bg:red\"; an empty value removes the inline style), or poc_bundle (the finding title). For replay it replaces the request body; omit it to send no body. For inject_canary it is the custom canary value; omit it to mint wm-canary-<8 hex>.",
+				"description": "Payload value for input/type (text; the result never echoes it), press_key (key combo fallback), eval (JS source), navigate (URL), select (option value), upload_file (single path fallback), set_style (a CSS declaration list such as \"background-image:url('/a.png');--page-bg:red\"; an empty value removes the inline style), set_attr (the attribute value; an empty value removes the attribute), set_html (the markup to write; not sanitised), poc_bundle (the finding title), or encode (the payload to encode). For replay it replaces the request body; omit it to send no body. For inject_canary it is the custom canary value; omit it to mint wm-canary-<8 hex>.",
+			},
+			"context": map[string]any{
+				"type": "string",
+				"enum": pageops.EncodeContexts(),
+				"description": "encode only: where the payload will land, which selects the variant set. " +
+					"html-text (HTML text node), attr-double / attr-single / attr-unquoted (inside an " +
+					"attribute, plus url for an href/src target), js-string / js-template (inside a " +
+					"JavaScript string or template literal), css-value (inside a CSS declaration), " +
+					"url-query / url-path (inside a URL). An unknown context fails as invalid_args and " +
+					"lists every accepted value.",
+			},
+			"variants": map[string]any{
+				"type":  "array",
+				"items": map[string]any{"type": "string"},
+				"description": "encode only: narrows the returned variants to these labels. Omit for the " +
+					"full set of the context. raw is always present. Labels are raw, entity, url, " +
+					"url-double, js, js-hex, unicode and html5-attr; a label the context does not " +
+					"offer fails as invalid_args.",
 			},
 			"targets": map[string]any{
 				"type":  "array",
@@ -328,7 +370,7 @@ func newActInputSchema() models.InputSchema {
 				"type":        "string",
 				"enum":        []string{"load", "idle", "stable", "interactable", "ms"},
 				"default":     "ms",
-				"description": "What to wait for (wait action): load, idle, stable, interactable (needs selector), or ms (sleeps timeout_ms).",
+				"description": "What to wait for (wait action): load, idle, stable, interactable (needs selector), or ms (sleeps timeout_ms). fill_form reuses load, idle or stable as the post-submit wait; ms and interactable are ignored there.",
 			},
 			"viewport": map[string]any{
 				"type": "object",
@@ -351,7 +393,36 @@ func newActInputSchema() models.InputSchema {
 			},
 			"name": map[string]any{
 				"type":        "string",
-				"description": "Snapshot name, unique per site (required by auth_save and auth_restore; a second save with the same site and name updates it instead of duplicating).",
+				"description": "Snapshot name, unique per site (required by auth_save and auth_restore; a second save with the same site and name updates it instead of duplicating). For set_attr it is the attribute name to write, e.g. href, src, onerror or srcdoc.",
+			},
+			"mode": map[string]any{
+				"type":        "string",
+				"enum":        []string{"inner", "outer", "append"},
+				"default":     "inner",
+				"description": "set_html only: inner (default) assigns innerHTML, outer assigns outerHTML, append calls insertAdjacentHTML('beforeend'). An unknown mode fails as invalid_args.",
+			},
+			"fields": map[string]any{
+				"type":                 "object",
+				"additionalProperties": map[string]any{"type": "string"},
+				"description": "fill_form only: a JSON object of field selector → value. Mutually exclusive " +
+					"with values. Without a form selector the selectors resolve against the document; with " +
+					"one they resolve inside that form. Example: " +
+					"{\"fields\":{\"#q\":\"wm1\",\"#go\":\"1\"},\"submit\":\"requestSubmit\"}.",
+			},
+			"values": map[string]any{
+				"type":                 "object",
+				"additionalProperties": map[string]any{"type": "string"},
+				"description": "fill_form only: a JSON object of field name → value, resolved inside the " +
+					"form named by selector. Requires selector. Mutually exclusive with fields. Example: " +
+					"{\"selector\":\"form#login\",\"values\":{\"user\":\"a\",\"pass\":\"b\"}}.",
+			},
+			"submit": map[string]any{
+				"type":    "string",
+				"enum":    []string{"requestSubmit", "click", "none"},
+				"default": "requestSubmit",
+				"description": "fill_form only: requestSubmit (default) calls form.requestSubmit(), click " +
+					"clicks the form's submit control, none only fills. A submit other than none requires a " +
+					"form (a form selector or a field inside a <form>).",
 			},
 			"force": map[string]any{
 				"type":    "boolean",

@@ -113,13 +113,59 @@ type securityCheck struct {
 type securityReport struct {
 	// URL is the audited page address.
 	URL string `json:"url"`
+	// Policy is the effective Content-Security-Policy parsed for an agent.
+	Policy securityPolicyInfo `json:"policy"`
 	// Checks are the findings in a stable order.
 	Checks []securityCheck `json:"checks"`
+	// Violations is the page's bounded securitypolicyviolation ring.
+	Violations securityViolations `json:"violations"`
 	// Count is len(Checks).
 	Count int `json:"count"`
 	// Truncated counts DOM and cookie entries omitted by securityMaxItems, so a
 	// cut is always explicit and never silent.
 	Truncated int `json:"truncated"`
+}
+
+// securityPolicyInfo is the effective policy an agent needs to answer whether a
+// payload can run: where the policy came from, its directives, and the script
+// controls that decide inline and eval execution.
+type securityPolicyInfo struct {
+	// Present reports that the page declares a policy.
+	Present bool `json:"present"`
+	// Source is "header" or "meta", empty when no policy is present.
+	Source string `json:"source"`
+	// ReportOnly reports a policy delivered as Content-Security-Policy-Report-Only,
+	// which reports violations and blocks nothing.
+	ReportOnly bool `json:"report_only"`
+	// Directives maps each directive to its source tokens, always non-nil.
+	Directives map[string][]string `json:"directives"`
+	// ScriptSrc is the declared script-src sources, empty when absent.
+	ScriptSrc string `json:"script_src"`
+	// StyleSrc is the declared style-src sources, empty when absent.
+	StyleSrc string `json:"style_src"`
+	// DefaultSrc is the declared default-src sources, empty when absent.
+	DefaultSrc string `json:"default_src"`
+	// UnsafeInline reports 'unsafe-inline' in the effective script-src, falling
+	// back to default-src.
+	UnsafeInline bool `json:"unsafe_inline"`
+	// UnsafeEval reports 'unsafe-eval' in the effective script-src, falling back
+	// to default-src.
+	UnsafeEval bool `json:"unsafe_eval"`
+	// Nonce is the script nonce, empty when the effective policy has none.
+	Nonce string `json:"nonce"`
+	// Hashes are the script hashes, always non-nil.
+	Hashes []string `json:"hashes"`
+}
+
+// securityViolations is the CSP violation ring section: the buffered events
+// oldest first, their count, and how many the engine's ring evicted.
+type securityViolations struct {
+	// Entries are the retained events, oldest first, never nil on the wire.
+	Entries []browsers.CSPViolation `json:"entries"`
+	// Count is len(Entries).
+	Count int `json:"count"`
+	// Dropped counts events the engine's 50-event ring evicted.
+	Dropped int `json:"dropped"`
 }
 
 // PageSecurity returns a passive security audit of the live page as
@@ -152,8 +198,15 @@ func PageSecurity(ctx context.Context, p *browsers.Page) (string, error) {
 
 	ring, _ := p.NetworkEntries()
 	doc, entries, found := securityDocumentRing(ring)
-	headers := doc.RespHeaders
-	cut := found && doc.RespHeadersTruncated
+	enforcedCSP, reportOnlyCSP := p.DocumentCSP()
+	headers, captured := documentHeaders(
+		doc.RespHeaders,
+		enforcedCSP,
+		reportOnlyCSP,
+		p.DocumentSecurityHeaders(),
+	)
+	found = found || captured
+	cut := found && doc.RespHeadersTruncated && !captured
 	cookies, cookiesOmitted := pageCookieChecks(pc, probe.URL, probe.Cookies)
 
 	checks := securityHeaderChecks(probe, headers, found, cut)
@@ -166,9 +219,20 @@ func PageSecurity(ctx context.Context, p *browsers.Page) (string, error) {
 	checks = append(checks, securityContentChecks(probe)...)
 	checks = append(checks, securityCORSCheck(entries))
 
+	violations, violationsDropped := p.CSPViolations()
 	report := securityReport{
-		URL:       probe.URL,
-		Checks:    checks,
+		URL: probe.URL,
+		Policy: effectiveSecurityPolicy(
+			headerValue(headers, "content-security-policy"),
+			strings.TrimSpace(probe.MetaCSP),
+			headerValue(headers, "content-security-policy-report-only"),
+		),
+		Checks: checks,
+		Violations: securityViolations{
+			Entries: violations,
+			Count:   len(violations),
+			Dropped: violationsDropped,
+		},
 		Count:     len(checks),
 		Truncated: securityOmitted(probe) + cookiesOmitted,
 	}
@@ -193,6 +257,62 @@ func securityOmitted(probe securityProbe) int {
 		}
 	}
 	return omitted
+}
+
+// documentHeaders returns the audited document's response headers, preferring
+// the page's uncapped capture over the network ring. The two CSP values and the
+// stored security headers are replaced by the page-side record when it has one,
+// so they survive clear_logs and are not clipped at 512 bytes; every other ring
+// header keeps its clipped value. captured reports whether any stored value was
+// applied, so the caller can stop describing the headers as absent or cut. The
+// ring itself is never modified.
+func documentHeaders(
+	headers map[string]string,
+	enforced,
+	reportOnly string,
+	stored map[string]string,
+) (map[string]string, bool) {
+	enforced = strings.TrimSpace(enforced)
+	reportOnly = strings.TrimSpace(reportOnly)
+
+	replaced := make(map[string]bool, len(stored)+2)
+	if enforced != "" {
+		replaced["content-security-policy"] = true
+	}
+	if reportOnly != "" {
+		replaced["content-security-policy-report-only"] = true
+	}
+	for name, value := range stored {
+		if strings.TrimSpace(value) != "" {
+			replaced[strings.ToLower(name)] = true
+		}
+	}
+
+	merged := make(map[string]string, len(headers)+len(replaced))
+	for name, value := range headers {
+		if replaced[strings.ToLower(name)] {
+			continue
+		}
+		merged[name] = value
+	}
+	captured := false
+	if enforced != "" {
+		merged["content-security-policy"] = enforced
+		captured = true
+	}
+	if reportOnly != "" {
+		merged["content-security-policy-report-only"] = reportOnly
+		captured = true
+	}
+	for name, value := range stored {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		merged[strings.ToLower(name)] = value
+		captured = true
+	}
+	return merged, captured
 }
 
 // securityDocumentRing returns the entry the engine marked as the audited
@@ -335,7 +455,7 @@ func securityHeaderChecks(
 		checks = append(checks, securityCheck{
 			ID:     "headers",
 			Status: "info",
-			Detail: "the audited document's response is not in the network ring (newest 200 requests, spanning navigations), so every header below reads as absent — re-open the page to audit headers without guessing",
+			Detail: "the audited document's response is not in the network ring (newest 200 requests, spanning navigations), so the other headers below read as absent — the CSP policy is still reported from the page's own capture; re-open the page to audit the rest",
 		})
 	case cut:
 		checks = append(checks, securityCheck{
@@ -377,9 +497,10 @@ func securityHeaderChecks(
 		policy = metaCSP
 	}
 	if policy != "" {
+		parsed := parseCSP(policy)
 		for _, weak := range []struct {
-			id        string
-			directive string
+			id    string
+			token string
 		}{
 			{"csp_unsafe_inline", "'unsafe-inline'"},
 			{"csp_unsafe_eval", "'unsafe-eval'"},
@@ -387,12 +508,12 @@ func securityHeaderChecks(
 			check := securityCheck{
 				ID:     weak.id,
 				Status: "ok",
-				Detail: "the policy does not allow " + weak.directive,
+				Detail: "the effective script directive does not allow " + weak.token,
 			}
-			if strings.Contains(policy, weak.directive) {
+			if d, ok := parsed.effective("script-src"); ok && hasSource(d.values, weak.token) {
 				check.Status = "warn"
-				check.Evidence = weak.directive
-				check.Detail = "the policy allows " + weak.directive + " — use nonces or hashes for scripts and avoid eval-style code"
+				check.Evidence = d.text
+				check.Detail = d.name + " allows " + weak.token + " — use nonces or hashes for scripts and avoid eval-style code"
 			}
 			checks = append(checks, check)
 		}
@@ -487,6 +608,103 @@ func securityPolicy(probe securityProbe, headers map[string]string) string {
 		return csp
 	}
 	return strings.TrimSpace(probe.MetaCSP)
+}
+
+// effectiveSecurityPolicy parses the enforced policy, preferring a
+// Content-Security-Policy header over a <meta http-equiv> form and falling back
+// to a Content-Security-Policy-Report-Only header when neither is present. A
+// report-only policy is parsed and flagged, because it still reports violations
+// and still tells an agent what the site intends to block.
+func effectiveSecurityPolicy(header, meta, reportOnly string) securityPolicyInfo {
+	info := securityPolicyInfo{
+		Directives: map[string][]string{},
+		Hashes:     []string{},
+	}
+	raw := strings.TrimSpace(header)
+	source := "header"
+	if raw == "" {
+		if m := strings.TrimSpace(meta); m != "" {
+			raw, source = m, "meta"
+		}
+	}
+	if raw == "" {
+		if ro := strings.TrimSpace(reportOnly); ro != "" {
+			raw, source = ro, "header"
+			info.ReportOnly = true
+		}
+	}
+	if raw == "" {
+		return info
+	}
+	info.Present = true
+	info.Source = source
+
+	p := parseCSP(raw)
+	for _, d := range p.directives {
+		info.Directives[d.name] = cspSources(d.text)
+	}
+	if d, ok := p.directive("script-src"); ok {
+		info.ScriptSrc = strings.Join(cspSources(d.text), " ")
+	}
+	if d, ok := p.directive("style-src"); ok {
+		info.StyleSrc = strings.Join(cspSources(d.text), " ")
+	}
+	if d, ok := p.directive("default-src"); ok {
+		info.DefaultSrc = strings.Join(cspSources(d.text), " ")
+	}
+
+	eff, ok := p.effective("script-src")
+	if !ok {
+		return info
+	}
+	sources := cspSources(eff.text)
+	info.UnsafeInline = hasSource(eff.values, "'unsafe-inline'")
+	info.UnsafeEval = hasSource(eff.values, "'unsafe-eval'")
+	info.Nonce = cspNonce(sources)
+	info.Hashes = cspHashes(sources)
+	return info
+}
+
+// cspSources returns the source tokens of one directive text, preserving their
+// case so a nonce or hash is never mangled. The result is never nil.
+func cspSources(text string) []string {
+	fields := strings.Fields(text)
+	if len(fields) < 2 {
+		return []string{}
+	}
+	return fields[1:]
+}
+
+// cspNonce extracts the first 'nonce-...' token from a source list, preserving
+// the nonce's case.
+func cspNonce(sources []string) string {
+	const prefix = "'nonce-"
+	for _, s := range sources {
+		if len(s) <= len(prefix) || !strings.HasSuffix(s, "'") {
+			continue
+		}
+		if !strings.HasPrefix(strings.ToLower(s), prefix) {
+			continue
+		}
+		return s[len(prefix) : len(s)-1]
+	}
+	return ""
+}
+
+// cspHashes returns the sha256/sha384/sha512 tokens from a source list,
+// preserving their case. The result is never nil.
+func cspHashes(sources []string) []string {
+	hashes := []string{}
+	for _, s := range sources {
+		token := strings.Trim(s, "'")
+		low := strings.ToLower(token)
+		if strings.HasPrefix(low, "sha256-") ||
+			strings.HasPrefix(low, "sha384-") ||
+			strings.HasPrefix(low, "sha512-") {
+			hashes = append(hashes, token)
+		}
+	}
+	return hashes
 }
 
 // cspBypassHost is a script-src host that cannot be trusted as a script source

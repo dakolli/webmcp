@@ -1,4 +1,4 @@
-> Tool: `page_act` · Server: web-mcp · Surface: MCP · Tested: 2026-10-28
+> Tool: `page_act` · Server: web-mcp · Surface: MCP · Tested: 2026-10-30
 
 # page_act
 
@@ -6,23 +6,25 @@ Interact with a live page that `fetch_page` opened.
 
 ## What it does
 
-`page_act` performs one action in an open session. The `session_id` picks the tab and the `action` field picks the operation. Actions cover clicking, typing, keys, mouse coordinates, drag, upload, JavaScript, navigation, waiting, waiting for a popup, emulation, log clearing, replaying and fuzzing a captured network request, in-flight request interception, sink control, canary injection, postMessage capture and sending, and auth snapshots.
+`page_act` performs one action in an open session. The `session_id` picks the tab and the `action` field picks the operation. Actions cover clicking, typing, keys, mouse coordinates, drag, upload, JavaScript, navigation, waiting, waiting for a popup, emulation, log clearing, replaying and fuzzing a captured network request, in-flight request interception, sink control, canary injection, postMessage capture and sending, and auth snapshots. The page-free `encode` helper encodes one payload into the mechanically equivalent variants for a target context without opening or touching a page.
 
-The confirmation rides the result envelope: the full reply is `{"ok":true,"data":<payload>}`. See `SKILL.md` for the envelope rules and the `{"ok":false,"error":…}` shape. The payload is one short prose string plus a state delta line. `eval`, `clear_logs`, the sink and canary actions, `replay`, `replay_fuzz`, the postMessage actions, `wait_open`, the `intercept_*` actions, and the dialog and HTTP-auth actions return compact JSON instead.
+The confirmation rides the result envelope: the full reply is `{"ok":true,"data":<payload>}`. See `SKILL.md` for the envelope rules and the `{"ok":false,"error":…}` shape. The payload is one short prose string plus a state delta line. `eval`, `encode`, `fill_form`, `clear_logs`, the sink and canary actions, `replay`, `replay_fuzz`, the postMessage actions, `wait_open`, the `intercept_*` actions, and the dialog and HTTP-auth actions return compact JSON instead.
 
 ## Inputs
 
-The schema is `code://pkg/mcp/tools/act.go#L125`. Only `session_id` and `action` are required, and a session held outside the declared `owner` is refused as `not_found`. Actions ignore fields they do not use.
+The schema is `code://pkg/mcp/tools/act.go#L125`. `session_id` and `action` are required by every page action, and a session held outside the declared `owner` is refused as `not_found`. `encode` needs neither `session_id` nor a live browser. Actions ignore fields they do not use.
 
 | Name | Type | Required by | Default | Meaning |
 | :--- | :--- | :--- | :--- | :--- |
-| `session_id` | string | always | — | Tab from `fetch_page`, for example `page-3`. |
+| `session_id` | string | every action except `encode` and `auth_list` | — | Tab from `fetch_page`, for example `page-3`. |
 | `action` | string | always | — | One of the actions below. |
 | `browser_id` | string | no | — | Optional. Resolve the session inside this browser only, for example `browser-2`. Omit it when exactly one live browser holds the id. |
 | `owner` | string | no | — | Optional. Restrict the lookup to browsers with this owner label, 1 to 64 characters of `A-Z`, `a-z`, `0-9`, `.`, `_`, `-`. |
-| `selector` | string | `click`, `input`, `type`, `hover`, `select`, `set_style`, `upload_file` | — | CSS selector or XPath. Optional for `press_key` and the drag source. |
+| `selector` | string | `click`, `input`, `type`, `hover`, `select`, `set_style`, `upload_file` | — | CSS selector or XPath. Optional for `press_key` and the drag source. For `fill_form` it names the `<form>` and may be omitted when `fields` carries full selectors. |
 | `handle` | string | alternative to `selector` | — | Handle from `page_fetch` `what=interactives\|dom\|links`. Wins over `selector`. |
-| `value` | string | `eval`, `navigate`, `input`, `type`, `select`, `set_style`, `replay`, `post_message`, `poc_bundle` | — | Payload text, JavaScript source, URL, option value, CSS declaration list, message payload, or the `poc_bundle` finding title. For `set_style` an empty value removes the inline style. For `replay` it replaces the request body and is sent only when the field is present. For `inject_canary` it is a custom canary. Omit it to mint `wm-canary-<8 hex>`. For `dialog_accept` it is the prompt text an accept supplies. For `http_auth` it is `user:password`, split at the first colon, and an empty value clears the credential. |
+| `value` | string | `eval`, `navigate`, `input`, `type`, `select`, `set_style`, `replay`, `post_message`, `poc_bundle`, `encode` | — | Payload text, JavaScript source, URL, option value, CSS declaration list, message payload, `poc_bundle` finding title, or the `encode` payload. For `set_style` an empty value removes the inline style. For `replay` it replaces the request body and is sent only when the field is present. For `inject_canary` it is a custom canary. Omit it to mint `wm-canary-<8 hex>`. For `dialog_accept` it is the prompt text an accept supplies. For `http_auth` it is `user:password`, split at the first colon, and an empty value clears the credential. |
+| `context` | string | `encode` | — | Where the payload lands, which selects the variant set: `html-text`, `attr-double`, `attr-single`, `attr-unquoted`, `js-string`, `js-template`, `css-value`, `url-query`, or `url-path`. An unknown context fails as `invalid_args` and lists every accepted value. |
+| `variants` | array | `encode` (optional) | full set | Narrows the returned labels. `raw` is always present. A label the context does not offer fails as `invalid_args`. |
 | `targets` | array | `inject_canary` (optional) | all four | Injection points: `query`, `hash`, `postmessage`, `name`. Each entry may be a comma-separated list. |
 | `target` | string | `replay`, `replay_fuzz`, `poc_bundle` | — | Captured network entry: a `seq` number or a substring of the request URL. |
 | `method` | string | `replay` (optional) | — | HTTP method override, for example `PUT`. Omit to keep the captured method. |
@@ -48,10 +50,14 @@ The schema is `code://pkg/mcp/tools/act.go#L125`. Only `session_id` and `action`
 | `device` | string | `emulate` | — | go-rod preset name, for example `IPhoneX`. `clear` resets. |
 | `rules` | array | `intercept_add` | — | Rules, each `{id?,url_pattern?,method?,action,headers?,status?,body?,delay_ms?}`. At most 50 per page across calls, and `action` is required. See [Request interception](#request-interception). |
 | `site` | string | `auth_save`, `auth_restore` (optional for `auth_list`) | — | Host the snapshot is scoped to, for example `www.saucedemo.com`. Accepts a bare host or a URL. For `auth_list` it is a filter. |
-| `name` | string | `auth_save`, `auth_restore` | — | Snapshot name, unique per site. A second save with the same site and name updates it. |
+| `name` | string | `auth_save`, `auth_restore`, `set_attr` | — | Snapshot name, unique per site, for the auth actions. For `set_attr` it is the attribute name to write, for example `href`, `src`, `onerror`, `srcdoc`, or `formaction`. |
+| `mode` | string | no | `inner` | `set_html` write: `inner` assigns `innerHTML`, `outer` assigns `outerHTML`, `append` calls `insertAdjacentHTML("beforeend")`. |
+| `fields` | object | `fill_form` (one shape) | — | `fill_form` field selector → value. Mutually exclusive with `values`. Without a form selector the selectors resolve against the document; with one they resolve inside that form. |
+| `values` | object | `fill_form` (one shape) | — | `fill_form` field name → value, resolved inside the form named by `selector`. Requires `selector`. Mutually exclusive with `fields`. |
+| `submit` | string | no | `requestSubmit` | `fill_form` submit mode: `requestSubmit` calls `form.requestSubmit()`, `click` clicks the form's submit control, `none` only fills. A submit other than `none` requires a form. |
 | `force` | boolean | no | `false` | `auth_restore` only. Restore across a user-agent mismatch. Without it the restore is refused and both agents are named. |
 
-`value` is required for `eval`, `navigate`, and `post_message`, and the server rejects an empty value for the first two before it touches the page. An empty `value` is valid for `set_style`: it removes the element's inline style. For `upload_file`, pass `paths` (a single `value` path also works).
+`value` is required for `eval`, `navigate`, and `post_message`, and the server rejects an empty value for the first two before it touches the page. An empty `value` is valid for `set_style`: it removes the element's inline style. For `upload_file`, pass `paths` (a single `value` path also works). `encode` needs `context`; an empty payload is encoded as empty variants.
 
 ## Actions
 
@@ -72,12 +78,16 @@ The schema is `code://pkg/mcp/tools/act.go#L125`. Only `session_id` and `action`
 | `reload` | — | Reloads and waits for load. | `reloaded page` | Yes, when state changes. |
 | `hover` | `selector` or `handle` | Moves the mouse over the element. | `hovered selector="…"` | No. |
 | `set_style` | `selector` or `handle`, `value` | Writes inline CSS declarations from `value` onto the element, split only at bracket depth zero so `url('a;b')` and `rgb(1,2,3)` survive. An empty `value` removes the inline style attribute. See [Inline styles](#inline-styles). | Compact JSON `{target,cleared,applied,rejected,style}`. | Yes, when state changes. |
+| `set_attr` | `selector` or `handle`, `name`, `value` | Sets one attribute from `name` and `value`. An empty `value` removes the attribute. There is no allowlist, so `javascript:` and `onerror` reach the page unchanged. See [Attribute and markup injection](#attribute-and-markup-injection). | Compact JSON `{target,name,value,removed,nodes_added}` plus `url_delta` only when the URL changed. | Yes, when state changes. |
+| `set_html` | `selector` or `handle`, `value`, optional `mode` | Writes markup into the element: `inner` (default), `outer`, or `append`. No sanitisation. See [Attribute and markup injection](#attribute-and-markup-injection). | Compact JSON `{target,mode,nodes_added,elements,scripts,executed}`. | Yes, when state changes. |
+| `encode` | `value`, `context`; optional `variants` | Page-free helper: encodes `value` for the target context without opening, locking, or touching a page. See [Payload encoding](#payload-encoding). | Compact JSON `{context,variants:[{label,value}]}`. | No. |
 | `scroll` | `x`, `y` (default `0`) | Calls `window.scrollBy(x, y)`. | `scrolled to [\n  0,\n  400\n]` | No. |
 | `select` | `selector` or `handle`, `value` | Selects an `<option>` by exact `value` attribute. | `selected option value="2" in selector="…"` | Yes, when state changes. |
+| `fill_form` | `fields`, or `selector` plus `values`; optional `submit`, `wait_mode` | Fills every field through its native setter with the events React and Vue listen for, then optionally submits. See [Filling a form](#filling-a-form). | JSON object `{form,filled:[{name,selector}],skipped:[{selector,reason}],submit,url_after}`. | Suppressed: `url_after` carries the change. |
 | `wait` | `wait_mode` | Waits for a readiness level or sleeps. | `waited 250ms`, `waited for "load"`, or `element "…" is interactable` | No. |
 | `set_viewport` | `viewport` | Applies a manual width and height override. | `set viewport to 800x600` | No. |
 | `emulate` | `device` | Applies a device preset, or clears it. | `emulated device: IPhoneX` | No. |
-| `clear_logs` | — | Empties the network, console, websocket, and dialog/auth rings and resets their `dropped` counters. | `{"network":132,"console":1,"websocket":0,"dialogs":2}` | No. |
+| `clear_logs` | — | Empties the network, console, websocket, dialog/auth, and CSP-violation rings and resets their `dropped` counters. | `{"network":132,"console":1,"websocket":0,"dialogs":2,"violations":0}` | No. |
 | `sinks_install` | — | Arms the source-to-sink tracer on the current document and every later navigation. Idempotent. Capture is opt-in and changes page behavior. | `{"installed":true}`. A failure returns an error, never `installed:false`. | No. |
 | `sinks_clear` | — | Empties the tracer's hit ring and resets `dropped`. Safe on a page that was never armed. | `{"cleared":N}`, `0` when never armed. | No. |
 | `replay` | `target`; optional `method`, `headers`, `query`, `value`, `max_bytes` | Resends one captured network entry through a Go HTTP client, outside the browser. See [Replay with what=network as the source](#replay-with-whatnetwork-as-the-source). | Compact JSON `{status,headers,body\|base64,bytes,body_bytes,truncated,body_redactions,body_uncaptured,ms,request,chain}`; secrets are `<redacted>`. | No. |
@@ -126,7 +136,7 @@ Cookie, Set-Cookie, Authorization and X-CSRF-Token values are `<redacted>` unles
 
 ## Returns
 
-The confirmation and the state delta arrive as one JSON string inside `data`. A live form submit on 2026-10-26 returned `{"ok":true,"data":"clicked selector=\"form button\"\n→ url=https://httpbin.org/post title=\"httpbin.org/post\""}`. The delta starts on a new line and lists only changed fields. `navigate`, `eval`, and `poc_bundle` never append one, so `eval` returns its own JSON only and stays parseable; `back` and `forward` do append one. `eval`, `set_style`, `clear_logs`, `sinks_install`, `sinks_clear`, `inject_canary`, `replay`, `replay_fuzz`, `postmessage_install`, `postmessage_clear`, `post_message`, `wait_open`, the three `intercept_*` actions, `dialog_accept`, `dialog_dismiss`, and `http_auth` return compact JSON in `data` instead of prose. A DOM node from `eval` comes back as `{}`. `click`, `click_at`, `press_key`, `upload_file`, `eval`, and `select` poll up to 900 ms for a navigation.
+The confirmation and the state delta arrive as one JSON string inside `data`. A live form submit on 2026-10-26 returned `{"ok":true,"data":"clicked selector=\"form button\"\n→ url=https://httpbin.org/post title=\"httpbin.org/post\""}`. The delta starts on a new line and lists only changed fields. `navigate`, `eval`, and `poc_bundle` never append one, so `eval` returns its own JSON only and stays parseable; `back` and `forward` do append one. `eval`, `set_style`, `set_attr`, `set_html`, `fill_form` (a JSON object), `clear_logs`, `sinks_install`, `sinks_clear`, `inject_canary`, `replay`, `replay_fuzz`, `postmessage_install`, `postmessage_clear`, `post_message`, `wait_open`, the three `intercept_*` actions, `dialog_accept`, `dialog_dismiss`, and `http_auth` return compact JSON in `data` instead of prose. A DOM node from `eval` comes back as `{}`. `click`, `click_at`, `press_key`, `upload_file`, `eval`, and `select` poll up to 900 ms for a navigation.
 
 ## Behavior and limits
 
@@ -142,11 +152,66 @@ A handle has the form `g<document>-b<backendNodeId>`, for example `gcq7sm3ng-b16
 
 ### Inline styles
 
-`set_style` writes arbitrary inline CSS declarations onto the element in `selector` or `handle` (`handle` wins when both are given). `value` is a declaration list such as `background-image:url('/a.png');--page-bg:red`, split only at bracket depth zero and outside quotes, so `url('a;b')`, quoted strings, `rgb(1,2,3)` and `!important` survive. There is no property allowlist: a `url(` value reaches the page unchanged, so a style-only payload can trigger a network request. An empty `value` removes the `style` attribute entirely and is the reset path.
+`set_style` writes arbitrary inline CSS declarations onto the element in `selector` or `handle` (`handle` wins when both are given). `value` is a declaration list such as `background-image:url('/a.png');--page-bg:red`, split only at bracket depth zero and outside quotes, so `url('a;b')`, quoted strings, `rgb(1,2,3)` and `!important` survive. There is no property allowlist: a `url(` value reaches the page unchanged, so a style-only payload can trigger a network request. A non-empty `value` merges onto the element's existing inline `cssText`: declarations from earlier calls persist, and only the properties you pass are overwritten. An empty `value` removes the whole `style` attribute and is the reset path.
 
-The result is compact JSON `{target,cleared,applied,rejected,style}`. `target` is `selector="…"` or `handle="…"`. `cleared` is `true` only for an empty `value`. `applied` lists the property names the CSSOM kept, `rejected` holds the declarations it dropped (an invalid value or a missing colon, never silently swallowed), and `style` is the element's `cssText` after the change, clipped at 2000 runes. Each declaration is validated against a detached probe first, so a rejected value is reported even when the element already held that property. A selector that matches nothing fails as `element_not_found` without waiting for `timeout_ms`.
+The result is compact JSON `{target,cleared,applied,rejected,style}`. `target` is `selector="…"` or `handle="…"`, and `cleared` is `true` only for an empty `value`. `applied` names the properties *this call set*, not the serialized shorthand list. `style` is the element's `cssText` after the change, clipped at 2000 runes, so a shorthand that already existed can serialize differently: live, `applied:["background-image"]` while `style` rendered `background: url(...)`, because a `background` shorthand was already present. `applied` is the call's input list and `style` is the CSSOM's serialization of the whole declaration.
+
+`rejected` holds the declarations it dropped (an invalid value or a missing colon, never silently swallowed). Each declaration is validated against a detached probe first, so a rejected value is reported even when the element already held that property. A selector that matches nothing fails as `element_not_found` without waiting for `timeout_ms`.
 
 **CLI and IPC.** `browser page act set_style '.site-footer' 'background-image:url("/favicon.ico?x=1")'` is the positional form. With a handle, pass the declarations through the flag: `browser page act set_style --handle g3k9x2ab-b6 --value 'color:red !important'`, because a lone positional always fills `selector`. IPC `page.act` carries the existing `action`, `selector`, `handle`, and `value` fields, so no new wire field is needed.
+
+### Attribute and markup injection
+
+`set_attr` and `set_html` are the raw write pair beside `set_style`. Neither has an allowlist or sanitises: `javascript:` and `onerror` values reach the page unchanged, and injected markup is parsed as markup. Parameterise every value you do not control.
+
+`set_attr` writes `name` on the element targeted by `selector` or `handle` (`handle` wins). A non-empty `value` calls `setAttribute`; an empty `value` removes the attribute and returns `removed:true`. The result is `{target,name,value,removed,nodes_added}`. `nodes_added` counts nodes the browser created: an attribute-only write is `0`, while `name:"srcdoc"` on an iframe reports the frame node as `1`. A `url_delta:true` field appears only when the write changed the top-level URL.
+
+`set_html` writes `value` into the target. `mode` is `inner` (default, `innerHTML`), `outer` (`outerHTML`), or `append` (`insertAdjacentHTML("beforeend")`). The result is `{target,mode,nodes_added,elements,scripts,executed}`. `elements` lists the created top-level elements as `{tag,attributes}` and caps at 50; `nodes_added` and `scripts` still count the whole write. `executed` is `true` only when the tracer recorded a hit beyond the write itself, so arm `sinks_install` first; markup inserted through these sinks does not execute its `<script>` children in Chromium, so `scripts:1` with `executed:false` is the normal result.
+
+**CLI and IPC.** `browser page act set_attr 'a' href 'javascript:void(0)'` and `browser page act set_html 'body' append '<b id=wm1>hi</b>'` are the positional forms. With a handle, use `--handle` plus `--attr-name`/`--value` or `--mode`/`--value`. IPC `page.act` carries `attr_name` and `mode` beside the existing `action`, `selector`, `handle`, and `value` fields, so `name` stays the auth snapshot field.
+
+### Filling a form
+
+`fill_form` fills a form and optionally submits it in one call, replacing the five-call `input` per field plus `click` loop. Pick one input shape: `fields` is a selector → value object, or `selector` names the `<form>` and `values` is a name → value object resolved inside it. `fields` and `values` are mutually exclusive, and `values` requires a form selector. When a form selector is given, `fields` selectors resolve inside that form; otherwise they resolve against the document.
+
+Each control is written through its native prototype setter, so a framework that shadows `value` still sees the change, and then receives the events it listens for: a checkbox or radio is checked and gets `change`, a select takes the option value and gets `change`, a textarea takes the value and gets `input`, and every other control takes the value and gets `input` and `change`. `submit` is `requestSubmit` (default, `form.requestSubmit()`), `click` (the form's submit control), or `none`. `wait_mode` `load`, `idle`, or `stable` waits after the submit; `ms` and `interactable` are ignored, because the action never sleeps.
+
+The result is a JSON object, not a JSON string: `{form,filled:[{name,selector}],skipped:[{selector,reason}],submit,url_after}`. No state delta is appended, because `url_after` already carries the landed URL. `form` is the resolved form selector or `""`. A field that does not resolve is reported in `skipped` with a reason, never as an error. A form selector that matches nothing is `element_not_found`. A `submit` other than `none` with no form (no selector and no field inside a `<form>`) is `invalid_args`. The action never moves the pointer or presses a key, so no humanized pause applies.
+
+**CLI and IPC.** `browser page act fill_form 'form#login' --field '#user=a' --field '#pass=b' --submit requestSubmit` fills by selector; `browser page act fill_form 'form#search' --form-value q=wm1 --submit click` fills by name inside the form. `--field` and `--form-value` split at the first `=`, so a selector must not contain `=`. IPC `page.act` carries the two object arguments as `fields` and `values` beside `selector`, `submit`, and `wait_mode`; it does not smuggle JSON through `value`.
+
+### Payload encoding
+
+`encode` is a pure helper with no page. It never validates, blocks, or encodes into the page: it returns the mechanically equivalent spellings of one payload so a bypass test can paste each one. It holds no page lock and sends no request, so it works with no browser open.
+
+`value` is the payload and `context` is where it lands. Each context offers a fixed variant set, and `raw` is always first:
+
+| `context` | Variants |
+| :--- | :--- |
+| `html-text` | `raw`, `entity`, `html5-attr` |
+| `attr-double` | `raw`, `entity`, `url`, `html5-attr` |
+| `attr-single` | `raw`, `entity`, `url`, `html5-attr` |
+| `attr-unquoted` | `raw`, `entity`, `url`, `html5-attr` |
+| `js-string` | `raw`, `js`, `js-hex`, `unicode` |
+| `js-template` | `raw`, `js`, `js-hex`, `unicode` |
+| `css-value` | `raw`, `url`, `unicode` |
+| `url-query` | `raw`, `url`, `url-double` |
+| `url-path` | `raw`, `url`, `url-double` |
+
+| Label | What it emits |
+| :--- | :--- |
+| `raw` | The payload unchanged. |
+| `entity` | HTML entities for `&`, `<`, `>`, `"`, and `'` (`&amp;`, `&lt;`, `&gt;`, `&#34;`, `&#39;`). |
+| `html5-attr` | Every character HTML5 forbids in an unquoted attribute value as an entity, so it is safe in quoted and unquoted attributes. |
+| `url` | Percent-encoding: query encoding for `url-query`, path encoding elsewhere. |
+| `url-double` | The `url` variant percent-encoded a second time. |
+| `js` | JavaScript string escaping of `\`, both quotes, control whitespace, `<`, `>`, `&`, and `/`. `js-template` also escapes the backtick and `$`. |
+| `js-hex` | Every rune as `\xHH` (2 hex digits) or `\uHHHH` above `0xFF`. |
+| `unicode` | Every rune as `\uHHHH`, or as a six-digit CSS escape in `css-value`. |
+
+The result is `{context,variants:[{label,value}]}`. `variants` narrows the labels; an unknown label for the context fails as `invalid_args`. An unknown `context` fails with `page_act: encode: unknown context "…" (must be one of attr-double, attr-single, attr-unquoted, css-value, html-text, js-string, js-template, url-path, url-query)`.
+
+**CLI and IPC.** `browser page act encode attr-double '<script>alert(1)</script>'` is the positional form (`context` then payload), and `--context`, `--value`, and `--variants` are the flag fallbacks. IPC `page.act` carries `action`, `value`, `context`, and `variants`; the handler resolves `encode` before the session lookup, so no `session_id` is needed.
 
 ### Keyboard combos
 
@@ -176,7 +241,7 @@ The source takes a `selector` (element center) or `x`/`y`, the target takes `tar
 
 ### Logs
 
-Network, console, websocket, and dialog/auth capture is cumulative from page creation. `clear_logs` empties all four rings, resets `dropped`, and returns `{"network":N,"console":M,"websocket":K,"dialogs":D}`. The `seq` counter does not reset. The recipe is `clear_logs`, then one action, then `page_fetch` `network`, `console`, `websocket`, or `dialogs`.
+Network, console, websocket, dialog/auth, and CSP-violation capture is cumulative from page creation. `clear_logs` empties all five rings, resets `dropped`, and returns `{"network":N,"console":M,"websocket":K,"dialogs":D,"violations":V}`. The `seq` counter does not reset. The recipe is `clear_logs`, then one action, then `page_fetch` `network`, `console`, `websocket`, `dialogs`, or `security` for violations.
 
 ### Request interception
 
@@ -244,7 +309,14 @@ An absent selector for `click`, `input`, `hover` or `select` fails immediately w
 | :--- | :--- | :--- |
 | `click` without a selector | `page_act: click requires selector (or a handle from page_fetch what=interactives)` | Add `selector` or a fresh `handle`. |
 | `set_style` without a selector | `page_act: set_style requires selector (or a handle from page_fetch what=interactives)` | Add `selector` or a fresh `handle`. |
-| `set_style` on an unmatched selector | `page_act: set_style: element ".missing": no element matched selector ".missing"` (`element_not_found`) | Fix the selector; it does not wait for `timeout_ms`. |
+| `set_style` on an unmatched selector | `page_act: set_style: element "#wm-no-such-element": cannot find element` (`element_not_found`) | Fix the selector; it does not wait for `timeout_ms`. The envelope hint is `no element matched the selector — read what=dom or what=links and retry with an exact selector`. |
+| `set_attr` without `name` | `page_act: set_attr requires name (the attribute to set, e.g. href)` (`invalid_args`) | Pass the attribute name. |
+| `set_html` with an unknown mode | `page_act: set_html: unknown mode "replace" (must be inner, outer or append)` (`invalid_args`) | Use `inner`, `outer`, or `append`. |
+| `fill_form` without a shape | `page_act: fill_form: missing required argument — pass fields (selector to value) or values (name to value)` (`invalid_args`) | Send `fields`, or `selector` plus `values`. |
+| `fill_form` with both shapes | `page_act: fill_form: fields and values are mutually exclusive; pass one` (`invalid_args`) | Drop one of them. |
+| `fill_form` `values` without a form | `page_act: fill_form: values requires a selector (the form whose fields are resolved by name)` (`invalid_args`) | Add the form `selector`. |
+| `fill_form` unknown submit | `page_act: fill_form: invalid arguments: unknown submit "post" (must be requestSubmit, click or none)` (`invalid_args`) | Use `requestSubmit`, `click`, or `none`. |
+| `fill_form` form selector matches nothing | `page_act: fill_form: element "#wm-no-form": cannot find element` (`element_not_found`) | Fix the form selector; a missing field is `skipped`, not an error. |
 | `click_at` without `x`/`y` | `page_act: click_at requires x and y coordinates (e.g. {"action":"click_at","x":100,"y":200})` | Send both fields. |
 | Bad key name | `page_act: press_key: unknown key name "Banana"` | Use a listed key. |
 | `eval` without `value` | `page_act: eval requires value (JavaScript function source, e.g. "() => document.title")` | Pass an arrow function. |
@@ -253,7 +325,9 @@ An absent selector for `click`, `input`, `hover` or `select` fails immediately w
 | Bad handle format | `page_act: invalid handle "x" (expected g<document>-b<backendNodeId> minted by page_fetch what=interactives\|dom\|links)` | Copy a handle exactly. |
 | Bad device or viewport input | `page_act: unknown device "Nokia3310" (see go-rod lib/devices presets, e.g. IPhoneX, IPadPro, LaptopWithHiDPIScreen)`, `page_act: emulate requires a device`, `page_act: set_viewport requires a viewport`, or `page_act: viewport width and height must be positive` | Use a real preset or `clear`, and send positive width and height. |
 | Unknown session | `page_act: session "page-999" not found` | Use `page_list` or `fetch_page`. |
-| Unknown action | `page_act: unknown action="konami" (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, set_style, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, inject_canary, postmessage_install, postmessage_clear, post_message, wait_open, intercept_add, intercept_list, intercept_clear, auth_save, auth_restore, auth_list, replay_fuzz, poc_bundle, dialog_accept, dialog_dismiss, http_auth)` | Use a listed action. |
+| Unknown action | `page_act: unknown action="konami" (must be one of click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, set_style, set_attr, set_html, fill_form, encode, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, inject_canary, postmessage_install, postmessage_clear, post_message, wait_open, intercept_add, intercept_list, intercept_clear, auth_save, auth_restore, auth_list, replay_fuzz, poc_bundle, dialog_accept, dialog_dismiss, http_auth, encode)` | Use a listed action. |
+| `encode` with an unknown context | `page_act: encode: unknown context "html" (must be one of attr-double, attr-single, attr-unquoted, css-value, html-text, js-string, js-template, url-path, url-query)` (`invalid_args`) | Use a listed context. |
+| `encode` with a variant the context does not offer | `page_act: encode: variant "js" is not available for context "attr-double" (must be one of raw, entity, url, html5-attr)` (`invalid_args`) | Drop `variants` or name a label the context offers. |
 | `upload_file` without paths | `page_act: upload_file: no file paths provided` | Pass `paths` or `value`. |
 | `replay_fuzz` without `target` | `page_act: replay_fuzz requires target=<seq> or target=<url substring> from page_fetch what=network` (`invalid_args`) | Read `what=network` and set `target`. |
 | `replay_fuzz` over a bound | `page_act: replay_fuzz: requests computed 243, over the 100 bound` (`invalid_args`) | Lower the payload or point count, or use `sniper`. |
@@ -297,8 +371,11 @@ Do not use `page_act` to open a URL in a new tab, use `fetch_page`. Do not use i
 - 2026-10-27 — `replay_fuzz` live on `https://www.debian.org/`: sniper over one `query` point with two payloads returned two runs plus the baseline and `anomalies:[]`, and a five-point `clusterbomb` with three payloads was refused before any request with `page_act: replay_fuzz: requests computed 243, over the 100 bound`. The live MCP enum listed all 36 actions then, `intercept_*` included, and the CLI/IPC vocabularies carry the same `intercept_*` names. Humanized timing and `raw` were read from the live schema.
 - 2026-10-27 — `auth_save`, `auth_list`, and `auth_restore` on `www.saucedemo.com`: the snapshot restored a login into a new browser and a new identity, `auth_list` answered with no live browser and a stale `session_id`, and a host-only `session-username` cookie stayed scoped to `www.saucedemo.com`.
 - 2026-10-28 — live on `https://www.freebsd.org/?probe=one`. `replay` with target `1` and `query:{"probe":"two"}` returned status 200 and `request.url` `https://www.freebsd.org/?probe=two`. `query:{"probe":""}` returned `https://www.freebsd.org/`. `replay_fuzz` over the same entry returned `summary.baseline` `{"status":200,"bytes":22060,"cold_ms":30,"ms":44}` with `anomalies:[]`.
-- 2026-10-28 — source-verified `dialog_accept`, `dialog_dismiss`, and `http_auth` against the action table (`code://pkg/cli/pageops/actions.go#L55-L57`) and the dispatch list (`code://pkg/cli/pageops/pageops.go#L73`). The table now holds 39 rows and this reference documents all 39. `clear_logs` returns the fourth `dialogs` count (`code://pkg/cli/pageops/websocket.go#L24-L47`), and `last` is `null` on an empty ring (`code://pkg/cli/pageops/dialogs.go#L155-L163`).
-- 2026-10-30 — source-verified `set_style` and the `eval` delta suppression against the action table and the CLI/IPC/MCP dispatch paths. The table now holds 40 rows. No live call yet, so the header date is unchanged.
+- 2026-10-28 — source-verified `dialog_accept`, `dialog_dismiss`, and `http_auth` against the action table (`code://pkg/cli/pageops/actions.go#L55-L57`) and the dispatch list (`code://pkg/cli/pageops/pageops.go#L73`). The table now holds 39 rows and this reference documents all 39. `clear_logs` returns the `dialogs` and CSP `violations` counts (`code://pkg/cli/pageops/websocket.go#L24-L47`), and `last` is `null` on an empty ring (`code://pkg/cli/pageops/dialogs.go#L155-L163`).
+- 2026-10-30 — `set_style` live on `https://www.php.net/manual/en/language.basic-syntax.php` and `https://htmx.org/docs/`. A two-call merge probe left a `background` from the first call in place after two later calls, and a `background-image:url(...)` payload produced a `favicon.ico?wmsetstyle=1` network hit. An empty `value` returned `cleared:true`, an invalid declaration came back in `rejected` instead of being swallowed, `!important` was handled without landing in the value, and a `url('data:…;base64,…')` value survived the semicolon. The handle path and the selector path both wrote, an unmatched selector failed as `element_not_found` with `page_act: set_style: element "#wm-no-such-element": cannot find element`, and `browser page act set_style …` reached the same engine. The table now holds 40 rows.
+- 2026-10-30 — source-verified and unit-tested the page-free `encode` action (`pkg/cli/pageops/encode_test.go`) across all nine contexts with `<script>alert(1)</script>` and an `& " ' space` payload. The `attr-double` `entity` variant contains no bare `"`, the `js` variant escapes both quotes and the angle brackets, and both `url` variants decode back to the payload. The action table now holds 41 rows. Not yet live-called on a running server, so the header date stays 2026-10-30.
+- 2026-10-30 — added `set_attr` and `set_html` beside `set_style`, source-verified against the action table and dispatch list. The mode mapping is unit-tested in `pkg/cli/pageops/inject_test.go`; the live server was not restarted, so no live call is recorded here. The action table now holds 43 rows.
+- 2026-10-30 — added `fill_form` beside `select`. The value coercion per control type is unit-tested in `pkg/cli/pageops/forms_test.go`; the field resolver reuses the `cssPath` builder `what=forms` reports. The live server was not restarted, so no live call is recorded here. The action table now holds 44 rows.
 
 ## Related tools
 

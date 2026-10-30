@@ -40,7 +40,7 @@ const (
 	MethodPageList = "page.list"
 	// MethodPageFetch extracts any aspect in the shared pageops registry from a live page.
 	MethodPageFetch = "page.fetch"
-	// MethodPageAct performs an action on a live page (click/input/type/press_key/click_at/hover_at/drag_and_drop/upload_file/eval/navigate/back/forward/reload/hover/scroll/select/wait/set_viewport/emulate/clear_logs/sinks_install/sinks_clear/replay/inject_canary/postmessage_install/postmessage_clear/post_message/wait_open/intercept_add/intercept_list/intercept_clear/auth_save/auth_restore/auth_list/replay_fuzz/poc_bundle/dialog_accept/dialog_dismiss/http_auth).
+	// MethodPageAct performs an action on a live page (click/input/type/press_key/click_at/hover_at/drag_and_drop/upload_file/eval/navigate/back/forward/reload/hover/set_style/set_attr/set_html/scroll/select/wait/set_viewport/emulate/clear_logs/sinks_install/sinks_clear/replay/inject_canary/postmessage_install/postmessage_clear/post_message/wait_open/intercept_add/intercept_list/intercept_clear/auth_save/auth_restore/auth_list/replay_fuzz/poc_bundle/dialog_accept/dialog_dismiss/http_auth).
 	MethodPageAct = "page.act"
 	// MethodPageClose closes an open page.
 	MethodPageClose = "page.close"
@@ -366,16 +366,18 @@ type PageFetchResult struct {
 
 // PageActParams carries the page.act parameters. action ∈ click|input|type|
 // press_key|click_at|hover_at|drag_and_drop|upload_file|eval|navigate|back|
-// forward|reload|hover|scroll|select|wait|set_viewport|emulate|clear_logs|
+// forward|reload|hover|set_style|set_attr|set_html|scroll|select|fill_form|wait|set_viewport|emulate|clear_logs|
 // sinks_install|sinks_clear|replay|replay_fuzz|inject_canary|postmessage_install|postmessage_clear|
 // post_message|wait_open|intercept_add|intercept_list|intercept_clear|auth_save|auth_restore|
 // auth_list|dialog_accept|dialog_dismiss|http_auth|poc_bundle; selector/handle/value/key/button/click_count/x/y/
-// target_x/target_y/target_selector/origin/paths/targets are the per-action
+// target_x/target_y/target_selector/origin/paths/targets/attr_name/mode are the per-action
 // payloads (handle wins over selector for element actions); viewport carries the
 // target size for set_viewport and device the preset for emulate; timeout_ms
 // bounds the action (default 30000) and sizes the wait action's "ms" sleep;
 // wait_mode selects what the wait action waits for: load|idle|stable|interactable|ms
-// (default ms). replay resends one captured network entry: target selects it by
+// (default ms). fill_form takes fields (selector → value) or selector plus values
+// (name → value) and submit (requestSubmit|click|none), and reuses wait_mode as
+// the post-submit wait. replay resends one captured network entry: target selects it by
 // seq or URL substring, method/headers/query override the captured request
 // (query edits URL parameters, an empty value removes one), value
 // replaces the captured body when value_set is true (or value is non-empty), and
@@ -496,11 +498,34 @@ type PageActParams struct {
 	Site string `json:"site,omitempty"`
 	// Name is the snapshot name for auth_save/auth_restore.
 	Name string `json:"name,omitempty"`
+	// AttrName is the attribute name set_attr writes; it is a separate wire
+	// field because Name already belongs to the auth snapshots.
+	AttrName string `json:"attr_name,omitempty"`
+	// Mode selects the set_html write: inner (default, innerHTML), outer
+	// (outerHTML) or append (insertAdjacentHTML beforeend).
+	Mode string `json:"mode,omitempty"`
 	// Force lets auth_restore proceed across a user-agent mismatch.
 	Force bool `json:"force,omitempty"`
 	// Rules are the request rules for intercept_add: each matches requests in
 	// order, the first match wins, and a request matching none continues.
 	Rules []browsers.InterceptRule `json:"rules,omitempty"`
+	// Context is where an encode payload lands (html-text, attr-double,
+	// attr-single, attr-unquoted, js-string, js-template, css-value, url-query,
+	// url-path). It selects the variant set and needs no live page.
+	Context string `json:"context,omitempty"`
+	// Variants narrows encode's returned labels; empty returns the full set for
+	// the context. raw is always present.
+	Variants []string `json:"variants,omitempty"`
+	// Fields is the fill_form selector → value map; Selector then optionally
+	// scopes the selectors to one form. It is mutually exclusive with Values.
+	Fields map[string]string `json:"fields,omitempty"`
+	// Values is the fill_form field name → value map, resolved inside the form
+	// named by Selector. It requires Selector and is mutually exclusive with
+	// Fields.
+	Values map[string]string `json:"values,omitempty"`
+	// Submit is the fill_form submit mode: requestSubmit (default), click or
+	// none.
+	Submit string `json:"submit,omitempty"`
 }
 
 // FuzzSpec projects the replay_fuzz wire fields onto the engine's FuzzSpec.

@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"regexp"
+	"slices"
+	"strings"
 
 	"github.com/dakolli/webmcp/pkg/browsers"
 )
@@ -402,4 +405,381 @@ func shapeForms(raw rawForms) FormsResult {
 	out.Count = len(out.Forms)
 	out.Truncated = truncated
 	return out
+}
+
+// fillFormArg is one selector/value or name/value pair handed to the resolve
+// script.
+type fillFormArg struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+// fillFormResolveJS resolves the target form and every field in one evaluation.
+// It reuses cssPath, the same selector builder PageForms reports, so a filled
+// field's selector matches what=forms. Each unresolved key is skipped with a
+// reason; the form is the target selector or the closest form of the first
+// resolved field.
+const fillFormResolveJS = `(formSelector, fields, values) => {` + cssPathJS + `
+  const form = formSelector ? document.querySelector(formSelector) : null;
+  const scope = form || document;
+  const describe = (el, value) => ({
+    selector: cssPath(el),
+    name: el.getAttribute('name') || '',
+    tag: el.tagName.toLowerCase(),
+    type: (el.tagName.toLowerCase() === 'input' ? (el.getAttribute('type') || 'text').toLowerCase() : ''),
+    value: value
+  });
+  const found = [];
+  const skipped = [];
+  for (const f of fields) {
+    let el = null;
+    try { el = scope.querySelector(f.key); } catch (e) { el = null; }
+    if (!el) { skipped.push({selector: f.key, reason: 'no element matched'}); continue; }
+    found.push(describe(el, f.value));
+  }
+  if (form) {
+    for (const v of values) {
+      let el = null;
+      for (const cand of form.elements) { if (cand.name === v.key) { el = cand; break; } }
+      if (!el) { skipped.push({selector: '[name="' + v.key + '"]', reason: 'no field named ' + v.key + ' in the form'}); continue; }
+      found.push(describe(el, v.value));
+    }
+  }
+  let resolved = form;
+  if (!resolved) {
+    for (const f of found) {
+      const el = document.querySelector(f.selector);
+      const c = el && el.closest ? el.closest('form') : null;
+      if (c) { resolved = c; break; }
+    }
+  }
+  return {form: resolved ? cssPath(resolved) : '', found: found, skipped: skipped};
+}`
+
+// fillFormApplyJS writes every resolved control through its native setter and
+// dispatches the events a framework listens for, then submits the form. It never
+// moves the pointer or presses a key.
+const fillFormApplyJS = `(payload) => {
+  const setNative = (el, prop, val) => {
+    let node = el;
+    while (node) {
+      const desc = Object.getOwnPropertyDescriptor(node, prop);
+      if (desc && desc.set) { desc.set.call(el, val); return; }
+      node = Object.getPrototypeOf(node);
+    }
+    el[prop] = val;
+  };
+  const applied = [];
+  const skipped = [];
+  for (const w of payload.writes) {
+    let el = null;
+    try { el = document.querySelector(w.selector); } catch (e) { el = null; }
+    if (!el) { skipped.push({selector: w.selector, reason: 'detached before write'}); continue; }
+    if (w.kind === 'checked') {
+      setNative(el, 'checked', true);
+    } else {
+      setNative(el, 'value', w.value);
+    }
+    for (const ev of w.events) el.dispatchEvent(new Event(ev, {bubbles: true}));
+    applied.push(w.selector);
+  }
+  let submitted = false;
+  if (payload.submit !== 'none' && payload.form) {
+    const form = document.querySelector(payload.form);
+    if (form) {
+      if (payload.submit === 'click') {
+        const btn = form.querySelector('button[type="submit"], input[type="submit"], input[type="image"], button:not([type])');
+        if (btn) { btn.click(); submitted = true; }
+      } else {
+        form.requestSubmit();
+        submitted = true;
+      }
+    }
+  }
+  return {applied: applied, skipped: skipped, submitted: submitted};
+}`
+
+// fieldWriteKind names the DOM operation a fill_form write performs.
+type fieldWriteKind string
+
+const (
+	// fieldWriteValue sets value on a text-like control and fires input+change.
+	fieldWriteValue fieldWriteKind = "value"
+	// fieldWriteTextarea sets value on a textarea and fires input.
+	fieldWriteTextarea fieldWriteKind = "textarea"
+	// fieldWriteSelect sets the option value on a select and fires change.
+	fieldWriteSelect fieldWriteKind = "select"
+	// fieldWriteChecked checks a checkbox or radio and fires change.
+	fieldWriteChecked fieldWriteKind = "checked"
+)
+
+// fieldWrite is one resolved control write the page script applies.
+type fieldWrite struct {
+	Selector string   `json:"selector"`
+	Kind     string   `json:"kind"`
+	Value    string   `json:"value"`
+	Events   []string `json:"events"`
+}
+
+// coerceField maps a resolved control's tag and input type to its write kind and
+// the events the page dispatches afterwards. Checkbox and radio controls are
+// checked; a select takes the option value; a textarea takes the value with an
+// input event; every other control takes the value with input and change.
+func coerceField(selector, tag, typ, value string) fieldWrite {
+	w := fieldWrite{
+		Selector: selector,
+		Kind:     string(fieldWriteValue),
+		Value:    value,
+		Events:   []string{"input", "change"},
+	}
+	switch tag {
+	case "select":
+		w.Kind = string(fieldWriteSelect)
+		w.Events = []string{"change"}
+	case "textarea":
+		w.Kind = string(fieldWriteTextarea)
+		w.Events = []string{"input"}
+	case "input":
+		if typ == "checkbox" || typ == "radio" {
+			w.Kind = string(fieldWriteChecked)
+			w.Events = []string{"change"}
+			w.Value = ""
+		}
+	}
+	return w
+}
+
+// fillFormResolved is one control the resolve script found.
+type fillFormResolved struct {
+	Selector string `json:"selector"`
+	Name     string `json:"name"`
+	Tag      string `json:"tag"`
+	Type     string `json:"type"`
+	Value    string `json:"value"`
+}
+
+// fillFormResolve is the resolve script's wire shape.
+type fillFormResolve struct {
+	Form    string             `json:"form"`
+	Found   []fillFormResolved `json:"found"`
+	Skipped []fillFormSkip     `json:"skipped"`
+}
+
+// fillFormSkip is one field the fill could not write, with the reason.
+type fillFormSkip struct {
+	Selector string `json:"selector"`
+	Reason   string `json:"reason"`
+}
+
+// fillFormApplyInput is the apply script's wire shape.
+type fillFormApplyInput struct {
+	Writes []fieldWrite `json:"writes"`
+	Submit string       `json:"submit"`
+	Form   string       `json:"form"`
+}
+
+// fillFormApply is the apply script's result.
+type fillFormApply struct {
+	Applied   []string       `json:"applied"`
+	Skipped   []fillFormSkip `json:"skipped"`
+	Submitted bool           `json:"submitted"`
+}
+
+// FillFormFilled is one control PageFillForm wrote.
+type FillFormFilled struct {
+	// Name is the control's name attribute, or "" when unnamed.
+	Name string `json:"name"`
+	// Selector is the CSS selector that addressed the control.
+	Selector string `json:"selector"`
+}
+
+// FillFormSkipped is one field PageFillForm could not resolve or write.
+type FillFormSkipped struct {
+	// Selector is the selector or name key that did not resolve.
+	Selector string `json:"selector"`
+	// Reason says why the field was skipped.
+	Reason string `json:"reason"`
+}
+
+// FillFormResult is the JSON envelope returned by PageFillForm.
+type FillFormResult struct {
+	// Form is the resolved form selector, or "" when no form was targeted or
+	// found.
+	Form string `json:"form"`
+	// Filled are the controls the write applied.
+	Filled []FillFormFilled `json:"filled"`
+	// Skipped are the fields that did not resolve or write.
+	Skipped []FillFormSkipped `json:"skipped"`
+	// Submit is the canonical submit mode: requestSubmit, click or none.
+	Submit string `json:"submit"`
+	// URLAfter is the page URL after the submit and any wait.
+	URLAfter string `json:"url_after"`
+}
+
+// fillFormPhase is the locked phase's output, before the post-submit wait and
+// URL read.
+type fillFormPhase struct {
+	Form      string
+	Filled    []FillFormFilled
+	Skipped   []FillFormSkipped
+	Submit    string
+	Submitted bool
+}
+
+// FillFormMode normalises the submit mode. An empty mode and "requestSubmit"
+// both submit through form.requestSubmit(); "click" clicks the form's submit
+// control; "none" fills only.
+func FillFormMode(mode string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "requestsubmit", "request_submit":
+		return "requestSubmit", nil
+	case "click":
+		return "click", nil
+	case "none":
+		return "none", nil
+	default:
+		return "", fmt.Errorf("fill_form: invalid arguments: unknown submit %q (must be requestSubmit, click or none)", mode)
+	}
+}
+
+// ValidateFillForm checks the submit mode and the two input shapes, returning
+// the canonical submit mode. Exactly one of fields (selector to value) or values
+// (name to value) must be supplied, and values requires a form selector.
+func ValidateFillForm(selector, submit string, fields, values map[string]string) (string, error) {
+	mode, err := FillFormMode(submit)
+	if err != nil {
+		return "", err
+	}
+	if len(fields) == 0 && len(values) == 0 {
+		return "", fmt.Errorf("fill_form: missing required argument — pass fields (selector to value) or values (name to value)")
+	}
+	if len(fields) > 0 && len(values) > 0 {
+		return "", fmt.Errorf("fill_form: fields and values are mutually exclusive; pass one")
+	}
+	if len(values) > 0 && selector == "" {
+		return "", fmt.Errorf("fill_form: values requires a selector (the form whose fields are resolved by name)")
+	}
+	return mode, nil
+}
+
+// PageFillForm fills a form's fields in one call and optionally submits it. The
+// target form is selector, or empty when fields carries full field selectors.
+// fields maps a field selector to its value; values maps a field name to its
+// value and requires a form selector. Each control is written through its native
+// setter and then receives the events React and Vue listen for. submit is
+// requestSubmit (default), click or none; waitMode (load, idle or stable) waits
+// after the submit. A field that does not resolve is reported in skipped, never
+// as an error; a missing form is an element_not_found. The action never moves the
+// pointer or presses a key.
+func PageFillForm(
+	ctx context.Context,
+	p *browsers.Page,
+	selector string,
+	fields, values map[string]string,
+	submit, waitMode string,
+) (string, error) {
+	mode, err := ValidateFillForm(selector, submit, fields, values)
+	if err != nil {
+		return "", err
+	}
+
+	fieldArgs := make([]fillFormArg, 0, len(fields))
+	for _, k := range slices.Sorted(maps.Keys(fields)) {
+		fieldArgs = append(fieldArgs, fillFormArg{Key: k, Value: fields[k]})
+	}
+	valueArgs := make([]fillFormArg, 0, len(values))
+	for _, k := range slices.Sorted(maps.Keys(values)) {
+		valueArgs = append(valueArgs, fillFormArg{Key: k, Value: values[k]})
+	}
+
+	before, _ := PageStateIfFree(ctx, p)
+
+	phase, err := browsers.GuardPage(ctx, p, "fill_form", func(ctx context.Context) (fillFormPhase, error) {
+		if p.Rod == nil {
+			return fillFormPhase{}, fmt.Errorf("page session is closed")
+		}
+		page := p.Rod.Context(ctx)
+		if selector != "" {
+			if _, err := resolveSelector(page, selector); err != nil {
+				return fillFormPhase{}, actionError("fill_form", "", selector, resolveError(selector, err))
+			}
+		}
+
+		res, err := page.Eval(fillFormResolveJS, selector, fieldArgs, valueArgs)
+		if err != nil {
+			return fillFormPhase{}, fmt.Errorf("fill_form: resolve fields: %w", err)
+		}
+		var resolved fillFormResolve
+		if err := res.Value.Unmarshal(&resolved); err != nil {
+			return fillFormPhase{}, fmt.Errorf("fill_form: decode fields: %w", err)
+		}
+
+		if mode != "none" && resolved.Form == "" {
+			return fillFormPhase{}, fmt.Errorf("fill_form: invalid arguments: submit %q requires a form (pass a form selector or a field inside a <form>)", mode)
+		}
+
+		writes := make([]fieldWrite, 0, len(resolved.Found))
+		filled := make([]FillFormFilled, 0, len(resolved.Found))
+		skipped := make([]FillFormSkipped, 0, len(resolved.Skipped)+len(resolved.Found))
+		for _, f := range resolved.Found {
+			writes = append(writes, coerceField(f.Selector, f.Tag, f.Type, f.Value))
+			filled = append(filled, FillFormFilled{Name: f.Name, Selector: f.Selector})
+		}
+		for _, s := range resolved.Skipped {
+			skipped = append(skipped, FillFormSkipped{Selector: s.Selector, Reason: s.Reason})
+		}
+
+		payload := fillFormApplyInput{Writes: writes, Submit: mode, Form: resolved.Form}
+		res, err = page.Eval(fillFormApplyJS, payload)
+		if err != nil {
+			return fillFormPhase{}, fmt.Errorf("fill_form: write fields: %w", err)
+		}
+		var applied fillFormApply
+		if err := res.Value.Unmarshal(&applied); err != nil {
+			return fillFormPhase{}, fmt.Errorf("fill_form: decode write result: %w", err)
+		}
+		for _, s := range applied.Skipped {
+			skipped = append(skipped, FillFormSkipped{Selector: s.Selector, Reason: s.Reason})
+		}
+
+		return fillFormPhase{
+			Form:      resolved.Form,
+			Filled:    filled,
+			Skipped:   skipped,
+			Submit:    mode,
+			Submitted: applied.Submitted,
+		}, nil
+	})
+	if err != nil {
+		return "", err
+	}
+
+	urlAfter := ""
+	if phase.Submitted {
+		switch waitMode {
+		case "load", "idle", "stable":
+			if err := WaitForPage(ctx, p, waitMode); err != nil {
+				return "", fmt.Errorf("fill_form: wait after submit: %w", err)
+			}
+		}
+		after := settleAfterAction(ctx, func() (PageState, error) {
+			return PageStateIfFree(ctx, p)
+		}, "fill_form", before, p.RawActions(ctx))
+		urlAfter = after.URL
+	} else if st, err := PageStateIfFree(ctx, p); err == nil {
+		urlAfter = st.URL
+	}
+
+	result := FillFormResult{
+		Form:     phase.Form,
+		Filled:   phase.Filled,
+		Skipped:  phase.Skipped,
+		Submit:   phase.Submit,
+		URLAfter: urlAfter,
+	}
+	b, err := json.Marshal(result)
+	if err != nil {
+		return "", fmt.Errorf("fill_form: encode result: %w", err)
+	}
+	return string(b), nil
 }

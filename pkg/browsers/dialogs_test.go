@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/go-rod/rod/lib/proto"
+	"github.com/ysmood/gson"
 )
 
 func TestNewPageDialogsDefaults(t *testing.T) {
@@ -83,6 +84,51 @@ func TestDialogRingDropsOldest(t *testing.T) {
 	}
 	if _, dropped, _ := p.Dialogs(); dropped != 0 {
 		t.Fatalf("dropped after clear = %d, want 0", dropped)
+	}
+}
+
+func TestViolationRingDropsOldest(t *testing.T) {
+	p := &Page{violations: newPageViolations()}
+	for i := 0; i < violationRingCap+3; i++ {
+		p.violations.record(CSPViolation{Directive: "script-src"})
+	}
+	entries, dropped := p.CSPViolations()
+	if len(entries) != violationRingCap {
+		t.Fatalf("ring holds %d entries, want %d", len(entries), violationRingCap)
+	}
+	if dropped != 3 {
+		t.Fatalf("dropped = %d, want 3", dropped)
+	}
+	if entries[0].Seq != 4 {
+		t.Fatalf("oldest retained seq = %d, want 4", entries[0].Seq)
+	}
+	if cleared := p.ClearCSPViolations(); cleared != violationRingCap {
+		t.Fatalf("ClearCSPViolations = %d, want %d", cleared, violationRingCap)
+	}
+	if _, dropped := p.CSPViolations(); dropped != 0 {
+		t.Fatalf("dropped after clear = %d, want 0", dropped)
+	}
+}
+
+func TestDecodeViolation(t *testing.T) {
+	got := decodeViolation(gson.New(map[string]any{
+		"directive":   "script-src",
+		"blocked_uri": "inline",
+		"source_file": "https://example.test/",
+		"line":        7,
+		"column":      3,
+		"disposition": "enforce",
+	}))
+	want := CSPViolation{
+		Directive:   "script-src",
+		BlockedURI:  "inline",
+		SourceFile:  "https://example.test/",
+		Line:        7,
+		Column:      3,
+		Disposition: "enforce",
+	}
+	if got != want {
+		t.Fatalf("decodeViolation = %+v, want %+v", got, want)
 	}
 }
 

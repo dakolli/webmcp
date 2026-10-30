@@ -108,8 +108,14 @@ type actArgs struct {
 	Device         string                   `json:"device"`
 	Site           string                   `json:"site"`
 	Name           string                   `json:"name"`
+	Mode           string                   `json:"mode"`
 	Force          bool                     `json:"force"`
 	Rules          []browsers.InterceptRule `json:"rules"`
+	Context        string                   `json:"context"`
+	Variants       []string                 `json:"variants"`
+	Fields         map[string]string        `json:"fields"`
+	Values         map[string]string        `json:"values"`
+	Submit         string                   `json:"submit"`
 }
 
 // validate checks the arguments an action requires and returns a one-line
@@ -117,9 +123,17 @@ type actArgs struct {
 // optional numeric fields can be distinguished from an explicit zero.
 func (a *actArgs) validate(provided map[string]json.RawMessage) error {
 	switch a.Action {
-	case "click", "input", "type", "hover", "select", "upload_file", "set_style":
+	case "click", "input", "type", "hover", "select", "upload_file", "set_style", "set_attr", "set_html":
 		if a.Handle == "" && a.Selector == "" {
 			return fmt.Errorf("%s requires selector (or a handle from page_fetch what=interactives)", a.Action)
+		}
+		if a.Action == "set_attr" && a.Name == "" {
+			return fmt.Errorf("set_attr requires name (the attribute to set, e.g. href)")
+		}
+		if a.Action == "set_html" {
+			if _, err := pageops.SetHTMLMode(a.Mode); err != nil {
+				return fmt.Errorf("set_html: %w", err)
+			}
 		}
 	case "click_at", "hover_at":
 		if _, ok := provided["x"]; !ok {
@@ -172,6 +186,12 @@ func (a *actArgs) validate(provided map[string]json.RawMessage) error {
 		if len(a.Paths) == 0 || strings.TrimSpace(a.Paths[0]) == "" {
 			return fmt.Errorf("poc_bundle requires paths=[<absolute output directory>]")
 		}
+	case "fill_form":
+		mode, err := pageops.ValidateFillForm(a.Selector, a.Submit, a.Fields, a.Values)
+		if err != nil {
+			return err
+		}
+		a.Submit = mode
 	}
 	return nil
 }
@@ -196,6 +216,13 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 	}
 	if a.Action == "auth_list" {
 		out, err := pageops.PageAuthList(ctx, a.Site)
+		if err != nil {
+			return failResult(fmt.Errorf("page_act: %w", err))
+		}
+		return okResult(out)
+	}
+	if pageops.PageFreeAction(a.Action) {
+		out, err := pageops.EncodePayload(a.Value, a.Context, a.Variants)
 		if err != nil {
 			return failResult(fmt.Errorf("page_act: %w", err))
 		}
@@ -284,10 +311,16 @@ func (t *Act) Execute(ctx context.Context, args json.RawMessage) (string, error)
 		out, err = pageops.PageHover(ctx, p, a.Handle, a.Selector)
 	case "set_style":
 		out, err = pageops.PageSetStyle(ctx, p, a.Handle, a.Selector, a.Value)
+	case "set_attr":
+		out, err = pageops.PageSetAttr(ctx, p, a.Handle, a.Selector, a.Name, a.Value)
+	case "set_html":
+		out, err = pageops.PageSetHTML(ctx, p, a.Handle, a.Selector, a.Value, a.Mode)
 	case "scroll":
 		out, err = pageops.PageScroll(ctx, p, a.X, a.Y)
 	case "select":
 		out, err = pageops.PageSelect(ctx, p, a.Handle, a.Selector, a.Value)
+	case "fill_form":
+		out, err = pageops.PageFillForm(ctx, p, a.Selector, a.Fields, a.Values, a.Submit, a.WaitMode)
 	case "wait":
 		d := timeout
 		if a.TimeoutMS > 0 {

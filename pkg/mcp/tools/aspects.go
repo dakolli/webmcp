@@ -118,4 +118,7 @@ func init() {
 	registerAspect("mutations", func(ctx context.Context, p *browsers.Page, a pageFetchArgs) (string, error) {
 		return pageops.PageMutations(ctx, p, a.Since, a.Selector)
 	}, truncationNone)
+	registerAspect("reflections", func(ctx context.Context, p *browsers.Page, a pageFetchArgs) (string, error) {
+		return pageops.PageReflections(ctx, p, a.Target, a.Selector)
+	}, truncationNone)
 }

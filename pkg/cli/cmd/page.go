@@ -102,7 +102,7 @@ resolve only against that browser and an unknown id fails with the live ids.
 
 Subcommands:
   list   List the browser's open pages (id, url)
-  fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, console, body, article, tables, forms, marks, security, storage, sinks, postmessage, websocket, dialogs, har, mutations); a URL opens a new page first
+  fetch  Extract an aspect of a live page (html, dom, text, css, js, links, screenshot, meta, interactives, a11y, network, console, body, article, tables, forms, marks, security, storage, sinks, postmessage, websocket, dialogs, har, mutations, reflections); a URL opens a new page first
   act    Perform an action on a live page (click, input, hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, replay_fuzz, inject_canary, wait_open, auth_save, auth_restore, auth_list, poc_bundle, dialog_accept, dialog_dismiss, http_auth)
   auth   Save, restore or list named auth snapshots (counts only, never values)
   close  Close an open page
@@ -230,7 +230,7 @@ func newPageFetchCmd(mgr *browsers.Manager) *cobra.Command {
 		Short: "Extract an aspect of a live page",
 		Long: `Extracts an aspect of a live page (html, text, links, meta, dom, css,
 js, screenshot, interactives, a11y, network, console, body, article, tables,
-forms, marks, security, storage, sinks, postmessage, websocket, dialogs, har, mutations) and prints it. The page id is optional when
+forms, marks, security, storage, sinks, postmessage, websocket, dialogs, har, mutations, reflections) and prints it. The page id is optional when
 only one page is open; 'last' means the most recently opened page; a bare number
 resolves to page-N. A URL in the [id] slot opens a NEW page for it first —
 creating the browser if needed, exactly like 'web-cli fetch <url>' — and then
@@ -244,13 +244,14 @@ dance).
   [what]  the aspect to extract: html, text, links, meta, dom, css, js,
           screenshot, interactives, a11y, network, console, body, article, tables,
           forms, marks, security, storage, sinks, postmessage, websocket, dialogs,
-          har, mutations (default: text)
+          har, mutations, reflections (default: text)
 
   --id <session>     the page/session id (the positional [id] wins when both
                      are given; never treated as a URL)
   --what <what>      the aspect to extract (the positional [what] wins when
                      both are given; default text)
-  --selector <css>   optional CSS selector scoping html/text/interactives extraction
+  --selector <css>   optional CSS selector scoping html/text/interactives/
+                     reflections extraction
   --filter <list>    narrow --what network by request type: a comma list where a
                      bare name keeps that type and a '-' prefix drops it
                      (e.g. document,script,xhr or -image,-font); with
@@ -258,14 +259,15 @@ dance).
                      the accepted list, and a filtered read adds filtered_out
   --target <url>     fetch exactly one css/js resource's full content instead
                      of the {url,type,size} list (with --what css|js); with
-                     --what body, select the entry by seq or URL substring
+                     --what body, select the entry by seq or URL substring;
+                     with --what reflections, the marker to hunt
   --full-page        capture the entire scrollable page (screenshot only)
   --include-values   with --what storage, print real cookie and storage values
                      instead of <redacted> (exposes live session tokens)
   --max-bytes <n>    cap output size (default 50000; screenshots,
                      interactives, a11y, network, console, body, article, tables,
-                      forms, marks, security, sinks, postmessage, websocket, dialogs
-                      and mutations are never truncated)
+                      forms, marks, security, sinks, postmessage, websocket, dialogs,
+                      mutations and reflections are never truncated)
   --since <seq>      with --what mutations, return only entries newer than this
                      seq: read mutations, keep last_seq, act, then read with
                      --since <last_seq> to see exactly what the action changed
@@ -288,7 +290,7 @@ dance).
                      another owner is refused, never returned.
 
 links, meta, dom, interactives, a11y, network, console, body, article, tables,
-forms, marks, security, sinks, postmessage, websocket, dialogs and mutations print JSON, mirroring the MCP page_fetch shapes. mutations is the DOM mutation timeline
+forms, marks, security, sinks, postmessage, websocket, dialogs, mutations and reflections print JSON, mirroring the MCP page_fetch shapes. mutations is the DOM mutation timeline
 ({entries:[{seq, ts, kind, target, attribute, added, removed, text}], count,
 dropped, truncated, last_seq}); capture starts with the page and survives
 navigation, and the two-read recipe brackets an action: read mutations, keep
@@ -315,7 +317,14 @@ aggregated across up to 20 frames and data is clipped at 500 runes. dialogs is
 the JavaScript-dialog and HTTP-auth ring ({entries, count, dropped, truncated,
 policy}); the engine answers every dialog as it opens, the default policy is
 dismiss, each entry's policy shows what answered it, and this read never changes
-policy. Screenshots print a data:image/png;base64,... data-URI. network/console emit
+policy. reflections hunts the --target marker across the live DOM (text, attributes,
+comments, script and style text), the serialized outerHTML and document.URL and reports
+{marker, count, truncated, hits:[{where, selector, context, snippet, survived, risk}],
+sinks_correlated?}; where is dom-text, attr, comment, script-text, style-text or url,
+context is html-text, attr-double, attr-single, attr-unquoted, js-string, js-template,
+css-value, url or comment, survived lists the marker's special characters that reached
+the DOM unescaped, and risk is dangerous, escaped or inert. --selector scopes the scan,
+and sinks_correlated names tracer hits whose value carries the marker. Screenshots print a data:image/png;base64,... data-URI. network/console emit
 {entries,count,dropped,truncated} over the newest 100 buffered entries; capture is
 cumulative from page creation, so clear with 'page act clear_logs' right before the
 step you want to observe, then filter client-side. body fetches the browser's
@@ -338,6 +347,7 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
   web-cli page fetch last sinks                         # source-to-sink hits after 'page act sinks_install'
   web-cli page fetch last dialogs                       # dialog/auth ring + current answer policy
   web-cli page fetch last mutations                     # DOM changes + last_seq; re-read with --since to bracket an action
+  web-cli page fetch last reflections --target wm-probe-1a2b  # where a reflected marker survived, and its risk
   web-cli page fetch last har --out traffic.har         # write HAR 1.2 to a file (import into Caido/Burp)
   web-cli page fetch https://hackernews.com links       # open + extract in one step`,
 		Args: cobra.MaximumNArgs(2),
@@ -524,7 +534,8 @@ payload is capped at 256 KB and binary bodies come back as base64.`,
 // hover, scroll, select, eval, navigate, back, forward, reload, wait, set_viewport,
 // emulate, clear_logs, sinks_install, sinks_clear, replay, replay_fuzz,
 // inject_canary, postmessage_install, postmessage_clear, post_message,
-// wait_open and poc_bundle (mirroring the MCP page_act surface).
+// wait_open, poc_bundle and the page-free encode helper (mirroring the MCP
+// page_act surface).
 func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 	var (
 		id             string
@@ -563,16 +574,24 @@ func newPageActCmd(mgr *browsers.Manager) *cobra.Command {
 		force          bool
 		maxBytes       int64
 		raw            bool
+		actContext     string
+		variants       []string
+		attrName       string
+		mode           string
+		fieldFlags     []string
+		formValueFlags []string
+		submit         string
 	)
 	cmd := &cobra.Command{
 		Use:   "act [id] [action] [payload...]",
 		Short: "Perform an action on a live page",
 		Long: `Performs an action on a live page (click, input, type, press_key, click_at,
-hover_at, drag_and_drop, upload_file, hover, scroll, select, eval, navigate, back,
+hover_at, drag_and_drop, upload_file, hover, scroll, select, fill_form, eval, navigate, back,
 forward, reload, wait, set_viewport, emulate, clear_logs, sinks_install,
 sinks_clear, replay, replay_fuzz, inject_canary, postmessage_install, postmessage_clear,
 post_message, wait_open, intercept_add, intercept_list, intercept_clear,
-auth_save, auth_restore, auth_list, poc_bundle, dialog_accept, dialog_dismiss, http_auth) and prints the confirmation. The page id
+auth_save, auth_restore, auth_list, poc_bundle, dialog_accept, dialog_dismiss,
+http_auth) or the page-free encode helper, and prints the confirmation. The page id
 is optional when only one page is open; 'last' means the most recently opened page;
 a bare number resolves to page-N.
 Positional payloads fill each action's fields — flags remain as fallbacks.
@@ -602,6 +621,7 @@ prevents a false transport timeout; it never extends the action.
   click        [selector]
   hover        [selector]
   select       [selector] [value]
+  fill_form    [selector]  (fields via --field selector=VALUE; names via --form-value name=VALUE; submit via --submit)
   input        [selector] [text]
   press_key    [key]
   click_at     [x] [y]
@@ -632,6 +652,21 @@ prevents a false transport timeout; it never extends the action.
   http_auth    [user:password] (sets per-page HTTP basic-auth; empty clears)
   back/forward/reload    (none)
   type         [selector] [text]
+  encode       [context] [payload]  (page-free; variants via --variants)
+
+fill_form fills a form and optionally submits it in one call. The optional
+positional selector names the <form>; --field SELECTOR=VALUE fills by selector
+(repeatable) and --form-value NAME=VALUE fills by name inside the form
+(repeatable), so pass one shape per call. Each control is written through its
+native setter and then receives the input and change events React and Vue listen
+for: a checkbox or radio is checked, a select takes the option value, a textarea
+takes the value, and every other control takes the value. --submit is
+requestSubmit (default, form.requestSubmit()), click, or none; --wait load|idle|stable
+waits after the submit (ms and interactable are ignored). The action never moves
+the pointer or presses a key. It prints
+{form,filled:[{name,selector}],skipped:[{selector,reason}],submit,url_after};
+an unresolved field lands in skipped, never as an error, and a missing form is
+element_not_found.
 
 clear_logs empties the network, console, websocket and dialog buffers and prints
 {"network":N,"console":M,"websocket":K,"dialogs":D}.
@@ -707,7 +742,10 @@ context; a stored user agent that differs from the live page is refused with
 both agents named unless --force is set. Restoring into a fresh identity writes
 only that identity's browser context. auth_list lists saved snapshots as
 {site,name,cookie_count,origin_count,user_agent,updated_at} with no values, and
-needs no page.`,
+needs no page. encode is a page-free helper: 'page act encode <context> <payload>'
+returns {context,variants:[{label,value}]} with the mechanically equivalent payloads
+(raw, entity, url, url-double, js, js-hex, unicode, html5-attr) for that context,
+without opening or touching a page; use --variants to narrow the labels.`,
 		Example: `  web-cli page act click "#submit"                          # click on the single open page
   web-cli page act 12 input "#search" "pizza"               # type into a search box
   web-cli page act 12 press_key "Enter"                     # press Enter key
@@ -717,6 +755,13 @@ needs no page.`,
   web-cli page act last set_style '.site-footer' 'background-image:url("/favicon.ico?x=1")'  # write inline CSS
   web-cli page act last set_style --handle g3k9x2ab-b6 --value 'color:red !important'  # same, by handle
   web-cli page act last set_style '.site-footer' ''          # clear the inline style, print cleared:true
+  web-cli page act last set_attr 'a' href 'javascript:void(0)'  # write an attribute, print nodes_added
+  web-cli page act last set_attr 'img' src ''                # remove the attribute, print removed:true
+  web-cli page act last set_html 'body' append '<b id=wm1>hi</b>'  # append markup, print created elements
+  web-cli page act last set_html '#host' outer '<p id=wm2>new</p>' # replace the element with markup
+  web-cli page act last fill_form 'form#login' --field '#user=a' --field '#pass=b' --submit requestSubmit
+  web-cli page act last fill_form 'form#search' --form-value q=wm1 --submit click
+  web-cli page act encode attr-double '<script>alert(1)</script>'  # page-free: payload variants, no page needed
   web-cli page act last replay /api/user --method PUT --value '{"id":2}'  # replay with an edited body
   web-cli page act last replay --target /api/user --header X-Env=staging  # header override, same target
   web-cli page act last replay-fuzz /api/search --points q:query --payloads a --payloads b  # 2 sniper runs
@@ -745,6 +790,9 @@ needs no page.`,
 				points: pointFlags, payloads: payloadFlags, strategy: strategy,
 				site: site, name: name, force: force,
 				valueSet: cmd.Flags().Changed("value"),
+				context:  actContext, variants: variants,
+				attrName: attrName, mode: mode,
+				fieldFlags: fieldFlags, formValueFlags: formValueFlags, submit: submit,
 			})
 			if err != nil {
 				return err
@@ -759,6 +807,9 @@ needs no page.`,
 			target, method, headers, maxBytes = parsed.target, parsed.method, parsed.headers, parsed.maxBytes
 			points, payloads, strategy = parsed.points, parsed.payloads, parsed.strategy
 			site, name, force = parsed.site, parsed.name, parsed.force
+			actContext, variants = parsed.context, parsed.variants
+			attrName, mode = parsed.attrName, parsed.mode
+			submit = parsed.submit
 			valueSet := parsed.valueSet
 
 			actionTimeout := ipc.PageActTimeout(timeoutMS)
@@ -789,6 +840,21 @@ needs no page.`,
 			}
 			if action == "post_message" && value == "" {
 				return fmt.Errorf("page act: post_message requires a payload (e.g. 'page act last post_message '{\"t\":\"wm\"}''")
+			}
+			if action == "set_attr" && attrName == "" {
+				return fmt.Errorf("page act: set_attr requires an attribute name (e.g. 'page act set_attr 'a' href 'javascript:void(0)'')")
+			}
+			if action == "set_html" {
+				if _, err := pageops.SetHTMLMode(mode); err != nil {
+					return fmt.Errorf("page act: set_html: %w", err)
+				}
+			}
+			if action == "fill_form" {
+				canonical, err := pageops.ValidateFillForm(selector, submit, parsed.fields, parsed.values)
+				if err != nil {
+					return fmt.Errorf("page act: %w", err)
+				}
+				submit = canonical
 			}
 			if action == "wait" {
 				if err := pageops.ValidateWait(waitMode); err != nil {
@@ -837,6 +903,25 @@ needs no page.`,
 			queryEdits, err := parseQueryFlags(queryFlags)
 			if err != nil {
 				return err
+			}
+
+			if action == "encode" {
+				variantList := splitVariants(variants)
+				if cl := dialServe(cmd); cl != nil {
+					defer cl.Close()
+					return pageActViaIPC(ctx, cl, &ipc.PageActParams{
+						Action:   action,
+						Value:    value,
+						Context:  actContext,
+						Variants: variantList,
+					})
+				}
+				out, err := pageops.EncodePayload(value, actContext, variantList)
+				if err != nil {
+					return fmt.Errorf("page act: %w", err)
+				}
+				emitActOutput(action, out)
+				return nil
 			}
 
 			if action == "auth_list" {
@@ -903,6 +988,11 @@ needs no page.`,
 					Strategy:       browsers.FuzzStrategy(strategy),
 					Site:           site,
 					Name:           name,
+					AttrName:       attrName,
+					Mode:           mode,
+					Fields:         parsed.fields,
+					Values:         parsed.values,
+					Submit:         submit,
 					Force:          force,
 					MaxBytes:       maxBytes,
 					Paths:          paths,
@@ -974,10 +1064,16 @@ needs no page.`,
 				out, err = pageops.PageHover(ctx, p, handle, selector)
 			case "set_style":
 				out, err = pageops.PageSetStyle(ctx, p, handle, selector, value)
+			case "set_attr":
+				out, err = pageops.PageSetAttr(ctx, p, handle, selector, attrName, value)
+			case "set_html":
+				out, err = pageops.PageSetHTML(ctx, p, handle, selector, value, mode)
 			case "scroll":
 				out, err = pageops.PageScroll(ctx, p, x, y)
 			case "select":
 				out, err = pageops.PageSelect(ctx, p, handle, selector, value)
+			case "fill_form":
+				out, err = pageops.PageFillForm(ctx, p, selector, parsed.fields, parsed.values, submit, waitMode)
 			case "wait":
 				out, err = pageops.PageWait(ctx, p, waitMode, handle, selector, actionTimeout)
 			case "set_viewport":
@@ -1060,10 +1156,10 @@ needs no page.`,
 		},
 	}
 	cmd.Flags().StringVar(&id, "id", "", "page/session id to act on (optional with one page open; 'last'; or a bare number)")
-	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, set_style, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, replay_fuzz, inject_canary, postmessage_install, postmessage_clear, post_message, wait_open, intercept_add, intercept_list, intercept_clear, auth_save, auth_restore, auth_list, poc_bundle, dialog_accept, dialog_dismiss, http_auth")
+	cmd.Flags().StringVar(&action, "action", "", "action: click, input, type, press_key, click_at, hover_at, drag_and_drop, upload_file, eval, navigate, back, forward, reload, hover, set_style, set_attr, set_html, fill_form, encode, scroll, select, wait, set_viewport, emulate, clear_logs, sinks_install, sinks_clear, replay, replay_fuzz, inject_canary, postmessage_install, postmessage_clear, post_message, wait_open, intercept_add, intercept_list, intercept_clear, auth_save, auth_restore, auth_list, poc_bundle, dialog_accept, dialog_dismiss, http_auth")
 	cmd.Flags().StringVar(&selector, "selector", "", "CSS selector targeting the element (element actions)")
 	cmd.Flags().StringVar(&handle, "handle", "", "element handle from page fetch (g<document>-b<backendNodeId>, scoped to its document); wins over --selector (element actions)")
-	cmd.Flags().StringVar(&value, "value", "", "value for eval (JS function), input (text), type (text), navigate (URL), select (option value), set_style (CSS declarations; empty clears), or inject_canary (custom canary)")
+	cmd.Flags().StringVar(&value, "value", "", "value for eval (JS function), input (text), type (text), navigate (URL), select (option value), set_style (CSS declarations; empty clears), set_attr (attribute value; empty removes), set_html (markup), or inject_canary (custom canary)")
 	cmd.Flags().StringVar(&key, "key", "", "key or key combo for press_key action (e.g. Enter, Escape, Control+A)")
 	cmd.Flags().StringVar(&button, "button", "left", "mouse button for click and click_at: left, right, middle")
 	cmd.Flags().IntVar(&clickCount, "click-count", 1, "click count for click and click_at (1 for single click, 2 for double click)")
@@ -1084,7 +1180,7 @@ needs no page.`,
 	cmd.Flags().StringArrayVar(&payloadFlags, "payloads", nil, "replay_fuzz payload value (repeatable); the same raw strings replay sends as a body/value")
 	cmd.Flags().StringVar(&strategy, "strategy", "sniper", "replay_fuzz strategy: sniper (one point at a time), pitchfork (nth point with nth payload) or clusterbomb (every combination)")
 	cmd.Flags().Int64Var(&maxBytes, "max-bytes", 0, "cap the replay response body in bytes (0 = the engine's 256 KB ceiling); with replay_fuzz it caps each run body")
-	cmd.Flags().StringVar(&waitMode, "wait", "ms", "wait mode (wait action): load, idle, stable, interactable (needs --selector or --handle), ms (sleep --timeout-ms; default ms)")
+	cmd.Flags().StringVar(&waitMode, "wait", "ms", "wait mode (wait action): load, idle, stable, interactable (needs --selector or --handle), ms (sleep --timeout-ms; default ms); fill_form reuses load|idle|stable as the post-submit wait")
 	cmd.Flags().IntVar(&timeoutMS, "timeout-ms", 30000, "action deadline in milliseconds (default 30000); it bounds the action, and a separate socket-read grace only prevents false transport errors")
 	cmd.Flags().BoolVar(&raw, "raw", false, "skip humanized pointer/keyboard timing for this call (instant moves, no pre/post pause); the same switch is available process-wide via WEB_MCP_RAW_ACTIONS=1")
 	cmd.Flags().StringVar(&browserID, "browser", "", "browser_id to resolve the page inside that browser only (use when more than one browser is live)")
@@ -1094,7 +1190,14 @@ needs no page.`,
 	cmd.Flags().StringVar(&device, "device", "", "go-rod device preset to apply (emulate action), e.g. IPhoneX, IPadPro")
 	cmd.Flags().StringVar(&site, "site", "", "auth snapshot site/host, e.g. example.org (auth_save, auth_restore; optional filter for auth_list)")
 	cmd.Flags().StringVar(&name, "name", "", "auth snapshot name, unique per site (auth_save, auth_restore)")
+	cmd.Flags().StringVar(&attrName, "attr-name", "", "attribute name for set_attr (e.g. href, src, onerror, srcdoc)")
+	cmd.Flags().StringVar(&mode, "mode", "", "set_html mode: inner (default, innerHTML), outer (outerHTML) or append (insertAdjacentHTML beforeend)")
+	cmd.Flags().StringArrayVar(&fieldFlags, "field", nil, "fill_form: field selector=VALUE (repeatable; maps to fields)")
+	cmd.Flags().StringArrayVar(&formValueFlags, "form-value", nil, "fill_form: field name=VALUE resolved inside the form (repeatable; maps to values)")
+	cmd.Flags().StringVar(&submit, "submit", "", "fill_form: submit mode: requestSubmit (default), click or none")
 	cmd.Flags().BoolVar(&force, "force", false, "auth_restore: restore even when the live page user agent differs from the stored one")
+	cmd.Flags().StringVar(&actContext, "context", "", "encode: where the payload lands (html-text, attr-double, attr-single, attr-unquoted, js-string, js-template, css-value, url-query, url-path)")
+	cmd.Flags().StringArrayVar(&variants, "variants", nil, "encode: narrow the returned variants (repeatable or comma-separated; raw is always present)")
 	return cmd
 }
 
@@ -1472,6 +1575,20 @@ func pageActViaIPC(
 	}
 	emitActOutput(params.Action, res.Data)
 	return nil
+}
+
+// splitVariants flattens the repeatable --variants flag, splitting each value
+// on commas and dropping empty entries.
+func splitVariants(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, raw := range values {
+		for _, part := range strings.Split(raw, ",") {
+			if part = strings.TrimSpace(part); part != "" {
+				out = append(out, part)
+			}
+		}
+	}
+	return out
 }
 
 // emitActOutput prints an action's result. poc_bundle renders its directory and

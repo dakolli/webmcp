@@ -29,7 +29,7 @@ var whatVocab = map[string]bool{
 	"console": true, "body": true, "article": true, "tables": true,
 	"forms": true, "marks": true, "security": true, "storage": true,
 	"sinks": true, "postmessage": true, "har": true, "websocket": true,
-	"dialogs": true, "mutations": true,
+	"dialogs": true, "mutations": true, "reflections": true,
 }
 
 // isAction reports whether name is a page-act action, accepting the CLI dashed
@@ -52,7 +52,11 @@ var actPayloadSpecs = map[string][]string{
 	"click":               {"selector"},
 	"hover":               {"selector"},
 	"set_style":           {"selector", "decls"},
+	"set_attr":            {"selector", "name", "value"},
+	"set_html":            {"selector", "mode", "value"},
+	"encode":              {"context", "value"},
 	"select":              {"selector", "value"},
+	"fill_form":           {"selector"},
 	"input":               {"selector", "text"},
 	"navigate":            {"url"},
 	"eval":                {"js"},
@@ -517,6 +521,13 @@ type actArgFlags struct {
 	maxBytes       int64
 	valueSet       bool
 	force          bool
+	context        string
+	variants       []string
+	attrName       string
+	mode           string
+	fieldFlags     []string
+	formValueFlags []string
+	submit         string
 }
 
 // actArgs is the merged result of `page act` parsing: the effective
@@ -555,6 +566,13 @@ type actArgs struct {
 	maxBytes       int64
 	valueSet       bool
 	force          bool
+	context        string
+	variants       []string
+	attrName       string
+	mode           string
+	fields         map[string]string
+	values         map[string]string
+	submit         string
 }
 
 // parseActArgs parses `page act` positional args against the flag values and
@@ -605,6 +623,37 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 	case "click", "hover", "select", "input", "type", "set_style":
 		if len(payload) >= 1 {
 			a.selector = payload[0]
+		}
+		if len(payload) >= 2 {
+			a.value = payload[1]
+		}
+	case "fill_form":
+		if len(payload) >= 1 {
+			a.selector = payload[0]
+		}
+	case "set_attr":
+		if len(payload) >= 1 {
+			a.selector = payload[0]
+		}
+		if len(payload) >= 2 {
+			a.attrName = payload[1]
+		}
+		if len(payload) >= 3 {
+			a.value = payload[2]
+		}
+	case "set_html":
+		if len(payload) >= 1 {
+			a.selector = payload[0]
+		}
+		if len(payload) >= 2 {
+			a.mode = payload[1]
+		}
+		if len(payload) >= 3 {
+			a.value = payload[2]
+		}
+	case "encode":
+		if len(payload) >= 1 {
+			a.context = payload[0]
 		}
 		if len(payload) >= 2 {
 			a.value = payload[1]
@@ -824,6 +873,35 @@ func parseActArgs(args []string, f actArgFlags) (actArgs, error) {
 	if a.name == "" {
 		a.name = f.name
 	}
+	if a.context == "" {
+		a.context = f.context
+	}
+	if len(a.variants) == 0 {
+		a.variants = f.variants
+	}
+	if a.attrName == "" {
+		a.attrName = f.attrName
+	}
+	if a.mode == "" {
+		a.mode = f.mode
+	}
+	if len(a.fields) == 0 && a.action == "fill_form" {
+		fields, err := parsePairFlags(f.fieldFlags, "--field")
+		if err != nil {
+			return a, err
+		}
+		a.fields = fields
+	}
+	if len(a.values) == 0 && a.action == "fill_form" {
+		values, err := parsePairFlags(f.formValueFlags, "--form-value")
+		if err != nil {
+			return a, err
+		}
+		a.values = values
+	}
+	if a.submit == "" {
+		a.submit = f.submit
+	}
 	a.force = a.force || f.force
 	if !xSet {
 		a.x = f.x
@@ -858,6 +936,23 @@ func canonicalAction(action string) string {
 		return a.Name
 	}
 	return action
+}
+
+// parsePairFlags turns repeatable KEY=VALUE flags into a map. It splits at the
+// first '=' so a value may contain '='.
+func parsePairFlags(flags []string, label string) (map[string]string, error) {
+	if len(flags) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(flags))
+	for _, raw := range flags {
+		key, value, ok := strings.Cut(raw, "=")
+		if !ok || key == "" {
+			return nil, fmt.Errorf("page act: %s %q must be KEY=VALUE", label, raw)
+		}
+		out[key] = value
+	}
+	return out, nil
 }
 
 // parseFuzzPoints builds replay_fuzz injection points from --points values.

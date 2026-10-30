@@ -86,6 +86,71 @@ Set a declaration list on one element, then clear it:
 
 Expect compact JSON inside `data`, for example `{"target":"selector=\".site-footer\"","cleared":false,"applied":["background-image","--page-bg"],"rejected":[],"style":"background-image: url(\"/favicon.ico?wmstyle=1\"); --page-bg: red;"}`. The image request shows as type `Image` in `what=network`, and the `eval` returns the new computed URL. The final call returns `{"target":"selector=\".site-footer\"","cleared":true,"applied":[],"rejected":[],"style":""}`. A declaration the CSSOM drops appears in `rejected`, never silently: `{"value":"color:notacolor"}` returns `"rejected":["color:notacolor"]`. The CLI form is `browser page act set_style '.site-footer' 'background-image:url("/favicon.ico?x=1")'`, or `--handle g3k9x2ab-b6 --value 'color:red !important'` when targeting a handle.
 
+## 5c. Encode a payload for a context (no page needed)
+
+`encode` is page-free: it runs with no browser and no `session_id`.
+
+```json
+{"tool":"page_act","arguments":{"action":"encode","context":"attr-double","value":"<script>alert(1)</script>"}}
+{"tool":"page_act","arguments":{"action":"encode","context":"attr-double","value":"a&b\"c'd e","variants":["entity"]}}
+{"tool":"page_act","arguments":{"action":"encode","context":"js-string","value":"<script>alert(1)</script>"}}
+{"tool":"page_act","arguments":{"action":"encode","context":"html","value":"x"}}
+```
+
+Expect `{"context":"attr-double","variants":[{"label":"raw","value":"<script>alert(1)</script>"},{"label":"entity","value":"&lt;script&gt;alert(1)&lt;/script&gt;"},{"label":"url","value":"%3Cscript%3Ealert%281%29%3C%2Fscript%3E"},{"label":"html5-attr","value":"&lt;script&gt;alert(1)&lt;/script&gt;"}]}`. The second call narrows to `raw` and `entity`, and the `entity` value is `a&amp;b&#34;c&#39;d e` with no bare `"`. The `js-string` call returns `\x3cscript\x3ealert(1)\x3c\/script\x3e` as its `js` variant. The unknown `html` context fails as `invalid_args` and lists every accepted context.
+
+From a shell with or without the daemon:
+
+```sh
+browser page act encode attr-double '<script>alert(1)</script>'
+browser page act encode js-string 'a&b"c' --variants js,js-hex
+```
+
+## 5d. Write an attribute and markup with set_attr and set_html
+
+Write an `onerror` attribute, then remove it, then inject markup in two modes:
+
+```json
+{"tool":"page_act","arguments":{"session_id":"page-5","action":"set_attr","selector":"img","name":"onerror","value":"window.wmAttr=1"}}
+{"tool":"page_act","arguments":{"session_id":"page-5","action":"set_attr","selector":"img","name":"onerror","value":""}}
+{"tool":"page_act","arguments":{"session_id":"page-5","action":"set_html","selector":"body","mode":"append","value":"<b id=\"wm1\">hi</b><script>window.wmScript=1</script>"}}
+{"tool":"page_act","arguments":{"session_id":"page-5","action":"set_html","selector":"#wm1","mode":"outer","value":"<i id=\"wm2\">replaced</i>"}}
+{"tool":"page_fetch","arguments":{"session_id":"page-5","what":"dom","selector":"#wm2"}}
+```
+
+Expect the first call to return `{"target":"selector=\"img\"","name":"onerror","value":"window.wmAttr=1","removed":false,"nodes_added":0}`. The second returns the same shape with `"value":"","removed":true`. The append call returns `{"target":"selector=\"body\"","mode":"append","nodes_added":4,"elements":[{"tag":"b","attributes":{"id":"wm1"}},{"tag":"script","attributes":{}}],"scripts":1,"executed":false}`; `nodes_added` counts the text nodes too, and markup inserted this way does not execute its `<script>` children, so `executed` stays false unless a nested sink hit appears after `sinks_install`. The outer call replaces `#wm1` with `<i id="wm2">`, and the final read finds it. A `name:"srcdoc"` write on an iframe reports `nodes_added:1` for the frame node.
+
+CLI forms:
+
+```sh
+browser page act set_attr 'a' href 'javascript:void(0)'
+browser page act set_attr 'img' src ''
+browser page act set_html 'body' append '<b id=wm1>hi</b>'
+browser page act set_html '#host' outer '<p id=wm2>new</p>'
+```
+
+## 5e. Fill a form and submit it with fill_form
+
+Read the form with `page_fetch` `what=forms`, then fill by selector or by name and submit in one call:
+
+```json
+{"tool":"page_fetch","arguments":{"session_id":"page-5","what":"forms"}}
+{"tool":"page_act","arguments":{"session_id":"page-5","action":"fill_form","selector":"form#search","fields":{"#q":"web-mcp"},"submit":"requestSubmit"}}
+{"tool":"page_act","arguments":{"session_id":"page-5","action":"fill_form","selector":"form#login","values":{"user":"alice","pass":"s3cret"},"submit":"click","wait_mode":"load"}}
+{"tool":"page_act","arguments":{"session_id":"page-5","action":"fill_form","fields":{"input[name=email]":"a@b.test"},"submit":"none"}}
+```
+
+Expect `{"form":"form#search","filled":[{"name":"q","selector":"form#search > input"}],"skipped":[],"submit":"requestSubmit","url_after":"https://example.test/search?q=web-mcp"}`. The `values` call resolves each name inside `form#login`, so `filled` names the controls. A selector that matches nothing lands in `skipped` with `"reason":"no element matched"`, never as an error; a form selector that matches nothing returns `element_not_found`. Each control is written through its native setter and receives `input`/`change` (or `change` for a checkbox, radio, or select, and `input` for a textarea), so a React or Vue field keeps the value.
+
+CLI forms:
+
+```sh
+browser page act fill_form 'form#login' --field '#user=a' --field '#pass=b' --submit requestSubmit
+browser page act fill_form 'form#search' --form-value q=wm1 --submit click --wait load
+```
+
+`--field` and `--form-value` split at the first `=`, so use a selector without `=`, or read the selectors from `what=forms`.
+
 ## 6. Drag and drop
 
 Open the W3Schools drag page as `page-4`, then drag the range slider:

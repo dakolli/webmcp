@@ -10,6 +10,7 @@ type Action struct {
 	NeedsSelector bool
 	NeedsValue    bool
 	NeedsPaths    bool
+	PageFree      bool
 	Summary       string
 }
 
@@ -31,8 +32,11 @@ var actions = []Action{
 	{Name: "reload", Summary: "Reload the page."},
 	{Name: "hover", NeedsSelector: true, Summary: "Hover an element matched by selector or handle."},
 	{Name: "set_style", NeedsSelector: true, NeedsValue: true, Summary: "Set inline CSS declarations on an element, or clear them with an empty value."},
+	{Name: "set_attr", NeedsSelector: true, NeedsValue: true, Summary: "Set one attribute on an element, or remove it with an empty value."},
+	{Name: "set_html", NeedsSelector: true, NeedsValue: true, Summary: "Write markup into an element's inner, outer or appended HTML."},
 	{Name: "scroll", Summary: "Scroll the page by x and y."},
 	{Name: "select", NeedsSelector: true, NeedsValue: true, Summary: "Select an option in a select element."},
+	{Name: "fill_form", Summary: "Fill a form's fields and optionally submit it in one call."},
 	{Name: "wait", Summary: "Wait for a readiness mode."},
 	{Name: "set_viewport", Summary: "Set the viewport size."},
 	{Name: "emulate", Summary: "Apply a device preset."},
@@ -56,6 +60,7 @@ var actions = []Action{
 	{Name: "dialog_accept", Summary: "Accept a JavaScript dialog, using value as the prompt text."},
 	{Name: "dialog_dismiss", Summary: "Dismiss a JavaScript dialog."},
 	{Name: "http_auth", NeedsValue: true, Summary: "Set or clear a per-page HTTP basic-auth credential given as user:password."},
+	{Name: "encode", NeedsValue: true, PageFree: true, Summary: "Encode a payload for a context without touching the page."},
 }
 
 // Actions returns a copy of the page-act action table in schema order.
@@ -89,4 +94,10 @@ func findAction(name string) (Action, bool) {
 		}
 	}
 	return Action{}, false
+}
+
+// PageFreeAction reports whether an action runs without a live page.
+func PageFreeAction(name string) bool {
+	a, ok := LookupAction(name)
+	return ok && a.PageFree
 }

@@ -57,20 +57,20 @@ const defaultPageOpTimeout = 30 * time.Second
 const inputAckTimeout = 2 * time.Second
 
 // dispatchActions lists the action names the CLI (pkg/cli/cmd) and IPC
-// (pkg/cli/ipc) dispatch paths handle, including auth_list, which both surfaces
-// resolve before the main switch because it needs no live page. The action
-// table is the source of truth; actions_test.go asserts this mirror stays in
-// lockstep so an action cannot exist on only one side.
+// (pkg/cli/ipc) dispatch paths handle, including auth_list and encode, which
+// both surfaces resolve before the main switch because they need no live page.
+// The action table is the source of truth; actions_test.go asserts this mirror
+// stays in lockstep so an action cannot exist on only one side.
 var dispatchActions = []string{
 	"click", "input", "type", "press_key", "click_at", "hover_at",
 	"drag_and_drop", "upload_file", "eval", "navigate",
-	"back", "forward", "reload", "hover", "set_style", "scroll", "select",
-	"wait", "set_viewport", "emulate", "clear_logs",
+	"back", "forward", "reload", "hover", "set_style", "set_attr", "set_html", "scroll", "select",
+	"fill_form", "wait", "set_viewport", "emulate", "clear_logs",
 	"sinks_install", "sinks_clear", "replay", "inject_canary",
 	"postmessage_install", "postmessage_clear", "post_message",
 	"wait_open", "intercept_add", "intercept_list", "intercept_clear",
 	"auth_save", "auth_restore", "auth_list", "replay_fuzz", "poc_bundle",
-	"dialog_accept", "dialog_dismiss", "http_auth",
+	"dialog_accept", "dialog_dismiss", "http_auth", "encode",
 }
 
 // PageHTTPAuth arms per-page HTTP basic-auth credentials from a user:password
@@ -928,6 +928,9 @@ var aspectEntries = []aspectEntry{
 	{name: "mutations", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, q AspectQuery) (string, error) {
 		return PageMutations(ctx, p, q.Since, q.Selector)
 	}},
+	{name: "reflections", selfCapped: true, read: func(ctx context.Context, p *browsers.Page, q AspectQuery) (string, error) {
+		return PageReflections(ctx, p, q.Target, q.Selector)
+	}},
 }
 
 // unknownAspectError is the one unknown-what error every surface emits; it names
@@ -1073,7 +1076,7 @@ const actSettleWindow = 900 * time.Millisecond
 // follow-up wait call.
 func actMayNavigate(action string) bool {
 	switch action {
-	case "click", "click_at", "press_key", "upload_file", "eval", "select":
+	case "click", "click_at", "press_key", "upload_file", "eval", "select", "fill_form":
 		return true
 	}
 	return false
@@ -1127,11 +1130,12 @@ func settleAfterAction(
 	return after
 }
 
-// ActStateDeltaFor formats the state change for one action. Navigation actions
-// already report their destination, and eval returns its own JSON, so those
-// produce no suffix.
+// ActStateDeltaFor formats the state change for one action. Actions whose own
+// result already carries the destination or a JSON envelope — navigate, eval,
+// poc_bundle and fill_form — produce no suffix.
 func ActStateDeltaFor(action string, before, after PageState) string {
-	if action == "navigate" || action == "poc_bundle" || action == "eval" {
+	switch action {
+	case "navigate", "poc_bundle", "eval", "fill_form":
 		return ""
 	}
 	return ActStateDelta(before, after)

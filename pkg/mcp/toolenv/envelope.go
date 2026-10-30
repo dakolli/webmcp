@@ -70,6 +70,8 @@ var invalidArgsMarkers = []string{
 	"missing required argument",
 	"unknown what=",
 	"unknown action=",
+	"unknown context",
+	"is not available for context",
 	"invalid wait_for",
 	"unknown wait_mode",
 	"must be positive",

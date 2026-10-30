@@ -1,10 +1,15 @@
 package browsers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSinkHitsEnvelope(t *testing.T) {
@@ -133,4 +138,159 @@ func TestSinkHitsEnvelope(t *testing.T) {
 			t.Fatalf("short value: got %q cut=%v, want it unchanged", short, cut)
 		}
 	})
+}
+
+// TestSinkSourceHooks pins the source set the tracer tags. Each name is part of
+// the sinks envelope contract, so a missing hook silently downgrades a hit to
+// source:"unknown".
+func TestSinkSourceHooks(t *testing.T) {
+	cases := []struct {
+		source string
+		marker string
+	}{
+		{"location.hash", "'location.hash'"},
+		{"location.search", "'location.search'"},
+		{"location.href", "'location.href'"},
+		{"document.URL", "'document.URL'"},
+		{"document.referrer", "'document.referrer'"},
+		{"document.cookie", "'document.cookie'"},
+		{"window.name", "'window.name'"},
+		{"localStorage.getItem", "'localStorage.getItem'"},
+		{"sessionStorage.getItem", "'sessionStorage.getItem'"},
+		{"message", "'message'"},
+		{"history.state", "'history.state'"},
+		{"URLSearchParams.get", "'URLSearchParams.get'"},
+		{"URLSearchParams.getAll", "'URLSearchParams.getAll'"},
+	}
+	for _, c := range cases {
+		t.Run(c.source, func(t *testing.T) {
+			if !strings.Contains(sinkScript, c.marker) {
+				t.Fatalf("sinkScript is missing the %s source tag %s", c.source, c.marker)
+			}
+		})
+	}
+
+	if !strings.Contains(sinkScript, "WM_SOURCE_CAP = 24;") {
+		t.Fatal("source ring cap changed; it must stay at 24")
+	}
+	if !strings.Contains(sinkScript, "wmClipCookie") {
+		t.Fatal("document.cookie must be clipped before it is recorded")
+	}
+	if !strings.Contains(sinkScript, "'…'") {
+		t.Fatal("document.cookie clipping must use an ellipsis")
+	}
+}
+
+// TestSinkSourceAttribution proves each widened source is named end-to-end: the
+// page reads the value and writes it with innerHTML, and the hit reports the
+// tagged source. It skips when the host has no Chromium-family browser.
+func TestSinkSourceAttribution(t *testing.T) {
+	p := newCanaryTestPage(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = io.WriteString(w, "<!doctype html><html><body></body></html>")
+	}))
+	t.Cleanup(server.Close)
+
+	if err := p.Rod.Navigate(server.URL); err != nil {
+		t.Fatalf("navigate: %v", err)
+	}
+	if err := p.Rod.WaitLoad(); err != nil {
+		t.Fatalf("wait for load: %v", err)
+	}
+	if err := p.InstallSinks(ctx); err != nil {
+		t.Fatalf("InstallSinks: %v", err)
+	}
+
+	cases := []struct {
+		name       string
+		setup      string
+		wantSource string
+	}{
+		{
+			"window.name",
+			`window.name = 'wmcanary-name-9371'; document.body.innerHTML = window.name;`,
+			"window.name",
+		},
+		{
+			"MessageEvent.data",
+			`window.addEventListener('message', function (e) { document.body.innerHTML = e.data; });
+			 window.dispatchEvent(new MessageEvent('message', { data: 'wmcanary-msg-4826' }));`,
+			"message",
+		},
+		{
+			"localStorage.getItem",
+			`localStorage.setItem('wmk', 'wmcanary-local-5183'); document.body.innerHTML = localStorage.getItem('wmk');`,
+			"localStorage.getItem",
+		},
+		{
+			"sessionStorage.getItem",
+			`sessionStorage.setItem('wmk', 'wmcanary-session-6204'); document.body.innerHTML = sessionStorage.getItem('wmk');`,
+			"sessionStorage.getItem",
+		},
+		{
+			"document.cookie",
+			`document.cookie = 'wmsecret=SUPERSECRETVALUE123456; path=/'; document.body.innerHTML = document.cookie;`,
+			"document.cookie",
+		},
+		{
+			"history.state",
+			`history.replaceState({ k: 'wmcanary-history-7345' }, '', location.href); document.body.innerHTML = JSON.stringify(history.state);`,
+			"history.state",
+		},
+		{
+			"URLSearchParams.get",
+			`document.body.innerHTML = new URLSearchParams('q=wmcanary-params-8467').get('q');`,
+			"URLSearchParams.get",
+		},
+		{
+			"URLSearchParams.getAll",
+			`document.body.innerHTML = new URLSearchParams('q=a&q=wmcanary-all-9578').getAll('q').join(',');`,
+			"URLSearchParams.getAll",
+		},
+		{
+			"unmatched value",
+			`document.body.innerHTML = 'zzz-unmatched-wm-0000';`,
+			"unknown",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := p.ClearSinks(ctx); err != nil {
+				t.Fatalf("ClearSinks: %v", err)
+			}
+			if _, err := p.Rod.Eval("() => {" + c.setup + "}"); err != nil {
+				t.Fatalf("run setup: %v", err)
+			}
+			res, err := p.SinkHits(ctx)
+			if err != nil {
+				t.Fatalf("SinkHits: %v", err)
+			}
+			var hit *SinkHit
+			for i := range res.Hits {
+				if res.Hits[i].Sink == "innerHTML" {
+					hit = &res.Hits[i]
+					break
+				}
+			}
+			if hit == nil {
+				t.Fatalf("hits = %+v, want an innerHTML hit", res.Hits)
+			}
+			if hit.Source != c.wantSource {
+				t.Fatalf("source = %q, want %q (value %q)", hit.Source, c.wantSource, hit.Value)
+			}
+			if c.name == "document.cookie" {
+				if strings.Contains(hit.Value, "SUPERSECRETVALUE") {
+					t.Fatalf("cookie value leaked: %q", hit.Value)
+				}
+				if !strings.Contains(hit.Value, "…") {
+					t.Fatalf("cookie value = %q, want it clipped with an ellipsis", hit.Value)
+				}
+			}
+		})
+	}
 }

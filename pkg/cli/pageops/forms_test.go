@@ -2,6 +2,7 @@ package pageops
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -122,8 +123,42 @@ func TestShapeFormsDroppedCounts(t *testing.T) {
 	})
 }
 
-// TestShapeFormsCSRF pins the candidate rule: only hidden inputs whose name or
-// value looks like a token qualify.
+// TestCoerceField pins the value coercion per control type: the write kind and
+// the events the page dispatches afterwards.
+func TestCoerceField(t *testing.T) {
+	cases := []struct {
+		name   string
+		tag    string
+		typ    string
+		value  string
+		kind   fieldWriteKind
+		events []string
+	}{
+		{"text", "input", "text", "hi", fieldWriteValue, []string{"input", "change"}},
+		{"email", "input", "email", "a@b.c", fieldWriteValue, []string{"input", "change"}},
+		{"checkbox", "input", "checkbox", "1", fieldWriteChecked, []string{"change"}},
+		{"radio", "input", "radio", "1", fieldWriteChecked, []string{"change"}},
+		{"select", "select", "", "opt", fieldWriteSelect, []string{"change"}},
+		{"textarea", "textarea", "", "line", fieldWriteTextarea, []string{"input"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := coerceField("#f", tc.tag, tc.typ, tc.value)
+			if got.Kind != string(tc.kind) {
+				t.Errorf("kind = %q, want %q", got.Kind, tc.kind)
+			}
+			if !slices.Equal(got.Events, tc.events) {
+				t.Errorf("events = %v, want %v", got.Events, tc.events)
+			}
+			if tc.kind == fieldWriteChecked && got.Value != "" {
+				t.Errorf("checked value = %q, want empty", got.Value)
+			}
+			if tc.kind != fieldWriteChecked && got.Value != tc.value {
+				t.Errorf("value = %q, want %q", got.Value, tc.value)
+			}
+		})
+	}
+}
 func TestShapeFormsCSRF(t *testing.T) {
 	raw := rawForms{
 		FormTotal: 1,
@@ -147,5 +182,38 @@ func TestShapeFormsCSRF(t *testing.T) {
 	}
 	if cands[1].Name != "whatever" || cands[1].Match != "value" {
 		t.Errorf("candidate[1] = %+v, want whatever matched by value", cands[1])
+	}
+}
+
+// TestFillFormResultHasNoDeltaSuffix pins that fill_form returns its JSON
+// envelope untouched: the result already carries url_after, so no state delta
+// may be appended. On the old code the suffix made the output invalid JSON and
+// the MCP envelope downgraded it to a string.
+func TestFillFormResultHasNoDeltaSuffix(t *testing.T) {
+	before := PageState{URL: "https://example.com", Title: "Home"}
+	after := PageState{URL: "https://example.com/?q=wm-probe", Title: "Home"}
+
+	for _, action := range []string{"navigate", "eval", "poc_bundle", "fill_form"} {
+		t.Run(action, func(t *testing.T) {
+			if got := ActStateDeltaFor(action, before, after); got != "" {
+				t.Fatalf("ActStateDeltaFor(%q) = %q, want no suffix", action, got)
+			}
+		})
+	}
+
+	const result = `{"form":"form#wmf","filled":[],"skipped":[],"submit":"requestSubmit","url_after":"https://example.com/?q=wm-probe"}`
+	out := result + ActStateDeltaFor("fill_form", before, after)
+	if out != result {
+		t.Fatalf("fill_form output = %q, want %q", out, result)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+		t.Fatalf("fill_form output is not a JSON object: %v", err)
+	}
+	if obj["url_after"] != "https://example.com/?q=wm-probe" {
+		t.Fatalf("url_after = %v, want the landed url", obj["url_after"])
+	}
+	if got := ActStateDeltaFor("click", before, after); got == "" {
+		t.Fatal("click lost its state delta")
 	}
 }

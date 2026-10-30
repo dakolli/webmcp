@@ -193,7 +193,29 @@ Expect `data` as `{"log":{"version":"1.2","creator":{"name":"web-mcp","version":
 
 The CLI writes the same document uncapped and prints one line, never the body: `browser page fetch page-1 har --out traffic.har` prints `wrote traffic.har (42 entries)`. The file is mode 0600 and its `log.comment` says `Cap: none`.
 
-## 13. Errors and cleanup
+## 13. Hunt a reflected marker
+
+Open a real search page with the marker in the query, then read `reflections`. The marker is your input, so use one unlikely token.
+
+```json
+{"tool":"fetch_page","arguments":{"url":"https://www.gnu.org/search/?q=wm-probe-1a2b","browser_id":"browser-20","wait_for":"idle"}}
+{"tool":"page_fetch","arguments":{"session_id":"page-7","what":"reflections","target":"wm-probe-1a2b"}}
+```
+
+Expect `data` as `{"marker":"wm-probe-1a2b","count":N,"truncated":false,"hits":[{"where":"dom-text","selector":"input#q","context":"html-text","snippet":"…wm-probe-1a2b…","survived":[],"risk":"inert"}]}`. `where` is `dom-text`, `attr`, `comment`, `script-text`, `style-text`, or `url`, and `context` names the surrounding construct. A marker inside a double-quoted attribute reports `attr-double` and names the attribute. `survived` lists the marker's own special characters that stayed raw, and `risk` is `dangerous`, `escaped`, or `inert`. A marker with no hits returns `count:0`, not an error. A page that reflects `wm-probe-1a2b<script>` escaped reports `escaped`, not `dangerous`.
+
+Scope the scan and correlate with the tracer:
+
+```json
+{"tool":"page_fetch","arguments":{"session_id":"page-7","what":"reflections","target":"wm-probe-1a2b","selector":"main"}}
+{"tool":"page_act","arguments":{"session_id":"page-7","action":"sinks_install"}}
+{"tool":"page_act","arguments":{"session_id":"page-7","action":"eval","value":"() => { const d=document.createElement('div'); d.innerHTML='wm-probe-1a2b'; document.body.appendChild(d); return d.textContent }"}}
+{"tool":"page_fetch","arguments":{"session_id":"page-7","what":"reflections","target":"wm-probe-1a2b"}}
+```
+
+Expect the scoped read to drop hits outside `main`, and the final read to add `"sinks_correlated":[{"sink":"innerHTML","context":"html","selector":"…","value":"wm-probe-1a2b"}]`, which links the reflection to a sink the tracer observed. Clear with `page_act action=sinks_clear`.
+
+## 14. Errors and cleanup
 
 A bad selector on `text` returns `{"ok":false,"error":{"type":"element_not_found","message":"page_fetch: no element matched selector \"#does-not-exist-xyz\": cannot find element"}}`, tested live on 2026-10-26.
 

@@ -174,6 +174,7 @@ Five prompts are registered: `fetch_and_summarize`, `inspect_page_decomposition`
 | `websocket` | WebSocket frames the page sent and received, oldest first, with socket id, direction, opcode, payload, and handshake status. Text payloads clip at 2000 runes. A binary frame reports size only. The newest 100 of a 200-frame ring. |
 | `dialogs` | Recorded `alert`, `confirm`, `prompt`, `beforeunload`, and basic-auth challenges with the policy that answered each one. The default is dismiss, so a dialog never blocks the page. Ring of 50. |
 | `mutations` | DOM change batches with `seq`, `kind`, `target`, `attribute`, and added and removed node counts. Read `last_seq`, act, then read again with `since` to see exactly what the action changed. Ring of 500. |
+| `reflections` | Hunts a marker (passed as `target`) across the live DOM, the serialized `outerHTML`, and `document.URL`. Each hit reports `where`, `context`, `survived` special characters, a 40-char `snippet`, and a `risk` of `dangerous`, `escaped`, or `inert`. Capped at 200 hits; `sinks_correlated` links tracer hits. |
 | `storage` | Cookies with flags, local and session storage, IndexedDB, and caches. Values are redacted unless `include_values`. |
 | `har` | HAR 1.2 export of the observed traffic for Burp, Caido, or ZAP. |
 | `html`, `text` | Raw `outerHTML`, or visible `innerText`. `selector` narrows both. |
@@ -191,8 +192,10 @@ reports `truncated` and `omitted` instead of cutting an object in half.
 | :--- | :--- |
 | Mouse | `click`, `click_at`, `hover`, `hover_at`, `drag_and_drop` |
 | Keyboard | `input`, `type`, `press_key` with combos such as `Control+a` |
-| Forms | `select`, `upload_file` |
+| Forms | `select`, `upload_file`, `fill_form` (fill fields and submit in one call) |
 | Style | `set_style` (inline CSS declarations, or clear with an empty value) |
+| Injection | `set_attr` (one attribute, or remove it with an empty value), `set_html` (inner, outer, or appended markup) |
+| Encoding | `encode` (page-free: payload variants for a target context) |
 | Navigation | `navigate`, `back`, `forward`, `reload` |
 | View and time | `scroll`, `wait`, `set_viewport`, `emulate` |
 | Code and logs | `eval`, `clear_logs` |
@@ -203,6 +206,23 @@ reports `truncated` and `omitted` instead of cutting an object in half.
 
 Element actions take a `handle` from `page_fetch`, or a CSS selector. A handle wins when both are
 given.
+
+`set_attr` writes one attribute (`name`, `value`; an empty `value` removes it) and returns
+`{target,name,value,removed,nodes_added}`. `set_html` writes markup with `mode` `inner` (default),
+`outer`, or `append` and returns `{target,mode,nodes_added,elements,scripts,executed}`; `elements`
+caps at 50 and `executed` is true only when the sink tracer saw a hit beyond the write itself.
+Neither action has an allowlist or sanitises: `javascript:` and `onerror` values reach the page
+unchanged.
+
+`fill_form` fills a form and optionally submits it in one call. Pass `fields` (a field selector to
+value object) or `selector` naming the `<form>` plus `values` (a field name to value object resolved
+inside that form). `submit` is `requestSubmit` (default, `form.requestSubmit()`), `click`, or `none`;
+`wait_mode` `load`, `idle`, or `stable` waits after the submit. Each control is written through its
+native setter and then receives the `input` and `change` events React and Vue listen for: a checkbox
+or radio is checked, a select takes the option value, a textarea takes the value, and every other
+control takes the value. It returns `{form,filled:[{name,selector}],skipped:[{selector,reason}],submit,url_after}`.
+An unresolved field is reported in `skipped`, never as an error; a missing form is
+`element_not_found`. The action never moves the pointer or presses a key.
 
 A pointer or keyboard action is humanised by default. Pass `raw:true` to skip it.
 
@@ -215,6 +235,12 @@ clicked selector="a.next"
 
 `eval` never appends a delta, so its result is always parseable JSON.
 
+`encode` is a pure helper: it needs `value` and `context` but no `session_id`, opens no page and
+sends no request. It returns `{context,variants:[{label,value}]}` with the mechanically equivalent
+payloads `raw`, `entity`, `url`, `url-double`, `js`, `js-hex`, `unicode`, and `html5-attr`. The
+contexts are `html-text`, `attr-double`, `attr-single`, `attr-unquoted`, `js-string`, `js-template`,
+`css-value`, `url-query`, and `url-path`. Pass `variants` to narrow the set; `raw` is always present.
+
 ## CLI
 
 The CLI mirrors the tools and adds the daemon lifecycle.
@@ -224,8 +250,13 @@ browser fetch https://news.ycombinator.com --wait stable
 browser page fetch last interactives
 browser page fetch last network --filter=-image,-font
 browser page act click ".titleline a"
+browser page act set_attr ".titleline a" href "javascript:void(0)"
+browser page act set_html "body" append "<b id=wm1>hi</b>"
+browser page act fill_form "form#login" --field "#user=a" --field "#pass=b" --submit requestSubmit
+browser page act fill_form "form#search" --form-value q=wm1 --submit click
 browser page act replay "api.example.com/session" --method PUT --query ref=5.0
 browser page act last poc_bundle --value "Stored XSS" --paths /tmp/poc-1
+browser page act encode attr-double '<script>alert(1)</script>'
 browser serve mcp --port 4099
 browser serve stop
 ```
